@@ -16,8 +16,7 @@ The whole window, on an AMD card: *Bumblebee* at 1280x720 in **Split**, source
 left of the divider and render right. The toolbar reads **Neural Rendering · On**,
 **DLSS Upscaling · On · FSR4** and **Interpolate · On**, and the status line says
 what each is doing — `DLSS Upscaling on: 2560x1440 (auto) · FSR4`, `Source
-1280x720 -> 2560x1440`, `48 / 24 fps`, and the render's own chip, `Render 99% ·
-ETA 33:34`.
+1280x720 -> 2560x1440`, `48 / 24 fps`
 
 > [!NOTE]
 > **A fork of [DLSS 5 Video Player](https://github.com/2600th/dlss5-video-player)
