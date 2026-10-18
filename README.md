@@ -62,7 +62,7 @@ offered on it. It is not a menu choice, because a machine has one of the two.
 | Passes | 1 to 4, stacked, with switches for the later ones only: keep skin tones, predict the third pass instead of running the network, and skip the later passes' block group. Every extra pass is another full network run |
 | Temporal model | The neural pass has none: no guide estimator, so its motion and depth guides are constants and the render is spatial. FSR 4 is a temporal upscaler, but it is handed constants too — no jitter, depth, exposure or motion vectors — so it upsamples the frame as given |
 | Colour | SDR. 10-bit and HDR are not wired on this path |
-| Speed | ≈21 ms a frame end-to-end at 1080p on an RX 9070 XT for the neural pass alone, against a 33.3 ms budget at 30 fps. The upscale's and the interpolation's own cost is unmeasured, and so are 900, 1440 and 4K |
+| Speed | ≈21 ms a frame end-to-end at 1080p for the neural pass alone, against a 33.3 ms budget at 30 fps. As a whole-video throughput, measured live on an RX 9070 XT: **2.6–2.7× real time at 720p, 1.5× at 1080p-class** (3.2–3.4× and 1.7× while a chunk is actually rendering — the rest is the window idling on purpose), with **zero dropped frames**. Every job pays a cold start of 5.6–8.8 s. [Measured speeds](#render-speed-and-the-render-ahead-window) has the numbers, what they cost, and which of them are measured rather than derived. The upscale's and the interpolation's own cost is unmeasured, and so are 900, 1440 and 4K |
 | What it needs | The `amd-neural-runtime/` package (≈600 MiB, not in this repository) beside the module directory, or named by `DLSS5_AMD_RUNTIME_DIR`. For the two newer stages, FidelityFX's `amd_fidelityfx_loader_dx12.dll` beside the exe, with `amd_fidelityfx_upscaler_dx12.dll` and `amd_fidelityfx_framegeneration_dx12.dll` — three files, in the packaged build, that [the notices](docs/THIRD-PARTY-NOTICES.md) list |
 | Add-on, ReShade, `dxgi.dll` | None. This backend loads no proxy and registers no add-on |
 
@@ -74,10 +74,95 @@ with its audio and its duration, and the upscaler takes a 1280x720 source to
 frame by frame against the two frames they sit between, which is how the
 brightness strobe in the interpolated cadence was found and then fixed. The
 captures below are a live session's compare views, so `D` has since been driven
-end to end on the same card; **a cache hit after a session and half-hour
-continuous playback are still unverified.** The
+end to end on the same card. Half an hour of continuous playback has now been
+walked through as well — 33 minutes of a 1280x720 film in 120-second chunks,
+six published cache entries; each of its three session starts waited 6–7 s for
+its first chunk and then never waited again — and **a cache hit after a session
+is still unverified.** The
 [integration plan](docs/AMD-LMXXF-INTEGRATION-PLAN-REV2-zh.md) (Chinese) records
 what was measured, on what, and what was not.
+
+### Render speed and the render-ahead window
+
+The neural pass is the whole cost, and it is linear in pixels: **≈21 ms a frame
+end-to-end at 1080p** on an RX 9070 XT — 63% of a 30 fps frame's budget spent
+converting, before the player decodes, upscales and presents anything. Two
+resolutions a factor of two apart in pixels confirm it, to within 2%:
+
+| | 1280×720 @ 23.976 fps | 1920×966 @ 25 fps |
+| --- | --- | --- |
+| Pixels | 921,600 | 1,854,720 |
+| Render, first segment to last | **3.18–3.37× real time** | **1.70–1.73× real time** |
+| One 120 s chunk, dispatch to published | **44.3 s and 45.7 s → 2.62–2.71×** | **78.9 s and 79.4 s → 1.51–1.52×** |
+| Buffer left when the next chunk starts | 48.0 s, 50.1 s of the 120 s window | 81.8 s, 82.8 s |
+| Frames dropped once playing | 0 | 0 (2, both in the first second) |
+
+The third row is the one a viewer feels, and it is lower than the second on
+purpose: a chunk also pays its cold start and the join-and-validate step that
+turns its segments into a cache entry, neither of which is render time. Same
+card, same window, 2.0× the pixels costs 1.98× the throughput — the model is
+the pixels and nothing else.
+
+**Two paces, and they are not the same number.** One is measured from a job's
+first segment to its last: the speed the render itself achieves. The other is
+the session's average, which also counts the time the window spends
+deliberately idle between chunks. On 720p those read 3.18× and **1.25×** at the
+same moment, because a 2.6× GPU only has to render 39% of the time to hold two
+minutes of buffer — a falling average there is the feature working, not the
+card slowing down. The status line's ETA uses the session average, since a
+viewer waiting on the film does experience the idle; the scheduler that decides
+when to start the next chunk uses the render's own pace. Pricing the schedule
+on the average would have forced the mark from 50 s to 108 s of the 120 s
+window, starting every chunk twice as early and doubling the GPU time for an
+identical result.
+
+Every job also pays a **cold start** — helper launch, runtime bring-up, the
+first output — measured at **5.6–8.8 s** end to end, of which 2.5–4.8 s is
+before the first frame comes back, at 720p and at 1080p alike. (Four runs took
+18–20 s; every one of those had waited 12–19 s for the request to be admitted,
+which is a busy player rather than a slower startup.) A window pays that once
+per chunk, which is the whole reason for the next table.
+
+**Why the window is 120 seconds.** A chunk costs one cold start plus its own
+render, so the overhead as a share of a chunk is `S/(S + N/ratio)`, and on this
+card `S × ratio` is about 14 seconds of video at 720p and at 1080p alike — the
+startup slows down in the same proportion the render does:
+
+| Window | Cold start's share of a chunk |
+| --- | --- |
+| 1:00 | 19% |
+| 1:30 | 13% |
+| **2:00** | **10%** |
+| 3:00 | 7% |
+
+120 s is where another minute of window stops buying anything worth the extra
+video rendered past a pause. At 2.6× a 120 s chunk lands in about 45 s of wall
+clock, 6–7 s of it cold start; at 1.5×, 79 s.
+
+**When the next chunk starts.** The trigger is the buffer, not the playhead:
+the next chunk starts once the lookahead has drained to
+`coldStart + window/ratio + 5` seconds — **48–50 s of a 120 s window at 720p,
+82 s at 1080p-class**. That is derived, not tuned: a chunk needs
+`7.3 + 120/ratio` seconds to produce, and the buffer has to stay above zero for
+exactly that long, so a faster GPU is allowed to sit idle longer. In practice
+the chip's percentage climbs one chunk at a time and playback never waits — the
+two sessions above dropped no frames once they were playing.
+
+Two cases break that arithmetic, and both are handled rather than hidden. If a
+chunk overruns — one measured here finished with 31 s of buffer left where its
+mark expected 67 — the next one simply starts later, and coverage keeps landing
+every second or two while it runs, so the buffer grows through a chunk rather
+than draining. And a GPU slower than the video (this card is not, at any
+resolution the runtime admits) has its low-water mark clamped to the window's
+own length, which turns the rule into "render whenever the buffer is not
+full": converting past a pause is better than a session that freezes.
+
+**What that costs over a film.** Rendering all of a two-hour film costs about
+45 minutes of GPU at 720p and 80 at 1080p-class, and that is what the old
+default did whether or not anyone was watching. With a 120 s window the render
+follows the playhead: ten minutes watched is ten minutes of video converted —
+under four minutes of GPU at 720p, seven at 1080p-class, plus one cold start
+per two-minute chunk — and nothing beyond the last two minutes is touched.
 
 ### Upscaling and frame generation
 

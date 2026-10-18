@@ -99,10 +99,11 @@ you by default: the part before the toggle point is never rendered (unless you
 seek back into it), and the GPU goes quiet about two minutes past where you are
 watching instead of converting a film to its end. Inside that window the stretch
 you are watching comes first and what is left is filled nearest-first; when the
-buffer has drained to about a minute, the next two-minute chunk is rendered. Off
-is the older behaviour — the whole video — and 1:00, 1:30 and 3:00 are the other
-rungs; a change applies to the next chunk rather than cancelling the job in
-flight.
+lookahead has drained to what the next chunk needs to produce — about 50 s at
+720p on this card, 80 s at 1080p, both measured — the next two-minute chunk is
+rendered. Off is the older behaviour — the whole video — and 1:00, 1:30 and 3:00
+are the other rungs; a change applies to the next chunk rather than cancelling
+the job in flight.
 
 The **Render** chip at the right of the status line measures how much of that
 job is done: rendered video over everything the session set out to render — the
