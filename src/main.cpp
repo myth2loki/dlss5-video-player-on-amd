@@ -13871,10 +13871,13 @@ static int RunCacheStatus(const CacheStatusRequest& request){
         // The verdict is the manifest's, not the clock's: an entry with a stamp
         // answers without reading the payload, and one published before the
         // field existed has nothing to answer with and must be hashed. The
-        // timings only show what that costs on this entry.
+        // timings only show what that costs on this entry - and below a few
+        // milliseconds of hash they cannot show anything, because a lookup also
+        // stats the directory and takes the cache root's lock.
+        const bool timingShowsIt = row.hashMs >= 5.0;
         const std::wstring verdict=!row.opened?L"lookup refused"
             :!row.stamped?L"no stamp recorded: hashed"
-            :row.lookupMs*3.0<row.hashMs?L"served by its stamp, not hashed"
+            :!timingShowsIt||row.lookupMs*3.0<row.hashMs?L"served by its stamp, not hashed"
             :L"stamp no longer matches: hashed again";
         console.Out(L"  "+row.key+L"  "+row.span+L"  "+FormatMegabytes(row.bytes)+L" MB  stamp="
                     +(row.stamped?L"yes":L"no ")+L"  lookup="+FormatMilliseconds(row.lookupMs)
