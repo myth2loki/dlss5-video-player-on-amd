@@ -4,6 +4,7 @@
 #include "MediaPipeline.h"
 #include "NeuralRenderTypes.h"
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -100,6 +101,35 @@ std::string NeuralCacheInstallation();
 // The environment terms of `identity`, plus this installation.
 NeuralCacheEnvironment NeuralCacheEnvironmentFor(const NeuralCacheIdentity& identity);
 
+// The payload's identity on disk as it stood when its digest was taken,
+// recorded beside the digest so a later lookup can answer "is this still the
+// file the digest describes?" without reading the bytes a promotion has already
+// read. It is the same five fields the in-process memo
+// (PublishedPayloadDigest) has always compared, made durable.
+//
+// The change time is not decoration: it is what catches a payload rewritten at
+// the same size with its write time put back (NeuralPrerenderTests'
+// "already-verified entries are served without hashing again" tampers exactly
+// that way), so dropping it from the comparison would quietly serve tampered
+// bytes. It survives the promotion's rename for the same reason the in-process
+// memo does: promotion renames within one volume and then checks this stamp at
+// the destination before remembering the digest - a full comparison, including
+// this field, is what that check has always been.
+//
+// An entry carrying no stamp - every entry published before this field existed,
+// and any payload that did not stay put while it was hashed - is hashed on
+// every lookup exactly as it was.
+struct NeuralPayloadStamp {
+    uint64_t size{};
+    int64_t lastWrite{};
+    int64_t change{};
+    uint64_t volume{};
+    std::array<uint8_t, 16> fileId{};
+
+    bool Recorded() const { return size != 0 && volume != 0; }
+    friend bool operator==(const NeuralPayloadStamp&, const NeuralPayloadStamp&) = default;
+};
+
 struct NeuralCacheManifest {
     // Schema 5 carries schema 4's field list. The bump retires every schema-4
     // entry, because those were written under a render identity that named
@@ -153,6 +183,11 @@ struct NeuralCacheManifest {
     // this field existed - refuses every render that backend publishes. See
     // IsReusableNeuralCacheManifest for what is asked instead.
     NeuralBackend backend{NeuralBackend::Nvidia};
+    // Optional, schema 5, renders and sources both: the payload's identity as it
+    // was when the digest above was taken over it. Written after `backend` and
+    // only when recorded, so a manifest without it is byte-for-byte what every
+    // earlier writer produced and those entries stay reusable.
+    NeuralPayloadStamp payloadStamp;
 
     friend bool operator==(const NeuralCacheManifest&, const NeuralCacheManifest&) = default;
 };

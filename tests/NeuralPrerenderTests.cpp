@@ -1501,6 +1501,85 @@ void fixture_sweep_leaves_a_live_runs_directory_alone_test()
 
 // Publishes a render under `key` with `environment` recorded (or none), and
 // the runtime digest `runtime`.
+// A fresh process, so the in-process digest memo is empty and only the manifest
+// can answer: this is what a cold cache hit pays. `publish` writes a 128 MB
+// payload and promotes it; `lookup` hashes that payload once for a baseline and
+// then times the lookup that should not hash it at all - the stamp promotion
+// recorded is what lets it answer. `key` names an entry to look up instead of
+// the probe's own, so a real entry in a real cache root can be measured.
+int RunPayloadStampProbe(std::wstring_view mode, const std::filesystem::path& root,
+                         std::string key = std::string(64, 'e'))
+{
+    constexpr size_t kPayloadBytes = size_t{128} << 20;
+    if (key.size() != 64) return 18;
+    NeuralCacheManager manager(root);
+    if (!manager.Valid()) return 10;
+    const auto payload =
+        manager.Root() / L"renders" / std::wstring(key.begin(), key.end()) / L"neural.mkv";
+    if (mode == L"publish") {
+        const auto staging = manager.BeginRenderStaging(key);
+        if (!staging) return 11;
+        {
+            std::ofstream out(*staging / L"neural.mkv", std::ios::binary | std::ios::trunc);
+            const std::string block(1 << 20, 'n');
+            for (size_t written = 0; written < kPayloadBytes; written += block.size())
+                out.write(block.data(), static_cast<std::streamsize>(block.size()));
+            if (!out) return 12;
+        }
+        StageRenderReceipt(*staging);
+        return manager.PromoteRender(key, *staging, CompleteRenderManifest()) ? EXIT_SUCCESS : 13;
+    }
+    if (mode != L"lookup") return 14;
+    const auto hashStart = std::chrono::steady_clock::now();
+    if (!Sha256File(payload).has_value()) return 15;
+    const double hashMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - hashStart).count();
+    const auto lookupStart = std::chrono::steady_clock::now();
+    const auto entry = manager.LookupRender(key);
+    const double lookupMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - lookupStart).count();
+    if (!entry) return 16;
+    std::error_code sizeError;
+    const auto bytes = std::filesystem::file_size(payload, sizeError);
+    std::cout << "payload " << (sizeError ? 0 : bytes >> 20) << " MB: hash " << hashMs
+              << " ms, lookup " << lookupMs << " ms" << std::endl;
+    // The lookup must be plainly cheaper than reading the bytes it skipped. The
+    // factor is 3 rather than 4 because this runs against the live player's own
+    // cache root too, where taking the root's lock for the last-use mark costs a
+    // few milliseconds that no amount of skipping the hash can remove.
+    return lookupMs * 3.0 < hashMs ? EXIT_SUCCESS : 17;
+}
+
+void RunPayloadStampChild(const std::filesystem::path& directory, std::wstring_view mode,
+                          const std::filesystem::path& root)
+{
+    const auto executable = directory / L"stamp-probe.exe";
+    std::error_code ignored;
+    std::filesystem::remove(executable, ignored);
+    std::filesystem::copy_file(CurrentExecutable(), executable);
+    std::wstring arguments = L"\"" + executable.wstring() + L"\" --payload-stamp-probe " +
+        std::wstring(mode) + L" \"" + root.wstring() + L"\"";
+    STARTUPINFOW startup{sizeof(startup)};
+    PROCESS_INFORMATION process{};
+    const auto workingDirectory = CurrentExecutable().parent_path();
+    CHECK(CreateProcessW(executable.c_str(), arguments.data(), nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW, nullptr, workingDirectory.c_str(), &startup, &process));
+    if (!process.hProcess) return;
+    CloseHandle(process.hThread);
+    const DWORD wait = WaitForSingleObject(process.hProcess, 120000);
+    CHECK_EQ(DWORD{WAIT_OBJECT_0}, wait);
+    if (wait != WAIT_OBJECT_0) {
+        TerminateProcess(process.hProcess, 99);
+        WaitForSingleObject(process.hProcess, 10000);
+    }
+    DWORD exitCode = 99;
+    CHECK(GetExitCodeProcess(process.hProcess, &exitCode));
+    CloseHandle(process.hProcess);
+    if (exitCode != EXIT_SUCCESS)
+        std::wcerr << L"Payload stamp probe " << mode << L" exited with " << exitCode << L'\n';
+    CHECK_EQ(DWORD{EXIT_SUCCESS}, exitCode);
+}
+
 bool PublishRender(NeuralCacheManager& manager, const std::string& key,
                    const NeuralCacheEnvironment& environment, char runtime = 'b')
 {
@@ -1580,6 +1659,135 @@ void manifest_environment_is_optional_additive_and_all_or_nothing_test()
     CHECK_EQ(NeuralCacheInstallation(), environment.installation);
     CHECK(!environment.installation.empty());
     CHECK(environment.installation.find('\\') == std::string::npos);
+}
+
+// The payload's identity, recorded at promotion, is what lets a lookup in a
+// later process answer "is this still the file the digest describes?" without
+// re-reading bytes a promotion already read - 30-90 ms on a block entry and
+// seconds on a whole-source one. Three things have to hold for that to be
+// safe: the field is additive, the stamp describes the file that was hashed,
+// and an entry without one is still served by hashing it.
+void manifest_payload_stamp_is_optional_additive_and_all_or_nothing_test()
+{
+    auto manifest = CompleteRenderManifest();
+    manifest.state = NeuralCacheState::Complete;
+    manifest.neuralDigest = std::string(64, 'c');
+    const std::string legacyBytes = SerializeNeuralCacheManifest(manifest);
+    CHECK(legacyBytes.find("payloadStamp") == std::string::npos);
+    const auto legacy = ParseNeuralCacheManifest(legacyBytes);
+    CHECK(legacy.has_value());
+    if (legacy) {
+        CHECK(!legacy->payloadStamp.Recorded());
+        CHECK(IsReusableNeuralCacheManifest(*legacy));
+    }
+
+    manifest.payloadStamp = {39389004, 133000000000000000, 133000000000000001, 0x1234, {}};
+    for (size_t index = 0; index < manifest.payloadStamp.fileId.size(); ++index)
+        manifest.payloadStamp.fileId[index] = static_cast<uint8_t>(index * 11 + 1);
+    const std::string recordedBytes = SerializeNeuralCacheManifest(manifest);
+    // Written last, and everything before it is the manifest without it.
+    CHECK(recordedBytes.find(",\"payloadStamp\":{\"size\":39389004,") != std::string::npos);
+    CHECK(recordedBytes.find("\"id\":\"010c17222d38434e59646f7a85909ba6\"") != std::string::npos);
+    CHECK(recordedBytes.ends_with("}}\n"));
+    // Everything before the extension is the manifest without it.
+    CHECK(recordedBytes.starts_with(legacyBytes.substr(0, legacyBytes.size() - 2)));
+    const auto recorded = ParseNeuralCacheManifest(recordedBytes);
+    CHECK(recorded.has_value());
+    if (recorded) {
+        CHECK_EQ(manifest, *recorded);
+        CHECK(IsReusableNeuralCacheManifest(*recorded));
+    }
+
+    // All or nothing: a missing field, an id that is not 16 bytes of lower-case
+    // hex, and an object that records nothing are all refused rather than read
+    // as "absent".
+    const auto withoutChange = [recordedBytes] {
+        std::string bytes = recordedBytes;
+        const size_t at = bytes.find(",\"change\":133000000000000001");
+        if (at != std::string::npos) bytes.erase(at, 27);
+        return bytes;
+    }();
+    CHECK(!ParseNeuralCacheManifest(withoutChange).has_value());
+    {
+        std::string bad = recordedBytes;
+        const size_t at = bad.find("\"id\":\"010c");
+        CHECK(at != std::string::npos);
+        if (at != std::string::npos) bad[at + 7] = 'g';
+        CHECK(!ParseNeuralCacheManifest(bad).has_value());
+    }
+    {
+        std::string shortId = recordedBytes;
+        const size_t at = shortId.find("010c17222d38434e59646f7a85909ba6");
+        CHECK(at != std::string::npos);
+        if (at != std::string::npos) shortId.erase(at, 31);
+        CHECK(!ParseNeuralCacheManifest(shortId).has_value());
+    }
+    {
+        std::string empty = recordedBytes;
+        const size_t at = empty.find("\"size\":39389004");
+        CHECK(at != std::string::npos);
+        if (at != std::string::npos) empty.replace(at, 15, "\"size\":0");
+        CHECK(!ParseNeuralCacheManifest(empty).has_value());
+    }
+}
+
+// Promotion stamps the payload it hashed - so a later process can trust the
+// digest without re-reading the bytes - and a payload rewritten under that stamp
+// is still caught, by the change time, even at the same size with its write time
+// put back.
+void promoted_entry_records_its_payload_stamp_and_rewrites_still_fail_authentication_test()
+{
+    TempDirectory fixture;
+    NeuralCacheManager manager(fixture.Path() / L"cache");
+    REQUIRE(manager.Valid());
+    const std::string key(64, 'f');
+    REQUIRE(PublishRender(manager, key, {}));
+    const auto directory = RenderDirectory(manager, key);
+    const auto payload = directory / L"neural.mkv";
+
+    const std::string bytes = ReadBytes(directory / L"manifest.json");
+    CHECK(bytes.find(",\"payloadStamp\":{") != std::string::npos);
+    CHECK(bytes.find("\"size\":" + std::to_string(std::filesystem::file_size(payload))) !=
+          std::string::npos);
+    const auto parsed = ParseNeuralCacheManifest(bytes);
+    REQUIRE(parsed.has_value());
+    if (parsed) CHECK(parsed->payloadStamp.Recorded());
+
+    // The digest the stamp was recorded beside is the payload's own, so a
+    // lookup that trusts the stamp hands back what a hashing lookup would.
+    CHECK(manager.LookupRender(key).has_value());
+
+    // Rewritten in place, same size, write time put back: the stamp no longer
+    // identifies the file and the hash behind it disagrees.
+    const auto written = std::filesystem::last_write_time(payload);
+    std::string tampered = ReadBytes(payload);
+    tampered.front() = tampered.front() == 'n' ? 'm' : 'n';
+    WriteBytes(payload, tampered);
+    std::filesystem::last_write_time(payload, written);
+    CHECK(!manager.LookupRender(key).has_value());
+
+    // Stripped of its stamp, an entry is the shape every earlier release
+    // published: it still parses, is still reusable, and is hashed on lookup.
+    const size_t at = bytes.find(",\"payloadStamp\":{");
+    REQUIRE(at != std::string::npos);
+    if (at != std::string::npos) WriteBytes(directory / L"manifest.json", bytes.substr(0, at) + "}\n");
+    const auto stripped = ParseNeuralCacheManifest(ReadBytes(directory / L"manifest.json"));
+    CHECK(stripped.has_value());
+    if (stripped) {
+        CHECK(!stripped->payloadStamp.Recorded());
+        CHECK(IsReusableNeuralCacheManifest(*stripped));
+    }
+}
+
+// The same claim across a process boundary, which is where it matters: the memo
+// dies with the publisher, so only the manifest can stop the second process from
+// reading 128 MB it has already read once.
+void a_recorded_payload_stamp_lets_a_later_process_skip_the_hash_test()
+{
+    TempDirectory fixture;
+    const auto root = fixture.Path() / L"cache";
+    RunPayloadStampChild(fixture.Path(), L"publish", root);
+    RunPayloadStampChild(fixture.Path(), L"lookup", root);
 }
 
 // Entries a driver update, a model refresh or an upgrade of this installation
@@ -6136,6 +6344,15 @@ int wmain(int argc, wchar_t* argv[])
 {
     if (argc == 3 && std::wstring_view(argv[1]) == L"--cache-root-probe")
         return RunCacheRootProbe(argv[2]);
+    if (argc == 4 && std::wstring_view(argv[1]) == L"--payload-stamp-probe")
+        return RunPayloadStampProbe(argv[2], argv[3]);
+    if (argc == 5 && std::wstring_view(argv[1]) == L"--payload-stamp-probe") {
+        // A cache key is 64 hex characters, so this narrowing cannot lose one.
+        std::string key;
+        for (const wchar_t* character = argv[4]; *character; ++character)
+            key.push_back(static_cast<char>(*character));
+        return RunPayloadStampProbe(argv[2], argv[3], key);
+    }
     // Never resumed: LiveChildProcess only needs a pid that stays alive.
     if (argc == 2 && std::wstring_view(argv[1]) == L"--suspended-child") return EXIT_SUCCESS;
     if (argc == 2 && std::wstring_view(argv[1]) == L"--contained-parent") return RunContainedParent();
@@ -6164,6 +6381,9 @@ int wmain(int argc, wchar_t* argv[])
     runtime_digest_is_order_independent_byte_sensitive_and_rejects_duplicates_test();
     manifest_round_trip_rejects_partial_duplicate_and_unknown_state_test();
     amd_render_with_both_manifest_extensions_publishes_test();
+    manifest_payload_stamp_is_optional_additive_and_all_or_nothing_test();
+    promoted_entry_records_its_payload_stamp_and_rewrites_still_fail_authentication_test();
+    a_recorded_payload_stamp_lets_a_later_process_skip_the_hash_test();
     manifest_fields_with_control_characters_round_trip_test();
     source_and_render_promotion_are_hash_validated_and_immutable_test();
     promotion_waits_out_a_transient_lock_and_names_the_failing_step_test();

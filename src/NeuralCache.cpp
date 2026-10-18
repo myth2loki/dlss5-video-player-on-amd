@@ -859,6 +859,47 @@ std::wstring PayloadMemoPath(const std::filesystem::path& path)
     return normalized;
 }
 
+// The manifest's own spelling of a payload's identity: lower-case hex for the
+// volume's file id, which is the one field a JSON number cannot carry.
+std::string PayloadIdHex(const std::array<uint8_t, 16>& id)
+{
+    static constexpr char kDigits[] = "0123456789abcdef";
+    std::string hex;
+    hex.reserve(id.size() * 2);
+    for (const uint8_t byte : id) {
+        hex.push_back(kDigits[byte >> 4]);
+        hex.push_back(kDigits[byte & 0x0f]);
+    }
+    return hex;
+}
+
+bool ParsePayloadId(std::string_view hex, std::array<uint8_t, 16>& id)
+{
+    if (hex.size() != id.size() * 2) return false;
+    for (size_t index = 0; index < id.size(); ++index) {
+        const auto nibble = [](char digit) -> int {
+            if (digit >= '0' && digit <= '9') return digit - '0';
+            if (digit >= 'a' && digit <= 'f') return digit - 'a' + 10;
+            return -1;
+        };
+        const int high = nibble(hex[index * 2]);
+        const int low = nibble(hex[index * 2 + 1]);
+        if (high < 0 || low < 0) return false;
+        id[index] = static_cast<uint8_t>(high * 16 + low);
+    }
+    return true;
+}
+
+// Whether the file at hand is still the one the recorded digest was taken over.
+// Every field counts: the change time is what catches a rewrite that put the
+// size and the write time back.
+bool StampIdentifies(const NeuralPayloadStamp& recorded, const PayloadStamp& actual)
+{
+    return recorded.size == actual.size && recorded.lastWrite == actual.lastWrite &&
+           recorded.change == actual.change && recorded.volume == actual.volume &&
+           recorded.fileId == actual.id;
+}
+
 struct PublishedPayload {
     std::wstring path;
     PayloadStamp stamp;
@@ -1247,6 +1288,15 @@ std::string SerializeNeuralCacheManifest(const NeuralCacheManifest& manifest)
     // one published by it on NVIDIA today are the same bytes.
     if (manifest.backend != NeuralBackend::Nvidia)
         json += ",\"backend\":\"" + JsonEscape(NeuralBackendName(manifest.backend)) + "\"";
+    // Written only when a promotion recorded one, and last, for the same reason
+    // the two extensions above are: an entry published before the field existed
+    // reads back as the same bytes it was written with.
+    if (const NeuralPayloadStamp& stamp = manifest.payloadStamp; stamp.Recorded())
+        json += ",\"payloadStamp\":{\"size\":" + std::to_string(stamp.size) +
+            ",\"lastWrite\":" + std::to_string(stamp.lastWrite) +
+            ",\"change\":" + std::to_string(stamp.change) +
+            ",\"volume\":" + std::to_string(stamp.volume) +
+            ",\"id\":\"" + PayloadIdHex(stamp.fileId) + "\"}";
     return json + "}\n";
 }
 
@@ -1323,6 +1373,22 @@ std::optional<NeuralCacheManifest> ParseNeuralCacheManifest(std::string_view byt
             const auto parsed = ParseNeuralBackend(backend);
             if (!parsed) return std::nullopt;
             manifest.backend = *parsed;
+        }
+        // The payload's identity as it was when the digest was taken, last of
+        // the optional extensions. An object that records nothing is refused
+        // rather than read as "absent", exactly as an empty environment is: this
+        // writer never produces one.
+        if (cursor.PeekKey() == "payloadStamp") {
+            NeuralPayloadStamp& stamp = manifest.payloadStamp;
+            std::string id;
+            if (!cursor.Expect(',') || !cursor.Key("payloadStamp") || !cursor.Expect('{') ||
+                !ReadIntegerField(cursor, "size", stamp.size) ||
+                !ReadIntegerField(cursor, "lastWrite", stamp.lastWrite) ||
+                !ReadIntegerField(cursor, "change", stamp.change) ||
+                !ReadIntegerField(cursor, "volume", stamp.volume) ||
+                !ReadStringField(cursor, "id", id, false) || !cursor.Expect('}') ||
+                !ParsePayloadId(id, stamp.fileId) || !stamp.Recorded())
+                return std::nullopt;
         }
     } else {
         // Schema 4 included, whose field list schema 5 keeps: those entries are
@@ -1619,6 +1685,24 @@ std::optional<NeuralCacheEntry> NeuralCacheManager::Lookup(
     const auto payload = directory /
         (kind == NeuralCacheEntryKind::Source ? L"source.mkv" : L"neural.mkv");
     auto digest = PublishedPayloadDigest(payload);
+    // A promotion hashed these bytes and recorded what they were, on the same
+    // device they were flushed to before the hash was taken. When the file is
+    // still that file - same size, write and change times, same identity on the
+    // same volume - hashing it again proves nothing the promotion did not, and
+    // it is 30-90 ms on a block entry and seconds on a whole-source one. An
+    // entry published before the stamp existed carries none, so it is hashed as
+    // before.
+    if (!digest && manifest->payloadStamp.Recorded()) {
+        const auto stamp = StampPayload(payload);
+        if (stamp && StampIdentifies(manifest->payloadStamp, *stamp)) {
+            LOG("Neural cache entry " << utf8_text::FromWide(directory.filename().wstring())
+                << " authenticated by its recorded payload stamp (size=" << manifest->payloadStamp.size
+                << "); the payload was not re-hashed.");
+            return NeuralCacheEntry{directory, payload, *manifest};
+        }
+        LOG("Neural cache entry " << utf8_text::FromWide(directory.filename().wstring())
+            << " no longer matches its recorded payload stamp; hashing it again.");
+    }
     if (!digest) digest = Sha256File(payload, stop);
     if (!digest) return std::nullopt;
     const std::string& expected = kind == NeuralCacheEntryKind::Source
@@ -1670,6 +1754,16 @@ bool NeuralCacheManager::Promote(NeuralCacheEntryKind kind, std::string_view key
     const auto digest = Sha256File(payload);
     if (!digest) return fail(NeuralCachePromotion::Stage::PayloadDigest);
     const bool hashedUnchanged = hashedStamp && StampPayload(payload) == hashedStamp;
+    // Recorded only when the payload provably did not move while it was hashed:
+    // a stamp that describes some other state than the hashed bytes would let a
+    // later lookup skip the hash and serve a file this digest never described.
+    if (hashedUnchanged) {
+        manifest.payloadStamp.size = hashedStamp->size;
+        manifest.payloadStamp.lastWrite = hashedStamp->lastWrite;
+        manifest.payloadStamp.change = hashedStamp->change;
+        manifest.payloadStamp.volume = hashedStamp->volume;
+        manifest.payloadStamp.fileId = hashedStamp->id;
+    }
     manifest.kind = kind;
     manifest.state = NeuralCacheState::Complete;
     manifest.schema = kSchema;
