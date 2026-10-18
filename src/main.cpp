@@ -13706,6 +13706,169 @@ static std::filesystem::path RenderScratchRoot(const std::filesystem::path& sett
     return root.is_absolute()&&length<32767&&automatic!=1?root:std::filesystem::path{};
 }
 
+// `--cache-status <input|key> [--cache-root <dir>]`: what the cache holds for a
+// source, and what opening each entry costs.
+//
+// It exists because the only other way to see this is to wait for a hit to
+// appear in the log, and a hit needs the render key of the moment: a live
+// session's render range starts at the playhead snapped to a frame, so no two
+// sessions ask for the same range and a "second open" is a new key rather than
+// a hit. This asks the cache directly. It recomputes nothing about the render
+// identity - the entries are matched by the source digest their own manifests
+// already record - so it cannot drift from what the player computes.
+struct CacheStatusRequest {
+    std::filesystem::path input;   // a media file, or
+    std::string key;               // one entry's key, when the word is 64 hex
+    std::filesystem::path root;    // empty: the configured or automatic root
+};
+
+static std::optional<CacheStatusRequest> ParseCacheStatus(const std::vector<std::wstring>& arguments){
+    CacheStatusRequest request;
+    bool seen=false;
+    for(size_t index=0;index<arguments.size();++index){
+        const std::wstring& argument=arguments[index];
+        if(argument==L"--cache-status"){
+            if(seen||index+1>=arguments.size())return std::nullopt;
+            request.input=arguments[++index];seen=true;continue;
+        }
+        if(argument==L"--cache-root"){
+            if(index+1>=arguments.size())return std::nullopt;
+            request.root=arguments[++index];continue;
+        }
+        return std::nullopt;   // not this verb, and never a half-parsed one
+    }
+    if(!seen)return std::nullopt;
+    const std::wstring word=request.input.wstring();
+    const bool hex=word.size()==64&&std::all_of(word.begin(),word.end(),[](wchar_t character){
+        return (character>=L'0'&&character<=L'9')||(character>=L'a'&&character<=L'f');});
+    if(hex)request.key=WideToUtf8(word);
+    return request;
+}
+
+static std::wstring FormatMilliseconds(double milliseconds){
+    wchar_t text[32]{};swprintf_s(text,L"%.1f",milliseconds);return text;
+}
+
+static std::wstring FormatMegabytes(uintmax_t bytes){
+    wchar_t text[32]{};swprintf_s(text,L"%.1f",double(bytes)/1048576.0);return text;
+}
+
+// One row per entry: what it covers, what it weighs, and the two timings that
+// answer "would opening this read the payload again". `served` is the same
+// verdict the player's own log gives when it prints the stamp line: a lookup
+// that costs a fraction of hashing the same file did not hash it. The lookup is
+// the real one, so it takes the entry's last-use mark exactly as opening it
+// would - a diagnostic that inspects an entry is a reason to keep it.
+struct CacheStatusRow {
+    std::wstring key;
+    std::wstring span;
+    uintmax_t bytes{};
+    bool stamped{};
+    bool whole{};
+    bool opened{};
+    double lookupMs{};
+    double hashMs{};
+    int64_t start100ns{};
+};
+
+static int RunCacheStatus(const CacheStatusRequest& request){
+    RenderConsole console;
+    std::filesystem::path executable;std::wstring pathError;
+    const std::filesystem::path helpers=CurrentExecutablePath(executable,pathError)?executable.parent_path():std::filesystem::path{};
+    const std::filesystem::path settings=helpers/L"DLSSVideoPlayer.ini";
+    NeuralCacheManager cache(request.root.empty()?RenderScratchRoot(settings):request.root);
+    if(!cache.Valid()){
+        console.Err(L"failed: no cache directory to read.");
+        return render_cli::kExitFailed;
+    }
+    console.Out(L"cache root               "+cache.Root().wstring());
+    std::string digest;
+    if(request.key.empty()){
+        std::error_code error;
+        const std::filesystem::path input=std::filesystem::absolute(request.input,error);
+        if(error||!std::filesystem::is_regular_file(input,error)){
+            console.Err(L"error: the input is not a file: "+request.input.wstring());
+            return render_cli::kExitBadArguments;
+        }
+        const auto started=std::chrono::steady_clock::now();
+        const auto hashed=Sha256File(input);
+        const double milliseconds=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-started).count();
+        if(!hashed){
+            console.Err(L"failed: the source could not be hashed.");
+            return render_cli::kExitFailed;
+        }
+        digest=*hashed;
+        std::error_code sizeError;
+        const uintmax_t bytes=std::filesystem::file_size(input,sizeError);
+        console.Out(L"source                   "+input.wstring());
+        console.Out(L"source digest            "+Utf8ToWide(digest));
+        console.Out(L"source hashed in         "+FormatMilliseconds(milliseconds)+L" ms over "
+                    +(sizeError?std::wstring(L"?"):FormatMegabytes(bytes))+L" MB");
+    }else{
+        console.Out(L"entry                    "+Utf8ToWide(request.key));
+    }
+    std::vector<CacheStatusRow> rows;
+    std::error_code iteratorError;
+    for(std::filesystem::directory_iterator iterator(cache.Root()/L"renders",iteratorError),end;
+        !iteratorError&&iterator!=end;iterator.increment(iteratorError)){
+        const std::wstring name=iterator->path().filename().wstring();
+        if(name.size()!=64)continue;
+        const std::string keyName=WideToUtf8(name);
+        if(!request.key.empty()&&request.key!=keyName)continue;
+        // Peek reads the manifest and nothing else: an entry that is not this
+        // source's is skipped before any payload is opened.
+        const auto entry=NeuralCacheManager::Peek(cache.Root(),NeuralCacheEntryKind::Render,keyName);
+        if(!entry)continue;
+        if(!digest.empty()&&entry->manifest.sourceDigest!=digest)continue;
+        CacheStatusRow row;
+        row.key=name.substr(0,12);
+        row.start100ns=entry->manifest.rangeStart100ns;
+        const bool whole=entry->manifest.rangeStart100ns==0&&entry->manifest.rangeEnd100ns==0;
+        row.whole=whole;
+        row.span=whole?L"whole source":FormatMilliseconds(double(entry->manifest.rangeStart100ns)*1e-7)
+            +L" - "+FormatMilliseconds(double(entry->manifest.rangeEnd100ns)*1e-7)+L" s";
+        std::error_code sizeError;
+        row.bytes=std::filesystem::file_size(entry->payloadPath,sizeError);
+        row.stamped=entry->manifest.payloadStamp.Recorded();
+        const auto hashStart=std::chrono::steady_clock::now();
+        Sha256File(entry->payloadPath);
+        row.hashMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-hashStart).count();
+        const auto lookupStart=std::chrono::steady_clock::now();
+        const auto opened=cache.LookupRender(keyName);
+        row.lookupMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-lookupStart).count();
+        row.opened=opened.has_value();
+        rows.push_back(std::move(row));
+    }
+    std::sort(rows.begin(),rows.end(),[](const CacheStatusRow& left,const CacheStatusRow& right){
+        return left.start100ns<right.start100ns;});
+    console.Out(L"entries                  "+std::to_wstring(rows.size()));
+    bool wholeSource=false;
+    for(const CacheStatusRow& row:rows){
+        if(row.whole)wholeSource=true;
+        // The verdict is the manifest's, not the clock's: an entry with a stamp
+        // answers without reading the payload, and one published before the
+        // field existed has nothing to answer with and must be hashed. The
+        // timings only show what that costs on this entry.
+        const std::wstring verdict=!row.opened?L"lookup refused"
+            :!row.stamped?L"no stamp recorded: hashed"
+            :row.lookupMs*3.0<row.hashMs?L"served by its stamp, not hashed"
+            :L"stamp no longer matches: hashed again";
+        console.Out(L"  "+row.key+L"  "+row.span+L"  "+FormatMegabytes(row.bytes)+L" MB  stamp="
+                    +(row.stamped?L"yes":L"no ")+L"  lookup="+FormatMilliseconds(row.lookupMs)
+                    +L" ms  hash="+FormatMilliseconds(row.hashMs)+L" ms  "+verdict);
+    }
+    if(request.key.empty()){
+        // The one entry opening this file asks for by itself, before any neural
+        // toggle: with it present the player starts on the cache and never
+        // renders, and it is the only whole-source key a reopen can reproduce.
+        console.Out(std::wstring(L"whole-source entry       ")+(wholeSource?L"present: opening this file plays the cached render"
+                                                                     :L"absent: opening this file will render"));
+    }
+    LOG("Cache status: root="<<WideToUtf8(cache.Root().wstring())<<" entries="<<rows.size()
+        <<" wholeSource="<<(wholeSource?"yes":"no")<<" key="<<request.key);
+    return render_cli::kExitOk;
+}
+
 // `--probe <input>`: what `dlss5-convert probe` prints. Everything a
 // conversion would find out minutes in - that the source is a photo, that no
 // Super Resolution rung grows it, that the runtime drifted from its lock, how
@@ -14016,6 +14179,10 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int)
     EnablePerMonitorDpiAwareness();
     EnableDarkPopupMenus();
     AppOptions options=ParseArgs();
+    // --cache-status answers on the console and never reaches the player, for
+    // the same reason --render does not: a batch run has nobody to answer a
+    // message box.
+    if(const auto status=ParseCacheStatus(options.userArguments))return RunCacheStatus(*status);
     LoadFrameGenAddon(options.safeMode);
     // --render and --help run headless and never reach the player, its
     // bootstrap or a window. ParseRuntimeArguments has already run, so the

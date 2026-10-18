@@ -513,6 +513,15 @@ inline std::wstring Usage()
         L"without rendering. --capabilities also measures frame generation's rate\n"
         L"cap, which brings up a device of its own. dlss5-convert probe runs this.\n"
         L"\n"
+        L"       DLSSVideoPlayer.exe --cache-status <input|key> [--cache-root DIR]\n"
+        L"\n"
+        L"Prints what the neural cache holds for a source and what opening each entry\n"
+        L"costs, as a lookup and a full hash of the same payload side by side. An entry\n"
+        L"whose lookup costs a fraction of its hash is served by the payload stamp its\n"
+        L"manifest records and is not read again. Also says whether the whole-source\n"
+        L"entry a plain open asks for is present - the only one a reopen can reproduce,\n"
+        L"because a live session's range starts at the playhead.\n"
+        L"\n"
         L"Exit codes: 0 done, 2 bad arguments, 3 refused (the reason is printed),\n"
         L"4 failed, 5 cancelled (Ctrl+C).";
 }
