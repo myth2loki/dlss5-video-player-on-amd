@@ -377,6 +377,15 @@ std::vector<std::wstring> AmdRuntimeIdentityFiles(const std::filesystem::path& r
             continue;
         }
         if (!it->is_regular_file(kindError) || kindError) continue;
+        // The runtime writes its own log beside its modules, and appends to it on
+        // every job - so a digest that includes it names a different runtime each
+        // time a render ends, which changes every render key with it. Measured
+        // 2026-10-19: two jobs two minutes apart recorded different
+        // `runtimeDigest` values in their manifests, and the second one could not
+        // find the first one's entry; the only file in the tree that had changed
+        // content was `lmxxf_runtime.log`.
+        const std::wstring name = LowerWide(it->path().filename().wstring());
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, L".log") == 0) continue;
         const fs::path relative = fs::relative(it->path(), runtimeDirectory, kindError);
         if (kindError) return {};
         files.push_back(relative.generic_wstring());

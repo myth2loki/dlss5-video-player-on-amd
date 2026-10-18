@@ -6282,6 +6282,45 @@ void progress_report_takes_the_last_block_and_nothing_else_test()
     }
 }
 
+// The AMD runtime writes its own log beside its modules and appends to it on
+// every job. Including it in the identity digest named a different runtime each
+// time a render ended, and every render key with it: two jobs two minutes apart
+// were recorded with different `runtimeDigest` values, and the second could not
+// find the first one's entry. The tree is identified by everything except what
+// the runtime writes about itself.
+void amd_runtime_identity_leaves_out_the_runtime_log_test()
+{
+    TempDirectory fixture;
+    std::error_code ignored;
+    std::filesystem::create_directories(fixture.Path() / L"lmxxf-modules", ignored);
+    std::filesystem::create_directories(fixture.Path() / L"shader-cache", ignored);
+    WriteBytes(fixture.Path() / L"LmxxfNrRuntime.dll", "runtime");
+    WriteBytes(fixture.Path() / L"lmxxf-modules" / L"m.hsaco", "weights");
+    WriteBytes(fixture.Path() / L"shader-cache" / L"warm.dxbc", "cache");
+    WriteBytes(fixture.Path() / L"lmxxf_runtime.log", "first run\n");
+    WriteBytes(fixture.Path() / L"notes.LOG", "upper case too\n");
+
+    const std::vector<std::wstring> files = AmdRuntimeIdentityFiles(fixture.Path());
+    // The module, the weights and nothing the runtime derives.
+    CHECK_EQ(size_t{2}, files.size());
+    for (const std::wstring& file : files) {
+        CHECK(file.find(L".log") == std::wstring::npos);
+        CHECK(file.find(L".LOG") == std::wstring::npos);
+        CHECK(file.find(L"shader-cache") == std::wstring::npos);
+    }
+    const auto first = BuildRuntimeDigest(fixture.Path(), files);
+    CHECK(first.has_value());
+    // A log that grew is not a different runtime; a module that changed is.
+    WriteBytes(fixture.Path() / L"lmxxf_runtime.log", "first run\nsecond run\n");
+    const auto afterLog = BuildRuntimeDigest(fixture.Path(), AmdRuntimeIdentityFiles(fixture.Path()));
+    CHECK(afterLog.has_value());
+    CHECK_EQ(first, afterLog);
+    WriteBytes(fixture.Path() / L"lmxxf-modules" / L"m.hsaco", "weights-changed");
+    const auto afterModule = BuildRuntimeDigest(fixture.Path(), AmdRuntimeIdentityFiles(fixture.Path()));
+    CHECK(afterModule.has_value());
+    CHECK(first != afterModule);
+}
+
 int RunFakeMediaPipelineChild(int argc, wchar_t* argv[])
 {
     const std::wstring name = CurrentExecutable().filename().wstring();
@@ -6430,6 +6469,7 @@ int wmain(int argc, wchar_t* argv[])
     promoted_entry_records_its_payload_stamp_and_rewrites_still_fail_authentication_test();
     a_recorded_payload_stamp_lets_a_later_process_skip_the_hash_test();
     progress_report_takes_the_last_block_and_nothing_else_test();
+    amd_runtime_identity_leaves_out_the_runtime_log_test();
     manifest_fields_with_control_characters_round_trip_test();
     source_and_render_promotion_are_hash_validated_and_immutable_test();
     promotion_waits_out_a_transient_lock_and_names_the_failing_step_test();
