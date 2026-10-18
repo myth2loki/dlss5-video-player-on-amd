@@ -154,15 +154,17 @@ Renders: RTX 4080 SUPER, driver 610.47 (`32.0.16.1047`), runtime lock
 
 ## AMD captures
 
-Six files in [`amd/`](amd/), all of the **AMD backend**, on an RX 9070 XT
-through `LmxxfNrRuntime` — not the NVIDIA path everything above documents. They
-are window captures of the player, cropped to the picture: the status row and
-the compare bar are left out. All six are frames of *Bumblebee* (2018), a film
-rather than one of the game trailers the rest of this page uses — film grain, a
-shallow depth of field, and faces lit for a camera instead of for a renderer.
+Seven files in [`amd/`](amd/), all of the **AMD backend**, on an RX 9070 XT
+through `LmxxfNrRuntime` — not the NVIDIA path everything above documents. All
+seven are frames of *Bumblebee* (2018), a film rather than one of the game
+trailers the rest of this page uses — film grain, a shallow depth of field, and
+faces lit for a camera instead of for a renderer. One of them is the whole
+window; the rest are cropped to the picture, with the status row and the compare
+bar left out.
 
 | File | What it is |
 | --- | --- |
+| [`overview.png`](amd/overview.png) | 2560x1392, the whole window: menu bar, **Split**, the compare bar and the status row. The toolbar's pills read Neural Rendering · On, DLSS Upscaling · On · FSR4, Interpolate · On; the status line reads DLSS Upscaling on: 2560x1440 (auto) · FSR4, Source 1280x720 -> 2560x1440, with the render chip at Render 99% · ETA 33:34 |
 | [`amd-split-view.png`](amd/amd-split-view.png) | 2121x1190, **Split**: the film in playback, source left of a hard divider, the render right |
 | [`amd-2x2.png`](amd/amd-2x2.png) | 2122x1195, **2 x 2**: original, DLSS 5, Difference (4x, luma) and DLSS 5 at Mix 50% |
 | [`amd-live-wipe.mp4`](amd/amd-live-wipe.mp4) | The same film in **Wipe**, 6.0 s, 2118x1046, 30 fps, H.264 High, 9.3 Mb/s, AAC stereo 48 kHz. The divider sweeps across the face while the video plays; audio is the source clip's |

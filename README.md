@@ -10,6 +10,15 @@ convert files or filter the desktop live; this one renders the whole video
 progressively, keeps every frame, and shows you what the model changed, and where
 it didn't help. [How it compares](docs/RELATED_PROJECTS.md).
 
+![The player on an AMD card, whole window: Bumblebee in Split, neural rendering and FSR 4 upscaling on, interpolation on at 48 of 24 fps, a subtitle under the picture, and the render filling in behind the playhead](docs/media/amd/overview.png)
+
+The whole window, on an AMD card: *Bumblebee* at 1280x720 in **Split**, source
+left of the divider and render right. The toolbar reads **Neural Rendering · On**,
+**DLSS Upscaling · On · FSR4** and **Interpolate · On**, and the status line says
+what each is doing — `DLSS Upscaling on: 2560x1440 (auto) · FSR4`, `Source
+1280x720 -> 2560x1440`, `48 / 24 fps`, and the render's own chip, `Render 99% ·
+ETA 33:34`.
+
 > [!NOTE]
 > **A fork of [DLSS 5 Video Player](https://github.com/2600th/dlss5-video-player)
 > with an AMD backend.** The player, the compare views, the render cache, the
@@ -108,10 +117,10 @@ sRGB decode that used to make generated frames come out bright is gone.
 
 ![Bumblebee in Split view on the AMD backend: the source left of a hard divider down the face, the render right of it, both tagged](docs/media/amd/amd-split-view.png)
 
-One frame of *Bumblebee* (2018) in **Split**, on the AMD backend: source left,
-render right, the same frame on both sides. All five captures here are of that
-film rather than of the game trailers above: film grain, a shallow depth of
-field, and faces lit for a camera rather than for a renderer.
+Cropped to the picture, the same view: source left of the divider, render right.
+It is film footage rather than a game trailer — grain, a shallow depth of field
+and faces lit for a camera rather than for a renderer — and every capture in this
+section is from that film.
 
 [![Bumblebee in Wipe, animated: the source left of a divider through the face, the render right of it, the divider sweeping across](docs/media/amd/amd-live-wipe-preview.webp)](docs/media/amd/amd-live-wipe.mp4)
 
