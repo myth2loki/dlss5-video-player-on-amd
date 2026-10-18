@@ -599,6 +599,32 @@ processed video; playback uses the original source for audio. `recent-videos.dat
 tracks history, and `staging/` holds work in progress. Local input videos remain
 at their original paths.
 
+An entry that records what it published is opened without being read again.
+Promotion records what it hashed — size, write time, change time, volume and file
+id — beside the digest in the entry's manifest, and a lookup that finds the file
+unchanged answers from that record instead of hashing 50–70 MB: 6.5–13 ms
+against 32–74 ms on entries a live session published, and 5.3 ms against 76.5 ms
+on a 128 MB one. An entry published before the record existed carries none and
+is hashed exactly as before, and so is a file that differs in any of the five —
+which is how a payload rewritten at the same size, with its write time put back,
+is still caught.
+
+A plain open asks for the whole-video entry, and only for it; its log line reads
+`range=[0,0)`. A live session publishes an entry per chunk it rendered (120 s of
+video by default, `[Playback] NeuralWindowSeconds`), and those do not answer that
+request, so the video renders again — expected, not a lost cache. **DLSS >
+Convert & export > Convert whole video to neural video** writes the entry a
+reopen looks for, once; every open after that lands on it.
+
+`DLSSVideoPlayer.exe --cache-status <video or 64-character key>` says what is
+cached without opening the player. For each entry it prints what the entry
+covers, its size, whether it carries that record, the cost of a lookup beside
+the cost of hashing the same payload, and the verdict that follows from the two.
+It ends by saying whether the whole-video entry is present. It needs no GPU,
+neural runtime or saved settings, and it renders nothing; a lookup does stamp
+the entry's last-used time, as the player's own does. Run it from the folder the
+player runs from, so it resolves the same cache root.
+
 **Advanced > Clear Neural Cache** shows its size and asks for confirmation. It
 closes current playback and removes owned cache data, keeping recent titles and
 original-source references. Work belonging to another player that is still
@@ -732,9 +758,12 @@ dither, both on by default, do:
 Each new neural render has a canonical `neural-settings.ini` snapshot and its
 SHA-256 in the manifest. The cache key covers that snapshot, source content,
 runtime binaries, the render revision (which a release moves only when it
-changes what a render writes), GPU path and source dimensions. Changes
-to neural settings trigger a new render. A settings change detected between
-render start and completion prevents publication of that result.
+changes what a render writes), GPU path and source dimensions. On the AMD
+backend "runtime binaries" means the modules and weights the runtime ships, not
+the log it writes while it works or its shader cache: those change with every
+job and would rename the runtime, and every key with it, after each render.
+Changes to neural settings trigger a new render. A settings change detected
+between render start and completion prevents publication of that result.
 
 The snapshot includes add-on enable state and the neural add-on's settings;
 overlay appearance is excluded. Playback adjustments and runtime upscaling do

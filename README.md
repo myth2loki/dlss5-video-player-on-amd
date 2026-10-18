@@ -78,7 +78,18 @@ end to end on the same card. Half an hour of continuous playback has now been
 walked through as well — 33 minutes of a 1280x720 film in 120-second chunks,
 six published cache entries; each of its three session starts waited 6–7 s for
 its first chunk and then never waited again — and **a cache hit after a session
-is still unverified.** The
+is verified**: a reopened source asked for its whole-video entry, the entry
+answered from the record its promotion had written — the payload's size, times
+and file id — rather than reading the payload again (3 ms), and playback opened
+it without rendering a frame.
+
+That hit used to be impossible, and the reason was not the one it looked like.
+The runtime's identity digest covered every file in the runtime tree, including
+`lmxxf_runtime.log`, which the runtime appends to on every job — so every
+finished chunk changed the key the next one looked under, and no session could
+find the entry the one before it had published. The digest is taken over the
+modules and weights now (the log and the shader cache are skipped), and two
+independent sessions on one source record the same identity. The
 [integration plan](docs/AMD-LMXXF-INTEGRATION-PLAN-REV2-zh.md) (Chinese) records
 what was measured, on what, and what was not.
 
@@ -102,6 +113,15 @@ purpose: a chunk also pays its cold start and the join-and-validate step that
 turns its segments into a cache entry, neither of which is render time. Same
 card, same window, 2.0× the pixels costs 1.98× the throughput — the model is
 the pixels and nothing else.
+
+**What that join-and-validate step costs.** On a 49–73 MB block it took
+996–1653 ms: about 460 ms joining 61 segments and 432–459 ms probing the joined
+file. Segments are 3 s now, so a 120 s block holds 41 and joins in 289–397 ms,
+and the join reports the frame count it muxed through FFmpeg's progress stream,
+so the probe reads a header instead of demuxing and decoding the whole file —
+124–128 ms on real publishes. A block publishes in ≈590–780 ms, on the critical
+path between two chunks. None of it changes what playback shows; the chunk
+times above predate it and shorten by about 0.4 s (≈1%).
 
 **Two paces, and they are not the same number.** One is measured from a job's
 first segment to its last: the speed the render itself achieves. The other is
@@ -301,7 +321,11 @@ reader knows where the other one lives.
 6. **DLSS > Convert & export** saves the rendered video to a file.
 
 **File > Recent videos** reopens a video with its render, if the render covers
-the whole video. Press `D` at the start to get one.
+the whole video. A live session publishes entries for the chunks it rendered —
+120 s of video each by default, `[Playback] NeuralWindowSeconds` — even one that
+runs to the end leaves a set of them, and none of those answers a plain open:
+**DLSS > Convert & export > Convert whole video to neural video** writes the one
+that does.
 
 ## What it does
 
@@ -330,8 +354,12 @@ the whole video. Press `D` at the start to get one.
   there.
 - **Keeps your renders.** A whole-video render is reused while the source,
   runtime and settings still match, at Standard, High (10-bit) or Lossless
-  quality. **Advanced > Render report** shows the flicker, grain and colour
-  shift a render added.
+  quality. Each entry records the identity of the payload it published, so
+  reopening it authenticates the file instead of hashing 50–70 MB again: 6.5–13
+  ms against 32–74 ms, measured on live-session entries.
+  `DLSSVideoPlayer.exe --cache-status <video>` says what a source has cached
+  and what each entry would cost to open. **Advanced > Render report** shows the
+  flicker, grain and colour shift a render added.
 - **Works on screenshots and GIFs.** A photo renders once and stays on its
   frame; an animated GIF renders frame by frame, keeping its timing. See
   [Screenshots and GIFs too](#screenshots-and-gifs-too).
@@ -664,7 +692,9 @@ how the toggle works, not what every source will gain.
   Cache** shows how much it will free before it does.
 - **Partial renders aren't joined.** A session started partway into a video
   leaves separate renders of the parts it covered, so reopening that video
-  renders it again.
+  renders it again. A plain open asks only for the whole-video entry; **DLSS >
+  Convert & export > Convert whole video to neural video** writes that entry
+  once, and every open after it is a cache hit.
 - **Network use.** Besides YouTube links, the player checks GitHub once a day
   for a new release (the menu bar then shows `↑ Update <version>`), and the
   start screen fetches the trailers' thumbnails from `i.ytimg.com`, again only

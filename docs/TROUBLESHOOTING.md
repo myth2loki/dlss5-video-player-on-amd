@@ -104,6 +104,10 @@ The cache is reused only after source/runtime/settings hashes, dimensions,
 timing and neural evidence pass validation. Changed settings, neural runtime,
 driver or model store trigger a new render; a player update does so only when
 its notes say it changes what a render writes. An incomplete, modified or invalid cache is not reusable.
+A reopen that renders although the video was watched to the end is a different
+case — the open asks for the whole-video entry, which a live session's chunks do
+not provide: see [A video renders again when it is
+opened](#a-video-renders-again-when-it-is-opened).
 
 Keep neural settings unchanged while rendering. Inspect
 `neural-runtime/NeuralWorker.log` and `neural-runtime/ReShade.log` for worker
@@ -115,6 +119,36 @@ by NVENC straight from the GPU or by the ffmpeg encoder, and why. Lines starting
 `NVENC direct:` name what stopped the direct encoder; the render then continued
 through ffmpeg, which writes the same file, so they explain a slower render
 rather than a failed one.
+
+## A video renders again when it is opened
+
+A plain open asks the cache for exactly one entry: the whole-video render, whose
+log line reads `range=[0,0)`. A live session publishes an entry per chunk it
+rendered (120 s of video by default), and neither those entries nor a set of
+them answers that request — so the video renders again, which is the cache
+working as built rather than a lost render. **DLSS > Convert & export > Convert
+whole video to neural video** writes the whole-video entry once; every open after
+it attaches to that render instead of rendering.
+
+`DLSSVideoPlayer.exe --cache-status <video>` says which case you have without
+opening the player: the entries the source has, what each covers, whether each
+one records the identity of its payload, and whether the whole-video entry is
+present — the last line reads `absent: opening this file will render` or
+`present`. Run it from the player's folder so it resolves the same cache root.
+
+A hit is three lines in `DLSSVideoPlayer.log`:
+
+```
+Checking neural cache key=... range=[0,0) ...
+Neural cache entry ... authenticated by its recorded payload stamp (size=...); the payload was not re-hashed.
+Verified neural cache hit opened without re-rendering.
+```
+
+If a hit reports `no longer matches its recorded payload stamp`, the payload was
+changed or moved after it was published and the player hashed it again; that is
+the check doing its job, not a cache failure. Entries published by builds before
+the runtime's identity stopped covering its own log are retired once and cannot
+be recovered; entries published since are not.
 
 ## The cache directory is unavailable
 

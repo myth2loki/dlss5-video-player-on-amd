@@ -735,16 +735,29 @@ success checkpoint that advances after the captured sequence, and no feature-18
 failure, skip, or pass-through marker in the stabilized job log segment.
 Sequential offline decoding requests CUDA, the same as playback: decode and
 encode are separate engines from the D3D12 neural and NVENC workloads, so
-software decoding would spend CPU time without relieving the GPU. The existing CUDA to D3D11VA to software fallback downgrades per codec. Cache
-hits retain full content-hash verification and use header-only metadata probes;
-the one exception is a payload this process published itself, whose promotion
-digest is reused while the file's size, write and change times and file id
-are those it had when it was hashed. The payload hash takes a stop token.
-Before promotion the joined entry is counted by demuxing it - one packet per
-coded frame, so the count and the video span come out of the container rather
-than a full decode, 0.05 s against 23.8 s on a 1440 p render - and its final
-frame is still decoded. A join that lost frames demuxes short, which is what
-the publish gate compares against the render's own frame count.
+software decoding would spend CPU time without relieving the GPU. The existing CUDA to D3D11VA to software fallback downgrades per codec. Cache hits
+authenticate the payload and read it only when it is not the file the digest
+describes. Promotion records the payload's size, write time, change time, volume
+and file id beside the digest, in the manifest's optional `payloadStamp`, and
+writes it only when a stat either side of the hash agrees — so the stamp always
+names the bytes the digest was taken over. A lookup that finds all five unchanged
+answers from the manifest and hashes nothing; an entry published before the field
+existed carries none and is hashed as it always was. A file that differs in any
+of the five is hashed again, which is what catches a payload rewritten at the
+same size with its write time put back — that is why the change time is in the
+comparison, even though promotion's rename was measured not to move it. The
+in-process memo that used to carry this identity across one process now feeds the
+durable one. The payload hash takes a stop token.
+
+Before promotion a live block's join is no longer demuxed to count it. FFmpeg's
+concat muxes exactly the packets it is handed, so `ConcatenateMedia` reads the
+frame count it reports through `-progress` and the gate compares that against the
+renderer's own count: an exact comparison, where a join that lost its tail fails,
+and a stronger check than the final-frame decode it replaced. The header probe
+that follows reads the joined file's geometry and duration in one process -
+124-128 ms on real publishes, against 432-459 ms for the packet count plus the
+final-frame decode. Offline renders keep both: their published file is the
+encoder's own output, written once per job and never on a block boundary.
 Invalid metadata is quarantined. Cancellation and failed
 validation can never publish a partial render.
 
@@ -779,6 +792,10 @@ The trigger is free space rather than a size cap because the key retires
 entries wholesale — `applicationVersion`, `driverVersion`, `modelStoreDigest`,
 `runtimeDigest` and the manifest schema are all key terms, so one driver update
 changes every key at once — while re-rendering a film costs minutes to hours.
+On the AMD backend `runtimeDigest` is taken over the runtime's modules and
+weights; the log it appends to and its shader cache are deliberately left out,
+because a digest that moved after every job renamed every key with it and no
+session could find the entry the one before it had published.
 A cap would have to be either small enough to delete renders on a half-empty
 disk or large enough never to fire on the machine that needed it.
 The cache root is resolved through a temporary delete-on-close file before bucket

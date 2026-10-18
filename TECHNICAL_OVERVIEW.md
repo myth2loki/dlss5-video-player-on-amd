@@ -63,9 +63,12 @@ from different packages. See [runtime setup](docs/DLSS5_SETUP.md).
    match beats standing still by a margin. The experimental add-on observes
    NGX calls in a persistent feature-18 session.
 3. **Validate and cache.** Every source frame must have a captured native
-   evaluation. Runtime receipts, dimensions, timing, final-frame decode and
-   content hashes must pass before atomic publication. Neural settings
-   snapshots and their hashes are part of the render identity.
+   evaluation. Runtime receipts, dimensions, timing, a final-frame decode (for
+   an offline render) or an exact frame-count comparison (for a live block's
+   join), and content hashes must pass before atomic publication. Publication
+   records the payload's size, times and file identity beside its digest, so a
+   later open authenticates the file it finds instead of reading it again.
+   Neural settings snapshots and their hashes are part of the render identity.
 4. **Play and compare.** Audio drives timestamp-matched original/neural frame
    pairs. Optional runtime Super Resolution runs independently in the player.
    Image adjustments are applied during presentation.
