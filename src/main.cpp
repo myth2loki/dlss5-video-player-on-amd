@@ -10883,13 +10883,21 @@ private:
         // that job onto.
         WidenLiveWindowBehind(at);
         if(NeuralJobActive())return;
-        const double lowWater=live_session::WindowLowWater(m_liveWindowSeconds,LivePaceRatio());
+        // Priced on what the render achieves while it is rendering. The
+        // session average would make the window the author of its own slowness
+        // - see LiveRenderThroughput - and the forecast is only there until
+        // the first job has measured anything.
+        const double throughput=LiveRenderThroughput();
+        const double lowWater=live_session::WindowLowWater(m_liveWindowSeconds,
+                                                           throughput>0.0?throughput:LivePaceRatio());
         const auto end=live_session::WindowEndAfterChunk(m_liveRange.end100ns,at,m_liveRangeCeiling100ns,
                                                          m_liveWindowSeconds,LiveLeadSeconds(),lowWater);
         if(!end)return;
         const double buffered=LiveLeadSeconds();
         LOG("Active neural window extending to "<<double(*end)*1e-7<<" s: "<<buffered<<" s of the "
-            <<m_liveWindowSeconds<<" s window still buffered (low-water "<<lowWater<<" s), ceiling "
+            <<m_liveWindowSeconds<<" s window still buffered (low-water "<<lowWater<<" s at "
+            <<(throughput>0.0?throughput:LivePaceRatio())<<"x rendering, "<<LiveRealtimeRatio()
+            <<"x over the session), ceiling "
             <<double(m_liveRangeCeiling100ns)*1e-7<<" s.");
         m_liveRange.end100ns=*end;m_cachedRange=m_liveRange;
         UpdateCachedStatus();InvalidatePlaybackProgress();
@@ -12389,6 +12397,29 @@ private:
         const int64_t covered=CoveredDuration100ns(LiveCoverage(),CoverageSpan{m_liveRange.start100ns,m_liveRange.end100ns});
         return live_session::RealtimeRatio(double(std::max<int64_t>(0,covered-m_liveCoveredAtStart))*1e-7,
                                            double(GetTickCount64()-m_liveStartTick)/1000.0);
+    }
+    // The pace the SCHEDULER prices the next chunk on: video seconds this
+    // session rendered per second it spent RENDERING - the jobs themselves,
+    // from their first segment to their last, not their startup and not the
+    // idle between them.
+    //
+    // LiveRealtimeRatio above is the session's average instead, idle included,
+    // and that is the right number for a person asking how long the film will
+    // take. It is the wrong one for deciding when to start the next chunk,
+    // because dividing by it charges the window for its own idleness: the
+    // fewer chunks a session runs, the lower its ratio, the higher the
+    // low-water mark that ratio buys, and the sooner the next chunk starts -
+    // so it renders more, idles more, and the ratio falls further. Measured
+    // here on a 1920x802 film: the session average went 1.88 -> 1.56 -> 1.37
+    // across three chunks whose own render times were 1.77-1.79x, while the
+    // mark climbed 76 s -> 89 s -> 100 s of a 120 s window and the feature
+    // came within one chunk of rendering continuously, which is the whole
+    // thing it exists to avoid.
+    double LiveRenderThroughput()const{
+        if(!m_liveSegments||!(m_decoder.FrameRate()>0.0))return 0.0;
+        const SegmentPace pace=m_liveSegments->MeasuredPace();
+        if(!(pace.wallMs>0.0)||!pace.frames)return 0.0;
+        return double(pace.frames)*1000.0/pace.wallMs/m_decoder.FrameRate();
     }
     std::wstring BuildStatusText()const{
         // The menu path the hint names has to be the one the menu has: the

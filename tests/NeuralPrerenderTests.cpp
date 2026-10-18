@@ -5554,6 +5554,21 @@ void live_session_window_renders_whole_chunks_and_holds_at_the_lookahead_test()
     CHECK(live_session::WindowLowWater(120.0,0.6,7.3)==120.0);          // slower than real time
     CHECK(live_session::WindowLowWater(60.0,0.0,7.3)<=60.0);             // unmeasured ratio
 
+    // The ratio it is priced on has to be the render's own, and the difference
+    // is not academic. Measured on a 1920x802 film: the jobs themselves ran at
+    // 1.78x while the session AVERAGE - idle between chunks included - decayed
+    // 1.88 -> 1.56 -> 1.37, because the average charges the window for its own
+    // idleness. Pricing on the average raised the mark from 76 s to 89 s to
+    // 100 s of a 120 s window; at 100 s the next chunk starts the moment the
+    // previous one lands, which is the conversion-everything behaviour the
+    // window exists to avoid. Same GPU, same chunks, 20 s of buffer of
+    // difference:
+    const double onRenderPace=live_session::WindowLowWater(120.0,1.78,7.3);
+    const double onSessionAverage=live_session::WindowLowWater(120.0,1.37,7.3);
+    CHECK(std::abs(onRenderPace-79.7)<0.2);        // 7.3 + 120/1.78 + 5
+    CHECK(std::abs(onSessionAverage-99.9)<0.2);    // 7.3 + 120/1.37 + 5
+    CHECK(onSessionAverage-onRenderPace>19.0);
+
     // A deep buffer starts nothing; a drained one starts a WHOLE chunk from
     // the render head. The sliver between the head and playhead+N is the
     // treadmill: it shrinks every cycle until a cold start buys ten seconds.

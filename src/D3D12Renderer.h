@@ -1617,13 +1617,16 @@ private:
     // #2 + CAS) and the presented backbuffer - and logs which one is black, so
     // the root cause is machine-confirmed instead of eyeballed. Gated by
     // DLSS5_FG_BLACK_PROBE (0 off / 1 every 30th generated frame / 2 every
-    // generated frame, the default: the 30th-frame sampler aliases past any
-    // flicker whose period divides it, which is how the first field run came
-    // back empty); DLSS5_FG_GEN_UPSCALE=0 forces the fallback for an instant
-    // A/B. The cost is one small copy plus one bounded wait, per sampled
-    // frame, on a command list of its own that touches no frame-slot
-    // bookkeeping.
-    int m_fgProbeMode = 2;
+    // generated frame); DLSS5_FG_GEN_UPSCALE=0 forces the fallback for an
+    // instant A/B.
+    //
+    // OFF by default, and it is a diagnostic that has to be asked for: the
+    // strobe it was written for is closed and fixed, and every frame read back
+    // to the CPU is a copy plus a bounded wait on a GPU that is also
+    // converting the film. It was left on every generated frame while that was
+    // being chased, which is not a default anyone should inherit. A run that
+    // needs it sets DLSS5_FG_BLACK_PROBE=2.
+    int m_fgProbeMode = 0;
     bool m_fgGenUpscaleAllowed = true;
     bool m_fgDiagRead = false;
     uint32_t m_fgProbeFrames = 0;    // generated frames seen by the probe gate
