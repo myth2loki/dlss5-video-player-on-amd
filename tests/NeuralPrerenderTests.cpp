@@ -6237,6 +6237,51 @@ void resident_helper_refuses_residency_for_an_unidentified_job_test()
     CHECK(HelperPlanName(HelperPlan::SingleShot)=="single-shot");
 }
 
+// The join reports its own frame count and length through FFmpeg's progress
+// stream, and the live publish path reads that instead of demuxing the joined
+// file a second time. The parser takes the last block's values, and nothing that
+// is not one of them.
+void progress_report_takes_the_last_block_and_nothing_else_test()
+{
+    CHECK(!ParseProgressReport("").has_value());
+    CHECK(!ParseProgressReport("out_time_us=1000\nprogress=continue\n").has_value());
+    // Two updates: the finished file is the last one. 119981000 us is 119.981 s.
+    const auto two = ParseProgressReport("frame=2508\nout_time_us=104448000\nprogress=continue\n"
+                                         "frame=2881\nout_time_us=119981000\nprogress=end\n");
+    CHECK(two.has_value());
+    if (two) {
+        CHECK_EQ(uint64_t{2881}, two->frames);
+        CHECK_EQ(int64_t{1199810000}, two->duration100ns);
+    }
+    // Windows line endings, and a stream that never wrote its closing line.
+    const auto crlf = ParseProgressReport("frame=40\r\nout_time_us=4000000\r\nprogress=continue\r\n"
+                                          "frame=41\r\nout_time_us=4100000\r\nprogress=end\r\n");
+    CHECK(crlf.has_value());
+    if (crlf) {
+        CHECK_EQ(uint64_t{41}, crlf->frames);
+        CHECK_EQ(int64_t{41000000}, crlf->duration100ns);
+    }
+    const auto unterminated = ParseProgressReport("frame=41\nout_time_us=4100000\n");
+    CHECK(unterminated.has_value());
+    if (unterminated) CHECK_EQ(uint64_t{41}, unterminated->frames);
+    // What ffmpeg writes when nothing was muxed, and lines that merely start
+    // with the key: neither is a count this code may believe.
+    CHECK(!ParseProgressReport("frame=N/A\nprogress=end\n").has_value());
+    CHECK(!ParseProgressReport("frame=\nprogress=end\n").has_value());
+    CHECK(!ParseProgressReport("frame=2881x\nprogress=end\n").has_value());
+    CHECK(!ParseProgressReport("frame=1.5\nprogress=end\n").has_value());
+    CHECK(!ParseProgressReport("frame=-1\nprogress=end\n").has_value());
+    CHECK(!ParseProgressReport("frames=2881\nprogress=end\n").has_value());
+    // A count without a time is still a count; the length is then unknown rather
+    // than believed to be zero-length.
+    const auto noTime = ParseProgressReport("frame=31\nprogress=end\n");
+    CHECK(noTime.has_value());
+    if (noTime) {
+        CHECK_EQ(uint64_t{31}, noTime->frames);
+        CHECK_EQ(int64_t{0}, noTime->duration100ns);
+    }
+}
+
 int RunFakeMediaPipelineChild(int argc, wchar_t* argv[])
 {
     const std::wstring name = CurrentExecutable().filename().wstring();
@@ -6384,6 +6429,7 @@ int wmain(int argc, wchar_t* argv[])
     manifest_payload_stamp_is_optional_additive_and_all_or_nothing_test();
     promoted_entry_records_its_payload_stamp_and_rewrites_still_fail_authentication_test();
     a_recorded_payload_stamp_lets_a_later_process_skip_the_hash_test();
+    progress_report_takes_the_last_block_and_nothing_else_test();
     manifest_fields_with_control_characters_round_trip_test();
     source_and_render_promotion_are_hash_validated_and_immutable_test();
     promotion_waits_out_a_transient_lock_and_names_the_failing_step_test();

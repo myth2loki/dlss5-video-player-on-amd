@@ -1286,7 +1286,16 @@ void JoinedFrameCountMatchesDecodedCountTest(const std::filesystem::path& helper
         L"-bf", L"2", L"-pix_fmt", L"yuv420p", second.wstring()}, log));
 
     const std::vector<std::filesystem::path> parts{first, second};
-    CHECK(ConcatenateMedia(helpers, parts, joined, {}) == EncodeError::None);
+    ProgressReport report;
+    CHECK(ConcatenateMedia(helpers, parts, joined, {}, &report) == EncodeError::None);
+    // The report the join gives for itself, which the live publish path now
+    // trusts instead of demuxing the file again: it has to be the same count a
+    // decode and a packet count give, on the same B-frame stream, and the same
+    // length the probe reads.
+    CHECK_EQ(uint64_t{31}, report.frames);
+    // out_time is the last packet's own timestamp, one frame behind the file's
+    // span: it is a witness that the join ran, not a length to publish against.
+    CHECK_EQ(int64_t{29000000}, report.duration100ns);
 
     // Ground truth: every frame actually decoded out of the joined file.
     const auto decoded = Probe(helpers, joined, log, {L"-count_frames", L"-select_streams", L"v:0",
@@ -1307,7 +1316,10 @@ void JoinedFrameCountMatchesDecodedCountTest(const std::filesystem::path& helper
     // What the gate is for: a join that lost a part has to read short, or a
     // truncated render would be published as a complete cache entry.
     const std::vector<std::filesystem::path> onePart{first};
-    CHECK(ConcatenateMedia(helpers, onePart, shortJoin, {}) == EncodeError::None);
+    ProgressReport shortReport;
+    CHECK(ConcatenateMedia(helpers, onePart, shortJoin, {}, &shortReport) == EncodeError::None);
+    CHECK_EQ(uint64_t{20}, shortReport.frames);
+    CHECK_EQ(int64_t{18000000}, shortReport.duration100ns);
     const auto shortMeasured = ProbeMedia(helpers, shortJoin, {});
     CHECK(shortMeasured.ok);
     CHECK_EQ(uint64_t{20}, shortMeasured.frameCount);
@@ -1332,6 +1344,25 @@ void JoinedFrameCountMatchesDecodedCountTest(const std::filesystem::path& helper
     CHECK(!NeuralPublishDurationsMatch(shortMeasured.duration100ns, renderedDuration100ns, expectedDuration100ns,
                                        tolerance100ns));
     CHECK(!CanPublishNeuralCompletion(true, probeMatches(shortMeasured), true));
+
+    // The composition the live publish path uses now: the join's own count and a
+    // probe that reads only the header. It has to reach the same verdict as the
+    // demuxing pair above - publishable for the full join, refused for the one
+    // that lost a part - because that pair is what it replaced.
+    ProbeResult header = ProbeMedia(helpers, joined, {}, MediaProbeMode::CachedMetadata);
+    CHECK(header.ok);
+    // Nothing was demuxed, so the probe brings no count of its own; the join's
+    // is the one that fills it.
+    CHECK_EQ(uint64_t{0}, header.frameCount);
+    header.frameCount = report.frames;
+    CHECK(probeMatches(header));
+    CHECK(CanPublishNeuralCompletion(true, probeMatches(header), true));
+
+    ProbeResult shortHeader = ProbeMedia(helpers, shortJoin, {}, MediaProbeMode::CachedMetadata);
+    CHECK(shortHeader.ok);
+    shortHeader.frameCount = shortReport.frames;
+    CHECK(!probeMatches(shortHeader));
+    CHECK(!CanPublishNeuralCompletion(true, probeMatches(shortHeader), true));
 }
 
 // One Y'CbCr colour, decoded to BGRA, under the three descriptions that

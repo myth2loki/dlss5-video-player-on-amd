@@ -2981,11 +2981,24 @@ private:
             return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-from).count();};
         const std::vector<std::filesystem::path> parts=liveIndex?neural_job::SegmentsOfRun(*liveIndex,liveRunId):std::vector<std::filesystem::path>{};
         const size_t joinedParts=liveIndex?parts.size():size_t{1};
-        if(liveIndex&&(parts.empty()||ConcatenateMedia(moduleDirectory,parts,*staging_/L"neural.mkv",stop_)!=EncodeError::None)){
+        // What the join itself says it wrote. A stream copy muxes the packets it
+        // is handed, so its report is the file's frame count and its length -
+        // what a second process used to read the whole block back to learn.
+        ProgressReport joined{};
+        if(liveIndex&&(parts.empty()||ConcatenateMedia(moduleDirectory,parts,*staging_/L"neural.mkv",stop_,&joined)!=EncodeError::None)){
             cache_.MarkInvalid(*staging_);completion_->result.ok=false;
             completion_->result.detail=L"The rendered segments could not be joined into a cache entry.";return false;
         }
         const double concatMs=msSince(publishStart);
+        if(liveIndex&&joined.frames!=completion_->result.frameCount){
+            // A short join is the failure the probe used to catch: a block whose
+            // last segment was cut off, or a join that stopped early. Both counts
+            // are known here, so it costs a comparison instead of a process.
+            LOG("Neural publish refused: the join holds "<<joined.frames<<" frames, the render reported "
+                <<completion_->result.frameCount<<".");
+            cache_.MarkInvalid(*staging_);completion_->result.ok=false;
+            completion_->result.detail=L"The joined neural video does not hold the frames the render produced.";return false;
+        }
         // The NVIDIA path re-reads the INI it wrote before the render: the helper
         // is a separate process that rewrites that file as it loads, so the file
         // is the only thing that says what the job actually ran with. An AMD job
@@ -2999,7 +3012,17 @@ private:
         const std::string receiptJson=BuildNeuralRenderReceiptJson(*receipt_);const auto receiptDigest=Sha256Bytes(receiptJson);
         {std::ofstream receiptFile(*staging_/L"receipt.json",std::ios::binary|std::ios::trunc);receiptFile.write(receiptJson.data(),static_cast<std::streamsize>(receiptJson.size()));if(!receiptFile||!receiptDigest){cache_.MarkInvalid(*staging_);completion_->result.ok=false;completion_->result.detail=L"The neural render receipt could not be staged.";return false;}}
         const auto probeStart=std::chrono::steady_clock::now();
-        const ProbeResult probe=ProbeMedia(moduleDirectory,*staging_/L"neural.mkv",stop_);
+        // A live block already knows its frame count from the join, so the probe
+        // here reads the header and stops: geometry and length, one process
+        // instead of a packet count plus a final-frame decode. A join that lost
+        // its tail is caught by the count comparison above, which is the failure
+        // the final-frame decode was there for - and it is exact, where the
+        // decode only said "the last frame parsed". An offline render has no such
+        // count: its published file is the encoder's own output, written once per
+        // job and never on a block boundary, so it keeps the full validation.
+        ProbeResult probe=ProbeMedia(moduleDirectory,*staging_/L"neural.mkv",stop_,
+            liveIndex?MediaProbeMode::CachedMetadata:MediaProbeMode::FullValidation);
+        if(liveIndex&&probe.ok)probe.frameCount=joined.frames;
         const double probeMs=msSince(probeStart);
         if(stop_.stop_requested()){cache_.MarkInvalid(*staging_);completion_->result.cancelled=true;completion_->result.ok=false;completion_->result.detail=L"Neural render was cancelled.";return false;}
         NeuralCacheManifest manifest{};manifest.sourceDigest=*sourceDigest_;manifest.runtimeDigest=*runtimeDigest_;manifest.encoder=neural_job::CacheEncoderName(completion_->result.encoder);manifest.width=width_;manifest.height=height_;manifest.frameCount=completion_->result.frameCount;manifest.duration100ns=completion_->result.duration100ns;manifest.nativeEvaluations=completion_->result.nativeEvaluations;manifest.verifiedNeuralFrames=completion_->result.verifiedNeuralFrames;manifest.observedFeature18Evaluations=completion_->result.evidence.highestObservedEvaluation;manifest.feature18Created=completion_->result.evidence.feature18Created;manifest.feature18ArmedBeforeCapture=completion_->result.feature18ArmedBeforeCapture;manifest.upscaling=false;

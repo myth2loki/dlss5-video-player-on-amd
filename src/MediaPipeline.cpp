@@ -15,8 +15,10 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <fstream>
 #include <functional>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <thread>
@@ -1405,10 +1407,92 @@ std::filesystem::path WriteConcatList(std::string_view text)
 
 } // namespace
 
+namespace {
+
+// A name nothing holds yet, for a file another process is about to create.
+std::filesystem::path UniqueTempPath(std::wstring_view prefix, std::wstring_view extension)
+{
+    std::error_code error;
+    const auto directory = std::filesystem::temp_directory_path(error);
+    if (error) return {};
+    static std::atomic_uint64_t sequence{};
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+        const auto candidate = directory / (std::wstring(prefix) +
+            std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) +
+            L"-" + std::to_wstring(sequence.fetch_add(1)) + std::wstring(extension));
+        std::error_code present;
+        if (!std::filesystem::exists(candidate, present)) return candidate;
+    }
+    return {};
+}
+
+std::optional<ProgressReport> ReadProgressReport(const std::filesystem::path& path)
+{
+    if (path.empty()) return std::nullopt;
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return std::nullopt;
+    const std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    return ParseProgressReport(text);
+}
+
+} // namespace
+
+std::optional<ProgressReport> ParseProgressReport(std::string_view progress)
+{
+    std::optional<ProgressReport> last;
+    ProgressReport current;
+    bool haveFrames = false;
+    size_t at = 0;
+    while (at < progress.size()) {
+        const size_t newline = progress.find('\n', at);
+        std::string_view line = progress.substr(
+            at, newline == std::string_view::npos ? std::string_view::npos : newline - at);
+        at = newline == std::string_view::npos ? progress.size() : newline + 1;
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        const size_t equals = line.find('=');
+        if (equals == std::string_view::npos) continue;
+        const std::string_view key = line.substr(0, equals);
+        const std::string_view value = line.substr(equals + 1);
+        // Parsed to the exact extent: a line this code did not write is not a
+        // count, and "frame=2881x" must not read as 2881.
+        const auto number = [value](int64_t& into) {
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), into);
+            return parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size();
+        };
+        if (key == "progress") {
+            // A block ends at `progress=`: everything before it belongs to the
+            // update that has just finished.
+            if (haveFrames) {
+                last = current;
+                haveFrames = false;
+            }
+            continue;
+        }
+        if (key == "frame") {
+            uint64_t frames = 0;
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), frames);
+            if (parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size()) {
+                current.frames = frames;
+                haveFrames = true;
+            }
+            continue;
+        }
+        if (key == "out_time_us") {
+            int64_t microseconds = 0;
+            if (number(microseconds) && microseconds >= 0) current.duration100ns = microseconds * 10;
+        }
+    }
+    // A stream that ended without its closing `progress=` line still reported
+    // one update, and that is the one that counts.
+    if (haveFrames) last = current;
+    return last;
+}
+
 EncodeError ConcatenateMedia(const std::filesystem::path& helperDirectory,
                              std::span<const std::filesystem::path> parts,
                              const std::filesystem::path& output,
-                             std::stop_token stop)
+                             std::stop_token stop,
+                             ProgressReport* joined)
 {
     if (parts.empty() || output.empty()) return EncodeError::InvalidSpecification;
     std::error_code error;
@@ -1429,10 +1513,22 @@ EncodeError ConcatenateMedia(const std::filesystem::path& helperDirectory,
         ~ListFile() { if (!path.empty()) { std::error_code ignored; std::filesystem::remove(path, ignored); } }
     } list{WriteConcatList(text)};
     if (list.path.empty()) return EncodeError::StartFailed;
-    const std::vector<std::wstring> arguments{
-        L"-hide_banner", L"-nostdin", L"-loglevel", L"error", L"-y",
-        L"-f", L"concat", L"-safe", L"0", L"-i", list.path.wstring(),
-        L"-c", L"copy", L"-f", L"matroska", output.wstring()};
+    // Where the muxer reports what it wrote. A file rather than a pipe: the
+    // capture this call already pays for is bounded, and a two-hour join emits
+    // more progress lines than that bound holds - the last one, which is the
+    // only one wanted, would be the first thing lost.
+    struct ProgressFile {
+        std::filesystem::path path;
+        ~ProgressFile() { if (!path.empty()) { std::error_code ignored; std::filesystem::remove(path, ignored); } }
+    } progress{joined ? UniqueTempPath(L"dlss-progress-", L".txt") : std::filesystem::path{}};
+    std::vector<std::wstring> arguments{
+        L"-hide_banner", L"-nostdin", L"-loglevel", L"error", L"-y"};
+    if (!progress.path.empty())
+        arguments.insert(arguments.end(), {L"-progress", progress.path.wstring(), L"-nostats"});
+    for (const std::wstring& argument : std::vector<std::wstring>{
+             L"-f", L"concat", L"-safe", L"0", L"-i", list.path.wstring(),
+             L"-c", L"copy", L"-f", L"matroska", output.wstring()})
+        arguments.push_back(argument);
     // A stream copy is bound by the disk: ten minutes plus the parts at 10 MB/s
     // covers a 45 GB join on a spinning disk five times over.
     const CaptureResult capture = RunCapture(ffmpeg, arguments, stop,
@@ -1442,6 +1538,11 @@ EncodeError ConcatenateMedia(const std::filesystem::path& helperDirectory,
     if (capture.cancelled || stop.stop_requested()) return EncodeError::Cancelled;
     if (capture.timedOut || capture.exitCode != 0 || !std::filesystem::is_regular_file(output, error) || error)
         return EncodeError::FinishFailed;
+    if (joined) {
+        const auto report = ReadProgressReport(progress.path);
+        if (!report || !report->frames) return EncodeError::InvalidSpecification;
+        *joined = *report;
+    }
     return EncodeError::None;
 }
 

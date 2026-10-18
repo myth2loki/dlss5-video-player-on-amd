@@ -365,13 +365,32 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// What an FFmpeg progress stream says about the file that was written. A
+// stream copy muxes exactly the packets it was handed, so `frames` is the frame
+// count of the output, and `out_time_us` is the length it wrote - both without a
+// second process reading the whole file back.
+struct ProgressReport {
+    uint64_t frames{};
+    int64_t duration100ns{};
+};
+
 // Losslessly joins already-encoded parts into one Matroska file, in the given
 // order, through FFmpeg's concat demuxer. Every part must share the same codec
 // and dimensions, which finalized neural segments of one job do.
+//
+// `joined`, when given, receives the report above for the file just written,
+// and a join that reported no frame count at all is refused: a publish gate
+// that compares counts cannot compare against nothing.
 EncodeError ConcatenateMedia(const std::filesystem::path& helperDirectory,
                              std::span<const std::filesystem::path> parts,
                              const std::filesystem::path& output,
-                             std::stop_token stop = {});
+                             std::stop_token stop = {},
+                             ProgressReport* joined = nullptr);
+
+// The last block of an FFmpeg progress stream, or nothing when it reported no
+// frame count. Progress is a key=value stream, one block per update, so the last
+// value belongs to the finished file.
+std::optional<ProgressReport> ParseProgressReport(std::string_view progress);
 
 // Stream-copies the first video stream of `input` into a Matroska `output` through
 // FFmpeg's muxer, with nothing re-encoded. The direct NVENC path writes its
