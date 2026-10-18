@@ -116,6 +116,15 @@ inline constexpr UINT IDM_UPSCALE_ENGINE_AUTO = 347;
 inline constexpr UINT IDM_UPSCALE_ENGINE_FSR4 = 348;
 inline constexpr UINT IDM_UPSCALE_ENGINE_FSR1 = 349;
 inline constexpr UINT IDM_UPSCALE_ENGINE_CAS = 350;
+// How far ahead of the playhead a live neural session renders, in seconds.
+// One contiguous radio block: Off, then the rungs LiveSessionPolicy.h reasons
+// about. Off is the pre-window behaviour - the session renders the whole of
+// what it set out to, which for a film is the whole film.
+inline constexpr UINT IDM_NEURAL_WINDOW_OFF = 351;
+inline constexpr UINT IDM_NEURAL_WINDOW_60 = 352;
+inline constexpr UINT IDM_NEURAL_WINDOW_90 = 353;
+inline constexpr UINT IDM_NEURAL_WINDOW_120 = 354;
+inline constexpr UINT IDM_NEURAL_WINDOW_180 = 355;
 inline constexpr UINT IDM_ASPECT_FIT = 400;
 inline constexpr UINT IDM_ASPECT_FILL = 401;
 inline constexpr UINT IDM_ASPECT_ONE_TO_ONE = 404;

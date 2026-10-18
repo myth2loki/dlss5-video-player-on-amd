@@ -93,6 +93,25 @@ inline std::wstring RenderText(double fraction, std::optional<double> etaSeconds
     return text;
 }
 
+// A windowed session reports the SAME word and the SAME measure as a range
+// render - rendered seconds over everything the session intends to render -
+// so it goes back to "Render". It used to print how full the two-minute
+// lookahead was, which is the reading that stops working: a full buffer is the
+// success state, so the gauge parked at 100% for the whole time the next chunk
+// rendered, and a session doing exactly what it was asked reported a number
+// that did not move. Counted against the ceiling it only ever climbs, and it
+// is the one number that answers the question the chip is asking: how much of
+// this video is neural now.
+inline std::wstring BufferedText(double fraction, std::optional<double> etaSeconds, bool starting = false)
+{
+    if (starting) return L"Render \u00b7 starting";
+    const long long percent = std::llround(std::clamp(fraction, 0.0, 1.0) * 100.0);
+    const long long shown = fraction < 1.0 ? std::min<long long>(percent, 99) : percent;
+    std::wstring text = L"Render " + std::to_wstring(shown) + L"%";
+    if (etaSeconds && *etaSeconds > 0.0 && fraction < 1.0) text += L" · ETA " + EtaText(*etaSeconds);
+    return text;
+}
+
 // Seconds until the rest of a range is rendered, at the pace the render is
 // actually managing (video seconds per wall-clock second). Nothing when the
 // pace is not known yet: an ETA made up from nothing is worse than none.
@@ -148,6 +167,18 @@ struct RenderProgress {
     std::optional<double> etaSeconds;
     // A live render that has not published its first second yet.
     bool starting{};
+    // The fraction is the same measure either way - rendered seconds over
+    // everything this session intends to render - so a windowed session says
+    // the same word and means the same thing as a range render. What differs
+    // is only that its total keeps being worked on in the background instead
+    // of in one go, and that the tooltip has to say so.
+    bool windowed{};
+    // What the chip flashes on, when that is not the fraction. A percentage
+    // that only moves when the render produces something cannot flash on its
+    // own level through a session that is doing nothing - so a windowed
+    // session passes whole windows of rendered video as the key instead: one
+    // flash per window, "the buffer was refilled".
+    std::optional<uint64_t> flashKey{};
 };
 
 inline Snapshot Build(bool mediaLoaded, RenderProgress render, double renderedFps, double sourceFps,
@@ -156,8 +187,11 @@ inline Snapshot Build(bool mediaLoaded, RenderProgress render, double renderedFp
     Snapshot snapshot{};
     if (!mediaLoaded) return snapshot;
     if (render.active) {
-        At(snapshot, Chip::Render) = Content{true, RenderText(render.fraction, render.etaSeconds, render.starting),
-                                             RenderFlashKey(render.fraction), false};
+        At(snapshot, Chip::Render) = Content{true,
+                                             render.windowed
+                                                 ? BufferedText(render.fraction, render.etaSeconds, render.starting)
+                                                 : RenderText(render.fraction, render.etaSeconds, render.starting),
+                                             render.flashKey.value_or(RenderFlashKey(render.fraction)), false};
     }
     // A still image has no rate; the chip would only ever say "0 / 0 fps".
     if (sourceFps > 0.0) {
@@ -224,6 +258,10 @@ struct TipFacts {
     // Frame generation is interleaving a generated midpoint for every source
     // frame, so `renderedFps` counts presents, not decoded frames.
     bool frameGenerated{};
+    // Non-zero when the session renders a window ahead instead of a range: the
+    // chip then reports the buffer, and the tooltip has to say so rather than
+    // call the window "the range".
+    double windowSeconds{};
 };
 
 inline std::wstring OneDecimal(double value)
@@ -239,6 +277,27 @@ inline std::wstring TipText(Chip chip, const TipFacts& facts)
     case Chip::Render: {
         const long long percent = std::llround(std::clamp(facts.render.fraction, 0.0, 1.0) * 100.0);
         const long long shown = facts.render.fraction < 1.0 ? std::min<long long>(percent, 99) : percent;
+        // A window keeps the same measure as a range - the percentage is rendered
+        // video over everything this session intends to render - so the tip
+        // says the same thing and adds the one fact the range case has not:
+        // that the work happens ahead of the playhead, a couple of minutes at
+        // a time.
+        if (facts.windowSeconds > 0.0) {
+            std::wstring text = L"Neural render\n" + std::to_wstring(shown) + L"% of " +
+                                (facts.rangeSeconds > 0.0 ? EtaText(facts.rangeSeconds) + L" of video rendered"
+                                                          : std::wstring(L"the range rendered"));
+            text += L". Kept " + EtaText(facts.windowSeconds) +
+                    L" rendered ahead of the playhead, and the next stretch is rendered as this one runs down";
+            if (facts.render.fraction >= 1.0)
+                return text + L". Playback is never waiting on the render at this depth.";
+            if (facts.paceRatio > 0.0)
+                    text += L". Rendering at " + OneDecimal(facts.paceRatio) + L"\u00d7 real time";
+                else
+                    text += L". The pace is measured once the first rendered second lands";
+            if (facts.render.etaSeconds && *facts.render.etaSeconds > 0.0)
+                text += L"; the rest in about " + EtaText(*facts.render.etaSeconds);
+            return text + L".";
+        }
         std::wstring text = L"Neural render\n" + std::to_wstring(shown) + L"% of " +
                             (facts.rangeSeconds > 0.0 ? EtaText(facts.rangeSeconds) + L" of video rendered"
                                                       : std::wstring(L"the range rendered"));

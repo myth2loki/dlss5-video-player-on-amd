@@ -1310,7 +1310,13 @@ std::optional<NeuralCacheManifest> ParseNeuralCacheManifest(std::string_view byt
         }
         if (cursor.PeekKey() == "backend") {
             std::string backend;
-            if (!cursor.Expect(',') || !ReadStringField(cursor, "backend", backend))
+            // No trailing comma: this is the LAST field, and the closing brace
+            // follows it. Read as if another field followed - which is what the
+            // comma defaults to - the reader demanded a comma, found the brace,
+            // and refused every manifest this line exists to accept: every AMD
+            // render was thrown away at the publish gate with a manifest that
+            // had written and re-read correctly.
+            if (!cursor.Expect(',') || !ReadStringField(cursor, "backend", backend, false))
                 return std::nullopt;
             // Refused rather than defaulted: a name this code does not write is a
             // manifest asking to be read as something this code cannot produce.
@@ -1709,8 +1715,33 @@ bool NeuralCacheManager::Promote(NeuralCacheEntryKind kind, std::string_view key
     {
         const auto serialized = ReadManifestBytes(manifestPath);
         const auto reparsed = serialized ? ParseNeuralCacheManifest(*serialized) : std::nullopt;
-        if (!reparsed || *reparsed != manifest || !IsReusableNeuralCacheManifest(*reparsed))
+        if (!reparsed || *reparsed != manifest || !IsReusableNeuralCacheManifest(*reparsed)) {
+            // Three verdicts in one refusal, and until now they were one line
+            // that said only "manifest-reread": an unreadable file, a round trip
+            // that lost a field, and a re-read that is not reusable are three
+            // different bugs and the log could not tell them apart. The bytes
+            // are the manifest this run just wrote - digests and a runtime
+            // identity, nothing a person has to keep secret - so naming them
+            // costs nothing and is the whole diagnosis.
+            LOG("Neural cache manifest reread refused the entry just written: read="
+                <<(serialized ? "yes" : "no") <<" parsed=" <<(reparsed ? "yes" : "no")
+                <<" equal=" <<(reparsed && *reparsed == manifest ? "yes" : "no")
+                <<" reusable=" <<(reparsed && IsReusableNeuralCacheManifest(*reparsed) ? "yes" : "no")
+                <<" schema=" <<manifest.schema <<" backend=" <<NeuralBackendName(manifest.backend)
+                <<" neuralDigest=" <<manifest.neuralDigest
+                <<" sourceDigest=" <<manifest.sourceDigest
+                <<" runtimeDigest=" <<manifest.runtimeDigest
+                <<" receipt=" <<manifest.receiptDigest.size()
+                <<" guides=" <<manifest.guides
+                <<" jobId=" <<manifest.jobId <<" frames=" <<manifest.frameCount
+                <<" native=" <<manifest.nativeEvaluations
+                <<" verified=" <<manifest.verifiedNeuralFrames
+                <<" feature18=" <<manifest.feature18Created <<"/" <<manifest.feature18ArmedBeforeCapture
+                <<"/" <<manifest.observedFeature18Evaluations
+                <<" environment=" <<(manifest.environment.Recorded() ? "recorded" : "absent")
+                <<" bytes=" <<(serialized ? *serialized : std::string("(none)")));
             return fail(NeuralCachePromotion::Stage::ManifestReread);
+        }
     }
 
     const auto destination = root_ /

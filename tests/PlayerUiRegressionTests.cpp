@@ -948,7 +948,11 @@ struct PlayerAppTestAccess {
         const wchar_t glyph = GlyphForIcon(UiIcon::Sparkles);
         struct ChipCase { status_chips::Chip chip; const wchar_t* widest; };
         const std::array chips{
+            // The widest of each chip's strings, in the form each mode prints:
+            // a windowed live session says the same word as a range render
+            // ("Render") and measures against its whole intended total.
             ChipCase{status_chips::Chip::Render, L"Render 99% · ETA 99:59:59"},
+            ChipCase{status_chips::Chip::Render, L"Render 100% · ETA 59:59"},
             ChipCase{status_chips::Chip::Fps, L"240 / 240 fps"},
             ChipCase{status_chips::Chip::Dropped, L"Dropped 99999"},
         };
@@ -966,6 +970,22 @@ struct PlayerAppTestAccess {
             }
         }
         app.UpdateFontsForDpi(96);
+
+        // A windowed chip measures the same thing a range render does - rendered
+        // video over everything the session intends to render - and flashes on
+        // the render's own key rather than on that level: the level creeps up
+        // every twelve seconds at 120 s, so a key taken from it flashed green
+        // through a render that was doing nothing.
+        const status_chips::Snapshot buffered =
+            status_chips::Build(true, {true, 0.62, 25.0, false, true, uint64_t{4}}, 24.0, 24.0, 0);
+        CHECK(buffered[0].visible);
+        CHECK(buffered[0].text == L"Render 62% · ETA 0:25");
+        CHECK_EQ(uint64_t{4}, buffered[0].flashKey);
+        // Without one it still keys on the fraction, which is what a range
+        // render has always done.
+        const status_chips::Snapshot ranged =
+            status_chips::Build(true, {true, 0.62, 25.0, false, true}, 24.0, 24.0, 0);
+        CHECK_EQ(status_chips::RenderFlashKey(0.62), ranged[0].flashKey);
 
         // A narrowed pill paints its state and not a truncated name.
         drawnText.clear();
@@ -3432,6 +3452,10 @@ struct PlayerAppTestAccess {
     static void CheckLiveExportEntry(PlayerApp& app)
     {
         const bool liveSession = app.m_liveSession, cached = app.m_cachedPlayback, requested = app.m_neuralRequested;
+        // The rule under test here is about a session that renders a RANGE, so
+        // the window is off for it; the windowed refusal is asserted below.
+        const double window = app.m_liveWindowSeconds;
+        app.m_liveWindowSeconds = 0.0;
         app.m_liveSession = true; app.m_liveAttached = true; app.m_cachedPlayback = true;
         app.m_liveRange = NeuralRenderRange{0, 600000000}; app.m_liveDirectory.clear();
         app.m_liveRenderFailures = 0; app.m_liveTargetRevision = 0;
@@ -3468,6 +3492,15 @@ struct PlayerAppTestAccess {
         app.CompleteLiveNeuralJob(completion);
         CHECK_EQ(app.m_neuralPath, entry);
         CHECK(exportEnabled());
+
+        // With a render window the session's range is a chunk of the film, not
+        // the film: the same job - covering the whole of that range - must not
+        // be offered as "the converted video".
+        app.m_neuralPath.clear();
+        app.m_liveWindowSeconds = 120.0;
+        app.CompleteLiveNeuralJob(completion);
+        CHECK(app.m_neuralPath.empty());
+        app.m_liveWindowSeconds = window;
 
         app.m_liveSegments.reset(); app.m_liveRange = {}; app.m_liveAttached = false;
         app.m_liveSession = liveSession; app.m_cachedPlayback = cached; app.m_neuralRequested = requested;

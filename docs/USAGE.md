@@ -93,11 +93,29 @@ between stops. Rendering keeps running
 behind playback; `Space` pauses playback rather than the render.
 
 The session's job is the whole video — or the marked range, when the playhead
-sits inside one — not just the part after the playhead. It renders the stretch
-you are watching first and then fills what is left, nearest to the playhead
-first, until every frame of the range is rendered; the **Render** chip at the
-right of the status line reports how much of it is done and, once the pace is
-known, how long the rest will take. **Seeking is not limited to what has been rendered.** Seek
+sits inside one — but **it renders ahead of the playhead rather than through the
+file**. **DLSS ▸ Render ahead** keeps two minutes of video rendered in front of
+you by default: the part before the toggle point is never rendered (unless you
+seek back into it), and the GPU goes quiet about two minutes past where you are
+watching instead of converting a film to its end. Inside that window the stretch
+you are watching comes first and what is left is filled nearest-first; when the
+buffer has drained to about a minute, the next two-minute chunk is rendered. Off
+is the older behaviour — the whole video — and 1:00, 1:30 and 3:00 are the other
+rungs; a change applies to the next chunk rather than cancelling the job in
+flight.
+
+The **Render** chip at the right of the status line measures how much of that
+job is done: rendered video over everything the session set out to render — the
+whole file, or the marked range you are inside. With a window on it climbs one
+chunk at a time in the background rather than in one pass, so a long film reads
+as a few percent for a long while and the ETA counts down at the pace the render
+is actually managing. (It used to report the two-minute lookahead instead, which
+sat at 100% for as long as the buffer stayed full — exactly while the next chunk
+was being rendered.) A session rendering the whole video in one go
+(`Render ahead` off) reports the same chip over its range.
+Because a window has no whole range to label, **Save converted video** is only
+offered when `Render ahead` is off; use **Convert & export** for a file.
+**Seeking is not limited to what has been rendered.** Seek
 into rendered frames and playback continues on them, wherever they are on the
 timeline. Seek into frames nobody has rendered yet and the original plays there
 while the render moves to that part of the video, and playback switches over

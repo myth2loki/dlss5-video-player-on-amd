@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -126,6 +127,90 @@ struct SessionView {
     bool paused = false;        // the playhead is not moving, so a narrow hole
                                 // in front of it is still worth rendering
 };
+
+// ---- A fixed render window ------------------------------------------------
+//
+// "Render from here to the end of the file" is the right default for a clip
+// and the wrong one for a film. The session keeps converting whether or not
+// anyone is watching, and the part behind the toggle point is work nobody
+// asked for: on this project's hardware a two-hour 1080p film is about
+// 51 minutes of GPU time, all of it spent while the viewer may be ten minutes
+// in and about to stop. A window bounds both - the render stays roughly one
+// window ahead of the playhead and goes quiet past it.
+//
+// The unit is a CHUNK, not a sliding edge. A window whose end is pinned to
+// `playhead + N` shrinks its own holes as the playhead advances, until each
+// job is only the sliver the playhead has eaten: measured here that settles at
+// S/(1 - 1/ratio) - about 10 s of video for a 5.8 s cold start at 2.3x - so
+// throughput collapses to 1.0x with two thirds of the GPU time spent launching
+// helpers. So the end moves in whole chunks from the RENDER HEAD, and only
+// once the buffer has drained to its low-water mark.
+//
+// Why 120 s: what a chunk costs is a cold start plus its own render, and the
+// startup overhead as a share of a chunk is S/(S + N/ratio). Measured on an
+// RX 9070 XT, S x ratio is ~14 seconds of video at 720p and at 1080p alike
+// (the startup slows down in the same proportion the render does), so the
+// share is 14/(N + 14): 19% at 60 s, 13% at 90, 10% at 120, 7% at 180. 120 is
+// where another 60 s of window stops buying anything worth the extra video
+// rendered past a pause.
+inline constexpr double kDefaultWindowSeconds = 120.0;
+
+// The rungs the menu offers, in seconds. Off (0) is a separate command.
+inline constexpr double kWindowChoices[] = {60.0, 90.0, 120.0, 180.0};
+
+// Where the buffer has to drain to before the next chunk is worth starting.
+// A chunk takes `coldStart + N/ratio` of wall clock to render, and the buffer
+// it starts from is what playback lives on meanwhile: below that, every chunk
+// would begin by stalling. Capped at the window itself, because a GPU that
+// cannot keep up still has to render - the player warns about that case before
+// the session starts, and refusing to start chunks would only freeze it.
+inline double WindowLowWater(double windowSeconds, double realtimeRatio,
+                             double coldStartSeconds = kColdStartSeconds)
+{
+    if (!(windowSeconds > 0.0)) return 0.0;
+    const double ratio = (std::isfinite(realtimeRatio) && realtimeRatio > 0.05) ? realtimeRatio : 1.0;
+    return std::clamp(coldStartSeconds + windowSeconds / ratio + 5.0, kStartLead + 1.0, windowSeconds);
+}
+
+// Where a windowed range should end now, or nullopt to leave it alone.
+//
+// Whole chunks from the render head (`rangeEnd`), never past `ceiling` (the
+// file, or the marked range the playhead is inside), never backwards: a range
+// that shrank would take rendered coverage out of the session's own
+// accounting. `base` takes the playhead into account so a forward seek starts
+// its chunk where the viewer now is, and the hole it opens over the skipped
+// stretch is clipped to the playhead by NextRenderTarget, so that part is not
+// rendered for a viewer who jumped over it.
+inline std::optional<int64_t> WindowEndAfterChunk(int64_t rangeEnd100ns, int64_t position100ns,
+                                                 int64_t ceiling100ns, double windowSeconds,
+                                                 double leadSeconds, double lowWaterSeconds)
+{
+    if (!(windowSeconds > 0.0)) return std::nullopt;
+    if (leadSeconds >= lowWaterSeconds) return std::nullopt;
+    const int64_t chunk = static_cast<int64_t>(std::llround(windowSeconds * 1e7));
+    const int64_t base = std::max(rangeEnd100ns, position100ns);
+    const int64_t end = std::min(ceiling100ns, base + chunk);
+    if (end <= rangeEnd100ns) return std::nullopt;
+    return end;
+}
+
+// What a windowed session's lookahead holds: how full it is, and how much is
+// missing from it. This is the SCHEDULER's arithmetic - when to start the next
+// chunk - and not what the chip reports: a window's own length is not the
+// session's whole job, so a percentage of it would be a percentage of two
+// minutes of a film. The chip counts against the ceiling instead; see
+// RenderChipProgress.
+struct WindowFill {
+    double fraction{};
+    double remainingSeconds{};
+};
+
+inline WindowFill WindowFillOf(double leadSeconds, double windowSeconds)
+{
+    if (!(windowSeconds > 0.0)) return {};
+    const double lead = std::clamp(leadSeconds, 0.0, windowSeconds);
+    return {lead / windowSeconds, windowSeconds - lead};
+}
 
 // Rendered seconds sitting ahead of the playhead.
 inline double Lead(const SessionView& view)

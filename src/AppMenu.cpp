@@ -186,6 +186,20 @@ HMENU CreateMenuBar(const Localizer& localizer, bool youtubeAvailable)
 
     // --- Neural rendering: the toggle, its looks, its controls. ------------
     add(dlss, IDM_NEURAL_RENDERING, L"menu.neural_rendering");
+    // How far ahead the toggle renders. A setting rather than a verb, and it
+    // belongs directly under the switch it governs: a viewer who turns this on
+    // in the middle of a film needs to know the GPU is not about to convert the
+    // remaining ninety minutes. Off is the old behaviour and stays available.
+    HMENU neuralWindow=CreatePopupMenu();
+    add(neuralWindow, IDM_NEURAL_WINDOW_OFF, L"menu.neural_window_off");
+    add(neuralWindow, IDM_NEURAL_WINDOW_60, L"menu.neural_window_60");
+    add(neuralWindow, IDM_NEURAL_WINDOW_90, L"menu.neural_window_90");
+    add(neuralWindow, IDM_NEURAL_WINDOW_120, L"menu.neural_window_120");
+    add(neuralWindow, IDM_NEURAL_WINDOW_180, L"menu.neural_window_180");
+    CheckMenuRadioItem(neuralWindow,IDM_NEURAL_WINDOW_OFF,IDM_NEURAL_WINDOW_180,
+                       IDM_NEURAL_WINDOW_120,MF_BYCOMMAND);
+    AppendMenuW(dlss,MF_POPUP,reinterpret_cast<UINT_PTR>(neuralWindow),
+                localizer.Get(L"menu.neural_window").c_str());
     // Pausing the background render is a neural command, so it belongs to the
     // neural block. In Playback it was a group of one under a separator, and it
     // asked the viewer to look for a render control in the transport menu.

@@ -1031,6 +1031,58 @@ void manifest_fields_with_control_characters_round_trip_test()
     }
 }
 
+// The AMD backend publishes the only manifest that carries BOTH optional
+// extensions - `backend`, which the NVIDIA one leaves out as the default, and a
+// recorded environment - and promotion re-reads what it wrote and refuses
+// anything that does not come back identical. That combination was never
+// exercised end to end: every test above promotes an NVIDIA manifest, whose
+// bytes end at receiptDigest. So a real AMD render was refused at
+// manifest-reread, never entered the cache, and every live session read that
+// refusal as two fruitless jobs and stopped filling holes.
+void amd_render_with_both_manifest_extensions_publishes_test()
+{
+    auto manifest = CompleteRenderManifest();
+    manifest.state = NeuralCacheState::Complete;
+    manifest.neuralDigest = std::string(64, 'c');
+    manifest.encoder = "hevc_amf";
+    manifest.backend = NeuralBackend::Amd;
+    manifest.observedFeature18Evaluations = 0;
+    manifest.feature18Created = false;
+    manifest.feature18ArmedBeforeCapture = false;
+    manifest.rangeStart100ns = 13333333;
+    manifest.rangeEnd100ns = 1213333330;
+    manifest.guides = "mv=1,depth=1";
+    manifest.jobId = 7;
+    manifest.historyResets = 2;
+    manifest.environment = {"0.29.0", "c:/dlss5/run-fg", "31.0.24002.92", std::string(64, 'd')};
+    CHECK(IsReusableNeuralCacheManifest(manifest));
+    {   // which of the two extensions does the reader refuse?
+        auto onlyEnvironment = manifest; onlyEnvironment.backend = NeuralBackend::Nvidia;
+        CHECK(ParseNeuralCacheManifest(SerializeNeuralCacheManifest(onlyEnvironment)).has_value());
+        auto onlyBackend = manifest; onlyBackend.environment = {};
+        CHECK(ParseNeuralCacheManifest(SerializeNeuralCacheManifest(onlyBackend)).has_value());
+        auto neither = manifest; neither.backend = NeuralBackend::Nvidia; neither.environment = {};
+        CHECK(ParseNeuralCacheManifest(SerializeNeuralCacheManifest(neither)).has_value());
+    }
+    const auto parsed = ParseNeuralCacheManifest(SerializeNeuralCacheManifest(manifest));
+    CHECK(parsed.has_value());
+    if (parsed) CHECK_EQ(manifest, *parsed);
+
+    TempDirectory fixture;
+    NeuralCacheManager manager(fixture.Path() / L"cache");
+    CHECK(manager.Valid());
+    const std::string renderKey(64, 'e');
+    const auto staging = manager.BeginRenderStaging(renderKey);
+    CHECK(staging.has_value());
+    if (!staging) return;
+    WriteBytes(*staging / L"neural.mkv", "amd-neural-frames");
+    StageRenderReceipt(*staging);
+    CHECK(manager.PromoteRender(renderKey, *staging, manifest));
+    const auto render = manager.LookupRender(renderKey);
+    CHECK(render.has_value());
+    if (render) CHECK_EQ(std::string("amd-neural-frames"), ReadBytes(render->payloadPath));
+}
+
 void source_and_render_promotion_are_hash_validated_and_immutable_test()
 {
     TempDirectory fixture;
@@ -5481,6 +5533,64 @@ void live_session_attaches_on_lead_resumes_earlier_and_finishes_on_any_coverage_
     CHECK(!live_session::ShouldRebaseStalledAttach(midSeek,live_session::kAttachFailureLimit));
 }
 
+// A render window bounds how far ahead a session renders, so a film is not
+// converted to its end while the viewer is ten minutes in. The unit is a whole
+// chunk from the render head, started once the buffer has drained to a
+// low-water mark that pays for the chunk's own cold start.
+void live_session_window_renders_whole_chunks_and_holds_at_the_lookahead_test()
+{
+    const auto ticks=[](double seconds){return static_cast<int64_t>(std::llround(seconds*1e7));};
+    // No window: no decision, whatever the buffer says.
+    CHECK(std::abs(live_session::WindowLowWater(0.0,2.3,5.8))<1e-9);
+    CHECK(!live_session::WindowEndAfterChunk(ticks(100),ticks(90),ticks(900),0.0,0.0,0.0));
+
+    // The low-water mark covers a chunk's own wall clock - cold start plus
+    // N/ratio - or every chunk would begin by stalling playback, and it never
+    // rises above the window itself, because a GPU that cannot keep up still
+    // has to render rather than freeze.
+    const double measured=live_session::WindowLowWater(120.0,2.3,5.8);   // this project's 1080p
+    CHECK(measured>5.8+120.0/2.3);
+    CHECK(measured<120.0);
+    CHECK(live_session::WindowLowWater(120.0,0.6,7.3)==120.0);          // slower than real time
+    CHECK(live_session::WindowLowWater(60.0,0.0,7.3)<=60.0);             // unmeasured ratio
+
+    // A deep buffer starts nothing; a drained one starts a WHOLE chunk from
+    // the render head. The sliver between the head and playhead+N is the
+    // treadmill: it shrinks every cycle until a cold start buys ten seconds.
+    CHECK(!live_session::WindowEndAfterChunk(ticks(100),ticks(50),ticks(900),120.0,80.0,60.0).has_value());
+    const auto chunk=live_session::WindowEndAfterChunk(ticks(100),ticks(50),ticks(900),120.0,50.0,60.0);
+    CHECK(chunk.has_value());
+    CHECK_EQ(ticks(220),*chunk);
+
+    // A forward seek starts its chunk at the playhead the viewer is at, not at
+    // the old end - the stretch jumped over is not rendered for them.
+    const auto jumped=live_session::WindowEndAfterChunk(ticks(100),ticks(500),ticks(900),120.0,0.0,60.0);
+    CHECK(jumped.has_value());
+    CHECK_EQ(ticks(620),*jumped);
+
+    // Never past the ceiling, and nothing at all once it is reached.
+    const auto capped=live_session::WindowEndAfterChunk(ticks(890),ticks(880),ticks(900),120.0,0.0,60.0);
+    CHECK(capped.has_value());
+    CHECK_EQ(ticks(900),*capped);
+    CHECK(!live_session::WindowEndAfterChunk(ticks(900),ticks(880),ticks(900),120.0,0.0,60.0).has_value());
+
+    // The scheduler's arithmetic is over the lookahead, not the file: it decides
+    // when the next chunk starts. It is NOT what the chip shows - a percentage
+    // of a two-minute window is a percentage of nothing much - so the chip
+    // counts the rendered seconds against the session's ceiling instead.
+    const auto empty=live_session::WindowFillOf(0.0,120.0);
+    CHECK(std::abs(empty.fraction)<1e-9);
+    CHECK(std::abs(empty.remainingSeconds-120.0)<1e-9);
+    const auto half=live_session::WindowFillOf(60.0,120.0);
+    CHECK(std::abs(half.fraction-0.5)<1e-9);
+    CHECK(std::abs(half.remainingSeconds-60.0)<1e-9);
+    // A buffer deeper than the window is full, not 200%: the percentage is a
+    // fill of the lookahead, and there is no such thing as more than full.
+    const auto full=live_session::WindowFillOf(240.0,120.0);
+    CHECK(std::abs(full.fraction-1.0)<1e-9);
+    CHECK(std::abs(full.remainingSeconds)<1e-9);
+}
+
 void live_session_retargets_the_render_to_the_hole_the_playhead_needs_test()
 {
     constexpr int64_t kFrame=333333;                             // 30 fps
@@ -6038,6 +6148,7 @@ int wmain(int argc, wchar_t* argv[])
     hashed_runtime_set_covers_the_worker_and_the_lock_set_does_not_test();
     runtime_digest_is_order_independent_byte_sensitive_and_rejects_duplicates_test();
     manifest_round_trip_rejects_partial_duplicate_and_unknown_state_test();
+    amd_render_with_both_manifest_extensions_publishes_test();
     manifest_fields_with_control_characters_round_trip_test();
     source_and_render_promotion_are_hash_validated_and_immutable_test();
     promotion_waits_out_a_transient_lock_and_names_the_failing_step_test();
@@ -6152,6 +6263,7 @@ int wmain(int argc, wchar_t* argv[])
     live_seek_backward_into_an_earlier_region_serves_that_regions_frames_test();
     live_seek_into_a_hole_is_refused_without_discarding_coverage_test();
     live_session_attaches_on_lead_resumes_earlier_and_finishes_on_any_coverage_test();
+    live_session_window_renders_whole_chunks_and_holds_at_the_lookahead_test();
     live_session_retargets_the_render_to_the_hole_the_playhead_needs_test();
     live_session_does_not_retarget_onto_the_hole_it_is_already_filling_test();
     live_session_waits_for_a_job_whose_head_is_close_behind_the_playhead_test();

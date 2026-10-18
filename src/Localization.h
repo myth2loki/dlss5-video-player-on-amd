@@ -69,6 +69,14 @@ private:
             {L"menu.depth", L"Depth\t4"}, {L"menu.fullscreen", L"Fullscreen\tF11"},
             {L"menu.generated", L"Generated frame\t5"},
             {L"menu.dlss", L"DLSS"}, {L"menu.neural_rendering", L"Neural Rendering\tD"},
+        // How far ahead of the playhead the live session renders. "Off" is the
+        // whole of what the session set out to render - for a film, all of it.
+        {L"menu.neural_window", L"Render ahead"},
+        {L"menu.neural_window_off", L"Off \u2014 render the whole video"},
+        {L"menu.neural_window_60", L"1:00 ahead"},
+        {L"menu.neural_window_90", L"1:30 ahead"},
+        {L"menu.neural_window_120", L"2:00 ahead (default)"},
+        {L"menu.neural_window_180", L"3:00 ahead"},
         {L"menu.dlss_upscaling", L"DLSS Upscaling"},
         {L"menu.rtx_vsr_upscaling", L"RTX VSR Upscaling (recommended)"},
         // The keep-up guard (VsrPolicy.h). %s is the quality's menu name.

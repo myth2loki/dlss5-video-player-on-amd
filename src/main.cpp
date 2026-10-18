@@ -1841,6 +1841,17 @@ static uint32_t ReadProcessingScale(const std::filesystem::path& settings){
     return IsProcessingScaleRung(saved)?saved:kDefaultProcessingScale;
 }
 
+// The render window a saved value names: 0 is off, anything else snaps to the
+// nearest rung the menu offers, so a hand-edited file cannot put the setting
+// somewhere no menu row can show (and so the radio check has a row to land on).
+static double SnapLiveWindowSeconds(double seconds){
+    if(!(seconds>0.0))return 0.0;
+    double best=live_session::kWindowChoices[0];
+    for(const double choice:live_session::kWindowChoices)
+        if(std::abs(choice-seconds)<std::abs(best-seconds))best=choice;
+    return best;
+}
+
 // The saved Super Resolution history, by name; anything else is the default.
 static UpscalingHistory ReadUpscalingHistory(const std::filesystem::path& settings){
     wchar_t saved[32]{};
@@ -4200,6 +4211,33 @@ private:
         LOG("Even cadence only "<<(enabled?"on":"off")<<"; the next conversion plans against it.");
         SaveVideoSettings();SyncFeatureMenuState();UpdateCachedStatus();InvalidateControls();
     }
+    // How far ahead of the playhead a live session renders. Takes effect on the
+    // next chunk: a running job keeps the range it was started on, which is why
+    // this never cancels one (the job may be a minute of work, and the setting
+    // is about what happens after it). 0 is "no window" - the whole of what the
+    // session set out to render.
+    void SetLiveWindowSeconds(double seconds){
+        const double rung=SnapLiveWindowSeconds(seconds);
+        if(std::abs(m_liveWindowSeconds-rung)<0.5)return;
+        m_liveWindowSeconds=rung;
+        // Switching the window OFF mid-session has one thing to undo: the range
+        // it had already cut short. Extending it to the ceiling is the only
+        // direction a live range may move, and it means "off" means off without
+        // a re-toggle. The other direction cannot be honoured on a running
+        // session - narrowing the range would take rendered coverage out of its
+        // accounting - so it waits for the next toggle and says so.
+        if(m_liveSession&&rung<=0.0&&m_liveRangeCeiling100ns>m_liveRange.end100ns){
+            m_liveRange.end100ns=m_liveRangeCeiling100ns;m_cachedRange=m_liveRange;
+            LOG("Neural render window off: the running session now renders to the end of its range ("
+                <<double(m_liveRangeCeiling100ns)*1e-7<<" s).");
+        }else if(m_liveSession){
+            LOG("Neural render window "<<rung<<" s: the running session keeps the range it started on; "
+                "the next toggle renders with this window.");
+        }else{
+            LOG("Neural render window "<<rung<<" s; the next session renders with it.");
+        }
+        SaveVideoSettings();SyncFeatureMenuState();UpdateCachedStatus();InvalidateControls();InvalidatePlaybackProgress();
+    }
     // What the status line says about frame generation when the conversion is
     // not the thing that owns the whole line. Every arm is a state the player
     // can actually be in, and each names the feature the way the menu and the
@@ -5303,6 +5341,10 @@ private:
         m_gpuSourceConversion=GetPrivateProfileIntW(L"Encoding",L"GpuSourceConversion",0,SettingsPath().c_str())!=0;
         m_nvencPreset=std::clamp<uint32_t>(uint32_t(GetPrivateProfileIntW(L"Encoding",L"NvencPreset",5,SettingsPath().c_str())),1,7);
         m_processingScale=ReadProcessingScale(SettingsPath());
+        // How far ahead the neural session renders. 0 keeps the old behaviour
+        // (the whole of what the session set out to render); anything else is
+        // a window, snapped to a rung the menu can show.
+        m_liveWindowSeconds=SnapLiveWindowSeconds(ReadIniFloat(L"Playback",L"NeuralWindowSeconds",float(kLiveWindowSeconds)));
         m_upscalingHistory=ReadUpscalingHistory(SettingsPath());
         m_exportSelection.engine=ReadSuperResolutionEngine(SettingsPath());
         m_captureDither=GetPrivateProfileIntW(L"Encoding",L"CaptureDither",1,SettingsPath().c_str())!=0;
@@ -5415,6 +5457,9 @@ private:
         WriteIniFloat(L"Playback",L"Muted",m_muted?1.0f:0.0f);
         WriteIniFloat(L"Playback",L"Fill",m_fill?1.0f:0.0f);
         WriteIniFloat(L"Playback",L"NeuralView",m_neuralRequested?1.0f:0.0f);
+        // Written as the rung itself, so the file says "120" and reads as the
+        // seconds it is; 0 is off.
+        WriteIniFloat(L"Playback",L"NeuralWindowSeconds",static_cast<float>(m_liveWindowSeconds));
         WriteIniFloat(L"Playback",L"SuperResolution",m_upscalingRequested?1.0f:0.0f);
         WriteIniFloat(L"Playback",L"FrameGenerationPlayback",m_playbackFrameGenRequested?1.0f:0.0f);
         WriteIniFloat(L"Playback",L"UpscaleEngine",
@@ -6127,6 +6172,15 @@ private:
                 :(m_upscaleTargetHeight==2160?IDM_UPSCALE_2160
                  :(m_upscaleTargetHeight==1080?IDM_UPSCALE_1080:IDM_UPSCALE_1440));
             CheckMenuRadioItem(menu,IDM_UPSCALE_AUTO,IDM_UPSCALE_2160,checked,MF_BYCOMMAND);
+            // The render window, snapped to its nearest rung on the way in, so
+            // one of these five is always the checked one. Checked through the
+            // submenu that owns the command: these live in a popup, and the
+            // command-id form above only reaches the menu it is handed.
+            const UINT windowCommand=m_liveWindowSeconds<=0.0?IDM_NEURAL_WINDOW_OFF
+                :(m_liveWindowSeconds<=75.0?IDM_NEURAL_WINDOW_60
+                 :(m_liveWindowSeconds<=105.0?IDM_NEURAL_WINDOW_90
+                  :(m_liveWindowSeconds<=150.0?IDM_NEURAL_WINDOW_120:IDM_NEURAL_WINDOW_180)));
+            app_menu::CheckRadioCommand(menu,IDM_NEURAL_WINDOW_OFF,IDM_NEURAL_WINDOW_180,windowCommand);
             // Custom ends the block, so a settings edit that leaves every preset
             // shows as Custom rather than leaving the last one checked.
             const size_t presetIndex=neural_presets::IndexOf(m_neuralSettings);
@@ -6372,9 +6426,16 @@ private:
         if(id>=kChipTipIdBase&&id<kChipTipIdBase+status_chips::kChipCount){
             const size_t index=size_t(id-kChipTipIdBase);
             if(!m_cachedChips[index].visible)return {};
-            status_chips::TipFacts facts{RenderChipProgress(),0.0,0.0,ScreenFps(),m_decoder.FrameRate(),m_droppedFrames,ScreenShowsGeneratedFrames()};
+            status_chips::TipFacts facts{RenderChipProgress(),0.0,0.0,ScreenFps(),m_decoder.FrameRate(),m_droppedFrames,ScreenShowsGeneratedFrames(),
+                                          m_liveSession?m_liveWindowSeconds:0.0};
             if(m_liveSession&&m_liveRange.end100ns>m_liveRange.start100ns){
-                facts.rangeSeconds=double(m_liveRange.end100ns-m_liveRange.start100ns)*1e-7;
+                // The tooltip's "of <length>" is whatever the chip's percentage
+                // is measured over, so a windowed session names its ceiling -
+                // the whole job - rather than the two minutes in hand.
+                const int64_t total=m_liveWindowSeconds>0.0
+                    ?std::max<int64_t>(m_liveRangeCeiling100ns,m_liveRange.end100ns)
+                    :m_liveRange.end100ns-m_liveRange.start100ns;
+                facts.rangeSeconds=double(total)*1e-7;
                 facts.paceRatio=LiveRealtimeRatio();
             }
             return status_chips::TipText(static_cast<status_chips::Chip>(index),facts);
@@ -8234,6 +8295,22 @@ private:
             return false;
         }
         if(m_cachedPlayback){
+            // A window has nothing behind its start, and the live pair clamps
+            // every seek to the start it was opened with - so a seek back before
+            // the window would silently land the viewer AT the window instead of
+            // where they asked. Treat it as unrendered: widen the window to the
+            // target so the session renders there, hand this frame to the
+            // original, and re-enter on the plain decoder.
+            if(m_liveSession&&m_liveWindowSeconds>0.0&&
+               static_cast<int64_t>(std::llround(sec*1e7))+3*LiveFrame100ns()<m_liveRange.start100ns){
+                LOG("Live seek to "<<sec<<" s is behind the render window ["
+                    <<double(m_liveRange.start100ns)*1e-7<<","<<double(m_liveRange.end100ns)*1e-7
+                    <<") s; widening it to the target and playing the original there.");
+                WidenLiveWindowBehind(static_cast<int64_t>(std::llround(sec*1e7)));
+                m_currentSec=sec;
+                DetachLivePlayback();
+                SetSeeking(false);RequestSeek(sec,resumeAfter);return false;
+            }
             m_haveNext=false;m_next=VideoFrame{};m_nextPairFrame.reset();m_synchronizedPlayback.SetPaused(false);
             if(!m_synchronizedPlayback.SeekSeconds(sec)||!m_synchronizedPlayback.VisibleFrame()){
                 // A live pair only holds what is rendered. Outside it the
@@ -9151,10 +9228,46 @@ private:
         // already supported. Repaint just that pill on every transition.
         InvalidateToolbarAction(ToolbarAction::TogglePlaybackFrameGeneration);
     }
-    // How far the render behind playback has got, for the render chip. A live
-    // session reports its whole range, holes and all, at the pace it is
-    // actually managing; a settings preview reports its own job.
+    // How far the render behind playback has got, for the render chip.
+    //
+    // A windowed session reports the same measure as a range render - rendered
+    // video over everything the session set out to render - because that is
+    // the job; the window only decides WHEN the work happens. The two earlier
+    // denominators were both wrong in the same way: the lookahead's own length
+    // parked the chip at 100% for as long as the buffer stayed full, which is
+    // exactly while the next chunk renders, and a growing range under it
+    // reported a share of a film that was not being worked on.
     status_chips::RenderProgress RenderChipProgress()const{
+        if(m_liveSession&&m_liveWindowSeconds>0.0){
+            // The window is a SCHEDULER, not the job: it decides when the next
+            // chunk starts. The job is everything the session intends to
+            // render - the file, or the marked range the playhead is in - so
+            // that is what the percentage is over. Measuring the two-minute
+            // lookahead instead made the chip read 100% for as long as the
+            // buffer stayed full, which is exactly while the next chunk was
+            // being rendered: a session doing precisely what it was asked,
+            // reporting a number frozen at the top of its scale. Rendered
+            // seconds over the whole intended total only climbs, one chunk at
+            // a time, and answers the question the chip is asking.
+            const int64_t ceiling=std::max<int64_t>(m_liveRangeCeiling100ns,0);
+            const int64_t covered=CoveredDuration100ns(LiveCoverage(),CoverageSpan{0,ceiling});
+            const double fraction=ceiling>0
+                ? std::clamp(double(covered)/double(ceiling),0.0,1.0) : 0.0;
+            // The flash still keys off whole windows of rendered video: it is
+            // the one quantity here that only moves when the render produces
+            // something, and a level that creeps up every twelve seconds would
+            // flash green through a session that is doing nothing at all.
+            const int64_t windowTicks=std::llround(m_liveWindowSeconds*1e7);
+            const uint64_t windows=windowTicks>0
+                ? uint64_t(std::max<int64_t>(0,covered))/uint64_t(windowTicks) : 0;
+            // And the ETA counts down to the same total the percentage is over,
+            // so the two agree: at the pace this session is managing, how long
+            // until everything it set out to render is rendered.
+            const double missing=double(std::max<int64_t>(0,ceiling-covered))*1e-7;
+            if(WarmUpStep()!=warm_up::Step::None)return {true,fraction,std::nullopt,true,true,1u+windows};
+            return {true,fraction,status_chips::SecondsToFullCoverage(missing,LivePaceRatio()),
+                    false,true,1u+windows};
+        }
         if(m_liveSession&&m_liveRange.end100ns>m_liveRange.start100ns){
             const CoverageSpan range{m_liveRange.start100ns,m_liveRange.end100ns};
             const double fraction=LiveSessionFinished()?1.0:std::min(CoveredFraction(LiveCoverage(),range),0.999);
@@ -9188,7 +9301,13 @@ private:
         // Before the unchanged-chips return below: the render chip reads
         // "Render 100%" a moment before the last hole is published, so the
         // chips can be unchanged on the call that sees the session finish.
-        if(m_completionLatch.Observe(m_liveSession&&m_liveSegments!=nullptr,LiveSessionFinished()))StartCompletionGlow();
+        //
+        // A windowed session fills its range once per chunk and then fills the
+        // next one, so "nothing left to render" is its steady state rather than
+        // an ending: the glow - and the "rendered X of video" toast under it -
+        // would fire every couple of minutes over a film that is not rendered.
+        if(m_completionLatch.Observe(m_liveSession&&m_liveSegments!=nullptr&&m_liveWindowSeconds<=0.0,
+                                     LiveSessionFinished()))StartCompletionGlow();
         ObserveBandGrowth();
         const status_chips::Snapshot chips=BuildStatusChips();
         if(chips==m_cachedChips)return;
@@ -10512,6 +10631,11 @@ private:
     static constexpr double kLiveFirstSegmentSeconds=0.5;
     static constexpr double kLiveStartLead=live_session::kStartLead;
     static constexpr double kLiveResumeLead=live_session::kResumeLead;
+    // What a session renders ahead of the playhead by default, and the reason
+    // it is not "the whole file": see LiveSessionPolicy.h's window block. A
+    // chunk is that many seconds from the render head, started when the buffer
+    // has drained to WindowLowWater() of it.
+    static constexpr double kLiveWindowSeconds=live_session::kDefaultWindowSeconds;
     // A session now renders the whole video by default, so its range chip named
     // the entire clip on every session - which reads as a user selection when
     // there was none. Only a range narrower than the source is worth saying.
@@ -10709,13 +10833,66 @@ private:
     }
     // What the session sets out to render: the marked range when the playhead is
     // inside one, otherwise the whole video. Holes inside it are filled one job
-    // at a time in the order the user needs them, so a session toggled on at 20 s
-    // renders the opening as well - which is what makes the whole video seekable
-    // with the picture the user asked for.
+    // at a time in the order the user needs them.
+    //
+    // The ceiling this returns is the furthest the session may ever render, and
+    // it is what the live pair is opened to. A render window then decides how
+    // much of it is rendered BEFORE the playhead gets there: see
+    // StartLiveNeuralSession and AdvanceLiveWindow.
     NeuralRenderRange LiveSessionRange(int64_t at,double fps,int64_t duration)const{
         if(const auto marked=RangeFromMarkers(m_markers,fps,duration);marked&&at>=marked->start100ns&&at<marked->end100ns)
             return NeuralRenderRange{marked->start100ns,marked->end100ns};
         return NeuralRenderRange{0,duration};
+    }
+    // Widens a windowed session's range back to `at` when the playhead is
+    // behind it. The one direction a live range may move: coverage is never
+    // discarded, and the pace baseline moves with the stretch that came into
+    // range, so the ratio keeps measuring what THIS session rendered.
+    //
+    // It has to happen before the pair is asked to seek, not after: the live
+    // pair clamps every seek to the start it was opened with
+    // (SynchronizedPlayback::SeekLive), so a seek that reached it first would
+    // land at the window instead of at the target it was given.
+    void WidenLiveWindowBehind(int64_t at){
+        if(!m_liveSession||!(m_liveWindowSeconds>0.0)||!m_liveSegments)return;
+        if(at+3*LiveFrame100ns()>=m_liveRange.start100ns)return;
+        const int64_t before=CoveredDuration100ns(LiveCoverage(),CoverageSpan{m_liveRange.start100ns,m_liveRange.end100ns});
+        LOG("Active neural window widening back to "<<double(at)*1e-7<<" s from "
+            <<double(m_liveRange.start100ns)*1e-7<<" s; keeping "<<m_liveSegments->Count()<<" segments.");
+        m_liveRange.start100ns=at;
+        const int64_t after=CoveredDuration100ns(LiveCoverage(),CoverageSpan{m_liveRange.start100ns,m_liveRange.end100ns});
+        m_liveCoveredAtStart+=std::max<int64_t>(0,after-before);
+    }
+    // Moves a windowed session's range end forward, one whole chunk at a time,
+    // once the buffer has drained to its low-water mark. Never under a running
+    // job: that job's target was chosen against this range, and moving the end
+    // under it would make its own hole disappear.
+    //
+    // Two things this does NOT do. It does not pin the end to the playhead
+    // (`playhead + N`), because that shrinks every hole to the sliver the
+    // playhead has eaten and burns a cold start on each - the treadmill
+    // LiveSessionPolicy.h's window block derives. And it never moves the end
+    // backwards, because a range that shrank would take rendered coverage out
+    // of the pace measurement and out of the hole arithmetic.
+    void AdvanceLiveWindow(){
+        if(!m_liveSession||!(m_liveWindowSeconds>0.0)||!m_liveSegments||m_liveRangeCeiling100ns<=0)return;
+        const int64_t at=SnapToFrame(Position100ns());
+        // A seek behind the window is a request to watch there, and a window
+        // has nothing there by construction. Done before the running-job check:
+        // the hole this opens under the playhead is what ShouldRetarget moves
+        // that job onto.
+        WidenLiveWindowBehind(at);
+        if(NeuralJobActive())return;
+        const double lowWater=live_session::WindowLowWater(m_liveWindowSeconds,LivePaceRatio());
+        const auto end=live_session::WindowEndAfterChunk(m_liveRange.end100ns,at,m_liveRangeCeiling100ns,
+                                                         m_liveWindowSeconds,LiveLeadSeconds(),lowWater);
+        if(!end)return;
+        const double buffered=LiveLeadSeconds();
+        LOG("Active neural window extending to "<<double(*end)*1e-7<<" s: "<<buffered<<" s of the "
+            <<m_liveWindowSeconds<<" s window still buffered (low-water "<<lowWater<<" s), ceiling "
+            <<double(m_liveRangeCeiling100ns)*1e-7<<" s.");
+        m_liveRange.end100ns=*end;m_cachedRange=m_liveRange;
+        UpdateCachedStatus();InvalidatePlaybackProgress();
     }
     // The hole this session should be rendering, given where the user is
     // watching: the one under the playhead, else the nearest ahead, else the
@@ -10767,12 +10944,30 @@ private:
             return;
         }
         const int64_t at=SnapToFrame(Position100ns());
-        const NeuralRenderRange range=LiveSessionRange(at,fps,duration);
+        NeuralRenderRange range=LiveSessionRange(at,fps,duration);
+        // The ceiling is the furthest this session may ever render - the file's
+        // end, or the marked range's when the playhead is inside one. The window
+        // only decides how much of that is rendered before the viewer arrives,
+        // and the live pair is opened to the CEILING so playback is never cut at
+        // a chunk boundary.
+        const int64_t ceiling=range.end100ns;
+        if(m_liveWindowSeconds>0.0){
+            // A window never renders the part before the toggle point: not
+            // rendering it is the whole of what it saves. The exception is an
+            // explicitly marked range, whose start is the user's own choice -
+            // there the backfill is at most one window long and was asked for.
+            const auto marked=RangeFromMarkers(m_markers,fps,duration);
+            const bool insideMarks=marked&&at>=marked->start100ns&&at<marked->end100ns;
+            if(!insideMarks)range.start100ns=at;
+            range.end100ns=std::min<int64_t>(ceiling,at+static_cast<int64_t>(std::llround(m_liveWindowSeconds*1e7)));
+        }
+        m_liveRangeCeiling100ns=ceiling;
         // Every exit below this point used to be silent, which is how a session
         // that started and then did nothing left no way to tell which of them
         // it had taken.
         LOG("Active neural session starting at "<<double(at)*1e-7<<" s over ["
-            <<double(range.start100ns)*1e-7<<","<<double(range.end100ns)*1e-7<<") s.");
+            <<double(range.start100ns)*1e-7<<","<<double(range.end100ns)*1e-7<<") s within [0,"
+            <<double(ceiling)*1e-7<<") s; render window "<<m_liveWindowSeconds<<" s.");
         if(range.end100ns<=range.start100ns){
             LOG("Active neural session refused: the range holds no frame to render.");
             return;
@@ -10852,7 +11047,7 @@ private:
                 <<" region(s) for the next toggle: "<<(spans.empty()?std::string("none"):spans)<<".");
         }
         m_liveSession=false;m_liveAttached=false;m_liveBuffering=false;m_liveResumePlaying=false;
-        m_livePaintedRevision=0;m_liveStartTick=0;m_liveRange={};m_liveTarget={};m_liveCoveredAtStart=0;
+        m_livePaintedRevision=0;m_liveStartTick=0;m_liveRange={};m_liveRangeCeiling100ns=0;m_liveTarget={};m_liveCoveredAtStart=0;
         HideBufferOverlay();
         RecordLiveRenderPace();
         m_liveSegments.reset();
@@ -10929,9 +11124,22 @@ private:
         // the same hole forever: a cache hit that publishes an entry but no
         // segment, and a range the worker refuses, both look like success. Two
         // fruitless jobs stop the session filling holes; what it rendered stays.
+        //
+        // Growth, not success, is the test - and that is not a wording change.
+        // The two are separate verdicts: the segments are written by the worker
+        // and land on disk whatever the cache gate then says, while `ok` also
+        // carries whether the joined entry was PUBLISHED. A gate that refuses
+        // an entry leaves `ok` false on a job that filled its hole completely,
+        // and reading that as fruitless stopped a windowed session after two
+        // good chunks: the buffer played out with a hole ahead of it and no job
+        // left to fill it, which is the one thing the window exists to prevent.
         const bool grew=m_liveSegments&&m_liveSegments->Revision()!=m_liveTargetRevision;
-        if(completion.result.ok&&grew)m_liveRenderFailures=0;
-        else if(++m_liveRenderFailures>=kLiveRenderFailureLimit)
+        if(grew){
+            if(!completion.result.ok)
+                LOG("Active neural session job added coverage but published no cache entry: "
+                    <<WideToUtf8(completion.result.detail)<<"; the session keeps rendering.");
+            m_liveRenderFailures=0;
+        }else if(++m_liveRenderFailures>=kLiveRenderFailureLimit)
             LOG("Active neural session stopped filling holes after "<<m_liveRenderFailures
                 <<" job(s) that added no coverage; keeping "<<(m_liveSegments?m_liveSegments->Count():size_t{0})<<" segments.");
         std::error_code entryError;
@@ -10943,9 +11151,11 @@ private:
             // Playback stays on the segments, but the published entry is what
             // "Save converted video" and the receipt need. The entry is this
             // job's hole, and the export labels it with the session's range,
-            // so it is only on offer when the hole WAS the range.
-            m_neuralPath=live_session::ExportableEntry(LiveCoverage(),CoverageSpan{m_liveRange.start100ns,m_liveRange.end100ns},
-                                                       CoverageSpan{completion.range.start100ns,completion.range.end100ns},LiveFrame100ns())
+            // so it is only on offer when the hole WAS the range. A windowed
+            // session's range is a moving chunk: its "whole range" is two
+            // minutes of a film, so an export labelled with it would be a lie.
+            m_neuralPath=(m_liveWindowSeconds<=0.0&&live_session::ExportableEntry(LiveCoverage(),CoverageSpan{m_liveRange.start100ns,m_liveRange.end100ns},
+                                                       CoverageSpan{completion.range.start100ns,completion.range.end100ns},LiveFrame100ns()))
                 ?completion.neuralPath:std::filesystem::path{};
             m_cachedReceiptPath=completion.receiptPath;m_cachedSettings=completion.settings;m_cachedGuides=completion.guides;m_cachedTemporal=completion.temporal;
             LOG("Active neural session rendered "<<completion.result.frameCount<<" frames and published its cache entry; save="<<(m_cachedPlayback&&!m_neuralPath.empty()&&!m_exportWorker.joinable()&&!ActivityBusy())<<" wholeRange="<<!m_neuralPath.empty()<<" entry="<<(completion.neuralPath.empty()?std::string("(none)"):WideToUtf8(completion.neuralPath.wstring())));
@@ -10986,7 +11196,12 @@ private:
         if(!m_liveSegments->Covered(at100))return false;
         const bool wasPlaying=m_playing||m_liveResumePlaying;
         Audio().Stop();m_haveNext=false;m_next=VideoFrame{};m_nextPairFrame.reset();
-        if(!m_synchronizedPlayback.OpenLive(m_path,m_liveSegments,SynchronizedRange{m_liveRange.start100ns,m_liveRange.end100ns},{},m_decoder.Media(),PairPrefersNv12())){LOG("Active neural playback could not open the live pair.");return false;}
+        // Bounded by the session's CEILING, not by its window: the window's end
+        // moves forward a chunk at a time as playback advances, and a pair
+        // opened to the old end would report end-of-stream at the first chunk
+        // boundary and refuse a seek past it. A marked range's ceiling is its
+        // out marker; a whole-file session's is the file's own end.
+        if(!m_synchronizedPlayback.OpenLive(m_path,m_liveSegments,SynchronizedRange{m_liveRange.start100ns,m_liveRangeCeiling100ns},{},m_decoder.Media(),PairPrefersNv12())){LOG("Active neural playback could not open the live pair.");return false;}
         if(!m_synchronizedPlayback.SeekSeconds(at)||!m_synchronizedPlayback.VisibleFrame()){LOG("Active neural playback could not position the live pair at "<<at<<" s.");m_synchronizedPlayback.Close();return false;}
         // The view has to switch before the frame is read: VisibleFrame returns
         // whichever side the view selects, and reading it first presented the
@@ -11131,6 +11346,10 @@ private:
         // buys a helper launch the next press discards. The hand-back above still
         // runs: a viewer who is seeking must never be left in a buffering panel.
         if(SecondsSinceSeek() < live_session::kSeekSettleSeconds)return;
+        // Before the target is chosen: a windowed session decides here whether
+        // there is more range to render at all, so the hole picked below is the
+        // new chunk's rather than a stale one.
+        AdvanceLiveWindow();
         const auto wanted=WantedLiveTarget();
         if(NeuralJobActive()){
             if(!wanted)return;
@@ -11148,10 +11367,15 @@ private:
         }
         if(!wanted){
             // Every frame of the range is rendered: nothing more to start, and
-            // the whole of it is now seekable on the render.
+            // the whole of it is now seekable on the render. With a window this
+            // is the steady state rather than an ending - the session sits here
+            // until playback drains the buffer far enough for the next chunk.
             if(m_liveTarget.end100ns>m_liveTarget.start100ns){
                 LOG("Active neural session rendered all of ["<<double(m_liveRange.start100ns)*1e-7<<","
-                    <<double(m_liveRange.end100ns)*1e-7<<") s over "<<m_liveSegments->Count()<<" segments.");
+                    <<double(m_liveRange.end100ns)*1e-7<<") s over "<<m_liveSegments->Count()<<" segments"
+                    <<(m_liveWindowSeconds>0.0
+                        ? ("; holding "+std::to_string(LiveLeadSeconds())+" s ahead until the buffer drains to the low-water mark.")
+                        : std::string(".")));
                 m_liveTarget={};UpdateCachedStatus();InvalidateControls();
             }
             return;
@@ -12775,6 +12999,11 @@ private:
         case IDM_UPSCALE_ENGINE_FSR4:SetUpscaleEngine(D3D12Renderer::UpscaleEngineMode::Fsr4);break;
         case IDM_UPSCALE_ENGINE_FSR1:SetUpscaleEngine(D3D12Renderer::UpscaleEngineMode::Fsr1);break;
         case IDM_UPSCALE_ENGINE_CAS:SetUpscaleEngine(D3D12Renderer::UpscaleEngineMode::Cas);break;
+        case IDM_NEURAL_WINDOW_OFF:SetLiveWindowSeconds(0.0);break;
+        case IDM_NEURAL_WINDOW_60:SetLiveWindowSeconds(60.0);break;
+        case IDM_NEURAL_WINDOW_90:SetLiveWindowSeconds(90.0);break;
+        case IDM_NEURAL_WINDOW_120:SetLiveWindowSeconds(120.0);break;
+        case IDM_NEURAL_WINDOW_180:SetLiveWindowSeconds(180.0);break;
         case IDM_AUDIO_PASSTHROUGH:SetAudioPassthrough(!m_audioPassthrough);break;
         case IDM_EXPORT_CACHED_VIDEO:ExportCachedVideo();break;
         case IDM_VIEW_FINAL:SetDebug(D3D12Renderer::DebugView::Final);break;case IDM_VIEW_INPUT:SetDebug(D3D12Renderer::DebugView::Input);break;case IDM_VIEW_MV:SetDebug(D3D12Renderer::DebugView::MotionVectors);break;case IDM_VIEW_DEPTH:SetDebug(D3D12Renderer::DebugView::Depth);break;case IDM_VIEW_FRAME_GENERATED:SetDebug(D3D12Renderer::DebugView::FrameGenerated);break;case IDM_VIDEO_ADJUSTMENTS:ShowAdjustments();break;case IDM_ASPECT_FIT:SetAspect(false,false);break;case IDM_ASPECT_FILL:SetAspect(true,false);break;case IDM_FULLSCREEN:ToggleFullscreen();break;case IDM_ADVANCED_SAFE_MODE:RestartInSafeMode();break;case IDM_CLEAR_NEURAL_CACHE:ClearNeuralCache();break;
@@ -13274,7 +13503,15 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // running job is filling inside it, which moves as the user watches and
     // seeks. Coverage itself lives in the index, as a set of rendered regions;
     // these two are only the intent.
+    //
+    // With a render window the end DOES move, a chunk at a time, and the start
+    // may widen back to a playhead seeked behind it (AdvanceLiveWindow). The
+    // ceiling is what neither may pass, and what the live pair is opened to.
     NeuralRenderRange m_liveRange{},m_liveTarget{};
+    int64_t m_liveRangeCeiling100ns{};
+    // Seconds of video kept rendered ahead of the playhead; 0 renders the whole
+    // of what the session set out to (the pre-2026-10-18 behaviour).
+    double m_liveWindowSeconds=kLiveWindowSeconds;
     // What every job of the session renders with, and so what its segments
     // are retained under (TakeLiveRenderSettings).
     RenderSettings m_liveRenderSettings{};
