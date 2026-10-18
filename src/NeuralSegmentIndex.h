@@ -340,8 +340,8 @@ public:
     // under this same mutex. This was rebuilt and re-sorted from all segments on
     // every call, several times per tick, under the lock the metadata reader
     // needs to append - and the input is already in order, so MergeSpans was
-    // sorting sorted data. A five-minute live session at 2 s/segment holds about
-    // 150 of them. The result is still returned by value: handing out a
+    // sorting sorted data. A five-minute live session at 3 s/segment holds about
+    // 100 of them. The result is still returned by value: handing out a
     // reference to storage this mutex guards would outlive the lock.
     std::vector<CoverageSpan> CoveredRanges() const
     {

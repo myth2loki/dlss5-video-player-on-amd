@@ -10625,7 +10625,18 @@ private:
     // keep up with 30 fps playback (break-even is a 57 s chunk): the
     // session is one long job that publishes finalized segments while it runs,
     // and playback follows the render head, buffering when it catches up.
-    static constexpr double kLiveSegmentSeconds=2.0;
+    // 3 s rather than 2. A segment is the unit playback can attach to, so the
+    // seconds it spends unfinished are lead the session cannot count: at the
+    // slowest pace this player measures (1.7x real time on a 1080p-class
+    // source) a segment covering L seconds is unplayable for the last L/1.7 of
+    // its own wall clock - 1.2 s at 2 s, 1.8 s at 3 s, both inside the 4 s
+    // start lead and the 2 s resume lead (LiveSessionPolicy.h), while 6 s would
+    // be 3.5 s and push an attach out of it. What it buys is the join at the
+    // end of every block: measured over six publishes of a 49-73 MB block, the
+    // join fell from 396-487 ms at 61 segments to 289-397 ms at 41, on the
+    // critical path between two render jobs ("the next hole cannot start until
+    // this returns"), and no session dropped a frame across a boundary.
+    static constexpr double kLiveSegmentSeconds=3.0;
     // The first file of a session is what the user is waiting for, so it is
     // short; the ones behind it stay at kLiveSegmentSeconds.
     static constexpr double kLiveFirstSegmentSeconds=0.5;
