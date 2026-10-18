@@ -358,3 +358,39 @@ live 播放本质不需要"视频流"——神经网络已经在 GPU 上产帧�
 **测试**：join 自报帧数必须等于解码得到的帧数（B 帧流，31 / 20 帧，编码序与显示序不同）；header 探测 + join 帧数要给出与"解复用那一对"相同的门判定（完整 join 通过、丢了一段的 refuse）；进度解析的边界——最后一个 block 胜出、`\r\n`、`N/A`、`frame=2881x`、负数、没有结尾 `progress=` 的流、有帧数没有时长。
 
 **还剩什么**：`concatMs` 289（只有分段集合条目能去掉）、`promoteMs` 174（哈希 50 + flush 16 + rename/复核）。要继续压，下一步是把发布整个挪到后台线程（`Render()` 返回即开始下一个 job），预计 −600 ms，但要动并发与退出路径。
+
+### 9.8 自动跑真机会话验证（2026-10-19 00:01–00:16）
+
+沙箱挡住 COM / Add-Type / 反射注入，所以按键和鼠标都发不进去。改用**投递 WM_COMMAND**：写了一个 30 行的 `sendcmd.exe`（`EnumWindows` 找带菜单的窗口，`PostMessage(hwnd, WM_COMMAND, id, 0)`），投的是菜单本身会发的消息——`IDM_NEURAL_RENDERING = 300`、`IDM_RENDER_WHOLE = 313`（`AppMenu.h`）。整个过程不碰鼠标键盘，等价于点了那两项菜单。
+
+**三次真实发布的 `Neural publish timing`**
+
+| 素材 | range | parts | concat | **probe** | promote | total |
+|---|---|---|---|---|---|---|
+| motion-fg 60 s | 36–60 s | 9 | 155.9 | **124.1** | 10.9 | 291.3 |
+| scroll-fg | 51–60 s | 19 | 168.1 | **127.7** | 17.7 | 314.1 |
+| scroll-fg | 同源另一段 | 20 | 171.3 | **127.5** | 18.5 | 317.8 |
+
+`probeMs` 从改造前的 432–459 降到 **124–128**，与隔离预测（120–150）一致。离线整片渲染仍是 `FullValidation`：412.7 ms（它不在块边界上）。
+
+**打开即命中，一次完整闭环**
+
+```
+[00:15:51.166] Checking neural cache key=0c28fe64… range=[0,0) …
+[00:15:51.169] Neural cache entry 0c28fe64… authenticated by its recorded payload stamp (size=2385585); the payload was not re-hashed.
+[00:15:55.155] Verified neural cache hit opened without re-rendering.
+```
+
+**顺带查出的真正根因（比"range 跟着播放头"更致命）**
+
+验证一开始失败：同一条目在两次启动里算出**不同的 key**，可 `range`/`guides`/`settings` 打印出来一模一样。对比两条 manifest 的 `runtimeDigest` 得到 `500630f4…` 与 `f9e2e465…`——同一会话内相隔两分钟的两次渲染，运行时的身份摘要都变了。追下去找到两个改变的候选文件，实测一轮渲染后：
+
+| 文件 | 内容是否变 |
+|---|---|
+| `shaders/shader-cache/*.dxbc` | 变，但已按目录排除 |
+| `DLSS5-AMD/custom-config.txt` | **没变**（被重写但字节相同） |
+| `lmxxf_runtime.log` | **变了**（3ae7feff… → 18c1dc52…） |
+
+`AmdRuntimeIdentityFiles` 把运行时树里**每一个普通文件**都算进了摘要，包括它自己每次 job 都追加的日志。于是每渲完一块，下一次渲染的 key 就换一个——缓存命中实际上不可能发生。这解释了用户最初的抱怨，且与 range 无关。
+
+修复：按扩展名跳过 `.log`（大小写不敏感），与既有的 shader-cache 目录排除并列。修复后两次独立会话给出**相同的** `ac613c95…`，第二次打开第一次的整片条目并走了 stamp。代价：修复前发布的条目（摘要含日志）会一次性失效。
