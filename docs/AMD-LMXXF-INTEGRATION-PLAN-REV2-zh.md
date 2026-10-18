@@ -1008,6 +1008,10 @@ resident helper：先禁用，每个任务独立 worker
 > （日志见上），**D 键之后的分段产出与缓存命中还没有实机跑过**——
 > 需要 GUI 按键，本轮没有可用的自动化。所以 §12 的退出条件
 > （30 分钟连续播放）**仍未验证**。
+>
+> **2026-10-19 更新：这一条已关闭。** 按键可以用 `PostMessage` 直接投
+> `WM_COMMAND` 绕过（`IDM_NEURAL_RENDERING=300`、`IDM_RENDER_WHOLE=313`），
+> 三次真实发布与一次"打开即命中"都已经跑出来，见 §12 的 2026-10-19 状态块。
 
 ## 12. 验收标准
 
@@ -1038,6 +1042,24 @@ resident helper：先禁用，每个任务独立 worker
 > `NeuralRangeRenderSmoke` 仍停在 `Unable to determine a readable ReShade.ini size`
 > ——它本来的环境性失败。`NeuralWorkerTests` exit 0（含此前新增的 5 条 AMD
 > 协议断言）。全量构建 0 error / 0 warning（`/W4 /WX`）。
+
+> **2026-10-19 的状态（只列相对上表变化的两条）：**
+>
+> | 条 | 状态 |
+> |---|---|
+> | D 键之后的分段产出与缓存命中 | ✅ **已验证**。自动投递菜单命令后三次真实发布：`parts=9/19/20`、`probeMs=124.1/127.7/127.5`（改前 432–459）、`totalMs=291/314/318`；重开同一源命中整片条目，日志为 `Neural cache entry … authenticated by its recorded payload stamp (size=2385585); the payload was not re-hashed.` 与 `Verified neural cache hit opened without re-rendering.` |
+> | 30 分钟连续直播 | ✅ **已完成**（33 分钟、1280×720、120 秒块、6 条条目，无掉帧；会话细节记在 README 的 `On an AMD card`）。 |
+>
+> 验证过程中查出的真正阻塞点是**运行时身份把 `lmxxf_runtime.log` 也算进了摘要**：
+> 运行时每完成一个 job 就往这个日志追加，于是每渲完一块、下一块的 key 就换一个，
+> 缓存命中在物理上不可能发生。修复是按扩展名跳过 `.log`（与既有的 shader-cache
+> 目录排除并列），修复后两次独立会话给出同一个 `runtimeDigest`。代价是修复前发布
+> 的条目一次性失效。
+>
+> 顺带压掉的两处发布开销：段长 2 s → 3 s（每块 61 段 → 41 段，`concatMs`
+> 463 → 343 中位），以及 join 通过 FFmpeg `-progress` 自报帧数后，发布只做
+> header 探测（`probeMs` 432–459 → 124–128）。两处合计使 49–73 MB 块的
+> `totalMs` 从 996–1653 降到约 590–780。
 
 ### 性能
 
@@ -1092,7 +1114,8 @@ resident helper：先禁用，每个任务独立 worker
 
 ### 稳定性
 
-- 连续 30 分钟渲染。**未做。**
+- 连续 30 分钟渲染。**已做**（2026-10-18，33 分钟，1280×720，120 秒块）：
+  六个条目、三次会话启动各等 6–7 s 首块，之后没有再等，播放无掉帧。
 - seek、暂停、取消、设备移除和 worker 重启。**未做。**
 - 权重、模块或 runtime 换版本后必须缓存失效。**机制已有**：runtime 身份是
   遍历整包算出的摘要（`AmdRuntimeIdentityFiles` + `BuildRuntimeDigest`），
@@ -1145,3 +1168,8 @@ resident helper：先禁用，每个任务独立 worker
 如果按上述边界实施，可以保留播放器现有的缓存、对比、导出和时间轴逻辑，
 同时把 AMD 模型执行隔离在独立 worker 中。这样风险是可控的，也不会把
 ReShade 和第三方运行时硬编码塞进主播放器。
+
+> **2026-10-19：** 上面「剩余未知」里的**30 分钟连续直播**与**D 键之后的分段
+> 产出和缓存命中**两项已经关闭（自动化投递菜单命令跑通，见 §12 与 README 的
+> `On an AMD card`）。仍未测的是 900/1440/4K 输入、设备移除恢复，以及 AMD 专用
+> 的 pace prior 与真实时序模型。

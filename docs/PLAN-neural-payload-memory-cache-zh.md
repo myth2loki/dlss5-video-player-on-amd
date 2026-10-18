@@ -23,10 +23,10 @@
 | # | 数据 | 位置 | 生命周期 | 实测大小 | 能否只留内存 |
 |---|---|---|---|---|---|
 | 1 | 已完成块的 payload | `cache/v1/renders/<key>/neural.mkv` | 持久、跨会话复用、`Get a copy` 的源 | 720p 块 33–52 MB / 120 s；今天累计 11 条、239 MB | **不能** |
-| 2 | live 会话分段 | `cache/v1/live/pid<N>/job<runId>/*.mkv` | **块内 2 s/段，发布后立即 retired 删除** | 每块 61 段 | 能，但只活 ~120 s |
+| 2 | live 会话分段 | `cache/v1/live/pid<N>/job<runId>/*.mkv` | **块内 3 s/段（原 2 s），发布后立即 retired 删除** | 每块 41 段（原 61） | 能，但只活 ~120 s |
 | 3 | 源副本 | `cache/v1/sources/<key>/source.mkv` | 持久 | 与源同尺寸 | 不能 |
 
-分段不是缓存，只是"发布前的临时容器"：播放先读分段（`SynchronizedPlayback.Open(sourcePath, neuralPath, ...)`，`main.cpp:11914`），整块渲完就 `ReplaceRun` 成单一 `neural.mkv`，播放改读条目、分段退休（日志：`Live run N now plays from its published entry; 61 segment files retired`）。
+分段不是缓存，只是"发布前的临时容器"：播放先读分段（`SynchronizedPlayback.Open(sourcePath, neuralPath, ...)`，`main.cpp:11914`），整块渲完就 `ReplaceRun` 成单一 `neural.mkv`，播放改读条目、分段退休（日志：`Live run N now plays from its published entry; 41 segment files retired`）。
 
 **所以"把落盘数据缓到内存"在这条流水线上等价于"把发布机制换成内存机制"** —— 而发布机制本身才是瓶颈（§三）。
 
@@ -353,7 +353,7 @@ live 播放本质不需要"视频流"——神经网络已经在 GPU 上产帧�
 
 改后几乎与文件大小无关（一次 spawn + 读 header），改前随 packet 数增长——这正是收益会随块变大而变多的原因。
 
-对应 `Neural publish timing`：`probeMs` 432–459 → 约 140–180；`totalMs` 895–1110 → **约 675–890（−22%）**。
+对应 `Neural publish timing`：`probeMs` 432–459 → **124–128（三次真实发布实测）**；`totalMs` 895–1110 → **约 590–780（−30%~−34%）**。
 
 **测试**：join 自报帧数必须等于解码得到的帧数（B 帧流，31 / 20 帧，编码序与显示序不同）；header 探测 + join 帧数要给出与"解复用那一对"相同的门判定（完整 join 通过、丢了一段的 refuse）；进度解析的边界——最后一个 block 胜出、`\r\n`、`N/A`、`frame=2881x`、负数、没有结尾 `progress=` 的流、有帧数没有时长。
 
