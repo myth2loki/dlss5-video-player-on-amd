@@ -511,6 +511,30 @@ Queue:
 > `TemporalGuides` 两个头声明的，本次没有独立验证 runtime 重投影的符号；
 > 以及**真实运动场**（而不是常量场）在真实内容上的读数还没有取到。
 >
+> **2026-10-20：这两项里的第二项已经取到，结论与上面的预判同向。**
+> CPU 块匹配器最终还是写了（`--guides mv=cpu`，见阶段 C 的"仍然缺的"），
+> 但它先是作为**测量工具**存在的：把它接进 AMD 路径是为了让 runtime 的历史第
+> 一次吃到真运动场，然后用四个受控臂回答"真场比零场好多少"。
+> 在 RX 9070 XT 上实测（三 clip × 四臂，`tools/benchmark/amdguides.py`，
+> 退出码 0，往返证明逐位一致；完整记录见
+> [measurements/amd-guide-ab-20261020](measurements/amd-guide-ab-20261020/REPORT.md)）：
+>
+> | clip | PSNR 真场 | PSNR 零场 | Δ |
+> |---|---|---|---|
+> | still-hold | 29.30 | 29.30 | 0.000（逐位相同：静止帧上估计器产出的本就是零场） |
+> | depth-pan | 21.23 | 22.12 | **−0.892**（零场胜） |
+> | real-game-motion | 32.12 | 31.95 | +0.166（真场胜，刚过 0.1 dB 平带） |
+>
+> 预登记的采纳条件是"运动段可量地更好**且**静止段不劣"同时成立，实际是一胜一负
+> 且负得更多，因此**不采纳真运动场，维持零场架构**。这跟上面 7.8% 的上界判断是
+> 同一件事的两个侧面：上界算出来就不够，实测出来也不够。
+>
+> 仍未验证的只剩位移向量的**符号**约定（照两个头的声明，未独立验证 runtime
+> 重投影的符号）。注意历史"真场"数据不可比：`AmdLmxxfEvaluator::UploadGuides`
+> 曾把 3 通道 PFM 用 2 通道跨距写进 RG 纹理（每个 y 落到下一像素的 x），
+> 修复前的任何 `mv=file:` 真场测量其运动场都是错排的；零场不受影响
+> （零怎么排都是零），所以 run 6 的零场结论仍然成立。
+>
 > 代码现状补充：run 7 用到的两个路径来自编译期定义
 > `DLSS5_FFMPEG_PATH` / `DLSS5_REAL_CLIP_PATH`（见 `tests/HardwareTests.cmake`），
 > 两者任一缺失时 run 7 自己跳过而不是失败——所以一个没有 staged ffmpeg 的
@@ -908,14 +932,21 @@ resident helper：先禁用，每个任务独立 worker
 >
 > **仍然缺的：**
 >
-> 2. **时序模型在播放器路径上不可达。** runtime 只在 recording-lease 生命周期下
->    跑时序模型，而它融合的 guide 是调用方给的，这个后端没有 estimator——
->    这是 §5.3 明确留给后续阶段的"贵的那一半"。所以 AMD 导出目前是**纯空间**渲染，
->    日志里以 `temporal=off, …this job brought no guide files` 明写，
+> 2. **时序模型在播放器路径上不可达——这是 2026-10-20 测完之后的决定，不是缺件。**
+>    runtime 只在 recording-lease 生命周期下跑时序模型，而它融合的 guide 是调用方给的。
+>    这个后端**已经有 estimator**：CPU 块匹配器（`--guides mv=cpu`，走
+>    `AmdLmxxfEvaluator::SetFrameGuides` 每帧内存递交），§5.3 当年"不足以支持先写
+>    一个 CPU 块匹配器"的那半句已经被执行了——写出来了，接上了，并且量过了。
+>    量完的结论是**不进产品路径**（见 §5.3 末段 2026-10-20 的表：运动段一胜一负，
+>    净负 0.726 dB）。所以 AMD 导出维持**纯空间**（零场）渲染，日志里以
+>    `temporal=off, …this job brought no guide files` 明写，
 >    末尾再用 `history=not-asked(no lease frame ran)` 复述一次：
 >    时序没跑和时序跑了但报 `off` 是两件事，不能都留空。
->    带 guide 文件的基准（`mv=file:`/`depth=file:`）会打开 lease 生命周期，
->    这是 `AmdLmxxfEvaluatorSmoke` run 6/7 测过的路径。
+>    `mv=cpu` 与带 guide 文件的基准（`mv=file:`/`depth=file:`）都会打开 lease
+>    生命周期，前者是基准测量专用（播放器 CLI 不暴露 `--guides`，产品路径取不到），
+>    后者是 `AmdLmxxfEvaluatorSmoke` run 6/7 测过的路径。
+>    **下一步的画质杠杆是 FidelityFX Optical Flow，不是这个 CPU 场**——
+>    它是另一件工作（需集成 FFX SDK），不在本方案内。
 > 4. **阶段 D 的捕获策略没接**：`CapturePixelFormat` 固定 BGRA，
 >    NV12/P010 的 GPU 转换路径在 AMD 上不存在，编码器因此选 H.264 软件路径
 >    或 FFV1（`RunJob` 里的 `selected` 分支），NVENC 直连不可能。
