@@ -1,0 +1,44 @@
+{
+  "amd-cpu": {
+    "guides": "mv=cpu,depth=1",
+    "worker_flags": [
+      "--guide-dump",
+      "{work}/guides/{clip}/cpu",
+      "--neural-backend",
+      "amd-lmxxf"
+    ],
+    "description": "AMD arm C: the CPU block matcher's motion and depth proxy, handed to the evaluator in memory; the runtime's temporal model runs under the recording-lease lifecycle. Guides dumped for arm Z's depth and the round-trip proof. Requires DLSS5_AMD_RUNTIME_DIR in the environment (or --amd-runtime-dir).",
+    "overrides": {}
+  },
+  "amd-cpu-nzmt": {
+    "guides": "mv=cpu,depth=1",
+    "worker_flags": [
+      "--guide-dump",
+      "{work}/guides/{clip}/cpu",
+      "--zero-motion-test",
+      "1",
+      "--neural-backend",
+      "amd-lmxxf"
+    ],
+    "description": "AMD arm C': arm C with the zero-motion test on - a frame byte-identical to its predecessor renders with a zero field, the host-side mirror of NvofResolveShader.h's test. Everything else is bit-for-bit arm C, so still-hold deltas are attributable to held-frame noise alone.",
+    "overrides": {}
+  },
+  "amd-zmv": {
+    "guides": "mv=file:{work}/guides/{clip}/zero/mv,depth=file:{work}/guides/{clip}/cpu/depth",
+    "worker_flags": [
+      "--neural-backend",
+      "amd-lmxxf"
+    ],
+    "description": "AMD arm Z: the zero motion field (guidefiles.py zero) with arm C's dumped depth replayed, so the only difference from arm C is the motion field. Run amd-cpu first; both arms run the temporal model under the same lease lifecycle.",
+    "overrides": {}
+  },
+  "amd-cpu-replay": {
+    "guides": "mv=file:{work}/guides/{clip}/cpu/mv,depth=file:{work}/guides/{clip}/cpu/depth",
+    "worker_flags": [
+      "--neural-backend",
+      "amd-lmxxf"
+    ],
+    "description": "AMD round-trip proof: arm C's dump fed back through the file path. The render must be byte-identical to amd-cpu's (the dump is grid-sized, the file path's area average copies at equal size, and both arms compact the three-channel PFM the same way). Only meaningful on the build with the motion stride fix in AmdLmxxfEvaluator::UploadGuides.",
+    "overrides": {}
+  }
+}

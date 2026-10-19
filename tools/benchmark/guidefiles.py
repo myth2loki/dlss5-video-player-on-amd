@@ -97,6 +97,23 @@ def write_frame(root: Path, frame: int, depth: np.ndarray | None, motion: np.nda
 
 
 # ---------------------------------------------------------------------------
+# The zero-field arm. Zero motion is size-invariant under the area average both
+# consumers apply (the evaluator's file path and the renderer's expansion pass),
+# so the files are written at whatever size is named and mean the same field.
+
+def cmd_zero(args) -> int:
+    root = args.out
+    motion = np.zeros((args.height, args.width, 2), np.float32)
+    depth = np.full((args.height, args.width), args.depth, np.float32) if args.depth is not None else None
+    for frame in range(args.frames):
+        write_frame(root, frame, depth, motion)
+    written = "mv" if depth is None else "mv+depth"
+    print(f"{args.frames} frames -> {root} ({written}, {args.width}x{args.height}, "
+          f"motion all zero{', depth flat ' + str(args.depth) if depth is not None else ''})")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # True guides of the synthetic near/far clips, from corpus.py's own constants.
 
 def truth_fields(clip: str, frame: int, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
@@ -251,12 +268,20 @@ def main() -> int:
     compare = sub.add_parser("compare", help="max |difference| between two directories of PFMs")
     compare.add_argument("a", type=Path)
     compare.add_argument("b", type=Path)
+    zero = sub.add_parser("zero", help="write the zero-motion field (and optionally a flat depth) as guide files")
+    zero.add_argument("--frames", type=int, required=True, help="how many frames to write")
+    zero.add_argument("--out", type=Path, required=True, help="directory, filled with mv/ and depth/")
+    zero.add_argument("--width", type=int, default=160)
+    zero.add_argument("--height", type=int, default=90)
+    zero.add_argument("--depth", type=float, default=None,
+                      help="also write a flat depth at this value (0 near, 1 far)")
     prove = sub.add_parser("prove", help="render the round-trip proof and compare digests")
     prove.add_argument("--clips", nargs="+", default=["depth-pan", "depth-subject", "real-game-motion"])
     prove.add_argument("--profile-file", type=Path, default=HERE / "roundtrip.profile.json")
     prove.add_argument("--timeout", type=float, default=900.0)
     args = parser.parse_args()
-    return {"truth": cmd_truth, "convert": cmd_convert, "compare": cmd_compare, "prove": cmd_prove}[args.command](args)
+    return {"truth": cmd_truth, "convert": cmd_convert, "compare": cmd_compare,
+            "zero": cmd_zero, "prove": cmd_prove}[args.command](args)
 
 
 if __name__ == "__main__":

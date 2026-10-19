@@ -2876,6 +2876,31 @@ struct AmdLmxxfEvaluatorAdapter {
     AmdLmxxfEvaluatorConfig config{};
     std::unique_ptr<AmdLmxxfEvaluator> evaluator;
     std::deque<JobEvaluation> captured{};
+    // The benchmark's guide sources (GuideFiles.h) and the CPU estimator that
+    // serves the mv=cpu arm. The generator is per-job state, made in
+    // ResetForJob the way production's is; fps and the source layout come from
+    // Initialize, which is the only place on this path that sees them.
+    TemporalGuideGenerator guides;
+    guide_files::Sources guideFiles{};
+    GuideControls controls{};
+    bool zeroMotionTest{false};
+    double fps{};
+    PixelLayout sourceLayout{PixelLayout::Bgra};
+    // The zero-motion test's held-frame state: the previous frame's exact
+    // bytes, kept so "this frame is identical to its predecessor" is a
+    // measurement rather than a hash's opinion. Benchmark-sized (one frame of
+    // BGRA), and only kept while the test is on.
+    std::vector<uint8_t> zeroMotionPrevious;
+    bool zeroMotionHasPrevious{false};
+    // Scratch for the full-frame guide handover. The evaluator takes bare
+    // pointers for exactly one Submit, so the buffers only have to outlive the
+    // call.
+    std::vector<float> motionFull;
+    std::vector<float> depthFull;
+    // A guide-stage failure. The guide stage runs before the evaluator sees the
+    // frame, so without this the job would report the evaluator's stale verdict.
+    NeuralRenderFailure guideFailure{NeuralRenderFailure::None};
+    std::string guideError;
     // The size this evaluator was brought up for, and which job model it was
     // created in. The runtime admits a box and arms its chain against it, and
     // nothing on this path resizes afterwards, so a job that differs is a new
@@ -2915,6 +2940,10 @@ struct AmdLmxxfEvaluatorAdapter {
     // file is read again before the network is built.
     uint32_t broughtUpStyle{1};
     uint32_t broughtUpOutputW{},broughtUpOutputH{};
+    // The frame rate the bring-up was made under. It feeds the guide
+    // generator's per-frame motion scaling, so a job at another rate is a new
+    // bring-up for the same reason a new size is.
+    double broughtUpFps{};
     uint32_t jobOutputW{},jobOutputH{};
     uint32_t jobPasses{1};
     bool jobSkinProtect{false};
@@ -2946,19 +2975,24 @@ struct AmdLmxxfEvaluatorAdapter {
     // Normalised here as the writer normalises it, so the reuse question and the
     // file say the same thing.
     void SetStyle(uint32_t style){jobStyle=amd_lmxxf::NormalizedAmdStyle(style);}
-    bool Initialize(HWND,uint32_t w,uint32_t h,uint32_t ow,uint32_t oh,double fps,
-                    const GuideControls& guides,PixelLayout,const SourceColorDescription&){
+    bool Initialize(HWND,uint32_t w,uint32_t h,uint32_t ow,uint32_t oh,double frameRate,
+                    const GuideControls& guideSwitches,PixelLayout layout,const SourceColorDescription&){
+        // The guide generator's inputs, whenever this bring-up (or a reuse of
+        // it) next renders. The guide switches are per-job state as well, but
+        // Initialize is the only place they arrive together with the layout.
+        fps=frameRate;sourceLayout=layout;controls=guideSwitches;
         if(!ow||!oh){ow=w;oh=h;}
         jobOutputW=ow;jobOutputH=oh;
         // The guides are per-frame inputs on this path rather than bring-up
         // state, so the size, the capture size, the job model, the accumulation
-        // rung, the pass count and the style are the whole inheritance question
-        // and a match on all of them means there is nothing to rebuild.
+        // rung, the pass count, the style and the frame rate are the whole
+        // inheritance question and a match on all of them means there is
+        // nothing to rebuild.
         reused=evaluator&&width==w&&height==h&&broughtUpTemporal==config.temporalHistory&&
                broughtUpStability==config.stability&&broughtUpPasses==jobPasses&&
                broughtUpSkinProtect==jobSkinProtect&&broughtUpPredict==jobPredict&&
                broughtUpSkip==jobSkip&&broughtUpStyle==jobStyle&&broughtUpOutputW==jobOutputW&&
-               broughtUpOutputH==jobOutputH;
+               broughtUpOutputH==jobOutputH&&broughtUpFps==fps;
         if(reused)return true;
         captured.clear();
         evaluator=std::make_unique<AmdLmxxfEvaluator>(config);
@@ -2971,19 +3005,104 @@ struct AmdLmxxfEvaluatorAdapter {
         broughtUpStyle=jobStyle;
         broughtUpOutputW=jobOutputW;
         broughtUpOutputH=jobOutputH;
-        if(evaluator->Initialize(nullptr,w,h,ow,oh,fps,guides))return true;
+        broughtUpFps=fps;
+        if(evaluator->Initialize(nullptr,w,h,ow,oh,fps,guideSwitches))return true;
         broughtUpFailure=evaluator->LastFailure();
         broughtUpError=evaluator->LastError();
         LOG("AMD neural runtime did not come up for "<<w<<"x"<<h<<": "<<broughtUpError);
         evaluator.reset();
         return false;
     }
+    // Guides for one frame. The mv=cpu arm runs the CPU block matcher on the
+    // decoded frame and hands the full-frame fields to the evaluator; every
+    // other arm hands an empty override, which leaves the evaluator on its
+    // configured directories or its constants. The generator's scene-cut
+    // decision travels with the frame (guide.id.reset), exactly as production's
+    // guide travels to the renderer.
+    bool PrepareGuides(const JobFrame& frame,const FrameIdentity& id,FrameIdentity& effectiveId){
+        effectiveId=id;
+        guideFailure=NeuralRenderFailure::None;guideError.clear();
+        if(!evaluator)return false;
+        if(guideFiles.motion!=guide_files::MotionSource::Cpu){
+            evaluator->SetFrameGuides({});
+            return true;
+        }
+        GuideFrame guide;
+        if(!guides.Generate(frame.bgra.data(),frame.bgra.size(),width,height,width,height,
+                            fps,id,guide,sourceLayout)){
+            guideFailure=NeuralRenderFailure::Neural;
+            guideError="the CPU guide generator failed on frame "+
+                       std::to_string(id.frameNumber);
+            return false;
+        }
+        // The zero-motion test, host-side: a frame byte-identical to its
+        // predecessor has no motion, whatever the estimator's blocks read in
+        // the compression noise between them. Zeroed before the file overlay
+        // (and before the dump that overlay writes), so the field a dump
+        // records is the field that renders. This mirrors NvofResolveShader.h's
+        // test, which exists because the hardware flow lies on held frames; the
+        // CPU matcher lies less, and this arm is how much that matters is
+        // measured.
+        if(zeroMotionTest){
+            const bool repeat=zeroMotionHasPrevious&&
+                              frame.bgra.size()==zeroMotionPrevious.size()&&
+                              std::equal(frame.bgra.begin(),frame.bgra.end(),
+                                         zeroMotionPrevious.begin());
+            zeroMotionPrevious=frame.bgra;
+            zeroMotionHasPrevious=true;
+            if(repeat){
+                const size_t cells=size_t(guide.gridW)*guide.gridH;
+                for(size_t cell=0;cell<cells;++cell){
+                    guide.guideGridRGBA32F[cell*4]=0.0f;
+                    guide.guideGridRGBA32F[cell*4+1]=0.0f;
+                }
+            }
+        }
+        std::string error;
+        if(guideFiles.Active()&&!guide_files::Apply(guideFiles,id.frameNumber,guide,&error)){
+            guideFailure=NeuralRenderFailure::Source;
+            guideError="benchmark guide files failed at frame#"+
+                       std::to_string(id.frameNumber)+": "+error;
+            return false;
+        }
+        // The grid onto the frame - the same area average the evaluator's file
+        // path applies - with the PFM's padding channel dropped on the way.
+        const guide_files::Plane motionGrid=guide_files::GridChannels(guide,true);
+        if(motionGrid.values.empty()){
+            guideFailure=NeuralRenderFailure::Neural;
+            guideError="the guide grid is empty";
+            return false;
+        }
+        const guide_files::Plane motionExpanded=
+            guide_files::ResampleArea(motionGrid,width,height);
+        motionFull.resize(size_t(width)*height*2u);
+        for(size_t pixel=0;pixel<size_t(width)*height;++pixel){
+            motionFull[pixel*2u]=motionExpanded.values[pixel*3u];
+            motionFull[pixel*2u+1u]=motionExpanded.values[pixel*3u+1u];
+        }
+        AmdLmxxfEvaluator::FrameGuides handover;
+        handover.motion=motionFull.data();
+        if(controls.depth){
+            const guide_files::Plane depthGrid=guide_files::GridChannels(guide,false);
+            const guide_files::Plane depthExpanded=
+                guide_files::ResampleArea(depthGrid,width,height);
+            depthFull=std::move(depthExpanded.values);
+            handover.depth=depthFull.data();
+        }
+        evaluator->SetFrameGuides(handover);
+        // A cut the generator saw restarts the runtime's history, as
+        // production's renderer restarts NGX's on the same signal.
+        effectiveId=guide.id;
+        return true;
+    }
     bool Submit(const JobFrame& frame,const FrameIdentity& id,bool capture,JobEvaluation& out){
         if(!evaluator)return false;
+        FrameIdentity effectiveId;
+        if(!PrepareGuides(frame,id,effectiveId))return false;
         OfflineEvaluation evaluation;
         if(!evaluator->Submit(OfflineDecodedFrame{frame.bgra,frame.timestamp100ns,frame.discontinuity,
                                                  frame.frameNumber,frame.sourceGeneration},
-                              id,capture,evaluation))return false;
+                              effectiveId,capture,evaluation))return false;
         out.bgra=std::move(evaluation.bgra);out.id=evaluation.id;
         out.neuralGpuMs=evaluator->LastNeuralGpuMs();return true;
     }
@@ -3024,11 +3143,16 @@ struct AmdLmxxfEvaluatorAdapter {
     // loop this serves never runs here.
     bool RequestFeatureRehook()const{return false;}
     NeuralRenderFailure LastFailure()const{
+        // A guide-stage failure belongs to this frame: the stage ran before the
+        // evaluator saw anything, so the evaluator's verdict here is the
+        // previous frame's.
+        if(guideFailure!=NeuralRenderFailure::None)return guideFailure;
         return evaluator?evaluator->LastFailure():broughtUpFailure;
     }
     // The reason behind it. A failed Initialize drops the evaluator, so the
     // bring-up's words are kept alongside its verdict the same way.
     std::string LastError()const{
+        if(!guideError.empty())return guideError;
         return evaluator?evaluator->LastError():broughtUpError;
     }
     uint64_t PeakLocalVideoMemoryMiB()const{return evaluator?evaluator->PeakLocalVideoMemoryMiB():0;}
@@ -3041,7 +3165,26 @@ struct AmdLmxxfEvaluatorAdapter {
     // KEPT, unlike production's device: its whole cost is the module load and the
     // session arming, and the runtime's history is restarted through the per-frame
     // reset flag the job's first submit carries, so a rebuild would buy nothing.
-    void ResetForJob(const GuideControls&){DiscardPending();}
+    // The guide generator is NOT kept - its scene-cut tally and its history
+    // generation are evidence about the job, and a job that inherited them would
+    // inherit the previous one's cuts.
+    void ResetForJob(const GuideControls& jobControls,scene_cut::Sensitivity cuts){
+        DiscardPending();
+        guides={};
+        controls=jobControls;
+        guides.SetControls(controls);
+        guides.SetSceneCutSensitivity(cuts);
+        // guideFiles and zeroMotionTest are deliberately NOT touched here:
+        // RunAmdJob sets them from the request before this call, and they are
+        // per-job inputs like the config, not state a job resets. Only the
+        // estimator's per-job memory is cleared.
+        zeroMotionPrevious.clear();
+        zeroMotionHasPrevious=false;
+        guideFailure=NeuralRenderFailure::None;
+        guideError.clear();
+        // The evaluator survives the job; its per-frame handover must not.
+        if(evaluator)evaluator->SetFrameGuides({});
+    }
     // Nothing here hands a workset back: this backend has no NGX feature for an
     // idle helper to release. False says "not released" rather than "nothing to
     // release", which is the same answer a production adapter gives when its
@@ -3767,14 +3910,20 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
         request.guideFiles.depthFromFile?request.guideFiles.depthDirectory:std::filesystem::path{};
     const bool fileGuides=!state.amdEvaluator.config.motionGuideDirectory.empty()||
                           !state.amdEvaluator.config.depthGuideDirectory.empty();
+    // The benchmark's mv=cpu arm: the adapter runs the CPU block matcher on each
+    // decoded frame and hands the full-frame fields to the evaluator in memory
+    // (AmdLmxxfEvaluator::SetFrameGuides), which is the estimator arm the
+    // integration plan's section 5.3 deferred and this path now has. The dump
+    // and the zero-motion test are arms of that estimator, gated below.
+    const bool estimatorGuides=request.guideFiles.motion==guide_files::MotionSource::Cpu;
+    state.amdEvaluator.guideFiles=request.guideFiles;
+    state.amdEvaluator.zeroMotionTest=request.guideFiles.zeroMotionTest.value_or(false);
     // The runtime engages its temporal model under the recording-lease lifecycle
-    // and nowhere else, and the guides it fuses are the caller's. This backend
-    // has no estimator - that is the expensive half docs/AMD-LMXXF-INTEGRATION-
-    // PLAN-REV2-zh.md section 5.3 leaves to a later stage - so the only job that
-    // can ask for the temporal model is one that brought the guides as files.
-    // Asking for the leases without them would fuse two constants into content
-    // that moves, which is a result about a still scene no caller asked for.
-    state.amdEvaluator.config.temporalHistory=fileGuides;
+    // and nowhere else, and the guides it fuses are the caller's. A job with no
+    // guides in any form would fuse the two constants into content that moves -
+    // a result about a still scene no caller asked for - so the leases are
+    // engaged for file guides and for the estimator's, and for nothing else.
+    state.amdEvaluator.config.temporalHistory=fileGuides||estimatorGuides;
     // The host-side accumulation, which is a different switch from the one just
     // above and answers to a different caller: it needs no guides and no lease,
     // it runs on both call orders, and its Off is the pass not running rather
@@ -3800,22 +3949,19 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
     // line real, and it is what lets a menu switch reach a session already
     // running in this helper.
     state.amdEvaluator.SetStyle(request.amdStyle);
-    // What this backend cannot be asked for. Each is a benchmark switch that
-    // exists to change what the NVIDIA path renders, and here it would change
-    // nothing at all - a run that reported the flag's arm while rendering the
-    // other one is a measurement of neither. The estimator itself is not on this
-    // list: it is what a caller who supplied files for one guide and left the
-    // other out is already asking for, and the constant is this backend's honest
-    // answer to it.
-    if(request.guideFiles.motion==guide_files::MotionSource::Cpu)
+    // What this backend cannot be asked for. The estimator refusal the old
+    // list opened with is gone - the CPU block matcher now runs here - and the
+    // two switches left are arms of that estimator, so each is refused when the
+    // estimator it would arm is not the one running: a run that reported the
+    // flag's arm while rendering the other one is a measurement of neither.
+    if(!request.guideFiles.dumpDirectory.empty() &&
+       request.guideFiles.motion!=guide_files::MotionSource::Cpu)
         return NeuralRenderResult{.failure=NeuralRenderFailure::Protocol,
-            .detail=L"The AMD backend has no CPU block matcher; motion must come from guide files or be the constant."};
-    if(!request.guideFiles.dumpDirectory.empty())
+            .detail=L"A guide dump writes what the estimator produced; on this backend that is the CPU block matcher, which --guides mv=cpu asks for."};
+    if(request.guideFiles.zeroMotionTest.value_or(false) &&
+       request.guideFiles.motion!=guide_files::MotionSource::Cpu)
         return NeuralRenderResult{.failure=NeuralRenderFailure::Protocol,
-            .detail=L"The AMD backend consumes guides rather than producing them; a guide dump asks for the estimator's field, which it does not have."};
-    if(request.guideFiles.zeroMotionTest)
-        return NeuralRenderResult{.failure=NeuralRenderFailure::Protocol,
-            .detail=L"The zero-motion test tunes the neural motion policy, which the AMD backend does not run."};
+            .detail=L"The zero-motion test zeroes the estimator's field on held frames; on this backend that is the CPU block matcher, which --guides mv=cpu asks for."};
     if(state.amdEvaluator.config.runtimeDirectory.empty())
         return NeuralRenderResult{.failure=NeuralRenderFailure::Preflight,
             .detail=L"The AMD neural runtime directory could not be resolved; set DLSS5_AMD_RUNTIME_DIR or put amd-neural-runtime beside the module."};
@@ -3827,12 +3973,15 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
     // a temporal one in every number this job publishes.
     LOG("Neural backend: "<<NeuralBackendName(request.backend)
         <<" runtime="<<state.amdEvaluator.config.runtimeDirectory.string()
-        <<" guides=motion:"<<(state.amdEvaluator.config.motionGuideDirectory.empty()
-            ?std::string("constant"):state.amdEvaluator.config.motionGuideDirectory.string())
+        <<" guides=motion:"<<(estimatorGuides
+            ?std::string("estimator(cpu block matcher)")
+            :state.amdEvaluator.config.motionGuideDirectory.empty()
+                ?std::string("constant"):state.amdEvaluator.config.motionGuideDirectory.string())
         <<" depth:"<<(state.amdEvaluator.config.depthGuideDirectory.empty()
             ?std::string("constant"):state.amdEvaluator.config.depthGuideDirectory.string())
-        <<" temporal="<<(fileGuides?"on, under the recording-lease lifecycle"
-            :"off, this backend has no guide estimator and this job brought no guide files")
+        <<" zero-motion-test="<<(state.amdEvaluator.zeroMotionTest?"on":"off")
+        <<" temporal="<<((fileGuides||estimatorGuides)?"on, under the recording-lease lifecycle"
+            :"off, this job brought no guides in any form")
         <<" accumulation="<<TemporalStabilityName(state.amdEvaluator.config.stability)
         <<" passes="<<request.amdPasses<<" (the runtime stacks the network itself; the count was handed to it before the network was built)"
         <<" style="<<amd_lmxxf::NormalizedAmdStyle(request.amdStyle)<<" (DLSS5_STYLE, handed over with the count)"
@@ -3844,7 +3993,7 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
     // Read before the per-job reset, so a bring-up the previous job left armed is
     // reported as inherited rather than as this job's cost.
     const bool inheritedArmedDevice=state.amdEvaluator.FeatureCreated();
-    state.amdEvaluator.ResetForJob(request.guides);
+    state.amdEvaluator.ResetForJob(request.guides,request.temporal.sceneCuts);
     // False because there is no feature to inherit on this backend: the job pays
     // the module load and the session arming every time. The reuse that exists
     // here is the device - AmdLmxxfEvaluatorAdapter::Reused reports it, and that

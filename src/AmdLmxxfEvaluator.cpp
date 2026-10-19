@@ -547,9 +547,18 @@ bool AmdLmxxfEvaluator::CreateGuideTextures()
 
 bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t sourceFrameNumber)
 {
-    // No directories is the constant-guide run 5 path: nothing to read, nothing
-    // to record, and the textures keep whatever CreateGuideTextures put in them.
-    if (config_.motionGuideDirectory.empty() && config_.depthGuideDirectory.empty()) return true;
+    // The frame's in-memory handover, when the adapter set one. It wins per
+    // guide over the directory: the mv=cpu arm hands the estimator's own field
+    // over, and a directory configured beside it would be the file arm's input,
+    // never both at once.
+    const float* overrideMotion = frameGuides_.motion;
+    const float* overrideDepth = frameGuides_.depth;
+    // No directories and no handover is the constant-guide run 5 path: nothing
+    // to read, nothing to record, and the textures keep whatever
+    // CreateGuideTextures put in them.
+    if (config_.motionGuideDirectory.empty() && config_.depthGuideDirectory.empty() &&
+        !overrideMotion && !overrideDepth)
+        return true;
     if (guideUploadMapped_ == nullptr)
         return Refuse("the guide upload buffer is not mapped, so a per-frame guide cannot be written");
 
@@ -564,36 +573,62 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
     std::vector<float> motionValues;
     std::vector<float> depthValues;
 
-    auto read = [&](const std::filesystem::path& directory, uint32_t channels, const char* what,
-                    std::vector<float>& values) {
+    auto read = [&](const std::filesystem::path& directory, uint32_t fileChannels,
+                    uint32_t textureChannels, const char* what, std::vector<float>& values) {
         const std::filesystem::path path = guide_files::FramePath(directory, sourceFrameNumber);
         std::string why;
         const std::optional<guide_files::Plane> plane = guide_files::ReadPfmFile(path, &why);
         if (!plane)
             return Refuse(std::string(what) + " guide for source frame " +
                           std::to_string(sourceFrameNumber) + ": " + why);
-        if (plane->channels != channels)
+        if (plane->channels != fileChannels)
             return Refuse(std::string(what) + " guide " + NarrowPath(path) + " has " +
                           std::to_string(plane->channels) + " channels; a " +
-                          (channels == 1 ? "depth map is one (Pf)" : "motion field is three (PF)"));
+                          (fileChannels == 1 ? "depth map is one (Pf)" : "motion field is three (PF)"));
         // Any size, resampled onto the texture. The field a video host computes
         // is the analysis grid - 160x90 for a 30 fps 1080p source - and this is
         // the same area average the renderer's own expansion pass applies, so a
         // file at the grid size blocks out exactly the way the estimator's own
         // field does. At equal size it copies rather than averages.
-        values = guide_files::ResampleArea(*plane, width_, height_).values;
+        guide_files::Plane resampled = guide_files::ResampleArea(*plane, width_, height_);
+        if (fileChannels == 3u && textureChannels == 2u) {
+            // The PFM's motion is three floats per pixel (the third a padding
+            // zero) while the texture is RG. Compact explicitly. The code below
+            // this read copies with a two-float stride, so handing it the
+            // three-float vector scrambled the field - every y landed on the
+            // next pixel's x and a third of the texels read the padding zero.
+            // Every true-field arm measured through this path before this fix
+            // fed a broken field; see the verification doc.
+            std::vector<float> compact(resampled.values.size() / 3u * 2u);
+            for (size_t pixel = 0; pixel < resampled.values.size() / 3u; ++pixel) {
+                compact[pixel * 2u] = resampled.values[pixel * 3u];
+                compact[pixel * 2u + 1u] = resampled.values[pixel * 3u + 1u];
+            }
+            values = std::move(compact);
+        } else {
+            values = std::move(resampled.values);
+        }
         return true;
     };
 
+    const size_t frameFloats = static_cast<size_t>(width_) * height_;
     bool writeMotion = false;
     bool writeDepth = false;
-    if (!config_.motionGuideDirectory.empty()) {
-        if (!read(config_.motionGuideDirectory, 3, "motion", motionValues)) return false;
+    if (overrideMotion) {
+        motionValues.assign(overrideMotion, overrideMotion + frameFloats * 2u);
+        updated[updatedCount++] = {motion_.Get(), &motionFootprint_};
+        writeMotion = true;
+    } else if (!config_.motionGuideDirectory.empty()) {
+        if (!read(config_.motionGuideDirectory, 3u, 2u, "motion", motionValues)) return false;
         updated[updatedCount++] = {motion_.Get(), &motionFootprint_};
         writeMotion = true;
     }
-    if (!config_.depthGuideDirectory.empty()) {
-        if (!read(config_.depthGuideDirectory, 1, "depth", depthValues)) return false;
+    if (overrideDepth) {
+        depthValues.assign(overrideDepth, overrideDepth + frameFloats);
+        updated[updatedCount++] = {depth_.Get(), &depthFootprint_};
+        writeDepth = true;
+    } else if (!config_.depthGuideDirectory.empty()) {
+        if (!read(config_.depthGuideDirectory, 1u, 1u, "depth", depthValues)) return false;
         updated[updatedCount++] = {depth_.Get(), &depthFootprint_};
         writeDepth = true;
     }
@@ -644,6 +679,11 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
         std::swap(barriers[index].Transition.StateBefore, barriers[index].Transition.StateAfter);
     list->ResourceBarrier(updatedCount, barriers);
 
+    // The handover is per frame: the next Submit gets the directories (or the
+    // constants) unless its adapter sets a new one. Left in place on the Refuse
+    // paths above on purpose - a retry resubmits the same source frame and has
+    // to find the same guides.
+    frameGuides_ = {};
     ++guideFrames_;
     return true;
 }

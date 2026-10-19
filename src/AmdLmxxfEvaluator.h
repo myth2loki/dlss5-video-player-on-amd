@@ -231,11 +231,12 @@ public:
     // temporal model was engaged and reported off" apart from "the lease path
     // never ran" - two things whose logs look identical otherwise.
     uint64_t TemporalFrames() const noexcept { return temporalFrames_; }
-    // How many frames had their guides read from files rather than from the two
-    // constants. Non-zero only when a guide directory was configured, and the
-    // number a run has to check to know it measured the file path: a config that
-    // silently lost its directory would otherwise produce a healthy-looking run
-    // of the constant path.
+    // How many frames had their guides read from files or handed over in memory
+    // rather than left on the two constants. Non-zero only when a guide directory
+    // was configured or a frame override was set, and the number a run has to
+    // check to know it measured a real-guide path: a config that silently lost
+    // its directory would otherwise produce a healthy-looking run of the
+    // constant path.
     uint64_t GuideFrames() const noexcept { return guideFrames_; }
     // How many frames the host-side temporal accumulation ran on. Zero when
     // config_.stability is Off, and the number a run has to check to know the
@@ -253,6 +254,29 @@ public:
         return Upscaling() ? std::pair{upscaleWidth_, upscaleHeight_}
                            : std::pair{width_, height_};
     }
+
+    // Guides for one frame, handed over in memory rather than read from the
+    // guide directories. The benchmark's mv=cpu arm is the producer: the adapter
+    // runs the CPU block matcher on the decoded frame, expands the analysis grid
+    // onto the frame (the same area average the file path applies) and hands the
+    // full-frame fields over here, so the estimator's own guides reach the
+    // runtime without a detour through the filesystem.
+    struct FrameGuides
+    {
+        // width_ * height_ * 2 floats, (x, y) in input pixels, pointing from the
+        // current frame to where the content was in the previous one - the same
+        // unit and direction the motion directory's PFM files carry.
+        const float* motion{};
+        // width_ * height_ floats, [0, 1], 0 near and 1 far - the depth
+        // directory's convention.
+        const float* depth{};
+    };
+    // Takes precedence over the guide directories for exactly the next Submit,
+    // per guide: a null motion leaves the motion directory (or the constants) in
+    // charge. UploadGuides consumes the handover, so a frame that does not set
+    // it falls back to whatever the config says - there is no way for one
+    // frame's override to leak into the next.
+    void SetFrameGuides(const FrameGuides& guides) noexcept { frameGuides_ = guides; }
 
 private:
     // True when the session exists and every object the frame path needs does.
@@ -451,6 +475,8 @@ private:
     uint32_t width_{};
     uint32_t height_{};
     uint64_t frameIndex_{};
+    // The next Submit's in-memory guides, if any. Consumed by UploadGuides.
+    FrameGuides frameGuides_{};
 
     std::string adapterName_;
     std::string runtimeStatus_;
