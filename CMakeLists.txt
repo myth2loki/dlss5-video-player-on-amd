@@ -309,6 +309,10 @@ add_library(player_render OBJECT
     src/VsrEngine.cpp src/VsrEngine.h src/VsrPolicy.h
     src/TemporalGuides.cpp src/TemporalGuides.h
     src/OpticalFlowNvof.cpp src/OpticalFlowNvof.h
+    # FidelityFX Optical Flow, as the third source of motion guides. Built
+    # whether or not the SDK is present: without one it compiles to a class that
+    # is never available, so no caller needs a conditional of its own.
+    src/OpticalFlowFfx.cpp src/OpticalFlowFfx.h
     src/NvencDirect.cpp src/NvencDirect.h src/NvencDirectPolicy.h src/NvencDirectMux.h
     src/RuntimePolicy.cpp src/RuntimePolicy.h)
 add_library(player_neural OBJECT
@@ -365,6 +369,71 @@ endif()
 # The RTX VSR engine behind its one switch, PUBLIC for the same reason.
 if(RTX_VSR_FOUND)
     target_compile_definitions(player_render PUBLIC DLSS_VIDEO_PLAYER_HAS_RTX_VSR)
+endif()
+
+# FidelityFX Optical Flow, when an SDK is pointed at it AND its shader blobs
+# have been generated.
+#
+# This one is not like the optional SDKs above. Optical flow has no ffx_api
+# effect id and no DLL - AMD ships it only as SDK source - and that source does
+# not compile without permutation headers that a compiler AMD stopped shipping
+# in the SDK produces (from the HLSL, at build time; see
+# third_party/ffx-compat/README.md). So pointing FFX_SDK_ROOT here is not by
+# itself enough, and when either the SDK or the blobs are missing the player
+# builds exactly as it did before and the optical-flow guide source simply does
+# not exist. That is what keeps the repository buildable with no AMD SDK on
+# disk, which is how it has always built.
+set(FFX_SDK_KITS "${FFX_SDK_ROOT}/Kits/FidelityFX")
+set(FFX_OF_BLOBS "${FFX_SDK_KITS}/framegeneration/fsr3/dx12/ffx_sc_output2")
+set(FFX_OPTICAL_FLOW_FOUND OFF)
+if(DEFINED FFX_SDK_ROOT
+        AND EXISTS "${FFX_SDK_KITS}/framegeneration/fsr3/internal/ffx_opticalflow.cpp"
+        AND EXISTS "${FFX_OF_BLOBS}/ffx_opticalflow_prepare_luma_pass_permutations.h")
+    set(FFX_OPTICAL_FLOW_FOUND ON)
+endif()
+if(FFX_OPTICAL_FLOW_FOUND)
+    # AMD's own sources, compiled into player_render rather than into a library
+    # of their own: player_render is an OBJECT library, and objects linked to an
+    # OBJECT library are not carried into the executables that link it, so a
+    # separate ffx library left every optical flow symbol unresolved at link
+    # time while every file compiled cleanly.
+    set(FFX_OF_SOURCES
+        "${FFX_SDK_KITS}/framegeneration/fsr3/internal/ffx_opticalflow.cpp"
+        "${FFX_SDK_KITS}/framegeneration/fsr3/internal/ffx_opticalflow_shaderblobs.cpp"
+        "${FFX_SDK_KITS}/backend/dx12/ffx_dx12.cpp"
+        "${FFX_SDK_KITS}/backend/dx12/ffx_backends_dx12.cpp"
+        "${FFX_SDK_KITS}/api/internal/ffx_object_management.cpp"
+        "${FFX_SDK_KITS}/api/internal/ffx_assert.cpp"
+        "${FFX_SDK_KITS}/api/internal/ffx_message.cpp")
+    target_sources(player_render PRIVATE ${FFX_OF_SOURCES})
+    # /W0 because they are not clean under the /W4 this project builds at, and
+    # they are not ours to fix or to keep patching across SDK versions. Per
+    # source, so it lands after the target's own /W4 and wins.
+    set_source_files_properties(${FFX_OF_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "/W0;/DNOMINMAX"
+        COMPILE_DEFINITIONS "FFX_CPU=1")
+    # ffx_message.cpp uses FFX_UNUSED without including the header that defines
+    # it. Force-including that header leaves the SDK source untouched, which
+    # matters because this build must not carry a patched copy of it.
+    set_source_files_properties("${FFX_SDK_KITS}/api/internal/ffx_message.cpp" PROPERTIES
+        COMPILE_OPTIONS "/W0;/DNOMINMAX;/FI${FFX_SDK_KITS}/api/internal/ffx_util.h"
+        COMPILE_DEFINITIONS "FFX_CPU=1")
+    target_include_directories(player_render PRIVATE
+        "${FFX_SDK_KITS}"
+        "${FFX_SDK_KITS}/api/internal"
+        "${FFX_SDK_KITS}/api/internal/gpu"
+        "${FFX_OF_BLOBS}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffx-compat")
+    # fsr3/include for ffx_opticalflow.h, backend/dx12 for ffx_dx12.h: the
+    # wrapper needs the effect's own API and the DX12 backend entry points that
+    # build the interface it runs on.
+    target_include_directories(player_render PUBLIC
+        "${FFX_SDK_KITS}/framegeneration/fsr3/include"
+        "${FFX_SDK_KITS}/backend/dx12")
+    target_compile_definitions(player_render PUBLIC DLSS_VIDEO_PLAYER_HAS_FFX_OPTICAL_FLOW)
+    message(STATUS "FidelityFX Optical Flow: enabled (${FFX_SDK_ROOT})")
+else()
+    message(STATUS "FidelityFX Optical Flow: disabled (set FFX_SDK_ROOT and generate the shader blobs to enable)")
 endif()
 
 add_executable(DLSSVideoPlayer WIN32
