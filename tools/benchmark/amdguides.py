@@ -248,37 +248,59 @@ def _value(line: str, key: str, *next_markers: str) -> str:
     return line[start:end].strip()
 
 
-def parse_log(directory: Path) -> dict:
+def parse_log(directory: Path, arm: str | None = None) -> dict:
     """The two log lines that decide whether an arm measured what it claims.
 
     The bring-up line names the arm (guides, zero-motion test, temporal mode)
     and the per-job line publishes guide-frames, lease-frames and history=.
     Both are the renderer's own account of itself; reading them is cheaper and
     more reliable than inferring the arm from the profile that asked for it.
+
+    Neither line is on the worker's stdout. The renderer writes them to the
+    worker's own log, under the per-profile clone run.py makes -
+    ``<work>/profiles/<arm>/neural-runtime/NeuralWorker.log`` - while
+    ``pass1-stdout.txt`` holds only the runtime's bring-up pulses (arch, driver,
+    shader cache). Reading only the stdout therefore found no arm at all and
+    every arm failed its self-check with "no bring-up line", which reads like a
+    broken render rather than like a log read from the wrong file.
+
+    That log is appended to, one ``===== session started ====`` banner per job,
+    and one profile clone serves every clip of an arm - so the job that just ran
+    is the LAST session in it. Anything earlier belongs to a previous clip and
+    would report another clip's frame count as this one's.
     """
     found = dict(runtime="", guides="", temporal="", zero_motion_test="", guide_frames=None,
                  lease_frames=None, history="")
-    for name in ("pass1-stdout.txt", "pass1-stdout-restart.txt"):
-        path = directory / name
+    sources = [directory / "pass1-stdout.txt", directory / "pass1-stdout-restart.txt"]
+    if arm:
+        sources.append(WORK / "profiles" / arm / "neural-runtime" / "NeuralWorker.log")
+    for path in sources:
         if not path.exists():
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        if "Neural backend:" in text:
-            line = next(l for l in text.splitlines() if "Neural backend:" in l)
-            found["runtime"] = _value(line, "runtime", " guides=")
-            # `guides=motion:estimator(cpu block matcher) depth:...` - the value
-            # contains spaces, so each field ends at the next separator the line
-            # actually uses rather than at whitespace. \S+ would cut it at
-            # "estimator(cpu" and every check downstream would compare the wrong
-            # string. Note `depth:` is a colon in the log, not `depth=`.
-            found["guides"] = _value(line, "guides", " depth:")
-            found["zero_motion_test"] = _value(line, "zero-motion-test", " temporal=")
-            found["temporal"] = "on" if " temporal=on" in line else "off"
-        if "AMD neural render:" in text:
-            line = next(l for l in text.splitlines() if "AMD neural render:" in l)
-            found["guide_frames"] = int(_first(r"guide-frames=(\d+)", line, "0")) or None
-            found["lease_frames"] = int(_first(r"lease-frames=(\d+)", line, "0")) or None
-            found["history"] = _first(r"history=(\S+)", line)
+        banner = "===== session started"
+        start = text.rfind(banner)
+        if start >= 0:
+            # The newest job. A log that predates this run, or a worker that was
+            # reused, would otherwise be read as the arm just rendered.
+            text = text[start:]
+        for line in reversed(text.splitlines()):
+            if not found["runtime"] and "Neural backend:" in line:
+                found["runtime"] = _value(line, "runtime", " guides=")
+                # `guides=motion:estimator(cpu block matcher) depth:...` - the value
+                # contains spaces, so each field ends at the next separator the line
+                # actually uses rather than at whitespace. \S+ would cut it at
+                # "estimator(cpu" and every check downstream would compare the wrong
+                # string. Note `depth:` is a colon in the log, not `depth=`.
+                found["guides"] = _value(line, "guides", " depth:")
+                found["zero_motion_test"] = _value(line, "zero-motion-test", " temporal=")
+                found["temporal"] = "on" if " temporal=on" in line else "off"
+            if found["guide_frames"] is None and "AMD neural render:" in line:
+                found["guide_frames"] = int(_first(r"guide-frames=(\d+)", line, "0")) or None
+                found["lease_frames"] = int(_first(r"lease-frames=(\d+)", line, "0")) or None
+                found["history"] = _first(r"history=(\S+)", line)
+            if found["runtime"] and found["guide_frames"] is not None:
+                break
     return found
 
 
@@ -505,7 +527,7 @@ def main() -> int:
             if not result["result"].get("ok"):
                 failed.append(f"{clip}/{arm}: {result['result'].get('detail', '')[:200]}")
                 continue
-            log = parse_log(directory)
+            log = parse_log(directory, arm)
             problems = self_check(by_name[clip], arm, log)
             checks.append(dict(clip=clip, arm=arm, log=log, problems=problems))
             for problem in problems:
