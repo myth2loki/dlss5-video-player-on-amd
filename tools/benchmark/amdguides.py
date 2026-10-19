@@ -66,14 +66,36 @@ PSNR_TIE_DB = 0.1
 def preflight_worker() -> Path:
     """The worker binary the arms will actually launch, or an explanation.
 
-    common.py's RELEASE_RUNTIME is `<build>/Release/neural-runtime`, where
-    `<build>` is DLSS_BENCHMARK_BUILD or `build-upscaling/`. This checkout's
-    build script (build-fsr4.bat) builds into `build-ninja/`, so on a fresh
-    machine the default points at a directory that does not exist and every arm
-    would fail identically with no hint. Checked once, here, where the message
-    can name the fix.
+    Two ways this harness can run the wrong code, both silent:
+
+    1. common.py's RELEASE_RUNTIME is `<build>/Release/neural-runtime`, where
+       `<build>` is DLSS_BENCHMARK_BUILD or `build-upscaling/`. This checkout's
+       build script (build-fsr4.bat) builds into `build-ninja/`, so on a fresh
+       machine the default points at a directory that does not exist and every
+       arm would fail identically with no hint.
+    2. run.py's runtime_source() prefers `benchmark-work/runtime-snapshot/` over
+       the build whenever that directory holds a NeuralWorker.exe. A snapshot
+       left from an earlier session therefore wins over the binary just built -
+       and for this plan that means the motion stride fix is NOT in the worker
+       whose round-trip proof is supposed to demonstrate it. The proof would
+       fail and read as "the fix is wrong" rather than "the snapshot is stale".
+       Checked here, before anything renders.
     """
+    snapshot = WORK / "runtime-snapshot" / "NeuralWorker.exe"
     worker = RELEASE_RUNTIME / "NeuralWorker.exe"
+    if snapshot.exists():
+        detail = ""
+        if worker.exists():
+            detail = (f"\n  snapshot: {snapshot} ({snapshot.stat().st_size} bytes, "
+                      f"mtime {snapshot.stat().st_mtime:.0f})\n"
+                      f"  build:    {worker} ({worker.stat().st_size} bytes, "
+                      f"mtime {worker.stat().st_mtime:.0f})")
+        raise SystemExit(
+            f"a frozen runtime snapshot exists and would be used instead of the build:{detail}\n"
+            f"run.py prefers {snapshot.parent} over {RELEASE_RUNTIME}, so the arms would "
+            f"render with that worker, not the one just built - and the round-trip proof that "
+            f"has to demonstrate the motion stride fix would be testing the old binary.\n"
+            f"Delete or rename that directory, then rerun.")
     if worker.exists():
         return worker
     alternatives = [BUILD / "build-ninja" / "Release" / "neural-runtime" / "NeuralWorker.exe",
@@ -90,6 +112,35 @@ def preflight_worker() -> Path:
         f"    build-ninja\\Release\\neural-runtime\\NeuralWorker.exe\n"
         f"and then either set DLSS_BENCHMARK_BUILD to the build directory or copy that\n"
         f"neural-runtime tree next to the harness's expected path.")
+
+
+def dependency_problems(clips: list[str], arms: list[str]) -> list[str]:
+    """Why this arm list cannot answer anything, before a single frame renders.
+
+    The two failures this catches both surface later as a dead render with a
+    "no such file" in it, which reads like a broken file path rather than like a
+    run that was assembled wrongly:
+
+    * arm C missing while Z/replay are present - they read its dump and nothing
+      in this run produces it;
+    * arm C ordered after them - the loop runs the arms in the order given, so
+      they would read the dump before it exists.
+    """
+    problems = []
+    needs_c = {"amd-zmv", "amd-cpu-replay"} & set(arms)
+    if needs_c and "amd-cpu" not in arms:
+        problems.append(f"{sorted(needs_c)} read arm C's guide dump, but amd-cpu is not in --arms; "
+                        f"run it first or point those arms at an existing dump")
+    elif needs_c:
+        first_reader = min(arms.index(a) for a in needs_c)
+        if arms.index("amd-cpu") > first_reader:
+            problems.append(f"amd-cpu is ordered after {arms[first_reader]}, which reads its dump; "
+                            f"the arms run in the order given")
+    if "amd-cpu-nzmt" in arms and "amd-cpu" not in arms:
+        # C' has to be measured against C to say anything about held frames.
+        problems.append("amd-cpu-nzmt is only meaningful beside amd-cpu: it is the same arm "
+                        "with the zero-motion test on, and the whole point is the comparison")
+    return problems
 
 
 def resolve_amd_runtime(explicit: Path | None) -> Path:
@@ -137,22 +188,36 @@ def write_zero_fields(manifest: dict, clips: list[str], root: Path) -> dict:
         clip = by_name[name]
         gw, gh = analysis_grid(clip["width"], clip["height"], clip["fps"])
         motion = np.zeros((gh, gw, 2), np.float32)
+        # Under a `zero/` subdirectory because that is where amd-guides.profile.json
+        # reads it: arm Z's guides string is `mv=file:{work}/guides/{clip}/zero/mv`.
+        # Writing to `{clip}/mv` instead leaves arm Z pointed at a directory that
+        # does not exist, and its every frame fails to read rather than rendering
+        # a zero field - a silent-looking failure that would read as "the file
+        # path is broken" rather than "the harness wrote to the wrong place".
         for frame in range(clip["frames"]):
-            guidefiles.write_frame(root / name, frame, None, motion)
+            guidefiles.write_frame(root / name / "zero", frame, None, motion)
         written[name] = dict(frames=clip["frames"], grid=f"{gw}x{gh}")
-        print(f"zero field: {name} {clip['frames']} frames at {gw}x{gh} -> {root / name}")
+        print(f"zero field: {name} {clip['frames']} frames at {gw}x{gh} -> {root / name / 'zero' / 'mv'}")
     return written
 
 
-def run_arm(clip: str, arm: str, timeout: float, corpus: Path) -> dict:
+def run_arm(clip: str, arm: str, timeout: float, corpus: Path, fresh: bool) -> dict:
     """Renders one arm through run.py's own machinery, so nothing diverges from
-    a profile the harness would run by hand."""
+    a profile the harness would run by hand.
+
+    `fresh` matters more here than in a plain ablation run: arm C's dump is arm
+    Z's and the replay's input, and run.py skips a run whose result.json already
+    exists. A rerun after a profile that names a different dump directory would
+    therefore be scored against the previous run's pictures while the directory
+    its arm reads is never written - the failure would look like a broken file
+    path rather than a stale result.
+    """
     import run as runner
     profiles = runner.load_profiles(PROFILE_FILE)
     if arm not in profiles:
         raise SystemExit(f"{PROFILE_FILE} has no arm {arm!r}; it has {list(profiles)}")
     manifest = {c["name"]: c for c in load_manifest(corpus)["clips"]}
-    return runner.run_one(manifest[clip], arm, profiles[arm], 1, timeout, corpus, False)
+    return runner.run_one(manifest[clip], arm, profiles[arm], 1, timeout, corpus, fresh)
 
 
 def _first(pattern: str, text: str, default: str = "") -> str:
@@ -247,7 +312,10 @@ def self_check(clip: dict, arm: str, log: dict) -> list[str]:
                         "have arrived on every frame")
     if arm == "amd-cpu-nzmt" and log["zero_motion_test"] != "on":
         problems.append("zero-motion-test=off: this arm is defined by that test being on")
-    if arm in ("amd-cpu", "amd-cpu-nzmt") and log["zero_motion_test"] != "off" and arm == "amd-cpu":
+    if arm == "amd-cpu" and log["zero_motion_test"] == "on":
+        # C is defined as the arm WITHOUT the test; C' is the one with it. If C
+        # renders with it on, the two arms are the same configuration and their
+        # difference measures nothing.
         problems.append("zero-motion-test=on: arm C is the arm without it")
     if log["history"] in ("off", "absent", "unreadable"):
         problems.append(f"history={log['history']}: the runtime dropped its history, so the temporal "
@@ -272,9 +340,17 @@ def metric(run_dir: Path, key: str):
 def verdict(clips: list[str]) -> list[dict]:
     """The pre-registered decision table, read from analyze.py's metrics.
 
-    Only the two in-memory arms and the zero-motion arm carry a sigma/PSNR
-    comparison; the replay arm exists to prove the round trip and is scored by
-    digest, not by image metrics.
+    Two different questions with two different pairs behind them:
+
+    * still-hold asks C against C' - does zeroing the field on held frames buy
+      anything - and needs neither arm Z nor a PSNR comparison.
+    * the moving clips ask C against Z - does a true field beat a zero one - and
+      need both.
+
+    So a run of only C and C' still produces its row, and a run missing Z drops
+    only the rows it cannot answer rather than the whole table. The replay arm
+    is absent from this function on purpose: it is scored by frame digest in the
+    round-trip proof, not by image metrics.
     """
     rows = []
     for clip in clips:
@@ -283,28 +359,40 @@ def verdict(clips: list[str]) -> list[dict]:
         z = metric(RUNS / f"{clip}__amd-zmv__1", "temporal_sigma_output")
         cpsnr = metric(RUNS / f"{clip}__amd-cpu__1", "psnr_mean")
         zpsnr = metric(RUNS / f"{clip}__amd-zmv__1", "psnr_mean")
-        zflick = metric(RUNS / f"{clip}__amd-zmv__1", "flicker_added")
         cflick = metric(RUNS / f"{clip}__amd-cpu__1", "flicker_added")
+        zflick = metric(RUNS / f"{clip}__amd-zmv__1", "flicker_added")
+        db = (cpsnr - zpsnr) if (cpsnr is not None and zpsnr is not None) else None
+        if clip == "still-hold":
+            if c is None and cp is None:
+                continue
+            if c is None:
+                reads = f"only arm C' rendered (sigma {cp:.4f}); no comparison"
+            elif cp is None:
+                reads = "arm C' did not render, so the held-frame question is unanswered"
+            elif cp < c:
+                reads = "zero-motion test wins on held frames - worth keeping (matches the NVIDIA mv-gate)"
+            elif cp == c:
+                reads = "identical: the estimator invented nothing on held frames, so the test has nothing to fix"
+            else:
+                reads = "the test made held frames worse - do not take it"
+            rows.append(dict(clip=clip, sigma_cpu=c, sigma_zmv=z, sigma_nzmt=cp,
+                             sigma_delta=(c - z) if (c is not None and z is not None) else None,
+                             psnr_cpu=cpsnr, psnr_zmv=zpsnr, psnr_delta_db=db,
+                             flicker_cpu=cflick, flicker_zmv=zflick, reads=reads))
+            continue
         if c is None or z is None:
             continue
-        db = (cpsnr - zpsnr) if (cpsnr is not None and zpsnr is not None) else None
-        row = dict(clip=clip, sigma_cpu=c, sigma_zmv=z, sigma_nzmt=cp,
-                   sigma_delta=(c - z) if (c is not None and z is not None) else None,
-                   psnr_cpu=cpsnr, psnr_zmv=zpsnr, psnr_delta_db=db,
-                   flicker_cpu=cflick, flicker_zmv=zflick)
-        if clip == "still-hold":
-            row["reads"] = ("zero-motion test wins" if (cp is not None and cp < c) else
-                            "estimator noise is not the problem here" if cp is not None else "n/a")
+        if db is None:
+            reads = "no PSNR"
+        elif db > PSNR_TIE_DB:
+            reads = "true motion wins by more than the tie band"
+        elif db < -PSNR_TIE_DB:
+            reads = "zero motion wins - keep the constant architecture"
         else:
-            if db is None:
-                row["reads"] = "no PSNR"
-            elif db > PSNR_TIE_DB:
-                row["reads"] = "true motion wins by more than the tie band"
-            elif db < -PSNR_TIE_DB:
-                row["reads"] = "zero motion wins - keep the constant architecture"
-            else:
-                row["reads"] = "tie - the motion field buys nothing here"
-        rows.append(row)
+            reads = "tie - the motion field buys nothing here"
+        rows.append(dict(clip=clip, sigma_cpu=c, sigma_zmv=z, sigma_nzmt=cp,
+                         sigma_delta=c - z, psnr_cpu=cpsnr, psnr_zmv=zpsnr,
+                         psnr_delta_db=db, flicker_cpu=cflick, flicker_zmv=zflick, reads=reads))
     return rows
 
 
@@ -313,15 +401,17 @@ def print_verdict(rows: list[dict]) -> None:
         print("no metrics yet: run analyze.py first (this script does it unless --skip-analyze)")
         return
     print("\n== decision matrix (pre-registered thresholds) ==")
-    print(f"{'clip':16s} {'sigma C':>9s} {'sigma Z':>9s} {'d sigma':>9s} {'PSNR C':>8s} {'PSNR Z':>8s} "
-          f"{'d PSNR':>8s}  reads")
+    print(f"{'clip':16s} {'sigma C':>9s} {'sigma C-prime':>13s} {'sigma Z':>9s} {'d sigma C-Z':>11s} "
+          f"{'PSNR C':>8s} {'PSNR Z':>8s} {'d PSNR':>8s}  reads")
 
     def f(value, digits=4):
         return "n/a" if value is None else f"{value:.{digits}f}"
 
     for r in rows:
-        print(f"{r['clip']:16s} {f(r['sigma_cpu']):>9s} {f(r['sigma_zmv']):>9s} {f(r.get('sigma_delta')):>9s} "
-              f"{f(r['psnr_cpu'], 2):>8s} {f(r['psnr_zmv'], 2):>8s} {f(r.get('psnr_delta_db'), 3):>8s}  {r['reads']}")
+        print(f"{r['clip']:16s} {f(r['sigma_cpu']):>9s} {f(r.get('sigma_nzmt')):>13s} "
+              f"{f(r['sigma_zmv']):>9s} {f(r.get('sigma_delta')):>11s} "
+              f"{f(r['psnr_cpu'], 2):>8s} {f(r['psnr_zmv'], 2):>8s} "
+              f"{f(r.get('psnr_delta_db'), 3):>8s}  {r['reads']}")
     moving = [r for r in rows if r["clip"] != "still-hold" and r.get("psnr_delta_db") is not None]
     still = next((r for r in rows if r["clip"] == "still-hold"), None)
     print("\n== overall ==")
@@ -339,11 +429,11 @@ def print_verdict(rows: list[dict]) -> None:
             print("tie on every moving clip -> the motion field buys nothing measurable; "
                   "the runtime's 0.081 blend weight is the ceiling")
     if still is not None:
-        # The still clip's own question is arm C against arm C' (the zero-motion
-        # test), so its sigma is printed here rather than left to the reader to
-        # look up in the analysis report.
-        print(f"still-hold: sigma C={f(still['sigma_cpu'])} vs zero-motion-test arm "
-              f"{f(still.get('sigma_nzmt'))} -> {still['reads']}")
+        # Repeated here rather than only in the matrix because it answers a
+        # different question from the moving clips, and "overall" is where a
+        # reader looks for a verdict. One line, and it carries the numbers.
+        print(f"still-hold (held-frame noise): sigma C={f(still['sigma_cpu'])} vs C'={f(still.get('sigma_nzmt'))} "
+              f"-> {still['reads']}")
 
 
 def main() -> int:
@@ -354,6 +444,9 @@ def main() -> int:
     parser.add_argument("--amd-runtime", type=Path, help="the amd-neural-runtime package")
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--skip-analyze", action="store_true")
+    parser.add_argument("--fresh", action="store_true",
+                        help="rebuild each profile's runtime clone and re-render arms whose result.json "
+                             "already exists (default: reuse, so a resumed run does not redo hours of work)")
     parser.add_argument("--skip-corpus", action="store_true", help="assume the corpus already exists")
     args = parser.parse_args()
 
@@ -373,6 +466,19 @@ def main() -> int:
         raise SystemExit(f"unknown clips {unknown}; the corpus has {sorted(known)}")
 
     zero_root = WORK / "guides"
+
+    # Checked before anything is written, so a run that cannot answer its
+    # question fails without leaving a half-prepared tree behind. Two facts the
+    # profile cannot express on its own, both of which otherwise surface as a
+    # dead render that reads like a broken path:
+    #
+    #  * arms Z and the replay READ arm C's dump, so arm C must be present and
+    #    ordered before them (the arms run in the order given);
+    #  * C' is only meaningful beside C - it is the same arm with the test on.
+    problems = dependency_problems(args.clips, args.arms)
+    if problems:
+        raise SystemExit("the run cannot answer its question:\n  " + "\n  ".join(problems))
+
     write_zero_fields(manifest, args.clips, zero_root)
 
     env = os.environ.copy()
@@ -381,11 +487,21 @@ def main() -> int:
 
     failed, checks, digests = [], [], {}
     by_name = {c["name"]: c for c in manifest["clips"]}
+    # Which clips arm C actually dumped for. A clip whose C arm failed leaves no
+    # fresh dump - and possibly the PREVIOUS run's dump in that directory, since
+    # nothing clears it. Z and the replay would then render happily from stale
+    # guides and their numbers would look like a result. Tracked per clip and
+    # used to skip those arms rather than to score them.
+    dumped: set[str] = set()
     for arm in args.arms:
         for clip in args.clips:
+            if arm in ("amd-zmv", "amd-cpu-replay") and clip not in dumped:
+                print(f"\n---- {clip} / {arm}: skipped, arm C produced no dump for this clip ----")
+                failed.append(f"{clip}/{arm}: skipped because amd-cpu did not produce a dump")
+                continue
             directory = RUNS / f"{clip}__{arm}__1"
             print(f"\n---- {clip} / {arm} ----")
-            result = run_arm(clip, arm, args.timeout, args.corpus)
+            result = run_arm(clip, arm, args.timeout, args.corpus, args.fresh)
             if not result["result"].get("ok"):
                 failed.append(f"{clip}/{arm}: {result['result'].get('detail', '')[:200]}")
                 continue
@@ -394,6 +510,11 @@ def main() -> int:
             checks.append(dict(clip=clip, arm=arm, log=log, problems=problems))
             for problem in problems:
                 print(f"  SELF-CHECK: {problem}")
+            # A dump is only trustworthy when the arm that wrote it passed its
+            # own checks: a C arm whose guides never arrived wrote something,
+            # but not the field this comparison is about.
+            if arm == "amd-cpu" and not problems:
+                dumped.add(clip)
             digests[(clip, arm)] = digest(directory)
 
     print("\n== round-trip proof (amd-cpu vs amd-cpu-replay) ==")

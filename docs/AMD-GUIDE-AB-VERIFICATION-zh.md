@@ -43,14 +43,19 @@ zero-motion test 的 AMD 语义：**上一帧与本帧逐字节相同 → 运动
 
 ## 3. 四个臂
 
-| profile | guides | 说明 |
-|---|---|---|
-| `amd-cpu` | `mv=cpu,depth=1` + `--guide-dump` | **C 臂**：真运动 + 深度代理，lease 生命周期，dump 供 Z 臂与往返证明用 |
-| `amd-cpu-nzmt` | C 臂 + `--zero-motion-test 1` | **C' 臂**：唯一差异是静止帧零化——量化块匹配在 held 帧上的噪声危害 |
-| `amd-zmv` | `mv=file:zero/mv,depth=file:cpu/depth` | **Z 臂**：零运动场 + C 臂同款深度 → 与 C 臂唯一差异是运动场 |
-| `amd-cpu-replay` | `mv=file:cpu/mv,depth=file:cpu/depth` | **往返证明**：C 臂 dump 回喂，必须与 C 臂逐位一致（验证 stride 修复） |
+| profile | guides | dump | 说明 |
+|---|---|---|---|
+| `amd-cpu` | `mv=cpu,depth=1` | `{clip}/cpu/` | **C 臂**：真运动 + 深度代理，lease 生命周期，dump 供 Z 臂与往返证明用 |
+| `amd-cpu-nzmt` | C 臂 + `--zero-motion-test 1` | `{clip}/cpu-nzmt/` | **C' 臂**：唯一差异是静止帧零化——量化块匹配在 held 帧上的噪声危害 |
+| `amd-zmv` | `mv=file:{clip}/zero/mv,depth=file:{clip}/cpu/depth` | — | **Z 臂**：零运动场 + C 臂同款深度 → 与 C 臂唯一差异是运动场 |
+| `amd-cpu-replay` | `mv=file:{clip}/cpu/mv,depth=file:{clip}/cpu/depth` | — | **往返证明**：C 臂 dump 回喂，必须与 C 臂逐位一致（验证 stride 修复） |
 
-全部走 `--neural-backend amd-lmxxf`；runtime 目录用环境变量 `DLSS5_AMD_RUNTIME_DIR` 指定。**执行顺序：amd-cpu →（其余任意，但 amd-zmv / amd-cpu-replay 依赖 amd-cpu 的 dump）。**
+零运动场由脚本写到 `{clip}/zero/mv/`（`guidefiles.py zero` 的布局），C 臂的 dump 写到
+`{clip}/cpu/`，C' 臂独立写到 `{clip}/cpu-nzmt/`——**两个臂不能共用一个 dump 目录**，否则
+谁后跑谁决定另一臂的输入，Z 臂与往返证明读到的就不是 C 臂的画。
+
+全部走 `--neural-backend amd-lmxxf`。**执行顺序由脚本固定：amd-cpu 必须最先**
+（Z 臂与往返证明读它的 dump），脚本会拒绝违反这个顺序的 `--arms`。
 
 ## 4. 执行步骤（Win11 + 9070 XT）
 
@@ -60,14 +65,13 @@ zero-motion test 的 AMD 语义：**上一帧与本帧逐字节相同 → 运动
 build-fsr4.bat
 ```
 
-产出 `build-ninja\Release\neural-runtime\NeuralWorker.exe`。benchmark harness 默认在
-`build-upscaling/` 下找这个文件，而本工程的构建脚本落在 `build-ninja/`，所以要指一次：
+产出 `build-ninja\Release\neural-runtime\NeuralWorker.exe`（`add_dependencies(DLSSVideoPlayer NeuralWorker)`，
+构建播放器会连带重建 worker）。两处路径问题脚本会在渲染前拦下：
 
-```bat
-set DLSS_BENCHMARK_BUILD=F:\dlss5-video\dlss5-video-amd\build-ninja
-```
-
-（`amdguides.py` 会在预检里检查这件事，并在路径不对时把该设的路径打印出来。）
+- harness 默认在 `build-upscaling/` 找 worker，而本工程构建到 `build-ninja/` → 设一次
+  `set DLSS_BENCHMARK_BUILD=F:\dlss5-video\dlss5-video-amd\build-ninja`
+- `benchmark-work/runtime-snapshot/` 若存在旧快照，`run.py` 会**优先用它**，新编译的 worker
+  根本不参与——那样往返证明测的是没有 stride 修复的旧二进制。脚本会报错并要求删除该目录。
 
 ### 4.2 跑（一条命令，其余全自动）
 
@@ -88,7 +92,12 @@ python tools\benchmark\amdguides.py
 python tools\benchmark\amdguides.py --amd-runtime F:\amd-neural-runtime
 python tools\benchmark\amdguides.py --clips still-hold --skip-corpus
 python tools\benchmark\amdguides.py --skip-analyze     :: 只渲染，不跑指标
+python tools\benchmark\amdguides.py --fresh            :: 重渲染已存在的臂（改了 profile 或 dump 目录后用）
 ```
+
+**`--fresh` 什么时候必须加**：`run.py` 见到 `runs/<clip>__<arm>__1/result.json` 就跳过该臂。
+改了 profile（例如 dump 目录改名）、换了构建、或怀疑上次跑到一半，都要带 `--fresh`，
+否则你看到的是上一轮的画面，而这一轮的 dump 目录可能压根没被写。
 
 退出码 0 = 四臂全部渲染成功 + 自检全过 + 往返逐位一致。
 A/B 结论无论正负都会打印出来——它是测量结果，不是通过/失败的门。
@@ -103,6 +112,9 @@ python tools\benchmark\run.py --profile-file tools\benchmark\amd-guides.profile.
     --clips still-hold --profiles amd-cpu
 python tools\benchmark\analyze.py --no-ocr --no-faces
 ```
+
+注意单独跑 `run.py` 时**不会**替你生成零运动场，也不会检查 `runtime-snapshot` 是否在顶替
+你的构建——这两件事只在 `amdguides.py` 里。
 
 每臂产出 `runs/<clip>__<profile>__1/`：`result.json`（含 temporal 指标）、`output.mkv`、
 `frames.md5`、`metrics.json`。

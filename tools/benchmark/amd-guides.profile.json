@@ -14,13 +14,13 @@
     "guides": "mv=cpu,depth=1",
     "worker_flags": [
       "--guide-dump",
-      "{work}/guides/{clip}/cpu",
+      "{work}/guides/{clip}/cpu-nzmt",
       "--zero-motion-test",
       "1",
       "--neural-backend",
       "amd-lmxxf"
     ],
-    "description": "AMD arm C': arm C with the zero-motion test on - a frame byte-identical to its predecessor renders with a zero field, the host-side mirror of NvofResolveShader.h's test. Everything else is bit-for-bit arm C, so still-hold deltas are attributable to held-frame noise alone.",
+    "description": "AMD arm C': arm C with the zero-motion test on - a frame byte-identical to its predecessor renders with a zero field, the host-side mirror of NvofResolveShader.h's test. Everything else is bit-for-bit arm C, so still-hold deltas are attributable to held-frame noise alone. It dumps to cpu-nzmt/ rather than cpu/ because its field is not arm C's (the held frames are zeroed), and arm C's dump is what arm Z and the round-trip proof read - two arms writing one directory would let whichever ran last decide the other's input.",
     "overrides": {}
   },
   "amd-zmv": {
