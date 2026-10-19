@@ -945,8 +945,12 @@ resident helper：先禁用，每个任务独立 worker
 >    `mv=cpu` 与带 guide 文件的基准（`mv=file:`/`depth=file:`）都会打开 lease
 >    生命周期，前者是基准测量专用（播放器 CLI 不暴露 `--guides`，产品路径取不到），
 >    后者是 `AmdLmxxfEvaluatorSmoke` run 6/7 测过的路径。
->    **下一步的画质杠杆是 FidelityFX Optical Flow，不是这个 CPU 场**——
->    它是另一件工作（需集成 FFX SDK），不在本方案内。
+>    **FFX Optical Flow 已经测过，同样不采纳**。它以 `mv=ffx`（`amd-ffx` 臂）接入
+>    本方案，在同一组 clip 上比零场：结果与 CPU 场同方向、相近幅度（depth-pan
+>    −0.908 dB、real-game-motion +0.276 dB、still-hold 0.000 dB）。两个完全不同
+>    的估计器给出一致的答案，说明"换一个更好的估计器"这条路整体不成立；零场架构
+>    是评估后的结论，不是缺件。见
+>    [amd-guide-ab-20261020](measurements/amd-guide-ab-20261020/REPORT.md)。
 > 4. **阶段 D 的捕获策略没接**：`CapturePixelFormat` 固定 BGRA，
 >    NV12/P010 的 GPU 转换路径在 AMD 上不存在，编码器因此选 H.264 软件路径
 >    或 FFV1（`RunJob` 里的 `selected` 分支），NVENC 直连不可能。

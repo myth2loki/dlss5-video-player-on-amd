@@ -34,6 +34,11 @@
 // one binary carries both and the request selects between them, so a build that
 // can render on an RTX card can also render on a Radeon without being rebuilt.
 #include "AmdLmxxfEvaluator.h"
+// FidelityFX Optical Flow, the mv=ffx arm's motion source. Included
+// unconditionally for the same reason: without an SDK it compiles to a class
+// whose Initialize says so, which is a guide failure on the one arm that asks
+// for it and costs every other arm nothing.
+#include "OpticalFlowFfx.h"
 #include "FrameResample.h"
 #include "NvencDirect.h"
 #include "NvencDirectPolicy.h"
@@ -2897,6 +2902,16 @@ struct AmdLmxxfEvaluatorAdapter {
     // call.
     std::vector<float> motionFull;
     std::vector<float> depthFull;
+    // The mv=ffx arm's estimator: FidelityFX Optical Flow, which is the one the
+    // integration plan named as the next lever and the CPU block matcher's
+    // replacement candidate. Built on the evaluator's device the first frame
+    // that asks for it rather than in Initialize, because every other arm would
+    // then pay for a context and a pair of GPU textures it never submits to.
+    // `flowBuilt` is the difference between "not asked for yet" and "asked for
+    // and failed": the first frame reports the failure and the rest do not try
+    // again, so a broken arm fails once instead of once per frame.
+    OpticalFlowFfx flow;
+    bool flowBuilt{};
     // A guide-stage failure. The guide stage runs before the evaluator sees the
     // frame, so without this the job would report the evaluator's stale verdict.
     NeuralRenderFailure guideFailure{NeuralRenderFailure::None};
@@ -3024,6 +3039,45 @@ struct AmdLmxxfEvaluatorAdapter {
         guideFailure=NeuralRenderFailure::None;guideError.clear();
         if(!evaluator)return false;
         if(guideFiles.motion!=guide_files::MotionSource::Cpu){
+            // The mv=ffx arm: AMD's own estimator, on the GPU. Unlike the CPU
+            // matcher's grid it hands over a full-frame field, so there is
+            // nothing to resample onto the frame and nothing for a dump to
+            // write; and it makes no scene-cut decision of its own, so the
+            // frame's identity travels unchanged and the runtime's history
+            // restarts only where the job asked for it.
+            if(guideFiles.motion==guide_files::MotionSource::Ffx){
+                std::string why;
+                if(!flowBuilt){
+                    if(!flow.Initialize(evaluator->Device(),width,height,&why)){
+                        guideFailure=NeuralRenderFailure::Neural;
+                        guideError="FidelityFX Optical Flow did not come up at "+
+                                   std::to_string(width)+"x"+std::to_string(height)+": "+why;
+                        return false;
+                    }
+                    flowBuilt=true;
+                    LOG("FidelityFX Optical Flow guides at "<<width<<"x"<<height<<" (mv=ffx)");
+                }
+                // A cut or a decoder break leaves the previous frame meaningless,
+                // and the field is a difference against it. The matcher's grid is
+                // rebuilt from scratch every frame so it has no equivalent; the
+                // flow keeps one, so it has to be told to drop it.
+                if(id.reset!=HistoryReset::None||frame.discontinuity)flow.Reset();
+                if(!flow.Submit(frame.bgra.data(),width,height,motionFull,&why)){
+                    guideFailure=NeuralRenderFailure::Neural;
+                    guideError="FidelityFX Optical Flow failed on frame "+
+                               std::to_string(id.frameNumber)+": "+why;
+                    return false;
+                }
+                AmdLmxxfEvaluator::FrameGuides handover;
+                handover.motion=motionFull.data();
+                // Depth is deliberately not handed over: the flow produces no
+                // depth, and a null pointer is what leaves the job's own depth
+                // source - a directory, or the constant - in charge. Which is
+                // what makes this arm comparable to arm Z: both take the same
+                // depth from the same place and differ in the motion field only.
+                evaluator->SetFrameGuides(handover);
+                return true;
+            }
             evaluator->SetFrameGuides({});
             return true;
         }
@@ -3180,6 +3234,14 @@ struct AmdLmxxfEvaluatorAdapter {
         // estimator's per-job memory is cleared.
         zeroMotionPrevious.clear();
         zeroMotionHasPrevious=false;
+        // The optical flow context borrows the evaluator's device, and the
+        // evaluator is rebuilt whenever the bring-up question changes - a moved
+        // size, pass count, style or rate - so the context is dropped here
+        // rather than left holding a pointer to a device the next job may have
+        // replaced. It costs one context per job, not one per frame, and a job
+        // that never asks for the flow never builds one.
+        flow.Shutdown();
+        flowBuilt=false;
         guideFailure=NeuralRenderFailure::None;
         guideError.clear();
         // The evaluator survives the job; its per-frame handover must not.
@@ -3786,7 +3848,8 @@ NeuralRenderResult OfflineNeuralRenderer::Run(const NeuralRenderRequest& request
         const auto& files=request.guideFiles;
         LOG("Benchmark guide sources: motion="
             <<(files.motion==guide_files::MotionSource::File?"file:"+files.motionDirectory.string()
-               :files.motion==guide_files::MotionSource::Cpu?std::string("cpu"):std::string("estimator"))
+               :files.motion==guide_files::MotionSource::Cpu?std::string("cpu")
+               :files.motion==guide_files::MotionSource::Ffx?std::string("ffx"):std::string("estimator"))
             <<" depth="<<(files.depthFromFile?"file:"+files.depthDirectory.string():std::string("estimator"))
             <<" dump="<<(files.dumpDirectory.empty()?std::string("none"):files.dumpDirectory.string())
             <<" zero-motion-test="<<(!files.zeroMotionTest?std::string("shipped"):*files.zeroMotionTest?std::string("on"):std::string("off")));
@@ -3916,14 +3979,21 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
     // integration plan's section 5.3 deferred and this path now has. The dump
     // and the zero-motion test are arms of that estimator, gated below.
     const bool estimatorGuides=request.guideFiles.motion==guide_files::MotionSource::Cpu;
+    // The same arm in the other estimator's clothes. It is kept separate from
+    // `estimatorGuides` because the two switches refused below are arms of the
+    // CPU matcher's grid specifically - a dump has no grid to write and a
+    // zero-motion test has no grid to zero - yet the runtime's temporal model
+    // engages for a handed-over field either way, so it counts here.
+    const bool ffxGuides=request.guideFiles.motion==guide_files::MotionSource::Ffx;
     state.amdEvaluator.guideFiles=request.guideFiles;
     state.amdEvaluator.zeroMotionTest=request.guideFiles.zeroMotionTest.value_or(false);
     // The runtime engages its temporal model under the recording-lease lifecycle
     // and nowhere else, and the guides it fuses are the caller's. A job with no
     // guides in any form would fuse the two constants into content that moves -
     // a result about a still scene no caller asked for - so the leases are
-    // engaged for file guides and for the estimator's, and for nothing else.
-    state.amdEvaluator.config.temporalHistory=fileGuides||estimatorGuides;
+    // engaged for file guides, for the CPU estimator's and for the optical
+    // flow's, and for nothing else.
+    state.amdEvaluator.config.temporalHistory=fileGuides||estimatorGuides||ffxGuides;
     // The host-side accumulation, which is a different switch from the one just
     // above and answers to a different caller: it needs no guides and no lease,
     // it runs on both call orders, and its Off is the pass not running rather
@@ -3975,12 +4045,14 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
         <<" runtime="<<state.amdEvaluator.config.runtimeDirectory.string()
         <<" guides=motion:"<<(estimatorGuides
             ?std::string("estimator(cpu block matcher)")
-            :state.amdEvaluator.config.motionGuideDirectory.empty()
-                ?std::string("constant"):state.amdEvaluator.config.motionGuideDirectory.string())
+            :ffxGuides
+                ?std::string("estimator(ffx optical flow)")
+                :state.amdEvaluator.config.motionGuideDirectory.empty()
+                    ?std::string("constant"):state.amdEvaluator.config.motionGuideDirectory.string())
         <<" depth:"<<(state.amdEvaluator.config.depthGuideDirectory.empty()
             ?std::string("constant"):state.amdEvaluator.config.depthGuideDirectory.string())
         <<" zero-motion-test="<<(state.amdEvaluator.zeroMotionTest?"on":"off")
-        <<" temporal="<<((fileGuides||estimatorGuides)?"on, under the recording-lease lifecycle"
+        <<" temporal="<<((fileGuides||estimatorGuides||ffxGuides)?"on, under the recording-lease lifecycle"
             :"off, this job brought no guides in any form")
         <<" accumulation="<<TemporalStabilityName(state.amdEvaluator.config.stability)
         <<" passes="<<request.amdPasses<<" (the runtime stacks the network itself; the count was handed to it before the network was built)"

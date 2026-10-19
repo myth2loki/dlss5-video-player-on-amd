@@ -56,8 +56,14 @@ namespace guide_files {
 //  Cpu       - the CPU block matcher even where the engine is present (mv=cpu),
 //              which is the only estimator a grid file can reproduce and so the
 //              reference the round-trip proof is taken against.
+//  Ffx       - FidelityFX Optical Flow on the GPU (mv=ffx): AMD's own estimator,
+//              compiled from the SDK. It hands over a full-frame field rather
+//              than the analysis grid, which is why it has nothing for a dump to
+//              write and takes no zero-motion test - both are arms of the CPU
+//              matcher's grid, and a run that reported them on this arm would be
+//              a measurement of neither.
 //  File      - the file's field (mv=file:<dir>).
-enum class MotionSource { Estimator, Cpu, File };
+enum class MotionSource { Estimator, Cpu, Ffx, File };
 
 struct Sources {
     MotionSource motion = MotionSource::Estimator;
@@ -104,6 +110,8 @@ inline std::optional<ParsedSpec> ParseSpec(std::wstring_view text)
         parsed.controls.motionVectors = mv == L"1";
     } else if (mv == L"cpu") {
         parsed.sources.motion = MotionSource::Cpu;
+    } else if (mv == L"ffx") {
+        parsed.sources.motion = MotionSource::Ffx;
     } else if (mv.substr(0, file.size()) == file && mv.size() > file.size()) {
         parsed.sources.motion = MotionSource::File;
         parsed.sources.motionDirectory = std::filesystem::path(mv.substr(file.size()));

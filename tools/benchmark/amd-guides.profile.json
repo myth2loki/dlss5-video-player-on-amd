@@ -40,5 +40,14 @@
     ],
     "description": "AMD round-trip proof: arm C's dump fed back through the file path. The render must be byte-identical to amd-cpu's (the dump is grid-sized, the file path's area average copies at equal size, and both arms compact the three-channel PFM the same way). Only meaningful on the build with the motion stride fix in AmdLmxxfEvaluator::UploadGuides.",
     "overrides": {}
+  },
+  "amd-ffx": {
+    "guides": "mv=ffx,depth=file:{work}/guides/{clip}/cpu/depth",
+    "worker_flags": [
+      "--neural-backend",
+      "amd-lmxxf"
+    ],
+    "description": "AMD arm F: FidelityFX Optical Flow's motion field with arm C's dumped depth replayed, so the motion field is the only difference from arm Z - AMD's own GPU estimator against the zero field this backend ships. Run amd-cpu first; arm F reads its depth dump, and it has no depth of its own. Needs a build configured with -DFFX_SDK_ROOT and an AMD adapter; the flow reads its field back to memory, so it is an offline arm by construction and never runs on playback.",
+    "overrides": {}
   }
 }

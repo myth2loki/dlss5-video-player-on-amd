@@ -49,7 +49,7 @@ PROFILE_FILE = HERE / "amd-guides.profile.json"
 
 # The arms in dependency order. amd-cpu dumps the guides the other two read, so
 # it is not merely first for tidiness - Z and the replay are invalid without it.
-ARMS = ["amd-cpu", "amd-cpu-nzmt", "amd-zmv", "amd-cpu-replay"]
+ARMS = ["amd-cpu", "amd-cpu-nzmt", "amd-zmv", "amd-cpu-replay", "amd-ffx"]
 
 # Clips chosen for what each one can answer. still-hold holds one frame, so it
 # measures what the estimator does on a still; the two moving clips are where a
@@ -127,7 +127,10 @@ def dependency_problems(clips: list[str], arms: list[str]) -> list[str]:
       they would read the dump before it exists.
     """
     problems = []
-    needs_c = {"amd-zmv", "amd-cpu-replay"} & set(arms)
+    # amd-ffx reads arm C's depth dump, not its motion: it has no depth of its
+    # own, and taking arm C's from the same files arm Z reads is what leaves the
+    # motion field as the only difference between the two.
+    needs_c = {"amd-zmv", "amd-cpu-replay", "amd-ffx"} & set(arms)
     if needs_c and "amd-cpu" not in arms:
         problems.append(f"{sorted(needs_c)} read arm C's guide dump, but amd-cpu is not in --arms; "
                         f"run it first or point those arms at an existing dump")
@@ -315,11 +318,17 @@ def self_check(clip: dict, arm: str, log: dict) -> list[str]:
     healthy run as broken.
     """
     problems = []
-    in_memory = arm in ("amd-cpu", "amd-cpu-nzmt")
+    # amd-ffx is an in-memory arm too: the flow's field reaches the runtime
+    # through the same handover, so "the guides arrived every frame" is its
+    # claim as well and guide-frames is the only thing that can show it.
+    in_memory = arm in ("amd-cpu", "amd-cpu-nzmt", "amd-ffx")
     if not log["runtime"]:
         problems.append("no bring-up line in the worker log: the render may not have reached the backend")
     if in_memory and "estimator" not in log["guides"]:
-        problems.append(f"guides={log['guides']!r}, expected the CPU estimator's field")
+        problems.append(f"guides={log['guides']!r}, expected the estimator's field")
+    if arm == "amd-ffx" and "ffx" not in log["guides"]:
+        problems.append(f"guides={log['guides']!r}, expected FidelityFX Optical Flow, "
+                        "not the CPU block matcher")
     if not in_memory and "estimator" in log["guides"]:
         problems.append(f"guides={log['guides']!r}, expected a file field, not the estimator")
     if in_memory and log["temporal"] != "on":
@@ -381,6 +390,11 @@ def verdict(clips: list[str]) -> list[dict]:
         z = metric(RUNS / f"{clip}__amd-zmv__1", "temporal_sigma_output")
         cpsnr = metric(RUNS / f"{clip}__amd-cpu__1", "psnr_mean")
         zpsnr = metric(RUNS / f"{clip}__amd-zmv__1", "psnr_mean")
+        # Arm F against arm Z: the same question the C/Z pair asks, with AMD's
+        # own estimator in the CPU matcher's place. Z is the reference because
+        # it is the zero field this backend ships, not because it is good.
+        fpsnr = metric(RUNS / f"{clip}__amd-ffx__1", "psnr_mean")
+        fdb = (fpsnr - zpsnr) if (fpsnr is not None and zpsnr is not None) else None
         cflick = metric(RUNS / f"{clip}__amd-cpu__1", "flicker_added")
         zflick = metric(RUNS / f"{clip}__amd-zmv__1", "flicker_added")
         db = (cpsnr - zpsnr) if (cpsnr is not None and zpsnr is not None) else None
@@ -400,6 +414,7 @@ def verdict(clips: list[str]) -> list[dict]:
             rows.append(dict(clip=clip, sigma_cpu=c, sigma_zmv=z, sigma_nzmt=cp,
                              sigma_delta=(c - z) if (c is not None and z is not None) else None,
                              psnr_cpu=cpsnr, psnr_zmv=zpsnr, psnr_delta_db=db,
+                             psnr_ffx=fpsnr, psnr_ffx_delta_db=fdb,
                              flicker_cpu=cflick, flicker_zmv=zflick, reads=reads))
             continue
         if c is None or z is None:
@@ -414,7 +429,8 @@ def verdict(clips: list[str]) -> list[dict]:
             reads = "tie - the motion field buys nothing here"
         rows.append(dict(clip=clip, sigma_cpu=c, sigma_zmv=z, sigma_nzmt=cp,
                          sigma_delta=c - z, psnr_cpu=cpsnr, psnr_zmv=zpsnr,
-                         psnr_delta_db=db, flicker_cpu=cflick, flicker_zmv=zflick, reads=reads))
+                         psnr_delta_db=db, psnr_ffx=fpsnr, psnr_ffx_delta_db=fdb,
+                         flicker_cpu=cflick, flicker_zmv=zflick, reads=reads))
     return rows
 
 
@@ -424,7 +440,7 @@ def print_verdict(rows: list[dict]) -> None:
         return
     print("\n== decision matrix (pre-registered thresholds) ==")
     print(f"{'clip':16s} {'sigma C':>9s} {'sigma C-prime':>13s} {'sigma Z':>9s} {'d sigma C-Z':>11s} "
-          f"{'PSNR C':>8s} {'PSNR Z':>8s} {'d PSNR':>8s}  reads")
+          f"{'PSNR C':>8s} {'PSNR Z':>8s} {'d PSNR':>8s} {'PSNR F':>8s} {'d F-Z':>8s}  reads")
 
     def f(value, digits=4):
         return "n/a" if value is None else f"{value:.{digits}f}"
@@ -433,7 +449,8 @@ def print_verdict(rows: list[dict]) -> None:
         print(f"{r['clip']:16s} {f(r['sigma_cpu']):>9s} {f(r.get('sigma_nzmt')):>13s} "
               f"{f(r['sigma_zmv']):>9s} {f(r.get('sigma_delta')):>11s} "
               f"{f(r['psnr_cpu'], 2):>8s} {f(r['psnr_zmv'], 2):>8s} "
-              f"{f(r.get('psnr_delta_db'), 3):>8s}  {r['reads']}")
+              f"{f(r.get('psnr_delta_db'), 3):>8s} {f(r.get('psnr_ffx'), 2):>8s} "
+              f"{f(r.get('psnr_ffx_delta_db'), 3):>8s}  {r['reads']}")
     moving = [r for r in rows if r["clip"] != "still-hold" and r.get("psnr_delta_db") is not None]
     still = next((r for r in rows if r["clip"] == "still-hold"), None)
     print("\n== overall ==")
@@ -450,6 +467,24 @@ def print_verdict(rows: list[dict]) -> None:
         else:
             print("tie on every moving clip -> the motion field buys nothing measurable; "
                   "the runtime's 0.081 blend weight is the ceiling")
+    # Arm F is scored against arm Z and reported separately on purpose: it is a
+    # different estimator answering the same question, and folding it into the
+    # C/Z verdict would let one arm's win cancel the other's loss. A run without
+    # it says so, because "no FFX arm ran" and "FFX bought nothing" are not the
+    # same finding.
+    ffx = [r for r in rows if r["clip"] != "still-hold" and r.get("psnr_ffx_delta_db") is not None]
+    if not ffx:
+        print("amd-ffx: no moving-clip comparison (the arm did not render, or analyze.py has no metrics for it)")
+    else:
+        fwins = [r for r in ffx if r["psnr_ffx_delta_db"] > PSNR_TIE_DB]
+        flosses = [r for r in ffx if r["psnr_ffx_delta_db"] < -PSNR_TIE_DB]
+        if fwins and not flosses:
+            print("amd-ffx beats the zero field on every moving clip -> FidelityFX Optical Flow is worth taking")
+        elif flosses:
+            print("amd-ffx loses to the zero field on some moving clip -> keep the constant architecture; "
+                  "AMD's own estimator is not the lever either")
+        else:
+            print("amd-ffx ties the zero field on every moving clip -> the motion field buys nothing measurable")
     if still is not None:
         # Repeated here rather than only in the matrix because it answers a
         # different question from the moving clips, and "overall" is where a

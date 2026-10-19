@@ -278,6 +278,14 @@ public:
     // frame's override to leak into the next.
     void SetFrameGuides(const FrameGuides& guides) noexcept { frameGuides_ = guides; }
 
+    // The device this evaluator is running on, for a caller that has GPU work of
+    // its own to do beside it. The mv=ffx arm needs it: FidelityFX Optical Flow
+    // gets a context of its own, and building it on another device would put it
+    // on another adapter. Borrowed - the evaluator owns it, so the pointer dies
+    // with the evaluator that handed it out. Null until Initialize has brought
+    // the device up.
+    ID3D12Device* Device() const noexcept { return device_.Get(); }
+
 private:
     // True when the session exists and every object the frame path needs does.
     bool Ready() const noexcept;

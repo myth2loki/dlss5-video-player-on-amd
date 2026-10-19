@@ -1,9 +1,14 @@
 # AMD 真引导 A/B：真运动场 vs 零场 — 2026 年 10 月 20 日，RX 9070 XT
 
 **结论：不采纳真运动场，维持零场架构。** AMD 路径的 runtime 历史第一次吃到真
-运动场（CPU 块匹配器，每帧内存递交），在三个 clip × 四个受控臂上比零场：静止段
-两者逐位相同，运动段一胜一负且净负，不满足预登记的采纳条件。下一步的画质杠杆是
-FidelityFX Optical Flow，不是这个场。
+运动场，在三个 clip × 五个受控臂上比零场：静止段两者逐位相同，运动段一胜一负且
+净负，不满足预登记的采纳条件。
+
+这个结论已被**两个完全不同的估计器**各测一遍：CPU 块匹配器（`mv=cpu`，C 臂）与
+AMD 自己的 FidelityFX Optical Flow（`mv=ffx`，F 臂，GPU 光流）。两者在两个运动
+clip 上给出**相同的胜负方向和相近的幅度**，静止段都是零。所以这不是"估计器不够
+好"，而是 runtime 对运动场的响应本身在这类内容上不划算——**换估计器这条路整体
+不成立**，零场架构保留。
 
 复现只需一条命令（脚本内部完成零场生成、依赖顺序、四项自检、往返证明与判据读数）：
 
@@ -11,6 +16,15 @@ FidelityFX Optical Flow，不是这个场。
 set DLSS_BENCHMARK_BUILD=F:\dlss5-video\dlss5-video-amd\build-ninja
 python tools\benchmark\amdguides.py --amd-runtime F:\dlss5-video\dlss5-video-amd\amd-neural-runtime
 ```
+
+两点环境要求，漏了会失败或测到旧代码：
+
+- `DLSS_BENCHMARK_BUILD` 必须指向 `build-ninja`（WORK/CORPUS/RUNS 都在其下）；
+- 要跑 F 臂，构建必须带 FFX SDK（`cmake -DFFX_SDK_ROOT=...`），否则该臂以 "this
+  build has no FidelityFX SDK" 失败；
+- **`--fresh` 目前不删 `runs/`**，会让除新臂外的臂被 skip、自检读上一个 clip 的
+  残留日志而误判（`guide-frames=76, expected 60`）。要干净重跑，先把
+  `benchmark-work` 下的 `runs`/`profiles`/`guides` 改名（如加 `.prev-<时间>`）再跑。
 
 方法、臂的设计与判据见 [AMD 真引导 A/B 验证方案](../../AMD-GUIDE-AB-VERIFICATION-zh.md)，
 结论已并入[集成计划 §5.3 末段](../../AMD-LMXXF-INTEGRATION-PLAN-REV2-zh.md)。
@@ -36,14 +50,19 @@ python tools\benchmark\amdguides.py --amd-runtime F:\dlss5-video\dlss5-video-amd
 零场不受影响（零怎么排都是零），所以历史零场结论仍然成立；但**历史"真场"数据不
 再可比**。本次测量用的构建包含此修复，并由下方的往返证明直接验证。
 
-## 四个臂
+## 五个臂
 
 | profile | guides | dump | 作用 |
 |---|---|---|---|
-| `amd-cpu` | `mv=cpu,depth=1` | `{clip}/cpu/` | **C 臂**：真运动 + 深度代理，lease 生命周期，dump 供 Z 臂与往返用 |
+| `amd-cpu` | `mv=cpu,depth=1` | `{clip}/cpu/` | **C 臂**：真运动（CPU 块匹配器）+ 深度代理，lease 生命周期，dump 供 Z、F 臂与往返用 |
 | `amd-cpu-nzmt` | C 臂 + `--zero-motion-test 1` | `{clip}/cpu-nzmt/` | **C′ 臂**：唯一差异是静止帧零化 |
-| `amd-zmv` | `mv=file:{clip}/zero/mv,depth=file:{clip}/cpu/depth` | — | **Z 臂**：零运动场 + C 臂同款深度，与 C 臂唯一差异是运动场 |
+| `amd-zmv` | `mv=file:{clip}/zero/mv,depth=file:{clip}/cpu/depth` | — | **Z 臂**：零运动场 + C 臂同款深度，与 C、F 两臂唯一差异是运动场 |
 | `amd-cpu-replay` | `mv=file:{clip}/cpu/mv,depth=file:{clip}/cpu/depth` | — | **往返证明**：C 臂 dump 回喂，须与 C 臂逐位一致 |
+| `amd-ffx` | `mv=ffx,depth=file:{clip}/cpu/depth` | — | **F 臂**：FidelityFX Optical Flow（GPU）+ C 臂同款深度，与 Z 臂唯一差异是运动场 |
+
+F 臂的 depth 走文件、复用 C 臂的 dump，是因为光流不产深度——若它自带别的深度，
+与 Z 臂就差两个变量、结论无法归因。它也不写 dump、不做零运动测试：那两者都是
+CPU 匹配器网格的臂，而光流交的是全帧场、没有网格。
 
 全部走 `--neural-backend amd-lmxxf`，执行顺序由脚本固定（`amd-cpu` 必须最先）。
 
@@ -51,11 +70,15 @@ python tools\benchmark\amdguides.py --amd-runtime F:\dlss5-video\dlss5-video-amd
 
 预登记阈值：PSNR 相差 0.1 dB 以内算平（再低编码器自身的量化就能推动这个数）。
 
-| clip | 帧数 | PSNR C（真场） | PSNR Z（零场） | Δ PSNR | sigma C | sigma Z | 读数 |
-|---|---|---|---|---|---|---|---|
-| still-hold | 60 | 29.30 | 29.30 | 0.000 | 0.7678 | 0.7678 | 逐位相同：静止帧上估计器产出的本就是零场 |
-| depth-pan | 90 | 21.23 | 22.12 | **−0.892** | 62.7350 | 63.9112 | 零场胜 |
-| real-game-motion | 76 | 32.12 | 31.95 | +0.166 | 20.9550 | 21.1211 | 真场胜，刚过平带 |
+| clip | 帧数 | PSNR C（cpu） | PSNR F（ffx） | PSNR Z（零场） | C−Z | **F−Z** | sigma C | sigma Z | 读数 |
+|---|---|---|---|---|---|---|---|---|---|
+| still-hold | 60 | 29.30 | 29.30 | 29.30 | 0.000 | **0.000** | 0.7678 | 0.7678 | 逐位相同：静止帧上两个估计器产出的本就是零场 |
+| depth-pan | 90 | 21.23 | 21.21 | 22.12 | **−0.892** | **−0.908** | 62.7350 | 63.9112 | 零场胜（两个估计器都输） |
+| real-game-motion | 76 | 32.12 | 32.23 | 31.95 | +0.166 | **+0.276** | 20.9550 | 21.1211 | 真场胜（两个估计器都赢，F 赢得更多） |
+
+F 臂在静止段与零场**逐位相同**（29.30，Δ=0.000）：光流在静止内容上没有发明
+噪声，它是个干净的估计器——只是没用。这一点值得单独记，因为它排除了"光流本身
+带来了抖动"的可能，把 depth-pan 的失败归因到 runtime 的重投影而不是估计器。
 
 C′（静止帧零化）与 C 在三个 clip 上**全部逐位相同**——估计器在 held 帧上没有发明
 噪声，零化测试在这里无事可做。这与 NVIDIA 侧的 mv-gate 结论方向相反但不相矛盾：
@@ -63,7 +86,16 @@ C′（静止帧零化）与 C 在三个 clip 上**全部逐位相同**——估
 输入本来就报零。
 
 **总判定**：采纳条件是"运动段可量地更好**且**静止段不劣"同时成立。实际运动段一胜
-一负（−0.892 与 +0.166，净 −0.726），因此不采纳，维持零场（纯空间）架构。
+一负（C：−0.892 与 +0.166；F：−0.908 与 +0.276），因此不采纳，维持零场（纯空间）
+架构。
+
+**两个估计器的交叉印证**（本次最有力的证据）：C 与 F 是完全不同的实现——一个在
+CPU 上做块匹配、输出 160x90 网格，一个在 GPU 上跑 AMD 的光流、输出全帧场——却在
+两个运动 clip 上给出**同方向、相近幅度**的结果（−0.892 / −0.908，+0.166 / +0.276），
+静止段都精确为零。若差距来自估计器质量，两个实现不可能如此一致；合理的解释是
+runtime 侧**对运动场的响应本身**在 depth-pan 这类内容上不划算（重投影把 relight
+误差带了进来），而融合权重只有 0.081，能兑现的收益本就被压在噪声量级。这条把
+"换一个更好的运动估计器"作为整体方向否掉了——不只是这两个估计器不行。
 
 ## 往返证明（同时验证了 stride 修复）
 
@@ -87,18 +119,24 @@ still-hold 的 Δ=0 不是测不出差异，而是差异确实为零。
 
 - GPU：AMD Radeon RX 9070 XT，驱动 32.0.31041.1004；runtime 包
   `F:\dlss5-video\dlss5-video-amd\amd-neural-runtime`（`LmxxfNrRuntime.dll` 1,653,536 B）
-- 每臂 wall 10–15 s，gpu p50 ≈ 9.6 ms，峰值本地显存 1502 MiB
-- 分析网格 160x90（30 fps 1080p 源）
+- 每臂 wall 10–15 s，gpu p50 ≈ 9.6 ms，峰值本地显存 1502 MiB。F 臂 1526 MiB
+  （光流的上下文与两张纹理约 +24 MiB），gpu p95 更高（depth-pan 20.9 vs 9.8 ms）
+- 分析网格 160x90（30 fps 1080p 源）。F 臂不经过这个网格：光流直接交全帧场
 - **两轮独立运行逐位一致**：换 runtime 路径（`F:\amd-neural-runtime` 与仓库内
   `amd-neural-runtime`）重跑，三 clip 的摘要与全部指标相同，退出码均为 0
-- 自检：12 臂全部 `history=active`、guide-frames 与各自 clip 帧数一致、`failures=[]`
+- 自检：15 臂（5 臂 × 3 clip）全部 `history=active`、guide-frames 与各自 clip 帧数
+  一致、`failures=[]`；脚本以 `all arms rendered, all self-checks passed, round trip
+  byte-identical` 收尾，退出码 0
 
 ## 仍未验证
 
 - 位移向量的**符号**约定仍是照 `GuideFiles.h` / `TemporalGuides` 两个头的声明，
-  本次没有独立验证 runtime 重投影的符号。
-- 真运动场只测了 CPU 块匹配器这一个来源。**FidelityFX Optical Flow 未测**——它需
-  要先集成 FFX SDK，是本方案的下一步而不是一部分。
+  本次没有独立验证 runtime 重投影的符号。光流侧的方向是被迫翻转过的（FFX 输出
+  previous→current，引导要 current→previous）：翻转后 F 臂在真实运动段赢了
+  0.276 dB，符号若反了重投影会朝错误方向做、不太可能赢——这是间接证据，不是验证。
+- 两个估计器都只在这三个 clip 上测过：一个静止、一个合成深度平移、一段真实游戏
+  运动。合成 clip 的 relight 很强，真实片段只有一段，样本不足以排除"某些内容类型
+  上真场会赢"。
 - depth-pan 的 PSNR 绝对值偏低（21–22 dB）是该合成 clip 强 relight 的预期结果；
   比较用的是同 clip 内的 Δ，不受影响。
 

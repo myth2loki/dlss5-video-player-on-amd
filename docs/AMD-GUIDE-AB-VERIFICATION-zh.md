@@ -148,8 +148,11 @@ python tools\benchmark\analyze.py --no-ocr --no-faces
 
 脚本最后打印总判定，规则与本文一致：**只有当"真运动在运动段可量地更好、且静止段不劣"
 同时成立**，才考虑把真引导带入产品路径；否则维持现状（零场 + 宿主侧 P2.5 累积），
-下一步的画质希望放在 **FidelityFX Optical Flow**（`dlss5-neural-amd` 的 `optical_flow.inc`，
-需集成 FFX SDK，见 `.workbuddy/memory/2026-10-19.md` 的调研结论），本方案不包含它。
+**FidelityFX Optical Flow 已经补测完毕**，作为第五个臂 `amd-ffx`（`mv=ffx`，需要带
+FFX SDK 的构建）：它与 CPU 场同方向、相近幅度，静止段同样为零，因此总判定不变——
+维持零场。两个估计器一致这个事实，比任何单个读数都更能说明问题出在 runtime 侧而
+非估计器侧。详见
+[测量结果](measurements/amd-guide-ab-20261020/REPORT.md)。
 
 ## 7. 已知风险
 
