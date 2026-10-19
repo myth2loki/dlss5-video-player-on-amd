@@ -21,6 +21,7 @@ python tools/benchmark/blind.py --pairs-per-clip 3     # sealed A/B pairs for on
 python tools/benchmark/knobs.py --clips real-film-cuts real-game-cuts  # which settings change the image
 python tools/benchmark/guidefiles.py truth             # true depth/motion of the near/far clips
 python tools/benchmark/guidefiles.py prove             # guide files render byte-identically to the estimator
+python tools/benchmark/amdguides.py                    # the AMD true-guide A/B: four arms, self-checks, verdict
 ```
 
 Requirements: Python 3.12 with `requirements.txt`, `external/ffmpeg/bin/ffmpeg.exe`
@@ -43,7 +44,8 @@ directory holding `ffmpeg.exe` and `ffprobe.exe`.
 | `duplab.py` | Scores `scene_cut::IsDuplicateDecodedPair` - frame generation's hold-a-repeat test - on corpus clips re-timed onto twos through libx264, against the real pairs of the same files and a small object crossing a still frame; needs no GPU |
 | `knobs.py` | Renders one control at a time from the player's shipped state and reports bytes differing, mean and max absolute delta, and how much of the change lands on detected faces; the table in `docs/BENCHMARK.md` is its output |
 | `governor.py` | Renders the shipped settings at each `NRNormGovernor` value, repeated, and scores reproducibility, flicker+, sigma+ and whole-frame brightness pumping, with a mean-luma-over-time plot per clip; builds `real-lighting` (real footage under an exposure schedule) for it |
-| `guidefiles.py` | The `depth=file:` / `mv=file:` layout (PFM read/write, area average), `truth` for the near/far clips, `convert` for offline depth maps, `compare`, and `prove` - the byte-identical round trip |
+| `guidefiles.py` | The `depth=file:` / `mv=file:` layout (PFM read/write, area average), `truth` for the near/far clips, `convert` for offline depth maps, `compare`, `zero` for the zero-motion field, and `prove` - the byte-identical round trip |
+| `amdguides.py` | Drives the AMD true-guide A/B end to end: writes each clip's zero field at its own frame count and grid, runs `amd-guides.profile.json`'s four arms in dependency order, parses the worker log for the four self-checks, proves the round trip by frame digest, and prints the pre-registered decision matrix. Exit 0 means every arm rendered, every self-check passed and the replay was byte-identical; the A/B verdict prints either way |
 | `roundtrip.profile.json` | The four arms `guidefiles.py prove` renders |
 | `blind.py` | Randomized A/B stills + excerpts with a sealed `key.json`; every candidate frame is provably inside a manifest shot and each excerpt is clipped to that shot, so `--seconds` caps a length it does not guarantee; `--score` tallies a ballot |
 | `common.py` | Paths, `ffprobe`/`framemd5` helpers, NWR1 protocol v6 decoder (progress, result, preflight, segment, timeline, and the render's own temporal metrics - the in-app counterpart of `analyze.py`'s flicker and sigma; unknown kinds are skipped by payload length, so a helper that adds one stays readable) |
