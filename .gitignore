@@ -40,6 +40,10 @@
 /amd-neural-runtime - 副本/
 /amd-neural-runtime copy/
 /amd-neural-runtime.backup/
+# Only the files a payload swap overwrites (modules, shaders, the runtime DLL, the
+# config dir) - the 575 MB of weights are byte-identical across 0.43 and 0.44 and
+# are not copied. Kept beside the pack so a swap can be undone file for file.
+/amd-neural-runtime.bak-044/
 
 # Screenshot dumps from manual A/B eyeballing.
 /_style-shots/

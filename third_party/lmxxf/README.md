@@ -36,7 +36,8 @@ LmxxfNrGetApi(3, 176) -> 0  OK
 ## ABI 6 的 runtime（2026-10-17 实测，表没动、两个结构体长了）
 
 更新的包把版本整数从 3 抬到了 **6**。对一个 ABI 6 的 `LmxxfNrRuntime.dll`
-（2026-10 包，1,653,536 字节）逐轴扫描的结果：
+（2026-10 包，1,653,536 字节；当前包的 DLL 已换成另一个同 ABI 的构建，见下节）
+逐轴扫描的结果：
 
 ```text
 LmxxfNrGetApi(3, 176) -> 1  UNSUPPORTED_ABI
@@ -56,6 +57,38 @@ PrepareFrame(其余任何 frame/job 组合) -> 2  "PrepareFrame: struct_size mis
 （`StampFrameInfoForAbi` / `StampJobForAbi`，落地在 `Session::PrepareFrame`）
 把 struct_size 盖成运行时自己那一版的尺寸。头文件里两个结构体按大的一版声明
 （168 / 32），ABI 3 时只报 160 / 24，尾部 8 字节永不外露、保持零。
+
+## 当前 runtime 包（2026-10-21）
+
+两条独立的供应线，别混：**宿主 DLL** 来自 TheAutomatic 的 `OptScaler-NR-*`
+（盘上 1.10.4.1 / 1.10.5-alpha-gai / 1.11.0 / 1.12.1 / 1.13.0-alpha8），
+**载荷（模块 + 权重 + 配置）** 来自 `OptiScaler-DLSS5-AMD-0.xx`。0.44 包里
+根本没有 DLL；NR 包只带 `native-game-tiled-assets/small/`，不带主权重。
+
+| 项 | 值 |
+| --- | --- |
+| 宿主 DLL | `OptScaler-NR-1.13.0-alpha8`，1,804,576 字节，sha256 `fdc98b823f77cd7b9a88394c66946a234dd737e3a7bee5fabe3a36b07c84330b` |
+| 载荷 | `OptiScaler-DLSS5-AMD-0.44`（`release.json`：`modules=80`、`small_weights=93`、`default_mode=0.5`、`bit_exact_vs_previous=false`、`source_commit=4764e4f1`） |
+| 模块 | `lmxxf-modules/gfx1200` + `gfx1201` 各 40 个 hsaco，与 0.44 逐字节一致 |
+| 权重 | `native-game-tiled-assets/` 464 项（452 个 block 张量与 0.43 相同，8 个 `.hlsl` 变），新增 `post70-history-head.f16` 与 `small/`(94) |
+| 运行锁 | 4 份清单 / 208 条，全树 ok=208 mismatch=0 |
+| ABI | 仍只有 `(6, 176)` 被接受（ctypes 扫 abi 1..24 × 12 个 struct_size 复扫），`kAcceptedAbiVersions = {6, 3}` 不用动 |
+| W16 布局 | `AmdLmxxfRuntimeProbe` 实到 `w16_blocks=96`、`c32_w16_calls=60`、`vit_w16_calls=48`、`vit_inter_byte_calls=108`，0.43 的权重路径真的在用 |
+
+版本键的来历：0.42 加 `DLSS5_TEMPORAL_MODE` / `DLSS5_TEMPORAL_ENHANCE_STRENGTH`
+（统一时序开关）；0.43 加 `DLSS5_HIP_C32_W16` 等 W16 权重布局键；0.44 把默认
+形态改成 31 块 Small 0.5x（它的 `default-config.txt` 写 `DLSS5_MULTI_PASS=0.5` +
+`DLSS5_STYLE=1`，并明确 `bit_exact_vs_previous=false`）。
+
+**我们的 `DLSS5-AMD/custom-config.txt` 故意不随 0.44 包更新**（仍
+`MULTI_PASS=2` / `STYLE=0` / `TEMPORAL_MODE=2`）：custom 压过 default，所以
+行为保持 Original 2-pass；要评估 0.44 的默认形态得连 `default-config.txt`
+一起换，并预期输出不逐位复现。
+
+升级到 0.44 载荷后的 A/B（`bumblebee-fight-20s.mkv` f0–f48，1280x720，
+passes=2，hevc_amf）：与上一套模块**逐比特一致**（ffmpeg `psnr` = inf，抽帧
+PIL 比对 MAD = 0.000000；对源 MAD 3.45，确认神经 pass 真的在改写画面），
+network 耗时差在 48 帧噪声内，不下性能结论。
 
 **验证（2026-10-17）**：同一个 `DLSSVideoPlayer.exe` 分别跑 ABI 6 与 ABI 3 的
 runtime，同一段 8 帧 `deadpool-s0.mkv` 的 `--render --stages nr` 输出
