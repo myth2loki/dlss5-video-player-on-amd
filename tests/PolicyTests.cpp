@@ -2932,6 +2932,34 @@ void playback_frame_generation_policy_separates_request_from_runtime_state_test(
     CHECK(!ResetHistory(12, false, false));
 }
 
+// The pill reads DoublingEstablished, and the whole point of it is the case
+// where the two disagree: a session whose cadence is established but whose
+// current frame is a reset frame (seek, dropped frame, scene cut) keeps
+// reporting On. DoublingActive is false for that frame - that is its job - and
+// painting a control from it is what made the Interpolate pill strobe.
+void playback_frame_generation_ui_state_survives_a_reset_frame_test()
+{
+    using playback_frame_gen::DoublingActive;
+    using playback_frame_gen::DoublingEstablished;
+    using playback_frame_gen::RuntimeStatus;
+
+    // Established, and the frame in flight happens to be a reset frame.
+    const RuntimeStatus resetFrame{true, true, false, false, true};
+    CHECK(!DoublingActive(resetFrame));
+    CHECK(DoublingEstablished(resetFrame));
+    // Established and doubling this very frame.
+    const RuntimeStatus live{true, true, false, true, true};
+    CHECK(DoublingActive(live));
+    CHECK(DoublingEstablished(live));
+    // Asked for, island healthy, but no pair has reached the screen yet: the
+    // pill may not claim On before there has been one.
+    CHECK(!DoublingEstablished(RuntimeStatus{true, true, false, false, false}));
+    // Revoked: the switch off, an abandoned island, no island at all.
+    CHECK(!DoublingEstablished(RuntimeStatus{false, true, false, false, true}));
+    CHECK(!DoublingEstablished(RuntimeStatus{true, true, true, false, true}));
+    CHECK(!DoublingEstablished(RuntimeStatus{true, false, false, false, true}));
+}
+
 void debug_view_popup_contains_all_existing_views_and_selection_test()
 {
     const HMENU menu = app_menu::CreateDebugViewMenu(app_menu::IDM_VIEW_DEPTH);
@@ -16032,6 +16060,7 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(advanced_menu_contains_clear_neural_cache_and_no_removed_quality_commands_test),
     TEST_CASE(feature_menu_uses_distinct_controls_and_honest_availability_test),
     TEST_CASE(playback_frame_generation_policy_separates_request_from_runtime_state_test),
+    TEST_CASE(playback_frame_generation_ui_state_survives_a_reset_frame_test),
     TEST_CASE(debug_view_popup_contains_all_existing_views_and_selection_test),
     TEST_CASE(range_preview_and_comparison_menus_route_keys_and_gate_availability_test),
     TEST_CASE(player_menu_is_english_only_and_retains_advanced_commands_test),

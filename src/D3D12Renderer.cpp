@@ -1790,6 +1790,10 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
         }
         if(!generated){
             m_fgFfxFailed=true;
+            // The island is abandoned for the session, so nothing it established
+            // survives either: the pill drops to Unavailable rather than sitting
+            // on an On that no longer has a runtime behind it.
+            m_fgDoublingEstablished=false;
             LOG("Playback frame generation: the FidelityFX island failed ("
                 <<utf8_text::FromWide(m_fgFfx->LastDetail())
                 <<"); falling back to the matcher from the next frame.");
@@ -1854,6 +1858,11 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
             if(probeDue)ProbeSourcePresent();
             const bool presented=PresentSwapchain("Present source frame");
             m_fgDoublingActive=m_playbackFrameGen&&showGenerated&&presented;
+            // Once a pair has reached the screen, interpolation is established
+            // until something revokes it. The per-frame flag above falls false
+            // again on the next frame's first line; this one must not, or the
+            // pill strobed at every reset frame.
+            if(m_fgDoublingActive)m_fgDoublingEstablished=true;
             return presented;
         }
         // A raw diagnostic takes the ordinary present below, not the
@@ -4060,6 +4069,10 @@ void D3D12Renderer::ReleaseFrameGenBridge()
     m_fgFfxOutputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     m_fgFfxFenceValue = 0;
     m_fgFfxIsland = false;
+    // No island, no cadence: a later session has to present its own pair before
+    // the UI may claim interpolation again.
+    m_fgDoublingActive = false;
+    m_fgDoublingEstablished = false;
     // The clamp's renderer-private resources ride the same lifecycle: the
     // island is the only thing that produces a frame for them to clamp.
     m_fgFfxPrevInput.Reset();

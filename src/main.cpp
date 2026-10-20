@@ -8042,7 +8042,12 @@ private:
         return m_renderer&&m_renderer->PlaybackFrameGenerationSupported();
     }
     bool PlaybackFrameGenerationActive()const{
-        return m_renderer&&m_renderer->PlaybackFrameGenDoubling();
+        // The established state, not the per-frame one. The pill is repainted
+        // from the window thread while the playback thread is inside a frame,
+        // and PlaybackFrameGenDoubling() is cleared at the top of every frame
+        // and only set again after both presents - a reset frame left the pill
+        // reading Off for one frame, which at the drop rate reads as a strobe.
+        return m_renderer&&m_renderer->PlaybackFrameGenInterpolating();
     }
     // `height` 0 selects Auto; anything else must name a rung. A refused
     // re-enable leaves the previous selection standing, the same way a failed
@@ -9316,10 +9321,14 @@ private:
     // (one per source frame), doubled while the FidelityFX island interleaves
     // a generated midpoint frame for every source frame. A renderer without a
     // live island - DLSS off, island failed - shows the plain submit rate.
+    //
+    // The established state, like the pill: the chip is repainted every tick and
+    // read from the window thread, so the per-frame flag made the rate itself
+    // alternate between x1 and x2 on every reset frame.
     double ScreenFps()const{
-        return (m_renderer&&m_renderer->PlaybackFrameGenDoubling())?m_submitFps*2.0:m_submitFps;
+        return (m_renderer&&m_renderer->PlaybackFrameGenInterpolating())?m_submitFps*2.0:m_submitFps;
     }
-    bool ScreenShowsGeneratedFrames()const{ return m_renderer&&m_renderer->PlaybackFrameGenDoubling(); }
+    bool ScreenShowsGeneratedFrames()const{ return m_renderer&&m_renderer->PlaybackFrameGenInterpolating(); }
     status_chips::Snapshot BuildStatusChips()const{
         return status_chips::Build(m_loaded&&m_renderer!=nullptr,RenderChipProgress(),ScreenFps(),
                                    m_decoder.FrameRate(),m_droppedFrames);

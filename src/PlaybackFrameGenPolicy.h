@@ -23,12 +23,15 @@
 namespace playback_frame_gen {
 
 // Runtime frame-generation status, in the exact braced-init order the renderer
-// builds it: {requested, islandUp, failed, doublingPresented}.
+// builds it: {requested, islandUp, failed, doublingPresented}. Trailing fields
+// default to false, so the four-element initializers the tests already use stay
+// valid.
 struct RuntimeStatus {
     bool requested = false;           // the user has asked for playback frame generation
     bool islandUp = false;            // the FidelityFX island came up (own optical flow ready)
     bool failed = false;             // the island failed and was abandoned this session
     bool doublingPresented = false;  // a generated/source present pair was actually shown
+    bool doublingEstablished = false;// a pair has been shown and nothing has revoked it since
 };
 
 // The playback-frame-generation control is usable: the island is up and has not
@@ -45,6 +48,24 @@ inline bool RuntimeAvailable(const RuntimeStatus& s)
 inline bool DoublingActive(const RuntimeStatus& s)
 {
     return s.requested && s.islandUp && !s.failed && s.doublingPresented;
+}
+
+// What the UI reports as "Interpolate . On": the user asked, the island is up
+// and healthy, and the cadence has been shown at least once since the session
+// was (re)started - and not revoked by a failure or by the switch going off.
+//
+// Deliberately NOT DoublingActive. That one answers "did the frame that was
+// just presented come in a pair?", which the renderer clears at the top of
+// every frame and only sets again at the bottom of a frame that completed both
+// presents. A reset frame (seek, dropped frame, scene cut), a raw diagnostic
+// view, or a single frame the island could not complete all leave it false for
+// one frame, and the pill painted from it strobed between On and Off at the
+// drop rate. The pill is a control's state, not a per-frame counter: it is
+// asked by WM_PAINT on the window thread while the playback thread is midway
+// through a frame, so it must not read a flag that frame is still writing.
+inline bool DoublingEstablished(const RuntimeStatus& s)
+{
+    return s.requested && s.islandUp && !s.failed && s.doublingEstablished;
 }
 
 // Whether the runtime should discard its accumulated history this frame:

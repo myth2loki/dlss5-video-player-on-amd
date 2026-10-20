@@ -719,7 +719,9 @@ public:
                 m_presentStale = true;
             }
         }
-        if (!on) m_fgDoublingActive = false;
+        // Both flags: the switch going off revokes the cadence for the UI too,
+        // not just for the frame in flight.
+        if (!on) { m_fgDoublingActive = false; m_fgDoublingEstablished = false; }
         m_playbackFrameGen = on;
     }
     bool PlaybackFrameGeneration() const { return m_playbackFrameGen; }
@@ -771,6 +773,15 @@ public:
     {
         return playback_frame_gen::DoublingActive({m_playbackFrameGen, m_fgFfxIsland,
                                                     m_fgFfxFailed, m_fgDoublingActive});
+    }
+    // The one the UI asks: is interpolation on and holding? Unlike the flag
+    // above it does not fall false for a single reset frame, so the toolbar
+    // pill and the rate chip stay still while the cadence hiccups.
+    bool PlaybackFrameGenInterpolating() const
+    {
+        return playback_frame_gen::DoublingEstablished(
+            {m_playbackFrameGen, m_fgFfxIsland, m_fgFfxFailed, m_fgDoublingActive,
+             m_fgDoublingEstablished});
     }
     void RequestDLSSRecreate() { m_recreateRequested = true; }
     bool DLSSFeatureCreated() const { return m_dlss.FeatureCreated(); }
@@ -1545,8 +1556,16 @@ private:
     bool m_fgFfxFailed = false;
     // A re-enabled session must not reuse the runtime's pre-off history.
     bool m_fgResetPending = false;
-    // Set only after a generated/source pair has actually been presented.
+    // Set only after a generated/source pair has actually been presented, and
+    // cleared at the top of every frame: "the pair I just presented came in a
+    // pair". Read by nothing that outlives the frame.
     bool m_fgDoublingActive = false;
+    // The same fact held until something revokes it: the switch going off, the
+    // island failing, or the island being released. This is the one the UI
+    // reads - see PlaybackFrameGenInterpolating, and the note in
+    // playback_frame_gen::DoublingEstablished about why a pill painted from
+    // m_fgDoublingActive strobed.
+    bool m_fgDoublingEstablished = false;
     // The interval the current frame arrived with (RenderFrame's argument),
     // remembered so the generation record can pass it to FidelityFX.
     float m_fgFrameTimeMs = 0.0f;
