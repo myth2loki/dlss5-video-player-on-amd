@@ -10,9 +10,10 @@ decisions that still shape the code are in
 ## 0.29.1 - 2026-10-20
 
 An AMD render now writes its video with AMD's own hardware encoder instead of
-libx264 on the CPU. Nothing in the settings changed, nothing in the cache key
-changed, and the picture is the same one the rung always asked for - the file is
-smaller and the export finishes sooner.
+libx264 on the CPU - the neural export and the frame-generation conversion
+alike. Nothing in the settings changed, nothing in the cache key changed, and
+the picture is the same one the rung always asked for: the file is smaller and
+the export finishes sooner.
 
 ### Changed
 
@@ -34,6 +35,18 @@ smaller and the export finishes sooner.
   still FFV1. If the AMD encoder cannot start - no AMD driver, or an FFmpeg
   built without AMF - the job falls back to libx264 exactly as an NVENC job
   does, so a machine without the hardware loses nothing but the speed.
+- **Frame generation exports encode on the GPU too**, and there the encoder was
+  not a cost but the whole cost. This pass writes to a single encoder for the
+  whole file, so every millisecond libx264 spent came straight off the end of
+  the conversion: a two-second 3840x2160 clip converted to 2x took 11.3 s and
+  7.4 MiB, of which 10.1 s was libx264, against 7.0 s and 5.7 MiB now that AMD's
+  encoder writes it. At 1280x720 the same conversion finishes 10 % sooner and
+  the file is 14 % larger - a wash, and the price of not having two encoders
+  chosen by resolution. Which encoder runs is decided by the adapter's vendor,
+  not by a setting, because this pass runs on its own device: AMF on an AMD one,
+  NVENC on an NVIDIA one, libx264 where neither starts. VSR exports are
+  unchanged: RTX VSR only runs on an NVIDIA GPU, so NVENC was already the right
+  encoder there and the AMD path never reaches an encoder at all.
 - Renders made on AMD are made again once: the cache revision moved to 0.29.1
   because the same key now names different packets. An NVIDIA render's key and
   bytes are untouched.

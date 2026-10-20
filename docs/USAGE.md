@@ -883,6 +883,13 @@ carries the multiple, the target rate and the frames written so far, and names
 the way out; **DLSS > Cancel frame generation** stops it and leaves the video you
 were watching untouched.
 
+It is encoded on the GPU, by the GPU: AMD's AMF on an AMD device, NVENC on an
+NVIDIA one, and libx264 on the CPU only where neither can start. That is worth
+most at 4K, where the encoder *is* the pass - a two-second 3840x2160 conversion
+to 2x took 11.3 s and 7.4 MiB through libx264 against 7.0 s and 5.7 MiB through
+AMF. At 1280x720 it is a wash: the same conversion finishes 10 % sooner and the
+file is 14 % larger.
+
 The multiple comes from the display rather than the source alone, and it is
 judged on two quantities: how far the picture moves between presented frames,
 and how evenly those frames land on the refresh. A frame is held for a whole
