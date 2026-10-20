@@ -545,16 +545,25 @@ bool AmdLmxxfEvaluator::CreateGuideTextures()
     return true;
 }
 
-bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t sourceFrameNumber)
+bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t sourceFrameNumber,
+                                     const GuideFrame* guides)
 {
-    // No directories is the constant-guide run 5 path: nothing to read, nothing
-    // to record, and the textures keep whatever CreateGuideTextures put in them.
-    if (config_.motionGuideDirectory.empty() && config_.depthGuideDirectory.empty()) return true;
+    // Which channels this frame writes. A per-frame field answers to the job's
+    // guide controls: a guide that is off keeps its constant, which is the
+    // neutral value GuideControls promises, rather than whatever the field
+    // carries for it. The directory path answers to the directories, which for
+    // a file spec are set exactly when that guide's control is on.
+    const bool wantsMotion = guides ? controls_.motionVectors
+                                    : !config_.motionGuideDirectory.empty();
+    const bool wantsDepth = guides ? controls_.depth : !config_.depthGuideDirectory.empty();
+    // Nothing to write is the constant path: the textures keep whatever
+    // CreateGuideTextures put in them and the frame renders on that.
+    if (!wantsMotion && !wantsDepth) return true;
     if (guideUploadMapped_ == nullptr)
         return Refuse("the guide upload buffer is not mapped, so a per-frame guide cannot be written");
 
-    // Both guides go through one read, so the failure text names the guide and
-    // the file rather than only the frame.
+    // Both guides go through one pass, so the failure text names the guide and
+    // the source rather than only the frame.
     struct Updated {
         ID3D12Resource* texture;
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT* footprint;
@@ -564,42 +573,81 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
     std::vector<float> motionValues;
     std::vector<float> depthValues;
 
-    auto read = [&](const std::filesystem::path& directory, uint32_t channels, const char* what,
-                    std::vector<float>& values) {
-        const std::filesystem::path path = guide_files::FramePath(directory, sourceFrameNumber);
-        std::string why;
-        const std::optional<guide_files::Plane> plane = guide_files::ReadPfmFile(path, &why);
-        if (!plane)
-            return Refuse(std::string(what) + " guide for source frame " +
-                          std::to_string(sourceFrameNumber) + ": " + why);
-        if (plane->channels != channels)
-            return Refuse(std::string(what) + " guide " + NarrowPath(path) + " has " +
-                          std::to_string(plane->channels) + " channels; a " +
-                          (channels == 1 ? "depth map is one (Pf)" : "motion field is three (PF)"));
-        // Any size, resampled onto the texture. The field a video host computes
-        // is the analysis grid - 160x90 for a 30 fps 1080p source - and this is
-        // the same area average the renderer's own expansion pass applies, so a
-        // file at the grid size blocks out exactly the way the estimator's own
-        // field does. At equal size it copies rather than averages.
-        values = guide_files::ResampleArea(*plane, width_, height_).values;
-        return true;
-    };
-
-    bool writeMotion = false;
-    bool writeDepth = false;
-    if (!config_.motionGuideDirectory.empty()) {
-        if (!read(config_.motionGuideDirectory, 3, "motion", motionValues)) return false;
-        updated[updatedCount++] = {motion_.Get(), &motionFootprint_};
-        writeMotion = true;
-    }
-    if (!config_.depthGuideDirectory.empty()) {
-        if (!read(config_.depthGuideDirectory, 1, "depth", depthValues)) return false;
-        updated[updatedCount++] = {depth_.Get(), &depthFootprint_};
-        writeDepth = true;
+    if (guides) {
+        // The field the caller computed for this frame - the player's estimator
+        // grid, or a benchmark's files already applied over it. Same geometry
+        // contract as the file path: motion is the grid's R and G, depth its B,
+        // and the grid is resampled onto the frame exactly as a file would be.
+        const size_t cells = size_t(guides->gridW) * guides->gridH;
+        if (!cells || guides->guideGridRGBA32F.size() < cells * 4u)
+            return Refuse("the guide grid for source frame " + std::to_string(sourceFrameNumber) +
+                          " is empty");
+        if (wantsMotion) {
+            guide_files::Plane plane{guides->gridW, guides->gridH, 2u, {}};
+            plane.values.resize(cells * 2u);
+            for (size_t cell = 0; cell < cells; ++cell) {
+                plane.values[cell * 2u + 0u] = guides->guideGridRGBA32F[cell * 4u + 0u];
+                plane.values[cell * 2u + 1u] = guides->guideGridRGBA32F[cell * 4u + 1u];
+            }
+            motionValues = guide_files::ResampleArea(plane, width_, height_).values;
+            updated[updatedCount++] = {motion_.Get(), &motionFootprint_};
+        }
+        if (wantsDepth) {
+            guide_files::Plane plane{guides->gridW, guides->gridH, 1u, {}};
+            plane.values.resize(cells);
+            for (size_t cell = 0; cell < cells; ++cell)
+                plane.values[cell] = guides->guideGridRGBA32F[cell * 4u + 2u];
+            depthValues = guide_files::ResampleArea(plane, width_, height_).values;
+            updated[updatedCount++] = {depth_.Get(), &depthFootprint_};
+        }
+    } else {
+        auto read = [&](const std::filesystem::path& directory, uint32_t channels, const char* what,
+                        std::vector<float>& values) {
+            const std::filesystem::path path = guide_files::FramePath(directory, sourceFrameNumber);
+            std::string why;
+            const std::optional<guide_files::Plane> plane = guide_files::ReadPfmFile(path, &why);
+            if (!plane)
+                return Refuse(std::string(what) + " guide for source frame " +
+                              std::to_string(sourceFrameNumber) + ": " + why);
+            if (plane->channels != channels)
+                return Refuse(std::string(what) + " guide " + NarrowPath(path) + " has " +
+                              std::to_string(plane->channels) + " channels; a " +
+                              (channels == 1 ? "depth map is one (Pf)" : "motion field is three (PF)"));
+            // Any size, resampled onto the texture. The field a video host computes
+            // is the analysis grid - 160x90 for a 30 fps 1080p source - and this is
+            // the same area average the renderer's own expansion pass applies, so a
+            // file at the grid size blocks out exactly the way the estimator's own
+            // field does. At equal size it copies rather than averages.
+            values = guide_files::ResampleArea(*plane, width_, height_).values;
+            // The motion PFM's third channel is padding the texture does not have.
+            // Repacking here, rather than striding around it in the writer below,
+            // is what keeps every row after the first reading the pixels it belongs
+            // to: a uniform field hid the difference, because every value a
+            // mis-strided row reads is the same one.
+            if (channels == 3u) {
+                const size_t pixels = size_t(width_) * height_;
+                for (size_t pixel = 0; pixel < pixels; ++pixel) {
+                    values[pixel * 2u + 0u] = values[pixel * 3u + 0u];
+                    values[pixel * 2u + 1u] = values[pixel * 3u + 1u];
+                }
+                values.resize(pixels * 2u);
+            }
+            return true;
+        };
+        if (wantsMotion) {
+            if (!read(config_.motionGuideDirectory, 3, "motion", motionValues)) return false;
+            updated[updatedCount++] = {motion_.Get(), &motionFootprint_};
+        }
+        if (wantsDepth) {
+            if (!read(config_.depthGuideDirectory, 1, "depth", depthValues)) return false;
+            updated[updatedCount++] = {depth_.Get(), &depthFootprint_};
+        }
     }
 
     // Row by row rather than one memcpy, because the footprint's row pitch is
-    // the 256-byte-aligned one the copy needs and not the tight row.
+    // the 256-byte-aligned one the copy needs and not the tight row. A channel
+    // that was not written this frame has an empty vector behind it and is
+    // skipped, which is what leaves its constant in place.
     auto write = [&](const std::vector<float>& values,
                      const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, uint32_t channels) {
         for (uint32_t row = 0; row < height_; ++row) {
@@ -610,8 +658,8 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
                         static_cast<size_t>(width_) * channels, target);
         }
     };
-    if (writeMotion) write(motionValues, motionFootprint_, 2u);
-    if (writeDepth) write(depthValues, depthFootprint_, 1u);
+    if (!motionValues.empty()) write(motionValues, motionFootprint_, 2u);
+    if (!depthValues.empty()) write(depthValues, depthFootprint_, 1u);
 
     // Out of the read state, in with the copy, back into the read state - all in
     // this frame's producer list, which is what the runtime runs behind on the
@@ -796,10 +844,14 @@ void AmdLmxxfEvaluator::TearDown()
 }
 
 bool AmdLmxxfEvaluator::Initialize(HWND, uint32_t width, uint32_t height, uint32_t outputWidth,
-                                   uint32_t outputHeight, double, const GuideControls&)
+                                   uint32_t outputHeight, double, const GuideControls& guides)
 {
     lastFailure_ = NeuralRenderFailure::None;
     lastError_.clear();
+    // Which of the two guide channels a per-frame field may write. Pure CPU
+    // state, so it is taken on every entry, reuse or not: a job may switch a
+    // guide off without anything about the session moving.
+    controls_ = guides;
 
     if (width == 0 || height == 0) return Refuse("Initialize was handed a zero-sized frame");
     // The runtime is a 1:1 denoiser: job.private_output is the colour geometry.
@@ -1748,7 +1800,8 @@ void AmdLmxxfEvaluator::RefreshHistoryStatus()
 }
 
 bool AmdLmxxfEvaluator::SubmitFrameLease(const std::vector<uint8_t>& bgra, bool resetRequested,
-                                        uint64_t sourceFrameNumber, std::vector<uint8_t>& out)
+                                        uint64_t sourceFrameNumber, const GuideFrame* guides,
+                                        std::vector<uint8_t>& out)
 {
     amd_lmxxf::Session& session = *session_;
 
@@ -1828,7 +1881,7 @@ bool AmdLmxxfEvaluator::SubmitFrameLease(const std::vector<uint8_t>& bgra, bool 
     // that is missing or malformed stops the frame here, with nothing submitted
     // and so nothing to release: the session is still Idle and the next frame
     // resets both lists.
-    if (!UploadGuides(list_.Get(), sourceFrameNumber)) {
+    if (!UploadGuides(list_.Get(), sourceFrameNumber, guides)) {
         (void)list_->Close();
         (void)consumerList_->Close();
         return Fail(NeuralRenderFailure::Source, lastError_);
@@ -1840,13 +1893,13 @@ bool AmdLmxxfEvaluator::SubmitFrameLease(const std::vector<uint8_t>& bgra, bool 
                                  static_cast<uint32_t>(kColorState), list_.Get(), 1, frameId,
                                  frameId);
 
-    amd_lmxxf::TemporalGuides guides;
-    guides.motion = motion_.Get();
-    guides.depth = depth_.Get();
-    guides.motionState = static_cast<uint32_t>(kGuideState);
-    guides.depthState = static_cast<uint32_t>(kGuideState);
-    guides.motionWidth = width_;
-    guides.motionHeight = height_;
+    amd_lmxxf::TemporalGuides temporalGuides;
+    temporalGuides.motion = motion_.Get();
+    temporalGuides.depth = depth_.Get();
+    temporalGuides.motionState = static_cast<uint32_t>(kGuideState);
+    temporalGuides.depthState = static_cast<uint32_t>(kGuideState);
+    temporalGuides.motionWidth = width_;
+    temporalGuides.motionHeight = height_;
     // The stored vector is already a frame-pixel displacement, so the value that
     // maps it onto the frame is the frame's own width. The kernel divides by
     // motion_width, which leaves the scale at 1 and this quantity with nothing
@@ -1857,16 +1910,16 @@ bool AmdLmxxfEvaluator::SubmitFrameLease(const std::vector<uint8_t>& bgra, bool 
     // field file arrives at, ResampleArea turns it into frame pixels before this
     // pair ever sees it. A host that stored normalised vectors instead would pass
     // 1.0f here and nothing else in this function would change.
-    guides.motionScaleX = static_cast<float>(width_);
-    guides.motionScaleY = static_cast<float>(height_);
-    guides.jitterX = 0.0f;
-    guides.jitterY = 0.0f;
-    guides.flags = amd_lmxxf::kTemporalVideoFlags;
+    temporalGuides.motionScaleX = static_cast<float>(width_);
+    temporalGuides.motionScaleY = static_cast<float>(height_);
+    temporalGuides.jitterX = 0.0f;
+    temporalGuides.jitterY = 0.0f;
+    temporalGuides.flags = amd_lmxxf::kTemporalVideoFlags;
     // The renderer declares resets on the identity, and the runtime declares its
     // own on any break in the frame_id sequence or a gap over 500 ms. This is the
     // host's half of one decision, not the whole of it.
-    guides.reset = resetRequested;
-    amd_lmxxf::ApplyTemporalGuides(frameInfo, guides);
+    temporalGuides.reset = resetRequested;
+    amd_lmxxf::ApplyTemporalGuides(frameInfo, temporalGuides);
 
     if (!session.PrepareFrame(frameInfo)) {
         Report("PrepareFrame", session.LastStatus());
@@ -1993,12 +2046,13 @@ bool AmdLmxxfEvaluator::SubmitFrameLease(const std::vector<uint8_t>& bgra, bool 
 }
 
 bool AmdLmxxfEvaluator::SubmitFrame(const std::vector<uint8_t>& bgra, bool resetRequested,
-                                    uint64_t sourceFrameNumber, std::vector<uint8_t>& out)
+                                    uint64_t sourceFrameNumber, const GuideFrame* guides,
+                                    std::vector<uint8_t>& out)
 {
     // Two call orders, one per job model. The lease order is the only one the
     // temporal model runs under, so it is selected by the same flag that put the
     // session into that model rather than by anything about this frame.
-    if (leases_) return SubmitFrameLease(bgra, resetRequested, sourceFrameNumber, out);
+    if (leases_) return SubmitFrameLease(bgra, resetRequested, sourceFrameNumber, guides, out);
 
     amd_lmxxf::Session& session = *session_;
     const LmxxfNrApi& api = runtime_.Api();
@@ -2191,7 +2245,8 @@ bool AmdLmxxfEvaluator::Submit(const OfflineDecodedFrame& frame, const FrameIden
     // deliberately not used for that: a renderer that evaluates the same source
     // frame twice - a preroll, a retry, a repeat - has to be handed the same
     // guides both times, and a counter would drift away from the decoder.
-    if (!SubmitFrame(frame.bgra, id.reset != HistoryReset::None, id.frameNumber, produced))
+    if (!SubmitFrame(frame.bgra, id.reset != HistoryReset::None, id.frameNumber, frame.guides,
+                     produced))
         return false;
     lastSubmitMs_ =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();

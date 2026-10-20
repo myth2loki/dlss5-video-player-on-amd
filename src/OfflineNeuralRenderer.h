@@ -277,6 +277,14 @@ struct OfflineDecodedFrame {
     bool discontinuity{};
     uint64_t frameNumber{};
     uint32_t sourceGeneration{};
+    // This frame's temporal guide field, when the evaluator's backend computed
+    // one: the analysis grid the estimator produced, in the layout
+    // TemporalGuides.h defines. Null on the backends that compute no field -
+    // the AMD evaluator then reads its configured guide directories, and an
+    // evaluator with neither keeps the constants it was created with. The
+    // pointer is borrowed: it is only read inside the Submit call it travels
+    // with, which is what lets the caller keep the frame on its stack.
+    const GuideFrame* guides{};
 };
 
 // Output of one evaluator submission. `id` is the identity the evaluator

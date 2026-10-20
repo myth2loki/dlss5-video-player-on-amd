@@ -89,13 +89,21 @@ struct AmdLmxxfEvaluatorConfig {
     // recording-lease lifecycle, so this changes the create flags AND the
     // per-frame call order - it is not a switch on the frame info alone.
     //
-    // The guides it supplies are CONSTANT, because the source it is written for
-    // is synthetic and its motion is analytically known: a still scene has zero
-    // motion, and a pan has a fixed per-frame displacement. That is the point of
-    // measuring here first - it asks what the temporal model does when it is
-    // told the truth, with no estimator in the loop at all. A real video host
-    // has to compute both guides, and section 5.3 says why that is the
-    // expensive half.
+    // The guides it supplies were CONSTANT when this was written, because the
+    // source it was written for is synthetic and its motion is analytically
+    // known: a still scene has zero motion, and a pan has a fixed per-frame
+    // displacement. That is the point of measuring here first - it asks what
+    // the temporal model does when it is told the truth, with no estimator in
+    // the loop at all. A real video host has to compute both guides, and
+    // section 5.3 says why that is the expensive half.
+    //
+    // The player now computes them: the offline renderer's AMD adapter runs the
+    // same TemporalGuideGenerator the NVIDIA path runs (the CPU block matcher,
+    // because the hardware flow engine is NVIDIA's and never comes up on an AMD
+    // card) and hands each frame's field to Submit, where it takes precedence
+    // over these constants. The constants remain what a caller that supplies no
+    // field gets, which is the smoke test's synthetic sources and a job whose
+    // guide controls are both off.
     bool temporalHistory{false};
     // Motion in frame pixels per frame, (x, y), current frame <- previous. The
     // motion texture carries this one value everywhere. Zero is a still scene.
@@ -112,6 +120,12 @@ struct AmdLmxxfEvaluatorConfig {
     // of frame-pixel displacement, depth as one channel in [0,1]. Empty means
     // the two constants above and nothing else, so the two sources compose - a
     // caller may drive motion from files and leave depth constant.
+    //
+    // A field the caller computed itself (Submit's `guides`) takes precedence
+    // over these directories, and the offline renderer's AMD adapter now always
+    // supplies one - so on the player's own path these are the smoke test's
+    // input, not the product's. They stay because the smoke test constructs
+    // this evaluator directly, with no adapter to run an estimator for it.
     //
     // This is the half a synthetic source cannot answer. With files the host is
     // fed the motion and depth a real clip actually has, so the measurement run 5
@@ -231,11 +245,13 @@ public:
     // temporal model was engaged and reported off" apart from "the lease path
     // never ran" - two things whose logs look identical otherwise.
     uint64_t TemporalFrames() const noexcept { return temporalFrames_; }
-    // How many frames had their guides read from files rather than from the two
-    // constants. Non-zero only when a guide directory was configured, and the
-    // number a run has to check to know it measured the file path: a config that
-    // silently lost its directory would otherwise produce a healthy-looking run
-    // of the constant path.
+    // Frames whose guides came from a per-frame field - the estimator the
+    // player runs for this backend, a benchmark's files applied over it, or a
+    // configured directory read directly - rather than from the two constants.
+    // Non-zero only when one of those was configured, and the number a run has
+    // to check to know it measured the field path: a config that silently lost
+    // its source would otherwise produce a healthy-looking run of the constant
+    // path.
     uint64_t GuideFrames() const noexcept { return guideFrames_; }
     // How many frames the host-side temporal accumulation ran on. Zero when
     // config_.stability is Off, and the number a run has to check to know the
@@ -270,13 +286,16 @@ private:
     bool Refuse(std::string detail);
 
     // One frame in the default call order. Answers false with lastFailure_ set.
+    // `guides` is this frame's field, or null when none was computed.
     bool SubmitFrame(const std::vector<uint8_t>& bgra, bool resetRequested,
-                     uint64_t sourceFrameNumber, std::vector<uint8_t>& out);
+                     uint64_t sourceFrameNumber, const GuideFrame* guides,
+                     std::vector<uint8_t>& out);
     // One frame in the lease order, which is the only one the temporal model
     // runs under. The two differ in where RecordOutputs and the first
     // submission sit; see the class comment in AmdLmxxfSession.h.
     bool SubmitFrameLease(const std::vector<uint8_t>& bgra, bool resetRequested,
-                          uint64_t sourceFrameNumber, std::vector<uint8_t>& out);
+                          uint64_t sourceFrameNumber, const GuideFrame* guides,
+                          std::vector<uint8_t>& out);
     // `sourceSlot` is which of the two source textures the temporal
     // accumulation's trust test should find this frame in, or -1 when it is not
     // running and the copy is skipped. It is the same slot the frame's output
@@ -289,10 +308,16 @@ private:
     // ever change. This fills the two constants; UploadGuides replaces them per
     // frame when a guide directory was configured.
     bool CreateGuideTextures();
-    // Rewrites the guide textures from the files for `sourceFrameNumber` and
-    // records the copy into `list`. A no-op that answers true when neither
-    // directory is set. Fails the frame on a missing or malformed file.
-    bool UploadGuides(ID3D12GraphicsCommandList* list, uint64_t sourceFrameNumber);
+    // Rewrites the guide textures for this frame and records the copy into
+    // `list`. Three sources, in precedence order: `guides` when the caller
+    // computed a field (the player's estimator, or a benchmark's files already
+    // applied over it), the configured directories, and the constants
+    // CreateGuideTextures filled. A no-op that answers true when there is
+    // neither a field nor a directory. A missing or malformed file fails the
+    // frame; which of the two channels is written answers to `controls_`, so a
+    // guide the job switched off keeps its constant rather than a zero.
+    bool UploadGuides(ID3D12GraphicsCommandList* list, uint64_t sourceFrameNumber,
+                      const GuideFrame* guides);
     bool CopyProducedToReadback(ID3D12GraphicsCommandList* list);
     // ---- temporal accumulation (TemporalStabilityPolicy.h) ----------------
     //
@@ -479,6 +504,13 @@ private:
     // the token is only ever printed into a status string.
     uint64_t temporalFrames_{};
     std::string lastHistoryStatus_;
-    // Frames whose guides came from files. See GuideFrames().
+    // Frames whose guides came from a per-frame field. See GuideFrames().
     uint64_t guideFrames_{};
+    // The per-guide switches this session was brought up under, from the same
+    // GuideControls the NVIDIA path takes. They decide which of the two guide
+    // channels a per-frame field is allowed to write: a guide the job switched
+    // off keeps the constant CreateGuideTextures filled, which is the neutral
+    // value GuideControls promises (zero motion, flat depth), not a zero the
+    // field happens to carry.
+    GuideControls controls_{};
 };

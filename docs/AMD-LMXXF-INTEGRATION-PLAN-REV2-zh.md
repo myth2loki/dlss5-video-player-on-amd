@@ -511,6 +511,46 @@ Queue:
 > `TemporalGuides` 两个头声明的，本次没有独立验证 runtime 重投影的符号；
 > 以及**真实运动场**（而不是常量场）在真实内容上的读数还没有取到。
 >
+> **实施记录（第四次）：估计器已接入，上面那条"不足以支持先写一个块匹配器"的
+> 判断被一个新的成本事实改写，而不是被推翻。**
+>
+> 改写成本的不是新测量，而是发现这个播放器**已经有一个**块匹配器：
+> `TemporalGuideGenerator`（CPU，NVOFA 在 AMD 卡上必然起不来，所以它就是
+> CPU 路径）一直为 NVIDIA 路径每帧跑着，1080p 实测 0.84 ms/帧。所以"先写一个
+> CPU 块匹配器"这件事不存在——存在的是把现成的这一个接到 AMD 后端上，边际
+> 成本是每帧 0.84 ms，对面是每帧数百 ms 的神经渲染。原先的判断（"收益上界
+> 7.8%，不值得为它专门写估计器"）在新的成本下不再适用，但**收益上界本身
+> 没有变**：时域模型能贡献的量仍由模型自己的 logit 钉住，本节上面的测量
+> 一条都没有被这次实施推翻。
+>
+> 落地形态（`OfflineNeuralRenderer` 的 AMD 适配器 + `AmdLmxxfEvaluator`）：
+>
+> - 适配器持有一个 `TemporalGuideGenerator`，与生产适配器同一种调用
+>   （`Generate` → 可选的 `guide_files::Apply` → 网格随 `Submit` 进求值器）；
+>   估计器看到的切会 OR 进提交身份的 reset，`ResetTemporal` 一并重置它的历史。
+>   重复帧是幂等的（`IsRepeat` 不推进历史），所以 RunJob 的重试路径安全。
+> - 求值器的 `UploadGuides` 新增内存来源：网格按通道拆 plane、
+>   `ResampleArea` 重采样到帧尺寸，走与文件路径**同一张**常驻上传缓冲和同一组
+>   barrier；优先级为 内存场 > 配置目录 > 常量。控件（`mv=`/`depth=`）决定写
+>   哪个通道，关掉的那路保留常量——即 `GuideControls` 承诺的中性值。
+> - `temporalHistory`（= lease 生命周期）从此由"作业要 guides" engage：
+>   `mv=1,depth=1` 是默认，所以默认 AMD 导出跑 lease + 估计器场；
+>   `mv=0,depth=0` 精确保持旧路径（无估计器、无 lease、常量）。
+> - `DLSS5_AMD_GUIDES=0` 是 A/B 臂：免重编切回常量场。benchmark 的文件臂与
+>   dump 臂照旧（文件经 `guide_files::Apply` 覆盖估计器场，dump 写渲染时用的
+>   那张场），`mv=cpu` 的拒绝随之解除——本卡的估计器就是 CPU 匹配器。
+> - 缓存：`kRenderCacheRevision` 0.27.2 → 0.28.3。同一个规范字符串
+>   `mv=1,depth=1` 在 AMD 后端上的含义变了，旧条目必须退休。
+>
+> **接下来要量的（本节留下的那一项）**：真实运动场在真实内容上的读数——
+> `DLSS5_AMD_GUIDES=1` 与 `=0` 在同一段真实视频上各跑一遍 run 7 的度量
+> （两个噪声种子相减）。这次实施让那个测量可以在产品路径上做，而不必先 dump
+> 成 PFM 再喂文件臂。若读数落在噪声内，默认值翻回关只是一行加一次 revision。
+>
+> 顺带修掉的一个潜在 bug：文件路径的 motion PFM 是三通道（第三个是 padding），
+> 而写入按两通道步长走——均匀场掩盖了它（每行读到的都是同一个值），非均匀场
+> 从第 2 行起会串列。现在读入后重排成两通道。
+>
 > 代码现状补充：run 7 用到的两个路径来自编译期定义
 > `DLSS5_FFMPEG_PATH` / `DLSS5_REAL_CLIP_PATH`（见 `tests/HardwareTests.cmake`），
 > 两者任一缺失时 run 7 自己跳过而不是失败——所以一个没有 staged ffmpeg 的

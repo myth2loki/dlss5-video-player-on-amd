@@ -33,10 +33,12 @@ enum class NeuralCacheState {
 // when one does: a change to what the capture, the encode, the guides, the model
 // input or a source copy produce, and that change's commit sets it to the
 // release that ships it. The other terms (runtime, driver, model store, settings,
-// pipeline) still retire what they always did. 0.27.2 is the last release whose
-// output changed; 0.28.2 reads 0.27.2's renders. A value past the player's own
-// version is refused by PolicyTests.
-inline constexpr std::string_view kRenderCacheRevision = "0.27.2";
+// pipeline) still retire what they always did. 0.27.2 was the last release whose
+// output changed before the AMD backend's guides reached its estimator, which
+// changed what "mv=1,depth=1" produces on that backend - the same canonical
+// string, a different picture - so 0.28.3 reads its own renders and not 0.27.2's.
+// A value past the player's own version is refused by PolicyTests.
+inline constexpr std::string_view kRenderCacheRevision = "0.28.3";
 
 struct NeuralCacheIdentity {
     std::string sourceDigest;

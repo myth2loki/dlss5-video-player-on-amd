@@ -2936,13 +2936,18 @@ void debug_view_popup_contains_all_existing_views_and_selection_test()
 {
     const HMENU menu = app_menu::CreateDebugViewMenu(app_menu::IDM_VIEW_DEPTH);
     CHECK(menu != nullptr);
-    CHECK_EQ(4, menu ? GetMenuItemCount(menu) : 0);
+    // One entry per view, and the fifth is the island's generated frame: a view
+    // of its own because the two halves of a doubled cadence are different
+    // pictures - that is what makes a bad generated frame visible rather than
+    // merely felt as a flicker.
+    CHECK_EQ(5, menu ? GetMenuItemCount(menu) : 0);
     std::vector<MenuEntry> entries;
     if (menu) collect_menu_entries(menu, entries);
     CHECK(has_menu_entry(entries, L"Final image\t1", app_menu::IDM_VIEW_FINAL));
     CHECK(has_menu_entry(entries, L"DLSS input\t2", app_menu::IDM_VIEW_INPUT));
     CHECK(has_menu_entry(entries, L"Motion vectors\t3", app_menu::IDM_VIEW_MV));
     CHECK(has_menu_entry(entries, L"Depth\t4", app_menu::IDM_VIEW_DEPTH));
+    CHECK(has_menu_entry(entries, L"Generated frame\t5", app_menu::IDM_VIEW_FRAME_GENERATED));
     for (const auto& entry : entries) {
         if (entry.command == app_menu::IDM_VIEW_DEPTH) CHECK((entry.state & MFS_CHECKED) != 0);
         else CHECK((entry.state & MFS_CHECKED) == 0);
