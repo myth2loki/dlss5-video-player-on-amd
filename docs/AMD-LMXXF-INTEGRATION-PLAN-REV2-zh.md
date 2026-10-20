@@ -542,10 +542,29 @@ Queue:
 > - 缓存：`kRenderCacheRevision` 0.27.2 → 0.28.3。同一个规范字符串
 >   `mv=1,depth=1` 在 AMD 后端上的含义变了，旧条目必须退休。
 >
-> **接下来要量的（本节留下的那一项）**：真实运动场在真实内容上的读数——
-> `DLSS5_AMD_GUIDES=1` 与 `=0` 在同一段真实视频上各跑一遍 run 7 的度量
-> （两个噪声种子相减）。这次实施让那个测量可以在产品路径上做，而不必先 dump
-> 成 PFM 再喂文件臂。若读数落在噪声内，默认值翻回关只是一行加一次 revision。
+> **首次产品路径验证（2026-10-20，RX 9070 XT，720p 实拍素材 1 s / 24 帧）**：
+>
+> - 默认臂日志：`guides=motion:estimator depth:estimator`、
+>   `temporal=on, estimator guides under the recording-lease lifecycle`，
+>   作业尾 `history=active lease-frames=24 guide-frames=24`——每帧都走了
+>   lease 且都带了场；估计器自报 0.93 ms/帧（720p），与 1080p 的 0.84 ms 同量级。
+> - `DLSS5_AMD_GUIDES=0` 臂日志：`guides=motion:constant depth:constant`、
+>   `temporal=off`、`history=not-asked(no lease frame ran) lease-frames=0`——
+>   旧路径逐字复现，kill-switch 成立。
+> - 两臂输出不是同一张图：PSNR y 43.3 dB / SSIM y 0.989（24 帧全段）。差异
+>   存在但不大，正符合"场确实被网络读到了、而时域模型的收益本来就被模型自身
+>   logit 钉住"这一预期——它排除的是"上传了但没人读"。
+> - 部署陷阱（排查时踩到）：神经渲染跑在 `<player 目录>/neural-runtime/NeuralWorker.exe`
+>   里，CMake 把新产物写到 `build-ninja/Release/neural-runtime/`，**不是**那个
+>   被播放器调用的路径。换了播放器却忘了拷 worker，日志里会出现旧文案
+>   （"this backend has no guide estimator"）却发现不了——验证前先比 worker 的
+>   时间戳。
+>
+> **接下来要量的（本节留下的那一项）**：上面那条 A/B 只回答了"场被读到"，
+> 没有回答"画质是否更好"。要的是真实运动场在真实内容上跑 run 7 的度量
+> （两个噪声种子相减），而且要在多个 rung（off/low/medium/high）上看，因为
+> `accumulation=low` 是 AMD 的默认，时域收益对 rung 敏感。若读数落在噪声内，
+> 默认值翻回关只是一行加一次 revision。
 >
 > 顺带修掉的一个潜在 bug：文件路径的 motion PFM 是三通道（第三个是 padding），
 > 而写入按两通道步长走——均匀场掩盖了它（每行读到的都是同一个值），非均匀场
