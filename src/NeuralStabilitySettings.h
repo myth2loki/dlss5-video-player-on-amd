@@ -61,6 +61,7 @@ inline constexpr uint32_t PassesSettingsDefault(NeuralBackend backend) noexcept
 }
 
 inline std::string AmdNeuralSettingsDocument(TemporalStability accumulation, uint32_t passes = 1,
+                                             bool smallModel = false,
                                              bool skinProtect = false, bool multiPassPredict = true,
                                              bool laterPassSkip = false, uint32_t style = 1)
 {
@@ -70,7 +71,14 @@ inline std::string AmdNeuralSettingsDocument(TemporalStability accumulation, uin
                            "depth=constant(1)\n";
     if (accumulation != TemporalStability::Off)
         document += "accumulation=" + std::string(TemporalStabilityName(accumulation)) + "\n";
-    if (passes != 1)
+    // The model first, because it is the wider question: Small (0.5) and
+    // Original (1..3) are differently trained networks behind the one key, so
+    // the two never share a count line. Small is single-pass by construction -
+    // the runtime's ladder is 0.5/1/2/3 - so a Small document carries no count
+    // and none of the stacking switches below can fire.
+    if (smallModel)
+        document += "model=small\n";
+    else if (passes != 1)
         document += "passes=" + std::to_string(passes) + "\n";
     // The style, off its default 1 - the runtime's own built-in answer and the
     // picture this backend keyed before the switch existed. Unlike the pass
@@ -83,18 +91,18 @@ inline std::string AmdNeuralSettingsDocument(TemporalStability accumulation, uin
     // passes exist, so at one pass this switch renders exactly what an off
     // switch renders, and a key term that claims otherwise would retire
     // coverage for a picture this backend would render the same either way.
-    if (skinProtect && passes > 1)
+    if (!smallModel && skinProtect && passes > 1)
         document += "skin-protect=1\n";
     // The prediction is a three-pass question: at any other count the runtime
     // never asks, so the key says nothing there whatever the switch says. At
     // three, the OFF spelling is the one written - on is the runtime's default
     // and the picture this backend keyed before the switch existed.
-    if (passes == 3 && !multiPassPredict)
+    if (!smallModel && passes == 3 && !multiPassPredict)
         document += "mp-predict=0\n";
     // Same rule as the prediction: a later-pass question, so the key says nothing
     // at one pass, and the ON spelling is the term because off is the built-in
     // default this backend keyed before the switch existed.
-    if (passes > 1 && laterPassSkip)
+    if (!smallModel && passes > 1 && laterPassSkip)
         document += "mp-skip=1\n";
     return document;
 }
@@ -153,10 +161,15 @@ inline std::string CanonicalNeuralSettingsForBackend(NeuralBackend backend,
                                                      bool amdSkinProtect = false,
                                                      bool amdMultiPassPredict = true,
                                                      bool amdMultiPassSkip = false,
-                                                     uint32_t amdStyle = 1)
+                                                     uint32_t amdStyle = 1,
+                                                     bool amdSmallModel = false)
 {
     if (backend == NeuralBackend::Amd) {
-        const uint32_t passes = std::clamp(settings.passes, 1, 4);
+        // Small is single-pass by construction and a different network from
+        // Original-at-one, so the count is forced to 1 beside it and the model
+        // is its own term: without it the two would share a key and one arm's
+        // frames would be served to the other.
+        const uint32_t passes = amdSmallModel ? 1u : std::clamp(settings.passes, 1, 3);
         // The skin switch lives beside the count in the player's own state
         // rather than in NeuralSettings - it is the runtime's, not the add-on's
         // - so it arrives as its own argument, and it counts only above one pass,
@@ -165,9 +178,10 @@ inline std::string CanonicalNeuralSettingsForBackend(NeuralBackend backend,
         // same road for the same reason: DLSS5_STYLE is the runtime's key, not
         // the add-on's NRStyle that NeuralSettings carries.
         std::string term = "passes=" + std::to_string(passes);
-        if (amdSkinProtect && passes > 1) term += " skin-protect=1";
-        if (passes == 3 && !amdMultiPassPredict) term += " mp-predict=0";
-        if (passes > 1 && amdMultiPassSkip) term += " mp-skip=1";
+        if (amdSmallModel) term += " model=small";
+        if (!amdSmallModel && amdSkinProtect && passes > 1) term += " skin-protect=1";
+        if (!amdSmallModel && passes == 3 && !amdMultiPassPredict) term += " mp-predict=0";
+        if (!amdSmallModel && passes > 1 && amdMultiPassSkip) term += " mp-skip=1";
         if (amdStyle != 1) term += " style=" + std::to_string(amdStyle);
         return term;
     }

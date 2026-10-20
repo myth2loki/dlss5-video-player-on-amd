@@ -62,6 +62,13 @@ struct Command {
     // local tone and local structure 0..2 and colour strength 0..1. Empty
     // leaves the value the preset or the saved settings give.
     std::optional<int> passes;
+    // The 0.44 Small model (31 blocks at 0.5x) instead of the Original 71-block
+    // one: the other spelling of the AMD runtime's one DLSS5_MULTI_PASS key,
+    // and AMD's own switch - the NVIDIA add-on has no such model. Single-pass
+    // by construction, so it forces the count to one. The parse leaves it
+    // false and the render path refuses it for a plan that is not the AMD
+    // backend's nr stage, the same way --processing-scale is judged late.
+    bool smallModel{};
     // The CAS strength on an upscaled capture (AmdUpscaleShader.h). Empty uses
     // the evaluator's default.
     std::optional<float> upscaleSharpness;
@@ -207,7 +214,7 @@ inline Parsed Parse(std::span<const std::wstring> userArguments)
          seenScale = false, seenPasses = false, seenIntensity = false, seenTone = false,
          seenSharpness = false,
          seenStructure = false, seenColor = false, seenEncode = false, seenHistory = false, seenEngine = false,
-         seenStyle = false, seenBackend = false, seenStability = false;
+         seenStyle = false, seenBackend = false, seenStability = false, seenSmallModel = false;
     std::wstring_view presetName;
     // What the dialog opens with: the neural pass alone.
     command.selection = ExportSelection{};
@@ -222,6 +229,14 @@ inline Parsed Parse(std::span<const std::wstring> userArguments)
         }
         if (argument == L"--safe-mode") {
             command.safeMode = true;
+            continue;
+        }
+        // A flag, not a value option, so it is answered here rather than by
+        // the takes-value table below: it names a model, and the model is the
+        // switch.
+        if (argument == L"--small-model") {
+            if (seenSmallModel) return bad(L"--small-model was given twice.");
+            seenSmallModel = command.smallModel = true;
             continue;
         }
         const auto once = [&](bool& seen) {
@@ -404,8 +419,8 @@ inline Parsed Parse(std::span<const std::wstring> userArguments)
     if (seenScale && (!selection.neural || selection.upscale))
         return bad(L"--processing-scale needs the nr stage without sr.");
     if (seenMultiplier && !selection.frameGeneration) return bad(L"--multiplier needs the fg stage.");
-    if ((seenPasses || seenIntensity || seenTone || seenStructure || seenColor || seenStyle) && !selection.neural)
-        return bad(L"--passes, --style, --intensity, --local-tone, --local-structure and --color-strength need the nr stage.");
+    if ((seenPasses || seenIntensity || seenTone || seenStructure || seenColor || seenStyle || seenSmallModel) && !selection.neural)
+        return bad(L"--passes, --small-model, --style, --intensity, --local-tone, --local-structure and --color-strength need the nr stage.");
     // The model keeps its own history on the carrier it runs on, so History is
     // Super Resolution's choice only when the model does not run (the dialog
     // greys it out the same way).
@@ -468,6 +483,11 @@ inline std::wstring Usage()
         L"  --passes N         Neural passes for nr, 1 to 4, stacked by the add-on; each\n"
         L"                     costs one more model evaluation per frame. Default: the\n"
         L"                     preset's or the saved setting.\n"
+        L"  --small-model      nr on the AMD runtime runs its 0.44 Small model (31 blocks\n"
+        L"                     at 0.5x) instead of the Original 71-block one - the\n"
+        L"                     runtime's own first rung, a differently trained network\n"
+        L"                     with different output. Single-pass by construction, so it\n"
+        L"                     forces --passes to 1. Needs --neural-backend amd.\n"
         L"  --upscale-sharpness X  The sharpening on an upscaled sr capture, 0 to 1; 0 is\n"
         L"                     the stretch alone. Default: 0.6.\n"
         L"  --style S          Neural style for nr: default, natural (the strongest\n"

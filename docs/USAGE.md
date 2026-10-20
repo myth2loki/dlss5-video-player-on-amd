@@ -379,6 +379,18 @@ measures. Measured over a 72-frame range: two passes took 9.81 s against 8.01 s
 and wrote 932,019 bytes against 780,048. **Keep temporal history per pass** sits
 beside it and greys out at a single pass, where it has nothing to govern.
 
+On the AMD backend the same combo's first rung is a different model rather than
+a count: **Small · 0.5× (31 blocks)**, the 0.44 runtime's own first rung, a
+differently trained network whose output changes (measured 5.554 ms/frame at the
+1080 tier against 6.559 for the Original). Above it, 1, 2 and 3 stack the
+Original 71-block model. Four is not offered there - the runtime reads an unknown
+count as 0.5, which would silently hand the Small model to someone who asked for
+four passes. Small is single-pass by construction, so picking it forces the
+count to one and greys out the stacking switches beside it; the model and the
+count are the two spellings of the one `DLSS5_MULTI_PASS` key, and the render
+identity carries `model=small` so a Small render is never served for an Original
+one.
+
 **DLSS > Processing scale** sets the resolution the model runs at. **Source,
 100%** is the default and the recommended rung: the model sees the decoded
 frame. **75%** and **50%** show the model an area-reduced picture and let DLSS
@@ -1047,6 +1059,14 @@ What to render, as the dialog's ticks and settings choose it:
   and applies over `--preset`; one not given keeps the preset's or the saved
   value. For example, three stacked passes of the strong look:
   `dlss5-convert clip.mp4 --preset strong --passes 3`.
+- `--small-model` is a flag, not a value: it runs the AMD runtime's 0.44 Small
+  model (31 blocks at 0.5x, the runtime's own first rung, a differently trained
+  network) instead of the Original 71-block one. Single-pass by construction, so
+  it forces `--passes` to 1 whatever that said, the same way the panel's first
+  rung does. Needs `--neural-backend amd` - the NVIDIA backend has no such
+  model, and asking for it there is refused rather than ignored. For example, a
+  fast Small pass of the strong look: `dlss5-convert clip.mp4
+  --neural-backend amd --preset strong --small-model`.
 - `--processing-scale` is `100`, `75` or `50`, the rungs of **DLSS >
   Processing scale**, for `nr` without `sr`. Without it, the saved rung.
 - `--encode` is the **Encoder settings** quality ladder: `standard` (8-bit

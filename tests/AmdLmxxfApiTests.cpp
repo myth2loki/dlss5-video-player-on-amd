@@ -495,9 +495,10 @@ void amd_accumulation_rung_is_on_by_default_and_off_keeps_the_old_key_test()
     // The experimental pass count keys the same way and for the same reason:
     // the default 1 writes nothing, so every render before the experiment keys
     // as it keyed, and each non-default count is its own line because N passes
-    // is N runs of the model and must never serve another count's entry.
+    // is N runs of the model and must never serve another count's entry. The
+    // AMD ladder tops at 3 - 4 is not a count this runtime takes.
     CHECK_EQ(before, AmdNeuralSettingsDocument(TemporalStability::Off, 1));
-    for (const uint32_t passes : {2u, 3u, 4u}) {
+    for (const uint32_t passes : {2u, 3u}) {
         const std::string document = AmdNeuralSettingsDocument(TemporalStability::Off, passes);
         const std::string line = "passes=" + std::to_string(passes) + "\n";
         CHECK_EQ(before.size() + line.size(), document.size());
@@ -509,24 +510,50 @@ void amd_accumulation_rung_is_on_by_default_and_off_keeps_the_old_key_test()
         CHECK(both.find(line) != std::string::npos);
     }
 
+    // The Small model is the wider question and is written first, as its own
+    // line rather than as a count: 0.5 and 1..3 are two differently trained
+    // networks behind the one DLSS5_MULTI_PASS key, so the two never share a
+    // count line. Single-pass by construction, so a Small document carries no
+    // count whatever the caller says and none of the stacking switches can
+    // fire beside it - but the style still composes, because it is the
+    // runtime's own key like the rest.
+    CHECK_EQ(before + "model=small\n", AmdNeuralSettingsDocument(TemporalStability::Off, 1, true));
+    CHECK_EQ(before + "model=small\n", AmdNeuralSettingsDocument(TemporalStability::Off, 3, true));
+    CHECK_EQ(before + "model=small\n", AmdNeuralSettingsDocument(TemporalStability::Off, 4, true));
+    CHECK_EQ(before + "model=small\n",
+             AmdNeuralSettingsDocument(TemporalStability::Off, 3, true, true, false, true));
+    const std::string smallBoth =
+        AmdNeuralSettingsDocument(TemporalStability::High, 1, true, false, true, false, 2);
+    CHECK(smallBoth.find("accumulation=high\n") != std::string::npos);
+    CHECK(smallBoth.find("model=small\n") != std::string::npos);
+    CHECK(smallBoth.find("style=2\n") != std::string::npos);
+    CHECK(smallBoth.find("passes=") == std::string::npos);
+    CHECK(smallBoth.find("skin-protect") == std::string::npos);
+    CHECK(smallBoth.find("mp-predict") == std::string::npos);
+    CHECK(smallBoth.find("mp-skip") == std::string::npos);
+    // And a Small document is never the document of an Original pass, whatever
+    // the count beside it: one key for both would serve one network's frames
+    // to the other's caller.
+    CHECK(AmdNeuralSettingsDocument(TemporalStability::Off, 1, true) !=
+          AmdNeuralSettingsDocument(TemporalStability::Off, 1));
+
     // The style keys the same way and for the same reason: its default 1 writes
     // nothing - that is the runtime's built-in answer and what every render
     // before the menu existed produced - and 0 and 2 are each their own line,
     // because they are different pictures at the same cost.
-    CHECK_EQ(before, AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, true, false, 1));
+    CHECK_EQ(before, AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, false, true, false, 1));
     for (const uint32_t style : {0u, 2u}) {
         const std::string document =
-            AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, true, false, style);
+            AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, false, true, false, style);
         const std::string line = "style=" + std::to_string(style) + "\n";
         CHECK_EQ(before.size() + line.size(), document.size());
         CHECK(document.compare(before.size(), line.size(), line) == 0);
         // Composes with the count rather than replacing it.
         const std::string stacked =
-            AmdNeuralSettingsDocument(TemporalStability::Off, 3, false, true, false, style);
+            AmdNeuralSettingsDocument(TemporalStability::Off, 3, false, false, true, false, style);
         CHECK(stacked.find("passes=3\n") != std::string::npos);
         CHECK(stacked.find(line) != std::string::npos);
-    }
-}
+    }}
 
 // Which key a rung is remembered under, and what a machine takes when its key
 // says nothing.
@@ -597,7 +624,16 @@ void amd_pass_count_reaches_the_runtime_through_its_own_config_file_test()
     CHECK(!amd_lmxxf::IsAmdStyleConfigLine("DLSS5_MULTI_PASS=2"));
     CHECK(!amd_lmxxf::IsAmdStyleConfigLine("#DLSS5_STYLE=0"));
     CHECK_EQ(std::string("DLSS5_MULTI_PASS=1"), amd_lmxxf::AmdPassesConfigLine(0));
-    CHECK_EQ(std::string("DLSS5_MULTI_PASS=4"), amd_lmxxf::AmdPassesConfigLine(9));
+    // The Original ladder tops at 3: 4 is not a count this runtime takes - it
+    // reads an unknown count as 0.5, which is the Small model, so the rung is
+    // clamped away rather than handed over as a silently different network.
+    CHECK_EQ(std::string("DLSS5_MULTI_PASS=3"), amd_lmxxf::AmdPassesConfigLine(9));
+    // The Small model is the other spelling of the one key, and it is spelled
+    // 0.5 whatever the count beside it says: the two are differently trained
+    // networks and never share a line.
+    CHECK_EQ(std::string("DLSS5_MULTI_PASS=0.5"), amd_lmxxf::AmdPassesConfigLine(1, true));
+    CHECK_EQ(std::string("DLSS5_MULTI_PASS=0.5"), amd_lmxxf::AmdPassesConfigLine(3, true));
+    CHECK_EQ(std::string("DLSS5_MULTI_PASS=0.5"), amd_lmxxf::AmdPassesConfigLine(9, true));
     // A value that is not exactly 0, 1 or 2 is normalised rather than handed
     // over: the runtime would read it as 1 anyway, and the file should say what
     // the render is.
@@ -607,13 +643,18 @@ void amd_pass_count_reaches_the_runtime_through_its_own_config_file_test()
     CHECK_EQ(std::string("DLSS5_STYLE=1"), amd_lmxxf::AmdStyleConfigLine(3));
 
     std::string error;
-    const auto write = [&](uint32_t passes, bool skin, bool predict, bool skip, uint32_t style) {
-        return amd_lmxxf::WriteAmdRuntimeConfig(root, passes, skin, predict, skip, style, error);
+    // The parameter is not called `small`: the Windows SDK's rpcndr.h
+    // #defines that word as char, and the lambda stopped compiling the day it
+    // was.
+    const auto write = [&](uint32_t passes, bool smallModel, bool skin, bool predict, bool skip,
+                           uint32_t style) {
+        return amd_lmxxf::WriteAmdRuntimeConfig(root, passes, smallModel, skin, predict, skip, style,
+                                                error);
     };
 
     // A file that does not exist yet: the folder is made and every key written,
     // the style included, at the runtime's own default (1).
-    CHECK(write(2, false, true, false, 1));
+    CHECK(write(2, false, false, true, false, 1));
     CHECK(fs::is_regular_file(file, ec) && !ec);
     CHECK(read() == "DLSS5_MULTI_PASS=2\n"
                     "DLSS5_MULTI_PASS_SKIN_PROTECT=0\n"
@@ -636,29 +677,59 @@ void amd_pass_count_reaches_the_runtime_through_its_own_config_file_test()
                "\n"
                "DLSS5_MULTI_PASS=3\n";
     }
-    CHECK(write(4, false, true, false, 0));
+    CHECK(write(4, false, false, true, false, 0));
     const std::string rewritten = read();
+    // 4 is clamped to the Original ladder's top rather than handed over: the
+    // runtime would read it as 0.5, the Small model, and the file has to say
+    // what the render is.
     CHECK(rewritten == "# hand written\n"
                        "DLSS5_MULTI_PASS_SKIN_PROTECT=0\n"
                        "DLSS5_STYLE=0\n"
                        "DLSS5_FAST_NUMERIC=1\n"
                        "\n"
-                       "DLSS5_MULTI_PASS=4\n"
+                       "DLSS5_MULTI_PASS=3\n"
                        "DLSS5_MULTI_PASS_PREDICT=1\n"
                        "DLSS5_MULTI_PASS_SKIP_BLOCKS=\n");
     CHECK(rewritten.find("DLSS5_MULTI_PASS=2") == std::string::npos);
-    CHECK(rewritten.find("DLSS5_MULTI_PASS=3") == std::string::npos);
+    CHECK(rewritten.find("DLSS5_MULTI_PASS=4") == std::string::npos);
 
     // Idempotent: writing the same settings again changes nothing, which is what
     // lets every job state them without churning the file.
-    CHECK(write(4, false, true, false, 0));
+    CHECK(write(3, false, false, true, false, 0));
     CHECK(read() == rewritten);
+
+    // The Small model is written as 0.5 in the same slot, whatever the count
+    // beside it says, and the stacking switches still take their own lines:
+    // they are the runtime's keys and a hand edit of them has to be
+    // overridable, even though beside Small they change nothing - the network
+    // is single-pass by construction.
+    CHECK(write(3, true, true, false, false, 0));
+    CHECK(read() == "# hand written\n"
+                   "DLSS5_MULTI_PASS_SKIN_PROTECT=1\n"
+                   "DLSS5_STYLE=0\n"
+                   "DLSS5_FAST_NUMERIC=1\n"
+                   "\n"
+                   "DLSS5_MULTI_PASS=0.5\n"
+                   "DLSS5_MULTI_PASS_PREDICT=0\n"
+                   "DLSS5_MULTI_PASS_SKIP_BLOCKS=\n");
+    // And back to the Original ladder, the count rewritten in place: the two
+    // models share the one key, so switching between them is a rewrite of that
+    // line and nothing else moves.
+    CHECK(write(2, false, false, true, false, 0));
+    CHECK(read() == "# hand written\n"
+                   "DLSS5_MULTI_PASS_SKIN_PROTECT=0\n"
+                   "DLSS5_STYLE=0\n"
+                   "DLSS5_FAST_NUMERIC=1\n"
+                   "\n"
+                   "DLSS5_MULTI_PASS=2\n"
+                   "DLSS5_MULTI_PASS_PREDICT=1\n"
+                   "DLSS5_MULTI_PASS_SKIP_BLOCKS=\n");
 
     // The skin switch is written whether or not it is on - a menu that has
     // released the switch has to be able to switch off one a hand edit turned
     // on, and the runtime reads its configuration only once per process. Its own
     // key survives as the menu's value, not as the value that was there.
-    CHECK(write(3, true, true, false, 0));
+    CHECK(write(3, false, true, true, false, 0));
     CHECK(read() == "# hand written\n"
                    "DLSS5_MULTI_PASS_SKIN_PROTECT=1\n"
                    "DLSS5_STYLE=0\n"
@@ -669,7 +740,7 @@ void amd_pass_count_reaches_the_runtime_through_its_own_config_file_test()
                    "DLSS5_MULTI_PASS_SKIP_BLOCKS=\n");
     // The prediction turns off a file that had it on - the same authority rule
     // the skin switch follows.
-    CHECK(write(3, true, false, false, 0));
+    CHECK(write(3, false, true, false, false, 0));
     CHECK(read() == "# hand written\n"
                    "DLSS5_MULTI_PASS_SKIN_PROTECT=1\n"
                    "DLSS5_STYLE=0\n"
@@ -678,7 +749,7 @@ void amd_pass_count_reaches_the_runtime_through_its_own_config_file_test()
                    "DLSS5_MULTI_PASS=3\n"
                    "DLSS5_MULTI_PASS_PREDICT=0\n"
                    "DLSS5_MULTI_PASS_SKIP_BLOCKS=\n");
-    CHECK(write(3, true, true, false, 0));
+    CHECK(write(3, false, true, true, false, 0));
     CHECK(read() == "# hand written\n"
                    "DLSS5_MULTI_PASS_SKIN_PROTECT=1\n"
                    "DLSS5_STYLE=0\n"
@@ -689,13 +760,13 @@ void amd_pass_count_reaches_the_runtime_through_its_own_config_file_test()
                    "DLSS5_MULTI_PASS_SKIP_BLOCKS=\n");
     // And the style alone moves the picture: the line is rewritten in place,
     // every other key stays exactly where it was.
-    CHECK(write(4, false, true, false, 2));
+    CHECK(write(3, false, false, true, false, 2));
     CHECK(read() == "# hand written\n"
                    "DLSS5_MULTI_PASS_SKIN_PROTECT=0\n"
                    "DLSS5_STYLE=2\n"
                    "DLSS5_FAST_NUMERIC=1\n"
                    "\n"
-                   "DLSS5_MULTI_PASS=4\n"
+                   "DLSS5_MULTI_PASS=3\n"
                    "DLSS5_MULTI_PASS_PREDICT=1\n"
                    "DLSS5_MULTI_PASS_SKIP_BLOCKS=\n");
     CHECK(!amd_lmxxf::IsAmdConfigLine("DLSS5_MULTI_PASS_SKIN_PROTECT=1", "DLSS5_MULTI_PASS"));

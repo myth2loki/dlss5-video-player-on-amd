@@ -306,6 +306,8 @@ inline std::wstring Usage()
         L"  --multiplier N         fg frames per source frame: 2 to 5. Default: 2.\n"
         L"  --preset NAME          nr look: standard, detail-only, gentle or strong.\n"
         L"  --passes N             nr passes, 1 to 4 (each one more model evaluation).\n"
+        L"  --small-model          nr on --neural-backend amd runs the runtime's 0.44 Small\n"
+        L"                         model (31 blocks at 0.5x) instead of the Original one.\n"
         L"  --upscale-sharpness X  sharpening on an upscaled sr capture, 0 to 1.\n"
         L"  --style S              nr style: default, natural or cinematic.\n"
         L"  --intensity X          nr intensity 0-1 (above 1 renders as 1); also\n"

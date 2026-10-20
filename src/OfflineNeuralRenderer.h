@@ -163,8 +163,19 @@ struct NeuralRenderRequest {
     // counts passes with. 1 is the single evaluation every job before the
     // control was wired ran, and a 1 in a request names the same render it
     // always did: the cache key carries the count only off the default.
-    // Clamped 1..4 by ValidRequest.
+    // Clamped 1..4 by ValidRequest - and 1..3 on the AMD backend, whose
+    // runtime's own ladder is 0.5/1/2/3.
     uint32_t amdPasses{1};
+    // The 0.44 Small model (31 blocks at 0.5x) instead of the Original 71-block
+    // one: the other spelling of the AMD runtime's one DLSS5_MULTI_PASS key the
+    // count above travels on, and AMD's own switch - the NVIDIA add-on has no
+    // such model, so the field is ignored there. A differently trained network
+    // with different output (0.44's own release notes carry
+    // bit_exact_vs_previous=false), so it is a key term like the count and a
+    // moved one rebuilds the network like the count does. Single-pass by
+    // construction: the runtime's ladder is 0.5/1/2/3, so ValidRequest holds
+    // this beside a count of exactly one.
+    bool amdSmallModel{false};
     // Whether the runtime's later passes keep skin-coloured pixels pinned to the
     // first pass (DLSS5_MULTI_PASS_SKIN_PROTECT). Off by default, and it changes
     // nothing at one pass - the runtime only blends it when the count is above

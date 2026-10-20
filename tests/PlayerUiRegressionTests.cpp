@@ -601,6 +601,66 @@ struct PlayerAppTestAccess {
         CheckNeuralSettingsDialog(app);
     }
 
+    // The AMD backend's first rung is the Small model rather than a pass count:
+    // the runtime's own F9 cycle, 0.5/1/2/3. The dialog is built once with the
+    // backend's own list, so this opens a second dialog under the AMD backend
+    // and holds the two spellings of the one DLSS5_MULTI_PASS key to each
+    // other: index 0 is the model and reads back as a single Original pass
+    // everywhere below - the stacking switches grey out at one pass - while
+    // 1/2/3 above it stack the Original 71-block network. Four is not offered
+    // there: the runtime reads an unknown count as 0.5, which would silently
+    // hand the Small model to someone who asked for four passes.
+    static void neural_settings_dialog_amd_ladder_test()
+    {
+        PlayerApp& app = fixture->app;
+        const NeuralBackend backend = app.m_opt.neuralBackend;
+        app.m_opt.neuralBackend = NeuralBackend::Amd;
+        app.m_neuralSettings = {}; app.m_renderGuides = {}; app.m_temporalSettings = {};
+        app.m_amdSmallModel = false; app.m_neuralSettings.passes = 3;
+        app.ShowNeuralSettings();
+        CHECK(app.m_neuralWnd != nullptr);
+        if (app.m_neuralWnd) {
+            const HWND dialog = app.m_neuralWnd;
+            CHECK_EQ(int(SendMessageW(GetDlgItem(dialog, IDC_NS_PASSES), CB_GETCOUNT, 0, 0)), 4);
+            // The saved count sits AT its index on this ladder, one above the
+            // NVIDIA one's: 3 passes is the third rung, not the second.
+            app.SyncNeuralSettingControls(dialog);
+            CHECK_EQ(int(SendMessageW(GetDlgItem(dialog, IDC_NS_PASSES), CB_GETCURSEL, 0, 0)), 3);
+            // The first rung is the model: it forces the count to one and the
+            // stacking switches render nothing beside it.
+            SendMessageW(GetDlgItem(dialog, IDC_NS_PASSES), CB_SETCURSEL, 0, 0);
+            app.NeuralWndProc(dialog, WM_COMMAND, MAKEWPARAM(IDC_NS_PASSES, CBN_SELCHANGE), 0);
+            CHECK(app.m_amdSmallModel);
+            CHECK_EQ(app.m_neuralSettings.passes, 1);
+            CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_NS_SKIN_PROTECT)) == FALSE);
+            CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_NS_MP_SKIP)) == FALSE);
+            CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_NS_CHAINED)) == FALSE);
+            // And back up the Original ladder, the model released: three passes
+            // is the top rung this runtime takes.
+            SendMessageW(GetDlgItem(dialog, IDC_NS_PASSES), CB_SETCURSEL, 3, 0);
+            app.NeuralWndProc(dialog, WM_COMMAND, MAKEWPARAM(IDC_NS_PASSES, CBN_SELCHANGE), 0);
+            CHECK(!app.m_amdSmallModel);
+            CHECK_EQ(app.m_neuralSettings.passes, 3);
+            CHECK(IsWindowEnabled(GetDlgItem(dialog, IDC_NS_SKIN_PROTECT)) != FALSE);
+            // Saved and read back, the model is its own value under the
+            // stacking switches' section - a machine that chose Small keeps
+            // rendering Small, and one that never touched it keeps the
+            // Original picture it always rendered.
+            SendMessageW(GetDlgItem(dialog, IDC_NS_PASSES), CB_SETCURSEL, 0, 0);
+            app.NeuralWndProc(dialog, WM_COMMAND, MAKEWPARAM(IDC_NS_PASSES, CBN_SELCHANGE), 0);
+            app.NeuralWndProc(dialog, WM_COMMAND, MAKEWPARAM(IDC_NS_APPLY, BN_CLICKED), 0);
+            CHECK_EQ(GetPrivateProfileIntW(L"AmdMultiPass", L"SmallModel", 0, app.SettingsPath().c_str()), 1u);
+            DestroyWindow(dialog);
+            // The key is removed again rather than left at 1: the cases after
+            // this one reload the settings, and a leftover model would follow
+            // them into backends that never offered it.
+            WritePrivateProfileStringW(L"AmdMultiPass", L"SmallModel", nullptr, app.SettingsPath().c_str());
+        }
+        app.m_opt.neuralBackend = backend;
+        app.m_neuralSettings = {}; app.m_amdSmallModel = false;
+        app.m_lastNeuralPreset = neural_presets::kPresetCount;
+    }
+
     static void neural_preset_strip_and_apply_state_test()
     {
         PlayerApp& app = fixture->app;
@@ -2891,6 +2951,7 @@ struct PlayerAppTestAccess {
         UI_CASE(neural_toggle_queued_during_seek_test),
         UI_CASE(export_stages_dialog_test),
         UI_CASE(neural_settings_dialog_test),
+        UI_CASE(neural_settings_dialog_amd_ladder_test),
         UI_CASE(neural_preset_strip_and_apply_state_test),
         UI_CASE(settings_ahead_notice_test),
         UI_CASE(render_report_test),
@@ -4195,14 +4256,8 @@ struct PlayerAppTestAccess {
         const auto tipHost = app.m_tipHosts.find(dialog);
         CHECK(tipHost != app.m_tipHosts.end());
         if (tipHost != app.m_tipHosts.end()) {
-            wchar_t text[512] = {};
-            TTTOOLINFOW info{};
-            info.cbSize = TTTOOLINFOW_V2_SIZE;
-            info.hwnd = dialog;
-            info.uId = reinterpret_cast<UINT_PTR>(track);
-            info.lpszText = text;
-            SendMessageW(tipHost->second, TTM_GETTEXTW, UINT_PTR{512}, reinterpret_cast<LPARAM>(&info));
-            CHECK(wcslen(text) > 20);
+            const std::wstring tip = ReadTip(app, dialog, tipHost->second, track, L"adjustments.neural_strength.tip");
+            CHECK(tip.size() > 20);
         }
         // One reset restores every adjustment, the dial included, without disturbing the
         // comparison mode it shares a struct with, and saves through the same path.
@@ -4498,18 +4553,30 @@ struct PlayerAppTestAccess {
         if (tipHost != app.m_tipHosts.end()) {
             const int tools = int(SendMessageW(tipHost->second, TTM_GETTOOLCOUNT, 0, 0));
             CHECK(tools >= 12);
-            for (const int id : {IDC_NS_INTENSITY, IDC_NS_STRUCTURE, IDC_NS_TONE, IDC_NS_SKIN,
-                                 IDC_NS_STYLE, IDC_NS_AUTOMASK, IDC_NS_GUIDE_MV, IDC_NS_GUIDE_DEPTH,
-                                 IDC_NS_PASSES, IDC_NS_CHAINED, IDC_NS_SCENE_CUTS, IDC_NS_STABILITY,
-                                 IDC_NS_APPLY, IDC_NS_RESET}) {
-                wchar_t text[512] = {};
-                TTTOOLINFOW info{};
-                info.cbSize = TTTOOLINFOW_V2_SIZE;
-                info.hwnd = dialog;
-                info.uId = reinterpret_cast<UINT_PTR>(GetDlgItem(dialog, id));
-                info.lpszText = text;
-                SendMessageW(tipHost->second, TTM_GETTEXTW, UINT_PTR{512}, reinterpret_cast<LPARAM>(&info));
-                CHECK(wcslen(text) > 20);
+            // One row per control, each with the key its tip was registered
+            // under - the dialog's own wiring, so a key that drifts from it
+            // fails the read below rather than quietly checking the wrong
+            // control's text. The stability row's key follows the backend the
+            // dialog was built for, as its rung names do.
+            const bool amdBackend = app.m_opt.neuralBackend == NeuralBackend::Amd;
+            for (const auto& [id, tipKey] : {
+                     std::pair<int, const wchar_t*>{IDC_NS_INTENSITY, L"neural.tip.intensity"},
+                     std::pair<int, const wchar_t*>{IDC_NS_STRUCTURE, L"neural.tip.structure"},
+                     std::pair<int, const wchar_t*>{IDC_NS_TONE, L"neural.tip.tone"},
+                     std::pair<int, const wchar_t*>{IDC_NS_SKIN, L"neural.tip.skin"},
+                     std::pair<int, const wchar_t*>{IDC_NS_STYLE, L"neural.tip.style"},
+                     std::pair<int, const wchar_t*>{IDC_NS_AUTOMASK, L"neural.tip.automask"},
+                     std::pair<int, const wchar_t*>{IDC_NS_GUIDE_MV, L"neural.tip.guide_mv"},
+                     std::pair<int, const wchar_t*>{IDC_NS_GUIDE_DEPTH, L"neural.tip.guide_depth"},
+                     std::pair<int, const wchar_t*>{IDC_NS_PASSES, L"neural.tip.passes"},
+                     std::pair<int, const wchar_t*>{IDC_NS_CHAINED, L"neural.tip.chained"},
+                     std::pair<int, const wchar_t*>{IDC_NS_SCENE_CUTS, L"neural.tip.scene_cuts"},
+                     std::pair<int, const wchar_t*>{IDC_NS_STABILITY,
+                         amdBackend ? L"neural.tip.stability.amd" : L"neural.tip.stability"},
+                     std::pair<int, const wchar_t*>{IDC_NS_APPLY, L"neural.tip.apply"},
+                     std::pair<int, const wchar_t*>{IDC_NS_RESET, L"neural.tip.reset"}}) {
+                const std::wstring tip = ReadTip(app, dialog, tipHost->second, GetDlgItem(dialog, id), tipKey);
+                CHECK(tip.size() > 20);
             }
         }
         // Apply saves the values even when nothing can be rendered right now.
@@ -4712,16 +4779,10 @@ struct PlayerAppTestAccess {
         const auto host = app.m_tipHosts.find(neural);
         CHECK(host != app.m_tipHosts.end());
         if (host != app.m_tipHosts.end()) {
-            wchar_t text[512]{};
-            TTTOOLINFOW info{};
-            info.cbSize = TTTOOLINFOW_V2_SIZE;
-            info.hwnd = neural;
-            info.uId = reinterpret_cast<UINT_PTR>(GetDlgItem(neural, IDC_NS_RESET));
-            info.lpszText = text;
-            SendMessageW(host->second, TTM_GETTEXTW, UINT_PTR{512}, reinterpret_cast<LPARAM>(&info));
+            const std::wstring tip = ReadTip(app, neural, host->second, GetDlgItem(neural, IDC_NS_RESET), L"neural.tip.reset");
             // The string the first dialog registered must still read back verbatim
             // after the second dialog built its own tools.
-            CHECK_EQ(std::wstring{text}, app.T(L"neural.tip.reset"));
+            CHECK_EQ(tip, app.T(L"neural.tip.reset"));
         }
         if (app.m_encoderWnd) DestroyWindow(app.m_encoderWnd);
         DestroyWindow(neural);
@@ -4735,6 +4796,30 @@ struct PlayerAppTestAccess {
         // characters, and a fixed buffer compared their first 63 against the rest.
         std::wstring text(static_cast<size_t>(std::max(0, GetWindowTextLengthW(window))) + 1, L'\0');
         text.resize(static_cast<size_t>(GetWindowTextW(window, text.data(), static_cast<int>(text.size()))));
+        return text;
+    }
+
+    // Reads a tool's tip back the way the dialog shows it, refusing first a
+    // tip that would not fit. TTM_GETTEXTW copies the tool's whole text into
+    // the caller's buffer and honours no size - not the wParam, not cbSize -
+    // so a tip of 512 characters or more writes past the buffer, smashes the
+    // frame's /GS cookie and takes the process down with __fastfail (exit
+    // 127, no message) at whatever return comes next. The ceiling is checked
+    // before the read because past the read nothing runs to report it: the
+    // check names the key instead of leaving a silent crash to bisect. Every
+    // reader of a tip goes through here.
+    static std::wstring ReadTip(PlayerApp& app, HWND dialog, HWND tipHost, HWND tool, const wchar_t* tipKey)
+    {
+        constexpr size_t kTipBuffer = 512;
+        CHECK(app.T(tipKey).size() < kTipBuffer);
+        std::wstring text(kTipBuffer, L'\0');
+        TTTOOLINFOW info{};
+        info.cbSize = TTTOOLINFOW_V2_SIZE;
+        info.hwnd = dialog;
+        info.uId = reinterpret_cast<UINT_PTR>(tool);
+        info.lpszText = text.data();
+        SendMessageW(tipHost, TTM_GETTEXTW, UINT_PTR{kTipBuffer}, reinterpret_cast<LPARAM>(&info));
+        text.resize(wcslen(text.c_str()));
         return text;
     }
 

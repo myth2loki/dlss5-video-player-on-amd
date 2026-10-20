@@ -450,6 +450,15 @@ Two ways under **DLSS > Convert & export**, and one from the command line:
   dlss5-convert clips -r --stages sr,nr,fg --neural-backend amd
   ```
 
+  The AMD runtime also has a second, smaller network: `--small-model` runs its
+  0.44 Small model (31 blocks at 0.5x, single-pass by construction, so it forces
+  `--passes` to 1) instead of the Original 71-block one — a faster pass whose
+  output differs:
+
+  ```bat
+  dlss5-convert clip.mp4 --neural-backend amd --preset strong --small-model
+  ```
+
 ![Export with DLSS stages: Super Resolution ticked, output height 2160p, Upscaler RTX VSR (recommended), neural rendering and frame generation unticked, and the result line 3840 × 2160 at 30 fps, 1 pass](docs/screenshots/current/export-stages-vsr.jpg)
 
 The dialog is the same on either backend; the **Upscaler** row in this capture is

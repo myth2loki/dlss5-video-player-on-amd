@@ -2403,6 +2403,21 @@ static uint32_t ReadSavedAmdStyle(const std::filesystem::path& settingsPath)
                               settingsPath.c_str())));
 }
 
+// The 0.44 Small model (31 blocks at 0.5x) against the Original 71-block one,
+// as this machine has saved it.
+//
+// OFF by default, and the reason is not caution about the new thing: the two
+// are differently trained networks with different output (0.44's own release
+// notes carry bit_exact_vs_previous=false), so a machine that never touched
+// the switch must keep rendering the picture it always rendered. Stored under
+// [AmdMultiPass] beside the stacking switches because it shares their road to
+// the runtime - the DLSS5_MULTI_PASS key, where 0.5 spells Small and 1..3 the
+// Original ladder.
+static bool ReadSavedAmdSmallModel(const std::filesystem::path& settingsPath)
+{
+    return GetPrivateProfileIntW(L"AmdMultiPass",L"SmallModel",0,settingsPath.c_str())!=0;
+}
+
 // Playback frame generation as this machine has saved it. Off unless saved on:
 // the shipped product path for a doubled cadence is the offline conversion
 // (progress, a file, then play), because presentation pacing is entangled with
@@ -2464,6 +2479,14 @@ struct NeuralJobInputs {
     // writes it, a moved value restarts the live session, and the job carries
     // the value it was started under (RenderSettings::amdStyle).
     uint32_t amdStyle{1};
+    // Which model the count selects: the 0.44 Small network (31 blocks at
+    // 0.5x) instead of the Original 71-block one. Same road as the count - it
+    // is the other spelling of the one DLSS5_MULTI_PASS key, and a moved
+    // value rebuilds the network, so the live session restarts on it like it
+    // does on the count. Single-pass by construction: the runtime's ladder is
+    // 0.5/1/2/3, so when this is set the count is forced to 1 and the
+    // stacking switches render nothing.
+    bool amdSmallModel{false};
     HANDLE pauseEvent{};
     bool prepareOnly{};
     // The background acquisition of this very source, when one is in flight.
@@ -2694,7 +2717,7 @@ private:
         // named mutex derived from the directory, so it costs the tree nothing.
         lease_.emplace(runtimeDirectory_);
         if(!lease_->Held()){completion_->result.failure=NeuralRenderFailure::Preflight;completion_->result.detail=L"Another neural render is using the experimental runtime. Wait for it to finish, then try again.";LOG("AMD neural runtime is in use by another render; refusing to share it.");return false;}
-        settingsSnapshot_=AmdNeuralSettingsDocument(in_.temporal.stability,in_.amdPasses,in_.amdSkinProtect,in_.amdMultiPassPredict,in_.amdMultiPassSkip,in_.amdStyle);
+        settingsSnapshot_=AmdNeuralSettingsDocument(in_.temporal.stability,in_.amdPasses,in_.amdSmallModel,in_.amdSkinProtect,in_.amdMultiPassPredict,in_.amdMultiPassSkip,in_.amdStyle);
         settingsDigest_=Sha256Bytes(*settingsSnapshot_);
         if(!settingsDigest_){completion_->result.detail=L"The neural settings digest could not be computed.";return false;}
         return true;
@@ -2884,7 +2907,7 @@ private:
         staging_=cache_.BeginRenderStaging(renderKey_);if(!staging_){completion_->result.detail=in_.cacheFailureText.Describe(cache_);return false;}
         {std::ofstream settingsFile(*staging_/L"neural-settings.ini",std::ios::binary|std::ios::trunc);settingsFile.write(settingsSnapshot_->data(),static_cast<std::streamsize>(settingsSnapshot_->size()));if(!settingsFile){cache_.MarkInvalid(*staging_);completion_->result.detail=L"The neural settings snapshot could not be staged.";return false;}}
         const auto& range=in_.range;
-        NeuralRenderRequest request{nullptr,sourcePath_,liveIndex?liveDirectory/L"neural.mkv":*staging_/L"neural.mkv",width_,height_,fps_,duration_};request.jobId=in_.generation;request.range=range;request.prerollFrames=PrerollFramesFor(range,fps_);request.guides=in_.guides;request.temporal=in_.temporal;request.amdPasses=in_.amdPasses;request.amdSkinProtect=in_.amdSkinProtect;request.amdMultiPassPredict=in_.amdMultiPassPredict;request.amdMultiPassSkip=in_.amdMultiPassSkip;request.amdStyle=in_.amdStyle;request.pauseEvent=in_.pauseEvent;request.segmentFrames=liveIndex?in_.segmentFrames:0u;request.firstSegmentFrames=liveIndex?in_.firstSegmentFrames:0u;request.gpuColorConversion=in_.gpuColorConversion;request.nvencPreset=in_.nvencPreset;request.gpuSourceConversion=in_.gpuSourceConversion;request.processingScale=in_.processingScale;request.captureDither=in_.captureDither;request.quality=in_.cacheQuality;request.sourceDeband=in_.sourceDeband;request.suppliedExposure=in_.suppliedExposure;
+        NeuralRenderRequest request{nullptr,sourcePath_,liveIndex?liveDirectory/L"neural.mkv":*staging_/L"neural.mkv",width_,height_,fps_,duration_};request.jobId=in_.generation;request.range=range;request.prerollFrames=PrerollFramesFor(range,fps_);request.guides=in_.guides;request.temporal=in_.temporal;request.amdPasses=in_.amdPasses;request.amdSmallModel=in_.amdSmallModel;request.amdSkinProtect=in_.amdSkinProtect;request.amdMultiPassPredict=in_.amdMultiPassPredict;request.amdMultiPassSkip=in_.amdMultiPassSkip;request.amdStyle=in_.amdStyle;request.pauseEvent=in_.pauseEvent;request.segmentFrames=liveIndex?in_.segmentFrames:0u;request.firstSegmentFrames=liveIndex?in_.firstSegmentFrames:0u;request.gpuColorConversion=in_.gpuColorConversion;request.nvencPreset=in_.nvencPreset;request.gpuSourceConversion=in_.gpuSourceConversion;request.processingScale=in_.processingScale;request.captureDither=in_.captureDither;request.quality=in_.cacheQuality;request.sourceDeband=in_.sourceDeband;request.suppliedExposure=in_.suppliedExposure;
         // Which backend runs the pass, and - on the AMD one - the tree it loads
         // its module from. The worker executable is not on this line for the
         // reason the export gives: one binary serves both backends and always
@@ -5364,6 +5387,7 @@ private:
         m_amdMultiPassPredict=ReadSavedAmdMultiPassPredict(SettingsPath());
         m_amdMultiPassSkip=ReadSavedAmdMultiPassSkip(SettingsPath());
         m_amdStyle=ReadSavedAmdStyle(SettingsPath());
+        m_amdSmallModel=ReadSavedAmdSmallModel(SettingsPath());
         }
         m_gpuColorConversion=GetPrivateProfileIntW(L"Encoding",L"GpuColorConversion",0,SettingsPath().c_str())!=0;
         m_gpuSourceConversion=GetPrivateProfileIntW(L"Encoding",L"GpuSourceConversion",0,SettingsPath().c_str())!=0;
@@ -5524,6 +5548,9 @@ private:
         wchar_t sharpness[16];std::swprintf(sharpness,16,L"%d",static_cast<int>(m_upscaleSharpness*100.0f+0.5f));
         WritePrivateProfileStringW(L"Comparison",L"AmdUpscaleSharpness",sharpness,SettingsPath().c_str());
         WritePrivateProfileStringW(L"AmdMultiPass",L"LaterPassSkip",m_amdMultiPassSkip?L"1":L"0",SettingsPath().c_str());
+        // The model the count selects, under the same section as the stacking
+        // switches: it is the other spelling of the one DLSS5_MULTI_PASS key.
+        WritePrivateProfileStringW(L"AmdMultiPass",L"SmallModel",m_amdSmallModel?L"1":L"0",SettingsPath().c_str());
         // The runtime's style, in a section of its own because it is not a
         // multi-pass switch and must not be mistaken for the add-on's NRStyle
         // (which LoadNeuralSettings reads from [NeuralSettings] Style).
@@ -6878,7 +6905,14 @@ private:
         select(IDC_NS_STYLE,std::clamp(m_neuralSettings.style,0,2));
         // The combo lists 1..4 and the setting IS the pass count, so the
         // index is one below it.
-        select(IDC_NS_PASSES,std::clamp(m_neuralSettings.passes,1,4)-1);
+        // The AMD combo's first rung is the Small model rather than a pass
+        // count - the runtime's own F9 ladder, 0.5/1/2/3 - so there the index
+        // IS the rung: 0 is the model and the count sits AT its index, one
+        // above the NVIDIA ladder's. NVIDIA keeps the add-on's 1..4 ladder.
+        if(m_opt.neuralBackend==NeuralBackend::Amd)
+            select(IDC_NS_PASSES,m_amdSmallModel?0:std::clamp(m_neuralSettings.passes,1,3));
+        else
+            select(IDC_NS_PASSES,std::clamp(m_neuralSettings.passes,1,4)-1);
         // The combo lists the rungs in the enum's own order, so the index IS the rung.
         select(IDC_NS_SCENE_CUTS,static_cast<int>(m_temporalSettings.sceneCuts));
         select(IDC_NS_STABILITY,static_cast<int>(m_temporalSettings.stability));
@@ -6906,7 +6940,17 @@ private:
         m_neuralSettings.colorStrength=float(pos(IDC_NS_COLOR))/100.0f;
         m_neuralSettings.style=sel(IDC_NS_STYLE,m_neuralSettings.style);
         m_neuralSettings.autoMask=checked(IDC_NS_AUTOMASK);
-        m_neuralSettings.passes=std::clamp(sel(IDC_NS_PASSES,m_neuralSettings.passes-1)+1,1,4);
+        // The AMD ladder's first rung is the Small model: it reads as a single
+        // Original pass everywhere below - the stacking switches grey out at
+        // one pass - while the model itself travels as its own switch. NVIDIA
+        // keeps the add-on's 1..4 ladder.
+        if(m_opt.neuralBackend==NeuralBackend::Amd){
+            const int rung=sel(IDC_NS_PASSES,m_amdSmallModel?0:m_neuralSettings.passes);
+            m_amdSmallModel=rung<=0;
+            m_neuralSettings.passes=m_amdSmallModel?1:std::clamp(rung,1,3);
+        } else {
+            m_neuralSettings.passes=std::clamp(sel(IDC_NS_PASSES,m_neuralSettings.passes-1)+1,1,4);
+        }
         m_neuralSettings.chainedHistory=checked(IDC_NS_CHAINED);
         m_amdSkinProtect=checked(IDC_NS_SKIN_PROTECT);
         m_amdMultiPassPredict=checked(IDC_NS_MP_PREDICT);
@@ -7043,7 +7087,23 @@ private:
         // costs render time rather than changing the model's look: a second
         // pass adds 89 % model GPU time per frame (knobs-upper-20261003).
         CreateSettingsGroupHeading(h,L"neural.settings.group_cost",12+top,right,400);
-        CreateNeuralCombo(h,IDC_NS_PASSES,L"neural.settings.passes",40+top,{L"1 (single pass)",L"2 passes",L"3 passes",L"4 passes"},L"neural.tip.passes",right);
+        // One ladder, two spellings of the one runtime key. On AMD the rungs
+        // are the runtime's own F9 cycle - 0.5 is the 0.44 Small model (31
+        // blocks, measured 5.554 ms/frame at the 1080 tier against 6.559 for
+        // the Original, a differently trained network whose output changes),
+        // and 1/2/3 stack the Original 71-block model. 4 is not offered: the
+        // runtime reads an unknown count as 0.5, which would silently hand the
+        // Small model to someone who asked for four passes. NVIDIA keeps the
+        // add-on's own ladder, which still stacks to four.
+        if(m_opt.neuralBackend==NeuralBackend::Amd){
+            CreateNeuralCombo(h,IDC_NS_PASSES,L"neural.settings.passes",40+top,
+                              {L"Small \u00b7 0.5\u00d7 (31 blocks)",L"1 (single pass)",L"2 passes",L"3 passes"},
+                              L"neural.tip.passes",right);
+        } else {
+            CreateNeuralCombo(h,IDC_NS_PASSES,L"neural.settings.passes",40+top,
+                              {L"1 (single pass)",L"2 passes",L"3 passes",L"4 passes"},
+                              L"neural.tip.passes",right);
+        }
         CreateNeuralCheck(h,IDC_NS_SKIN_PROTECT,L"neural.settings.skin_protect",12+right,74+top,116,L"neural.tip.skin_protect");
         CreateNeuralCheck(h,IDC_NS_CHAINED,L"neural.settings.chained",132+right,74+top,224,L"neural.tip.chained");
         // Its own row, below the other two: the stacking group's row is full
@@ -7206,9 +7266,17 @@ private:
         // one: a moved style is a different picture at the same cost, so it
         // restarts a live session and writes a new cache key.
         uint32_t amdStyle{1};
+        // Which model the count selects: the 0.44 Small network (31 blocks at
+        // 0.5x) instead of the Original 71-block one. The other spelling of the
+        // one DLSS5_MULTI_PASS key (0.5 against 1..3), so it travels the same
+        // road as the count: a moved value rebuilds the network, restarts a
+        // live session and writes a new cache key. Single-pass by
+        // construction - when set, the count is forced to 1 and the stacking
+        // switches render nothing.
+        bool amdSmallModel{false};
         friend bool operator==(const RenderSettings&,const RenderSettings&)=default;
     };
-    RenderSettings CurrentRenderSettings()const{return {m_neuralSettings,m_renderGuides,m_temporalSettings,m_amdSkinProtect,m_amdMultiPassPredict,m_amdMultiPassSkip,m_amdStyle};}
+    RenderSettings CurrentRenderSettings()const{return {m_neuralSettings,m_renderGuides,m_temporalSettings,m_amdSkinProtect,m_amdMultiPassPredict,m_amdMultiPassSkip,m_amdStyle,m_amdSmallModel};}
 
     // The render the picture came from is not what the dialog now holds. Only the
     // export path noticed this before, so a settings change made during playback
@@ -7267,14 +7335,18 @@ private:
             // backend never read. The rung and the count are the exceptions the
             // other way: the session in flight is rendering under the previous
             // ones, so leaving it running is how a user who moves either switch
-            // sees nothing happen.
+            // sees nothing happen. The model switch is the third exception for
+            // the same reason: it is the other spelling of the count's key, and
+            // a session rendering the Original network shows nothing of a
+            // switch to Small until it restarts.
             const bool restart=BackendReadsNeuralSettings(m_opt.neuralBackend)||
                                m_temporalSettings.stability!=m_liveRenderSettings.temporal.stability||
                                m_neuralSettings.passes!=m_liveRenderSettings.neural.passes||
                                m_amdSkinProtect!=m_liveRenderSettings.amdSkinProtect||
                                m_amdMultiPassPredict!=m_liveRenderSettings.amdMultiPassPredict||
                                m_amdMultiPassSkip!=m_liveRenderSettings.amdMultiPassSkip||
-                               m_amdStyle!=m_liveRenderSettings.amdStyle;
+                               m_amdStyle!=m_liveRenderSettings.amdStyle||
+                               m_amdSmallModel!=m_liveRenderSettings.amdSmallModel;
             if(!restart){
                 LOG("Neural settings applied at "<<Position()<<" s; this backend's render reads the accumulation rung and the pass count and nothing else in the dialog, and neither moved, so the active session is left running.");
                 return;
@@ -7306,7 +7378,7 @@ private:
         case WM_SIZE:ResizeSettingsChildren(h,kNeuralDesignW,kNeuralDesignH);return 0;
         case WM_COMMAND:{
             const int id=LOWORD(w);const int code=HIWORD(w);
-            if(id==IDC_NS_RESET){m_neuralSettings={};m_neuralSettings.passes=PassesSettingsDefault(m_opt.neuralBackend);m_renderGuides={};m_temporalSettings={};m_amdSkinProtect=true;m_amdMultiPassPredict=true;m_amdMultiPassSkip=true;ApplyLiveGuideControls();SyncNeuralSettingControls(h);SaveVideoSettings();SchedulePausedSettingsPreview();return 0;}
+            if(id==IDC_NS_RESET){m_neuralSettings={};m_neuralSettings.passes=PassesSettingsDefault(m_opt.neuralBackend);m_renderGuides={};m_temporalSettings={};m_amdSkinProtect=true;m_amdMultiPassPredict=true;m_amdMultiPassSkip=true;m_amdSmallModel=false;ApplyLiveGuideControls();SyncNeuralSettingControls(h);SaveVideoSettings();SchedulePausedSettingsPreview();return 0;}
             if(id==IDC_NS_APPLY){ApplyNeuralSettings();return 0;}
             if(id==IDC_NS_CLOSE){DestroyWindow(h);return 0;}
             if(id==IDC_NS_OPEN_ADJUST&&code==BN_CLICKED){ShowAdjustments();return 0;}
@@ -10845,7 +10917,7 @@ private:
     // takes the rung from the temporal term instead - hashing the panel there
     // would retire coverage a restart would have rendered identically.
     std::string RetentionKeyFor(const RenderSettings& render)const{
-        return LiveSourceGeometryKey()+"|"+CanonicalNeuralSettingsForBackend(m_opt.neuralBackend,render.neural,render.amdSkinProtect,render.amdMultiPassPredict,render.amdMultiPassSkip,render.amdStyle)+"|"+CanonicalGuideControls(render.guides)+
+        return LiveSourceGeometryKey()+"|"+CanonicalNeuralSettingsForBackend(m_opt.neuralBackend,render.neural,render.amdSkinProtect,render.amdMultiPassPredict,render.amdMultiPassSkip,render.amdStyle,render.amdSmallModel)+"|"+CanonicalGuideControls(render.guides)+
                "|"+CanonicalTemporalSettings(render.temporal);
     }
     std::string LiveRetentionKey()const{return RetentionKeyFor(CurrentRenderSettings());}
@@ -11896,7 +11968,16 @@ private:
             // reports from the request.
             job.backend=m_opt.neuralBackend;job.amdRuntimeDirectory=m_opt.amdRuntimeDirectory;
             const RenderSettings render=JobRenderSettings(kind);
-            job.guides=render.guides;job.temporal=render.temporal;job.settings=render.neural;job.amdPasses=std::clamp(render.neural.passes,1,4);job.amdSkinProtect=render.amdSkinProtect;job.amdMultiPassPredict=render.amdMultiPassPredict;job.amdMultiPassSkip=render.amdMultiPassSkip;job.amdStyle=render.amdStyle;job.pauseEvent=m_neuralPauseEvent;
+            job.guides=render.guides;job.temporal=render.temporal;job.settings=render.neural;
+            // Small is single-pass by construction, and 4 is not a count the
+            // AMD runtime takes (it reads an unknown count as 0.5, the Small
+            // model), so the ladder's top rung differs per backend: 1..3 on
+            // AMD, the add-on's 1..4 on NVIDIA. The model switch is AMD's own
+            // and is dropped for the other backend.
+            job.amdPasses=render.amdSmallModel?1u:std::clamp(render.neural.passes,1,job.backend==NeuralBackend::Amd?3:4);
+            job.amdSkinProtect=render.amdSkinProtect;job.amdMultiPassPredict=render.amdMultiPassPredict;job.amdMultiPassSkip=render.amdMultiPassSkip;job.amdStyle=render.amdStyle;
+            job.amdSmallModel=job.backend==NeuralBackend::Amd&&render.amdSmallModel;
+            job.pauseEvent=m_neuralPauseEvent;
             job.gpuColorConversion=m_gpuColorConversion;job.gpuSourceConversion=m_gpuSourceConversion;job.nvencPreset=m_nvencPreset;job.processingScale=m_processingScale;job.captureDither=m_captureDither;job.cacheQuality=m_cacheQuality;job.sourceDeband=m_sourceDeband;job.suppliedExposure=m_suppliedExposure;
             job.reuseSourceKey=reuseSourceKey;job.expectedDurationSeconds=expectedDurationSeconds;job.range=range;job.prepareOnly=prepareOnly;
             // The background acquisition of this very source, when one is in
@@ -13610,6 +13691,12 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // own built-in answer and what this backend rendered before the menu existed
     // - so a machine that never opens the menu keeps its picture.
     uint32_t m_amdStyle{1};
+    // Which model the count selects: the 0.44 Small network (31 blocks at
+    // 0.5x) instead of the Original 71-block one. Off unless saved on - the
+    // two are differently trained networks with different output, so a machine
+    // that never touched the switch keeps the picture it always rendered. See
+    // RenderSettings::amdSmallModel and ReadSavedAmdSmallModel.
+    bool m_amdSmallModel{false};
     // The preset the Look settings were last taken from, so Custom can say
     // which one it departed from. kPresetCount when none is known yet.
     size_t m_lastNeuralPreset=neural_presets::kPresetCount;
@@ -14104,6 +14191,14 @@ static int RunRenderCommand(const render_command::Parsed& parsed,const std::vect
         const ExportPlan plan=PlanExport(selection,width,height,fps,maxMultiplier,still,
                                          VsrExportReady(helpers,DetectHighPerformanceGpu().generation));
         if(!plan.valid)return refuse(loc.Get(ExportRefusalKey(plan.refusal)));
+        // The Small model is the AMD runtime's own: the NVIDIA add-on has no
+        // such network, so asking for it there is a script that believes
+        // something untrue about its output rather than a switch to ignore.
+        // Judged here rather than at the parse because the backend is only
+        // known once the plan is, the same road --processing-scale's own
+        // backend questions travel.
+        if(command.smallModel&&plan.backend!=NeuralBackend::Amd)
+            return refuse(L"--small-model is the AMD runtime's 0.44 Small model; the NVIDIA backend has no such model. Use --neural-backend amd, or drop the flag.");
 
         NeuralRenderRange range{};
         if(command.hasRange){
@@ -14125,6 +14220,10 @@ static int RunRenderCommand(const render_command::Parsed& parsed,const std::vect
         // Each knob given on the command line wins over the preset or the
         // saved settings; the ones not given keep theirs.
         if(command.passes)neuralSettings.passes=*command.passes;
+        // Small is single-pass by construction - the runtime's ladder is
+        // 0.5/1/2/3 - so asking for the Small model forces the count to one
+        // whatever --passes said, the same way the panel's first rung does.
+        if(command.smallModel)neuralSettings.passes=1;
         if(command.intensity)neuralSettings.intensity=std::min(*command.intensity,kIntensityMax);
         if(command.localTone)neuralSettings.localTone=*command.localTone;
         if(command.localStructure)neuralSettings.localStructure=*command.localStructure;
@@ -14176,15 +14275,30 @@ static int RunRenderCommand(const render_command::Parsed& parsed,const std::vect
         // for it (the menu is the surface), so a scripted --render uses this
         // machine's value.
         job.amdStyle=ReadSavedAmdStyle(settings);
+        // The model the count selects: the command line's, or what this
+        // machine has saved. AMD's own switch - the NVIDIA add-on has no such
+        // model - so the saved value is only read for the backend that has
+        // one, exactly as the panel shows the rung only there.
+        job.amdSmallModel=plan.backend==NeuralBackend::Amd&&
+                          (command.smallModel||ReadSavedAmdSmallModel(settings));
 
         say(StageExportPlanSummary(plan,width,height,fps));
         // What the render will look like and how it is encoded, whichever of
         // the command line, the preset and the saved settings each came from.
-        if(plan.requireNeural)say(L"neural: "+Utf8ToWide(CanonicalNeuralSettings(neuralSettings)));
+        // The AMD backend's own term rather than the add-on's canonical string:
+        // the panel values the runtime never reads would otherwise be printed
+        // as the render's settings, and the model the count selects - the one
+        // thing the add-on's string cannot say - would be missing from the
+        // line a script reads back.
+        if(plan.requireNeural)say(L"neural: "+Utf8ToWide(plan.backend==NeuralBackend::Amd
+            ?CanonicalNeuralSettingsForBackend(plan.backend,neuralSettings,job.amdSkinProtect,
+                job.amdMultiPassPredict,job.amdMultiPassSkip,job.amdStyle,job.amdSmallModel)
+            :CanonicalNeuralSettings(neuralSettings)));
         say(StageExportEncodeSummary(plan,width,job.quality,job.upscalingHistory));
         say(L"writing "+output.wstring());
         LOG("--render plan: upscale="<<command.selection.upscale<<" engine="<<SuperResolutionEngineName(selection.engine)<<" neural="<<command.selection.neural
             <<" backend="<<NeuralBackendName(plan.backend)
+            <<(job.amdSmallModel?" model=small(0.5, 31 blocks)":"")
             <<" framegen="<<command.selection.frameGeneration<<" output="<<plan.outputWidth<<"x"<<plan.outputHeight
             <<" fps="<<plan.outputFps<<" range=["<<range.start100ns<<","<<range.end100ns<<") preset="
             <<(command.preset?std::string(neural_presets::kPresets[*command.preset].key):std::string("saved")));

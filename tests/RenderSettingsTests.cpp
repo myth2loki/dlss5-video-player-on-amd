@@ -825,8 +825,9 @@ void skin_structure_is_off_or_what_the_runtime_acts_on()
 
 // The retention key's neural term follows the backend (NeuralStabilitySettings.h):
 // NVIDIA's render reads the whole panel, so its term is the canonical string byte
-// for byte; AMD's reads exactly one panel value - the pass count, which the
-// evaluator stacks the model with - so its term is that value alone, and a panel
+// for byte; AMD's reads exactly two panel values - the pass count and which model
+// that count selects, the 0.44 Small network (31 blocks at 0.5x) against the
+// Original 71-block one - so its term is those and nothing else, and a panel
 // that differs only in values this backend cannot reach keeps the same retained
 // coverage. The rung travels in the key's temporal term
 // (CanonicalTemporalSettings), not here.
@@ -839,12 +840,33 @@ void the_retained_settings_term_reads_only_what_the_backend_reads()
     // AMD: exactly the count. Two counts are two pictures - N passes is N runs
     // of the model - so they must not share retained coverage; every other
     // panel value is unreachable on this backend, so moving it retires nothing.
+    // The ladder is the runtime's own and tops at 3: 4 is not a count it takes.
     NeuralSettings single; single.passes = 1;
-    NeuralSettings stacked; stacked.passes = 4;
+    NeuralSettings stacked; stacked.passes = 3;
     CHECK_EQ(CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, single), std::string("passes=1"));
-    CHECK_EQ(CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked), std::string("passes=4"));
+    CHECK_EQ(CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked), std::string("passes=3"));
     CHECK(CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, single) !=
           CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked));
+    // The model the count selects is the other half of the one runtime key, and
+    // it is the wider question: Small is a differently trained network, so it
+    // is its own term, it forces the count to 1 beside it, and none of the
+    // stacking switches can fire there. A Small term is never an Original
+    // term, whatever the count the caller passed says.
+    CHECK_EQ(std::string("passes=1 model=small"),
+             CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, single, false, true, false, 1,
+                                               true));
+    CHECK_EQ(std::string("passes=1 model=small"),
+             CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked, true, true, true, 1,
+                                               true));
+    CHECK(CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, single, false, true, false, 1, true) !=
+          CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, single));
+    // The style still composes beside Small - it is the runtime's own key like
+    // the rest - while the count itself writes nothing there.
+    CHECK_EQ(std::string("passes=1 model=small style=2"),
+             CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked, true, false, true, 2,
+                                               true));
+    CHECK(CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, single, false, true, false, 1, true)
+              .find("passes=3") == std::string::npos);
     // The rest of the panel: unreachable. intensity, style, chained history -
     // none of them reaches an AMD pixel, so two panels differing only there are
     // the same picture and the same coverage.
@@ -858,26 +880,26 @@ void the_retained_settings_term_reads_only_what_the_backend_reads()
     // The skin switch is the runtime's and lives beside the count in the same
     // file, so it arrives as its own argument - and counts only above one pass,
     // where the runtime actually blends it in.
-    NeuralSettings stacked4; stacked4.passes = 4;
-    CHECK_EQ(std::string("passes=4"),
-             CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked4, false));
-    CHECK_EQ(std::string("passes=4 skin-protect=1"),
-             CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked4, true));
+    NeuralSettings stacked3; stacked3.passes = 3;
+    CHECK_EQ(std::string("passes=3"),
+             CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked3, false));
+    CHECK_EQ(std::string("passes=3 skin-protect=1"),
+             CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked3, true));
     CHECK_EQ(std::string("passes=1"),
              CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, single, true));
     // The later-pass skip: the ON spelling above one pass, absent at one, and
     // absent on NVIDIA whatever the switch says.
-    CHECK_EQ(std::string("passes=4 mp-skip=1"),
-             CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked4, false, true, true));
+    CHECK_EQ(std::string("passes=3 mp-skip=1"),
+             CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked3, false, true, true));
     CHECK_EQ(std::string("passes=1"),
              CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, single, false, true, true));
-    CHECK(CanonicalNeuralSettingsForBackend(NeuralBackend::Nvidia, stacked4, false, true, true).find("mp-skip") ==
+    CHECK(CanonicalNeuralSettingsForBackend(NeuralBackend::Nvidia, stacked3, false, true, true).find("mp-skip") ==
           std::string::npos);
     // NVIDIA has no such switch, so its term never carries it - matched on the
     // term itself, not on "skin", which its own panel field skinStructure has.
-    CHECK(CanonicalNeuralSettingsForBackend(NeuralBackend::Nvidia, stacked4, true).find("skin-protect") ==
+    CHECK(CanonicalNeuralSettingsForBackend(NeuralBackend::Nvidia, stacked3, true).find("skin-protect") ==
           std::string::npos);
-    CHECK(CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked4, true).find("skin-protect=1") !=
+    CHECK(CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked3, true).find("skin-protect=1") !=
           std::string::npos);
     // The style is the runtime's too (DLSS5_STYLE, not the panel's NRStyle), and
     // keys only off its default: at 1 the term is what it was before the menu
@@ -886,8 +908,8 @@ void the_retained_settings_term_reads_only_what_the_backend_reads()
              CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, single, false, true, false, 1));
     CHECK_EQ(std::string("passes=1 style=0"),
              CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, single, false, true, false, 0));
-    CHECK_EQ(std::string("passes=4 style=2"),
-             CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked4, false, true, false, 2));
+    CHECK_EQ(std::string("passes=3 style=2"),
+             CanonicalNeuralSettingsForBackend(NeuralBackend::Amd, stacked3, false, true, false, 2));
 }
 
 void removing_one_owned_entry_preserves_other_entries_and_outside_files()

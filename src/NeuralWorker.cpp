@@ -985,6 +985,14 @@ bool ValidRequest(const NeuralRenderRequest& request)
     // than clamped - a typo'd value should stop the job, not quietly renumber
     // what the caller asked the model to run.
     if (request.amdPasses < 1 || request.amdPasses > 4) return false;
+    // On the AMD backend the ladder is the runtime's own - 0.5 is the 0.44
+    // Small model and 1..3 stack the Original 71-block one - so a 4 there is
+    // malformed, and beside the Small model a count other than 1 is: the
+    // runtime reads an unknown count as 0.5, which would silently hand the
+    // Small network to a caller who asked for something else. The NVIDIA
+    // add-on's ladder still stacks to four.
+    if (request.backend == NeuralBackend::Amd &&
+        (request.amdSmallModel ? request.amdPasses != 1 : request.amdPasses > 3)) return false;
     return true;
 }
 
@@ -1371,6 +1379,15 @@ std::vector<std::wstring> neural_worker_detail::BuildWorkerArguments(
             arguments.emplace_back(L"--amd-passes");
             arguments.emplace_back(std::to_wstring(request.amdPasses));
         }
+        // The model the count selects: the 0.44 Small network (31 blocks at
+        // 0.5x) against the Original 71-block one, the other spelling of the
+        // one DLSS5_MULTI_PASS key. Sent only when on, like the count - an
+        // absent value is the Original model every job before the switch ran -
+        // and it forces the count to one, which the parent has already done.
+        if (request.amdSmallModel) {
+            arguments.emplace_back(L"--amd-small-model");
+            arguments.emplace_back(L"1");
+        }
         if (request.amdSkinProtect) {
             arguments.emplace_back(L"--amd-skin-protect");
             arguments.emplace_back(L"1");
@@ -1529,7 +1546,8 @@ std::optional<neural_worker_detail::WorkerArguments> neural_worker_detail::Parse
                GpuSourceConversion, FirstSegmentFrames, Command, ParentProcess, IdleVram,
                OutputWidth, OutputHeight, RequireNeural, ProcessingScale, Temporal, UpscalingHistoryKey,
                CaptureDither, CacheQuality, Deband, SuppliedExposure, EncoderPathKey, NeuralBackendKey,
-               AmdRuntimeDirectoryKey, AmdPassesKey, AmdSkinProtectKey, AmdPredictKey, AmdLaterPassSkipKey,
+               AmdRuntimeDirectoryKey, AmdPassesKey, AmdSmallModelKey, AmdSkinProtectKey, AmdPredictKey,
+               AmdLaterPassSkipKey,
                AmdStyleKey,
     UpscaleSharpnessKey, KeyCount };
     constexpr std::array<std::wstring_view, KeyCount> names{
@@ -1561,6 +1579,12 @@ std::optional<neural_worker_detail::WorkerArguments> neural_worker_detail::Parse
         // The pass count, sent only off the default, so the command
         // line of every job before the experiment is byte-identical to before.
         L"--amd-passes",
+        // The model the count selects, sent only when it is the Small one:
+        // an absent value is the Original network every job before the switch
+        // ran, so an older helper and a newer player still agree there. The
+        // count beside it is forced to 1 by the sender, and ValidRequest
+        // refuses a Small job that says otherwise.
+        L"--amd-small-model",
         // The skin switch: sent when on, absent when off, because the runtime's
         // own default is off and the helper has nothing to say about it then.
         L"--amd-skin-protect",
@@ -1717,6 +1741,12 @@ std::optional<neural_worker_detail::WorkerArguments> neural_worker_detail::Parse
         uint64_t passes = 0;
         if (!ParseUnsigned(*values[AmdPassesKey], passes) || passes > UINT32_MAX) return std::nullopt;
         request.amdPasses = static_cast<uint32_t>(passes);
+    }
+    // The model the count selects: a 0/1 flag, like the skin switch below it.
+    if (values[AmdSmallModelKey]) {
+        uint64_t smallModel = 0;
+        if (!ParseUnsigned(*values[AmdSmallModelKey], smallModel) || smallModel > 1) return std::nullopt;
+        request.amdSmallModel = smallModel != 0;
     }
     if (values[AmdSkinProtectKey]) {
         uint64_t on = 0;

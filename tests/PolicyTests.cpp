@@ -6133,6 +6133,20 @@ void render_command_line_parses_the_stages_and_refuses_what_it_cannot_describe_t
     CHECK(tuned.command.localStructure == std::optional<float>(2.0f));
     CHECK(tuned.command.colorStrength && std::abs(*tuned.command.colorStrength - 0.8f) < 1e-6f);
     CHECK(tuned.command.quality == "lossless");
+    // --small-model is a flag rather than a value option: it names a model, and
+    // the model is the switch. The parse leaves the count beside it alone - the
+    // render path forces it to one, the way the panel's first rung does - and
+    // it is judged where the other nr knobs are, at the stage.
+    const Parsed small = parse({L"--small-model", L"--render", L"clip.mp4", L"--passes", L"2"});
+    CHECK(small.mode == Mode::Render);
+    CHECK(small.command.smallModel);
+    CHECK(small.command.passes == std::optional<int>(2));
+    CHECK(parse({L"--render", L"c.mp4", L"--small-model", L"--small-model"}).mode == Mode::BadArguments);
+    CHECK(parse({L"--render", L"c.mp4", L"--stages", L"sr", L"--small-model"}).mode == Mode::BadArguments);
+    CHECK(parse({L"--render", L"c.mp4", L"--stages", L"fg", L"--small-model"}).mode == Mode::BadArguments);
+    // An older front end that never heard of it is not broken by it: the flag
+    // is what dlss5-convert forwards, and a value in its place is refused.
+    CHECK(parse({L"--render", L"c.mp4", L"--small-model", L"1"}).mode == Mode::BadArguments);
         for (const auto& refused : std::vector<std::vector<std::wstring>>{
              {L"--render", L"c.mp4", L"--passes", L"5"}, {L"--render", L"c.mp4", L"--passes", L"0"},
              {L"--render", L"c.mp4", L"--intensity", L"2.5"}, {L"--render", L"c.mp4", L"--intensity", L"-1"},
@@ -6179,9 +6193,10 @@ void render_command_line_parses_the_stages_and_refuses_what_it_cannot_describe_t
     // them in NVIDIA's order whatever the list says.
     const Parsed full = parse({L"--quiet", L"--stages", L"FG,nr,sr", L"--height", L"2160",
                                L"--multiplier", L"3", L"--preset", L"Gentle", L"--range", L"0:10-0:25.5",
-                               L"--out", L"D:/out/film.MKV", L"--render", L"in put.mp4", L"--safe-mode"});
+                               L"--out", L"D:/out/film.MKV", L"--render", L"in put.mp4", L"--safe-mode",
+                               L"--small-model"});
     CHECK(full.mode == Mode::Render);
-    CHECK(full.command.quiet); CHECK(full.command.safeMode);
+    CHECK(full.command.quiet); CHECK(full.command.safeMode); CHECK(full.command.smallModel);
     CHECK(full.command.selection.upscale && full.command.selection.neural &&
           full.command.selection.frameGeneration);
     CHECK_EQ(uint32_t{2160}, full.command.selection.targetHeight);

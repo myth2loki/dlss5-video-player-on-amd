@@ -94,6 +94,12 @@ void planner_test()
     // --style reaches the player as given, like the rest of the Look group.
     CHECK((ParseLine({L"a.mp4", L"--style", L"natural"}).renderOptions ==
            std::vector<std::wstring>{L"--style", L"natural"}));
+    // --small-model is a flag, handed over as given: the player is the one that
+    // knows which backend it names a model for.
+    CHECK((ParseLine({L"a.mp4", L"--small-model"}).renderOptions ==
+           std::vector<std::wstring>{L"--small-model"}));
+    CHECK((ParseLine({L"a.mp4", L"--neural-backend", L"amd", L"--small-model"}).renderOptions ==
+           std::vector<std::wstring>{L"--neural-backend", L"amd", L"--small-model"}));
     CHECK((ParseLine({L"a.mp4", L"--stages", L"sr", L"--sr-engine", L"dlss"}).renderOptions ==
            std::vector<std::wstring>{L"--stages", L"sr", L"--sr-engine", L"dlss"}));
     CHECK(ParseLine({}).mode == Mode::BadArguments);
@@ -214,9 +220,11 @@ void render_contract_test()
               .command.processingScale == 75u);
 
     // Every option the player's help names is one --render reads - forwarded,
-    // set by convert, or one of the player's own (--help, and --probe's) - and
-    // every forwarded value option is in convert's help too.
-    const std::vector<std::wstring> playerOwn{L"--help", L"--probe", L"--json", L"--capabilities"};
+    // set by convert, or one of the player's own (--help, --probe and the
+    // --cache-status diagnostic's) - and every forwarded value option is in
+    // convert's help too.
+    const std::vector<std::wstring> playerOwn{L"--help", L"--probe", L"--json", L"--capabilities",
+                                              L"--cache-status", L"--cache-root"};
     for (const std::wstring& named : OptionsNamedIn(render::Usage())) {
         const bool listed = render_cli::IsRenderValueOption(named) || render_cli::IsForwardedFlag(named) ||
                             render_cli::Listed(std::wstring_view(named), render_cli::kConvertOwnedFlags) ||

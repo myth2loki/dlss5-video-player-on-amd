@@ -19,6 +19,15 @@ public:
 
 private:
 
+    // A tip a tool shows (the "*.tip.*" keys) is read back by the UI
+    // regression's tip readers into a 512-wchar buffer with TTM_GETTEXTW,
+    // which copies the whole string and honours no size - not the wParam,
+    // not cbSize - so a tip of 512 characters or more overflows that buffer
+    // and the suite dies with __fastfail at the next return, with nothing
+    // said about why. Every tip a reader touches stays at 511 or fewer -
+    // the readers check the key's length before the read that would smash
+    // the frame's /GS cookie - and the detail that does not fit belongs in
+    // docs/USAGE.md. A tip no reader touches is unbounded by this.
     static const Map& EnglishDefaults() {
         static const Map strings = {
             {L"app.title", L"DLSS 5 Video Player"},
@@ -482,9 +491,9 @@ private:
             // not the things that moved. Written as what happens rather than as
             // what the pass can do with a flow, because on this backend there is
             // no flow to speak of.
-            {L"neural.tip.stability.amd", L"Steadies what the model changes from frame to frame on surfaces that hold still, which is what shows up as flicker.\nThis backend has no motion estimate, so none is used: a pixel is blended only where this source frame and the one before it agree, so still areas are steadied and anything the source moved is taken as the model made it. Low, Medium and High keep 30, 50 and 70 % of that history, and Low is the default here. Changing it renders again.\nOff is the model's own output with nothing holding it, which is the one that flickers."},
+            {L"neural.tip.stability.amd", L"Steadies what the model changes from frame to frame on still surfaces, which is what shows up as flicker.\nThis backend has no motion estimate, so none is used: a pixel is blended only where this frame and the one before it agree, so still areas are steadied and anything that moved is taken as the model made it. Low, Medium and High keep 30, 50 and 70 % of that history; Low is the default here. Changing it renders again.\nOff is the model's own output, nothing holding it - the rung that flickers."},
             {L"neural.tip.apply", L"Applies these settings to what is on screen: an active session restarts at the playhead, a paused frame is rendered again.\nEvery distinct combination is rendered from scratch - about 10 s for one 1080p frame - and repeats come back from cache."},
-            {L"neural.tip.passes", L"Runs the model over each frame more than once.\nThe add-on warns games away from this because every extra pass is another full neural evaluate against a frame budget; a conversion has no frame budget, so the cost lands on render time instead.\nMeasured on the 72-frame range clip: two passes took 9.81 s against 8.01 s and wrote 932,019 bytes against 780,048."},
+            {L"neural.tip.passes", L"Runs the model over each frame more than once.\nEvery extra pass is another full neural evaluate; a conversion has no frame budget, so the cost lands on render time - two passes took 9.81 s against 8.01 s.\nOn the AMD backend the first rung is the 0.44 Small model (31 blocks at 0.5x) rather than a pass count: a differently trained network, single-pass by construction; 1, 2 and 3 stack the Original 71-block one, and four is the NVIDIA ladder only."},
             {L"neural.tip.chained", L"Gives every stacked pass its own temporal history, reset only on a scene cut.\nTurning it off makes passes 2 and up stateless - NVIDIA documents a per-frame reset as a flicker and aliasing risk, so this is an A/B switch for suspected ghosting rather than a setting to leave off.\nNo effect at one pass."},
             {L"neural.tip.reset", L"Returns every control to the model defaults and previews the paused frame again."},
             {L"neural.settings.reset", L"Reset"}, {L"neural.settings.apply", L"Apply"}, {L"neural.settings.close", L"Close"},

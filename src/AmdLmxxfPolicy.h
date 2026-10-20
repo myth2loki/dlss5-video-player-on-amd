@@ -153,9 +153,22 @@ constexpr LayoutState ClassifyLayout(const RuntimeLayout& layout) noexcept
 // DLSS5_, holds '=', and is at least 8 characters; anything else, comments
 // included, passes through), because a file rewritten wholesale would take the
 // user's other switches with it.
-inline std::string AmdPassesConfigLine(uint32_t passes)
+//
+// The count is one key with two models behind it, and the 0.44 runtime is
+// explicit about the domain: "DLSS5_MULTI_PASS=%s invalid (0.5/1/2/3), using
+// 0.5". 0.5 is the 31-block Small model, 1/2/3 the Original 71-block one at
+// one, two or three stacked passes - the ladder the runtime's own F9 hotkey
+// cycles. 4 is NOT a value this runtime takes: it reads an unknown count as
+// 0.5, which is the Small model, so the rung is clamped away here rather than
+// handed over as a silently different network. Small is a differently trained
+// model, so it is spelled as its own argument and never as a count: the two
+// never share a line, and a caller that says Small does not also say a count.
+// (The parameter is not called `small`: the Windows SDK's rpcndr.h #defines
+// that word as char, and the declaration stopped compiling the day it was.)
+inline std::string AmdPassesConfigLine(uint32_t passes, bool smallModel = false)
 {
-    return "DLSS5_MULTI_PASS=" + std::to_string(passes < 1 ? 1u : (passes > 4 ? 4u : passes));
+    if (smallModel) return "DLSS5_MULTI_PASS=0.5";
+    return "DLSS5_MULTI_PASS=" + std::to_string(passes < 1 ? 1u : (passes > 3 ? 3u : passes));
 }
 
 // Whether `line` sets `key` exactly, under the reader's own rule: a line counts
@@ -209,7 +222,8 @@ inline bool IsAmdStyleConfigLine(std::string_view line) noexcept
     return IsAmdConfigLine(line, "DLSS5_STYLE");
 }
 
-// What the player owns inside the runtime's configuration file: the pass count,
+// What the player owns inside the runtime's configuration file: which model
+// the count selects (DLSS5_MULTI_PASS: 0.5 Small, 1..3 Original stacked),
 // whether later passes keep skin-coloured pixels pinned to the first pass
 // (DLSS5_MULTI_PASS_SKIN_PROTECT), the third-pass forecast, the later-pass block
 // list, and the style (DLSS5_STYLE). All of them are written on every AMD job -
@@ -217,8 +231,8 @@ inline bool IsAmdStyleConfigLine(std::string_view line) noexcept
 // turned on, and a runtime that reads its configuration once cannot be told
 // again.
 inline bool WriteAmdRuntimeConfig(const std::filesystem::path& runtimeDirectory, uint32_t passes,
-                                  bool skinProtect, bool multiPassPredict, bool laterPassSkip,
-                                  uint32_t style, std::string& error)
+                                  bool smallModel, bool skinProtect, bool multiPassPredict,
+                                  bool laterPassSkip, uint32_t style, std::string& error)
 {
     namespace fs = std::filesystem;
     const fs::path directory = runtimeDirectory / L"DLSS5-AMD";
@@ -234,7 +248,7 @@ inline bool WriteAmdRuntimeConfig(const std::filesystem::path& runtimeDirectory,
     std::string keys[5];
     std::string values[5];
     keys[0] = "DLSS5_MULTI_PASS";
-    values[0] = AmdPassesConfigLine(passes).substr(keys[0].size() + 1);
+    values[0] = AmdPassesConfigLine(passes, smallModel).substr(keys[0].size() + 1);
     keys[1] = "DLSS5_MULTI_PASS_SKIN_PROTECT";
     values[1] = skinProtect ? "1" : "0";
     keys[2] = "DLSS5_MULTI_PASS_PREDICT";

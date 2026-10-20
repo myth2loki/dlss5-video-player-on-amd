@@ -110,6 +110,12 @@ struct StageExportJob {
     // The runtime's multi-pass skin switch (AMD only); see
     // RenderSettings::amdSkinProtect in the player.
     bool amdSkinProtect{false};
+    // Which model the pass count selects: the 0.44 Small network (31 blocks at
+    // 0.5x) instead of the Original 71-block one, the other spelling of the
+    // one DLSS5_MULTI_PASS key (AMD only); see RenderSettings::amdSmallModel in
+    // the player. Single-pass by construction, so the count travels as 1
+    // beside it and the stacking switches render nothing.
+    bool amdSmallModel{false};
     // Whether a third pass is predicted rather than really run; see
     // RenderSettings::amdMultiPassPredict in the player.
     bool amdMultiPassPredict{true};

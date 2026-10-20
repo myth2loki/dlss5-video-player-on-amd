@@ -138,9 +138,14 @@ StageExportOutcome RunStageExport(const StageExportJob& job,std::stop_token stop
         request.suppliedExposure=job.suppliedExposure;
         request.gpuSourceConversion=job.gpuSourceConversion;
         request.temporal=job.temporal;
-        // The pass count and the skin switch, the panel values this backend
-        // stacks the model with; the count is clamped again by ValidRequest.
-        request.amdPasses=std::clamp(job.neuralSettings.passes,1,4);
+        // The model the count selects, the pass count and the skin switch, the
+        // panel values this backend stacks the model with; the count is clamped
+        // again by ValidRequest, and on this backend it is the runtime's own
+        // ladder: 1 beside the Small model, 1..3 otherwise - 4 is a count the
+        // runtime reads as 0.5, the Small model.
+        request.amdSmallModel=job.amdSmallModel;
+        request.amdPasses=job.amdSmallModel?1u:std::clamp(job.neuralSettings.passes,1,
+            plan.backend==NeuralBackend::Amd?3:4);
         request.amdSkinProtect=job.amdSkinProtect;
         request.amdMultiPassPredict=job.amdMultiPassPredict;
         request.amdMultiPassSkip=job.amdMultiPassSkip;

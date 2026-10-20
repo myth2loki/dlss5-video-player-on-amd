@@ -33,7 +33,7 @@ inline constexpr std::wstring_view kForwardedValueOptions[] = {
 };
 
 // --render flags that dlss5-convert hands the player as given.
-inline constexpr std::wstring_view kForwardedFlags[] = {L"--safe-mode"};
+inline constexpr std::wstring_view kForwardedFlags[] = {L"--safe-mode", L"--small-model"};
 
 // --render options dlss5-convert sets itself for each file rather than passing
 // through: the input (--render), where it goes (--out, from --out, --out-dir

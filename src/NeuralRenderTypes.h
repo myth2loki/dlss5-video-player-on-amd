@@ -55,14 +55,16 @@ constexpr std::optional<NeuralBackend> ParseNeuralBackend(std::string_view name)
 //     helper loads (NeuralAddonOverridesFor) and they are a term of the render
 //     key, so any of them can change what comes back.
 //   * Amd - almost none of it. This backend loads no proxy and reads no INI;
-//     of the panel it reads exactly one value, the pass count, which the
-//     runtime stacks the model with - and the rung and the multi-pass skin
-//     switch travel outside this struct, so no value of THIS struct but the
-//     count reaches a pixel. The
-//     job's key carries the count in AmdNeuralSettingsDocument(), and the
+//     of the panel it reads exactly two values: the pass count, which the
+//     runtime stacks the model with, and which model that count selects - the
+//     0.44 Small network (31 blocks at 0.5x) against the Original 71-block one,
+//     the other spelling of the one DLSS5_MULTI_PASS key. The rung, the skin
+//     switch and the multi-pass switches travel outside this struct, so no
+//     other value of THIS struct reaches a pixel. The
+//     job's key carries the pair in AmdNeuralSettingsDocument(), and the
 //     retention key carries it through CanonicalNeuralSettingsForBackend();
-//     ApplyNeuralSettings restarts an AMD session when the count moved, and a
-//     caller that wires a second panel value through to this backend must flip
+//     ApplyNeuralSettings restarts an AMD session when either moved, and a
+//     caller that wires a further panel value through to this backend must flip
 //     all three in the same change, or the picture moves and neither the keys
 //     nor the session follow it.
 //
@@ -72,7 +74,8 @@ constexpr std::optional<NeuralBackend> ParseNeuralBackend(std::string_view name)
 // this player's own accumulation over the runtime's output. So this function is
 // not "nothing in the dialog matters on AMD", and a caller that reads it that
 // way leaves a moved rung unapplied - ApplyNeuralSettings states the real
-// condition, which on this backend is the rung or the pass count having moved.
+// condition, which on this backend is the rung, the pass count or the model
+// having moved.
 //
 // A caller may ask this only about a picture a render would produce. It is not a
 // statement that the panel is inert for the user - the values are still saved

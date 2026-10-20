@@ -2967,6 +2967,10 @@ struct AmdLmxxfEvaluatorAdapter {
     bool broughtUpSkinProtect{false};
     bool broughtUpPredict{true};
     bool broughtUpSkip{false};
+    // The model the bring-up was made under, beside the count it was made with:
+    // the two are one key in the runtime's file (0.5 against 1..3), so a
+    // network built for Small holds a network an Original job cannot use.
+    bool broughtUpSmallModel{false};
     // The style the bring-up was made under. It is the RUNTIME's too - the
     // network is compiled with it as preprocess feature 6 from the file the
     // writer above left - so a moved style is the same kind of question as a
@@ -2987,6 +2991,13 @@ struct AmdLmxxfEvaluatorAdapter {
     bool jobSkinProtect{false};
     bool jobPredict{true};
     bool jobSkip{false};
+    // Which model the count selects: the 0.44 Small network (31 blocks at 0.5x)
+    // against the Original 71-block one, the other spelling of the one
+    // DLSS5_MULTI_PASS key. A differently trained network, so a moved one is a
+    // moved bring-up exactly as a moved count is: the runtime reads the key
+    // once, when the network is built, and only a fresh load of the DLL reads
+    // the file again.
+    bool jobSmallModel{false};
     uint32_t jobStyle{1};
     bool reused=false;
     // Why the last bring-up failed, kept because a failed Initialize drops the
@@ -3001,9 +3012,16 @@ struct AmdLmxxfEvaluatorAdapter {
     bool Reused()const{return reused;}
     // Told before Initialize, because the reuse question is where the count
     // enters: an evaluator built under another count holds a network that
-    // stacks that many passes.
-    void SetMultiPassConfig(uint32_t passes,bool skinProtect){
-        jobPasses=passes<1u?1u:(passes>4u?4u:passes);
+    // stacks that many passes. The model is the same kind of question one key
+    // along: Small is a differently trained network, single-pass by
+    // construction, so beside it the count is forced to one and the stacking
+    // switches below it render nothing.
+    // (The parameter is not called `small`: the Windows SDK's rpcndr.h
+    // #defines that word as char, and the declaration stopped compiling the
+    // day it was.)
+    void SetMultiPassConfig(uint32_t passes,bool skinProtect,bool smallModel=false){
+        jobSmallModel=smallModel;
+        jobPasses=smallModel?1u:(passes<1u?1u:(passes>4u?4u:passes));
         jobSkinProtect=skinProtect&&jobPasses>1u;
     }
     // The prediction only exists at three passes: at any other count the field
@@ -3040,6 +3058,7 @@ struct AmdLmxxfEvaluatorAdapter {
         // and a match on all of them means there is nothing to rebuild.
         reused=evaluator&&width==w&&height==h&&broughtUpTemporal==config.temporalHistory&&
                broughtUpStability==config.stability&&broughtUpPasses==jobPasses&&
+               broughtUpSmallModel==jobSmallModel&&
                broughtUpSkinProtect==jobSkinProtect&&broughtUpPredict==jobPredict&&
                broughtUpSkip==jobSkip&&broughtUpStyle==jobStyle&&broughtUpOutputW==jobOutputW&&
                broughtUpOutputH==jobOutputH&&broughtUpTenBit==config.tenBitCapture&&
@@ -3054,6 +3073,7 @@ struct AmdLmxxfEvaluatorAdapter {
         broughtUpSourceConversion=conversion;
         broughtUpStability=config.stability;
         broughtUpPasses=jobPasses;
+        broughtUpSmallModel=jobSmallModel;
         broughtUpSkinProtect=jobSkinProtect;
         broughtUpPredict=jobPredict;
         broughtUpSkip=jobSkip;
@@ -3961,9 +3981,15 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
     // The style travels the same road for the same reason: it is the runtime's
     // key, read from the same file at the same moment.
     {
+        // Small is single-pass by construction - the runtime's ladder is
+        // 0.5/1/2/3 - and 4 is not a count this runtime takes (it reads an
+        // unknown count as 0.5, the Small model), so the count handed over is
+        // one beside the Small model and clamped to the Original ladder's top
+        // otherwise. The writer spells the pair as the one key it is.
+        const uint32_t passes=request.amdSmallModel?1u:std::clamp(request.amdPasses,1u,3u);
         std::string passesError;
         if (!amd_lmxxf::WriteAmdRuntimeConfig(state.amdEvaluator.config.runtimeDirectory,
-                                              std::clamp(request.amdPasses, 1u, 4u),
+                                              passes, request.amdSmallModel,
                                               request.amdSkinProtect, request.amdMultiPassPredict,
                                               request.amdMultiPassSkip, request.amdStyle,
                                               passesError)) {
@@ -4034,8 +4060,11 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
     // The count is the runtime's, not the evaluator's (the network stacks itself
     // when it is built); this only tells the adapter that a moved count is a
     // moved bring-up, so the next Initialize reloads the module and the runtime
-    // reads the file the player just wrote.
-    state.amdEvaluator.SetMultiPassConfig(request.amdPasses, request.amdSkinProtect);
+    // reads the file the player just wrote. The model travels with it for the
+    // same reason: the Small network is a different network, so a moved one is
+    // a moved bring-up too.
+    state.amdEvaluator.SetMultiPassConfig(request.amdSmallModel?1u:request.amdPasses,
+                                          request.amdSkinProtect,request.amdSmallModel);
     // The prediction changes how the third pass is made (a local forecast rather
     // than a full run), which is a moved bring-up for the same reason the count
     // and the skin switch are: the runtime reads its configuration once.
@@ -4090,7 +4119,11 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
                   ?"off, this job asked for no guides"
                   :"off, DLSS5_AMD_GUIDES=0 asked for the constant-guide arm"))
         <<" accumulation="<<TemporalStabilityName(state.amdEvaluator.config.stability)
-        <<" passes="<<request.amdPasses<<" (the runtime stacks the network itself; the count was handed to it before the network was built)"
+        // The model the count selects, in the runtime's own vocabulary: 0.5 is
+        // the 0.44 Small network (31 blocks), 1..3 the Original 71-block one
+        // stacked. Two renders that differ only here are different pictures,
+        // so the line says which one this is.
+        <<" passes="<<(request.amdSmallModel?"0.5 (the 0.44 Small model, 31 blocks)":std::to_string(std::clamp(request.amdPasses,1u,3u)))<<" (the runtime stacks the network itself; the count was handed to it before the network was built)"
         <<" style="<<amd_lmxxf::NormalizedAmdStyle(request.amdStyle)<<" (DLSS5_STYLE, handed over with the count)"
         <<" skin-protect="<<(request.amdSkinProtect?"on":"off")
         <<" mp-predict="<<(request.amdMultiPassPredict?"on":"off")
