@@ -21,20 +21,30 @@ inline constexpr std::wstring_view kLockFileName = L"amd-runtime-lock.json";
 
 // The rung an AMD render takes when nothing asked for one.
 //
-// The runtime relights every frame on its own and this backend has no history
-// for it to fuse with - its own temporal model needs guides, and the estimator
-// that would produce them is the expensive half this backend does not have - so
-// what a viewer sees between frames is the model's own frame-to-frame jitter.
-// The host-side accumulation (TemporalStabilityPolicy.h) is what takes that out,
-// which makes Off here not a neutral setting but the arm that flickers: measured
-// on a still source, frame-to-frame Y PSNR is 49.1 dB at the model's own output
-// against the source's own 96.6 dB, and Low takes the added jitter down 28.5%
-// for 0.1 dB of distance from the source
-// (docs/AMD-TEMPORAL-ACCUMULATION-zh.md).
+// Two paths reach this constant and they want it for different reasons.
 //
-// Low rather than Medium or High because this is a default and not a choice: the
-// rungs trade steadiness for detail monotonically, Low is the one that moves the
-// picture least, and a viewer who wants more can ask for it.
+// With guides on - the default, mv=1,depth=1 - the runtime fuses history under
+// the recording-lease lifecycle and the field it fuses is the player's own
+// estimator (OfflineNeuralRenderer's AmdLmxxfEvaluatorAdapter). The host-side
+// accumulation then runs on top of a picture that is already temporally
+// resolved, where its job is the model's residual jitter rather than all of it.
+//
+// With guides off - DLSS5_AMD_GUIDES=0, or a job that asked for neither channel -
+// the runtime relights every frame on its own and has no history to fuse with,
+// so what a viewer sees between frames is the model's own frame-to-frame
+// jitter and the accumulation is the only thing taking it out. That is the arm
+// the numbers below were measured in, and it makes Off here not a neutral
+// setting but the arm that flickers: on a still source, frame-to-frame Y PSNR
+// is 49.1 dB at the model's own output against the source's own 96.6 dB, and
+// Low takes the added jitter down 28.5% for 0.1 dB of distance from the source
+// (docs/AMD-TEMPORAL-ACCUMULATION-zh.md). The rung was chosen for that arm and
+// is not re-derived for the guided one: it is the same knob, it still trades
+// steadiness for detail monotonically, and a job that wants a different rung
+// says so.
+//
+// Low rather than Medium or High because this is a default and not a choice:
+// the rungs trade steadiness for detail monotonically, Low is the one that moves
+// the picture least, and a viewer who wants more can ask for it.
 inline constexpr TemporalStability kAmdDefaultStability = TemporalStability::Low;
 
 enum class GpuFamily
