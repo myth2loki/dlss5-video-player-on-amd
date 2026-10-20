@@ -714,7 +714,19 @@ public:
     // FidelityFX island came up; the call is harmless when it did not.
     void SetPlaybackFrameGeneration(bool on)
     {
-        if (on && !m_playbackFrameGen) m_fgResetPending = true;
+        if (on && !m_playbackFrameGen) {
+            m_fgResetPending = true;
+            // Turning interpolation on while a raw diagnostic (keys 2/3/4) is up
+            // means the user wants the cadence, not the guide: return to Final
+            // exactly as key 1 would. Without this the diagnostic parks the
+            // frame-generation present (see RecordAndPresentFrame), the chip
+            // reads off, and flipping the control on appears to do nothing.
+            if (m_debugView == DebugView::Input || m_debugView == DebugView::MotionVectors
+                || m_debugView == DebugView::Depth) {
+                m_debugView = DebugView::Final;
+                m_presentStale = true;
+            }
+        }
         if (!on) m_fgDoublingActive = false;
         m_playbackFrameGen = on;
     }

@@ -1782,6 +1782,20 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
     // a true from a prior cadence frame would leak into the debug/reset present
     // path and sample a stale m_fgUpscaleSharp.
     m_fgUpscaledReady = false;
+    // Which debug view, if any, is up decides what frame generation owes this
+    // frame. Final (the default - no view selected) runs the cadence as the user
+    // left it. FrameGenerated asks for the intermediate alone: the island may
+    // run to produce it, but the present is one draw, not the doubled pair. The
+    // three raw diagnostics (Input / MotionVectors / Depth) ask for the picture
+    // ahead of the frame-generation stage. Generation itself keeps running for
+    // them - the runtime's history must stay continuous or the first cadence
+    // frame back would interpolate across however long the view was up - but
+    // the present falls through to the ordinary debug-view switch below. The
+    // island branch's own present draw never reads m_debugView, which is what
+    // swallowed keys 2/3/4 and hid key 5 inside the cadence whenever
+    // Interpolate was on.
+    const bool fgDiagnosticView=m_debugView==DebugView::Input
+        ||m_debugView==DebugView::MotionVectors||m_debugView==DebugView::Depth;
     const bool fgWanted=m_playbackFrameGen||m_debugView==DebugView::FrameGenerated;
     const bool islandWanted=m_fgFfxIsland&&!m_fgFfxFailed&&m_psoFgConvert&&m_fgFfxInput&&m_fgFfxOutput;
     if(islandWanted&&fgWanted){
@@ -1835,7 +1849,11 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
             LOG("Playback frame generation: cadence active - each source frame is presented "
                 "as the generated midpoint and then the frame itself.");
         }
-        if(m_playbackFrameGen&&showGenerated){
+        // The doubled pair is Interpolate's product behaviour with no view
+        // selected. A view selected alongside it takes the single present below:
+        // key 5 with Interpolate on is the generated frame on its own, not the
+        // cadence it would otherwise be indistinguishable from.
+        if(m_playbackFrameGen&&showGenerated&&m_debugView==DebugView::Final){
             // Cadence: the generated midpoint first, the source frame second.
             // Two lists and two Presents, because each Present takes its own
             // backbuffer and the first list is still queued when the second is
@@ -1865,13 +1883,23 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
             m_fgDoublingActive=m_playbackFrameGen&&showGenerated&&presented;
             return presented;
         }
-        m_fgDoublingActive=false;
-        // Debug view, or a reset frame under playback generation: one present
-        // of the generated frame when there is one, of the source otherwise.
-        if(!RecordFrameGenPresentDraw(cmd,slot,showGenerated)) return false;
-        if(!DeviceHR(cmd->Close(),"Close frame command list")) return false;
-        {ID3D12CommandList*ls[]={cmd};m_queue->ExecuteCommandLists(1,ls);}
-        return PresentSwapchain("Present");
+        // A raw diagnostic takes the ordinary present below, not the
+        // frame-generation one. The island has already run for this frame and
+        // its history is continuous, so the view can come and go without the
+        // runtime ever interpolating across the gap. The cadence chip stays
+        // lit: generation is on, the picture is merely parked on a guide.
+        if(fgDiagnosticView){
+            m_fgDoublingActive=m_playbackFrameGen;
+        }else{
+            // A view-5 frame, or a reset frame under playback generation: one
+            // present of the generated frame when there is one, of the source
+            // otherwise.
+            m_fgDoublingActive=false;
+            if(!RecordFrameGenPresentDraw(cmd,slot,showGenerated)) return false;
+            if(!DeviceHR(cmd->Close(),"Close frame command list")) return false;
+            {ID3D12CommandList*ls[]={cmd};m_queue->ExecuteCommandLists(1,ls);}
+            return PresentSwapchain("Present");
+        }
     }
     // Playback frame generation, recorded between the upscale and the present
     // draw. Only the debug view asks for it in this build: it writes the same
