@@ -641,10 +641,21 @@ public:
     bool DLSSSourceOutsideRange() const { return m_dlss.SourceOutsideSupportedRange(); }
     bool DLSSEnabled() const { return m_dlssEnabled && m_dlss.Available(); }
     // Whether anything this frame will read the motion and depth textures: the
-    // NGX evaluate, or a debug view that draws them. False is the shipped
-    // default - SetDLSS(false) runs on every media load - and on that path the
-    // guide estimator, upload and two full-resolution passes have no consumer.
-    bool GuidesRequired() const { return DLSSEnabled() || m_debugView != DebugView::Final; }
+    // NGX evaluate, a debug view that draws them, or FSR 4 - whose reprojection
+    // runs on the real motion field when the guide estimator has one (see
+    // FsrUpscaleBackend). False is the shipped default - SetDLSS(false) runs on
+    // every media load - and on that path the guide estimator, upload and two
+    // full-resolution passes have no consumer. FSR 1 and Cas are single-frame
+    // spatial filters and never join this list: when the cascade has stepped
+    // down to them, m_fsrUpscaleActive is false and the guides go back to
+    // having no reader.
+    bool GuidesRequired() const {
+        return DLSSEnabled() || m_debugView != DebugView::Final
+            || (m_fsr4RealGuides && m_fsrUpscaleActive && m_fsrUpscale
+                && m_fsrUpscale->Available()
+                && (m_upscaleEngineMode == UpscaleEngineMode::Auto
+                    || m_upscaleEngineMode == UpscaleEngineMode::Fsr4));
+    }
     bool LastFrameUsedDLSS() const { return m_lastDLSSUsed; }
     // ---- this player's own upscale for playback (AmdUpscaleShader.h) -------
     //
@@ -1564,6 +1575,14 @@ private:
     // no other pass learns the difference.
     std::unique_ptr<FsrUpscaleBackend> m_fsrUpscale;
     bool m_fsrUpscaleActive = false;
+    // Whether FSR 4 reprojects against the playback guide estimator's real
+    // motion field (and its depth proxy) instead of the backend's zero-motion
+    // constants. On by default: the guides are already computed for the neural
+    // chain whenever anything reads them, and FSR 4 in service is now a reader
+    // (see GuidesRequired). DLSS5_FSR4_GUIDES=0 latches this false, which puts
+    // the identity reprojection back - the A/B arm for a picture comparison,
+    // and the way back if a measured field ever proves worse than none.
+    bool m_fsr4RealGuides = true;
     // FSR1 EASU, the middle tier (see PresentUpscaleEngineName). True when its
     // PSO compiled; it then serves every frame FSR 4 does not.
     bool m_easuActive = false;

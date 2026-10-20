@@ -20,7 +20,7 @@
 //
 // WHAT VIDEO DOES NOT HAVE: FSR expects a rendered frame - jittered colour,
 // depth, motion vectors, an exposure - and a camera. None of that survives
-// encoding, so it is supplied the way the vendor allows rather than invented:
+// encoding, so what the vendor allows is supplied rather than invented:
 //
 //   depth          flat 1.0 everywhere (no disocclusion can be inferred, which
 //                  is the honest answer: there is no geometry)
@@ -38,6 +38,18 @@
 // frame generation hit (Map/Unmap of a staging buffer while an FFX context is
 // alive -> TDR on the next execute) applies to any upload made after the
 // context exists.
+//
+// THE PLAYBACK EXCEPTION (depth and motion only): the renderer runs a
+// temporal-guide pass for the neural chain anyway - CPU block matching over the
+// decoded frames, expanded to full render resolution - and that field has
+// exactly the shape FSR wants: backward vectors (current -> previous) in
+// render-size pixels, and a [0,1] depth proxy that reads 0 near / 1 far, the
+// same way round as the flat constant. When the caller hands those two
+// resources to Dispatch, FSR reprojects against measured motion instead of
+// the identity; the constants stay as the fallback for every frame the guides
+// did not run for (Super Resolution off, no debug view, no FSR 4 in service).
+// The exposure stays constant either way: it is a tone input, not a temporal
+// one, and a metered log-average luminance is not the auto-exposure FSR means.
 class FsrUpscaleBackend {
 public:
     ~FsrUpscaleBackend();
@@ -64,8 +76,14 @@ public:
     // and `output` at upscaleSize in UNORDERED_ACCESS; the caller owns both
     // barriers, because the present chain already tracks those states.
     // `reset` clears the accumulated history (seek, switch, first frame).
+    // `depthGuide` / `motionGuide` are the renderer's full-resolution guide
+    // textures when the temporal-guide pass ran this frame (see the class
+    // comment); null falls back to the constants. Their states are the ones
+    // the guide pass leaves them in - the same states the constants sit in
+    // after their one clear - so no extra barrier is owed around them.
     bool Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12Resource* color, ID3D12Resource* output,
-                  bool reset, float frameTimeMs);
+                  bool reset, float frameTimeMs,
+                  ID3D12Resource* depthGuide = nullptr, ID3D12Resource* motionGuide = nullptr);
 
     void Shutdown();
 

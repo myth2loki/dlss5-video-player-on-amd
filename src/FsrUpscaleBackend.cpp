@@ -397,7 +397,8 @@ bool FsrUpscaleBackend::Initialize(ID3D12Device* device, uint32_t renderW, uint3
 }
 
 bool FsrUpscaleBackend::Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12Resource* color,
-                                 ID3D12Resource* output, bool reset, float frameTimeMs)
+                                 ID3D12Resource* output, bool reset, float frameTimeMs,
+                                 ID3D12Resource* depthGuide, ID3D12Resource* motionGuide)
 {
     if (!m_context || !g_dispatch || m_failed) return false;
 
@@ -406,10 +407,20 @@ bool FsrUpscaleBackend::Dispatch(ID3D12GraphicsCommandList* cmd, ID3D12Resource*
     dispatch.header.pNext = nullptr;
     dispatch.commandList = cmd;
     dispatch.color = fsr_fg::GetResourceDX12(color, FFX_API_RESOURCE_STATE_COMPUTE_READ);
-    dispatch.depth = fsr_fg::GetResourceDX12(m_depth.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ,
+    // The playback guides when the caller ran them this frame, the constants
+    // otherwise. Both arrive in a state FSR reads as-is: the constants sit in
+    // NON_PIXEL_SHADER_RESOURCE after their one clear, and the guide pass
+    // leaves the renderer's pair in GuideReadState / DepthGuideReadState, whose
+    // NON_PIXEL bit is what makes them compute-readable - the same contract
+    // NGX consumes the depth resource under, so no barrier is inserted here.
+    // The guide motion is backward (current -> previous) in render-size
+    // pixels, which is what motionVectorScale of 1,1 below spells out.
+    dispatch.depth = fsr_fg::GetResourceDX12(depthGuide ? depthGuide : m_depth.Get(),
+                                             FFX_API_RESOURCE_STATE_COMPUTE_READ,
                                              FFX_API_RESOURCE_USAGE_DEPTHTARGET);
     dispatch.motionVectors =
-        fsr_fg::GetResourceDX12(m_motion.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+        fsr_fg::GetResourceDX12(motionGuide ? motionGuide : m_motion.Get(),
+                                FFX_API_RESOURCE_STATE_COMPUTE_READ);
     dispatch.exposure = fsr_fg::GetResourceDX12(m_exposure.Get(),
                                                 FFX_API_RESOURCE_STATE_COMPUTE_READ);
     // Absent, which the API spells as an empty resource: with a flat depth and

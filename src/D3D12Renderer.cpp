@@ -3279,9 +3279,21 @@ bool D3D12Renderer::RecordFrameGenUpscale(ID3D12GraphicsCommandList* cmd)
         // accumulates is as valid as the source's.
         Barrier(cmd, m_fgUpscaleStretch.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // The same guide pair the source context takes: the generated midpoints
+        // are a temporally adjacent sequence of their own, and the field the
+        // source frame was matched against is the closest measured motion this
+        // half has. Null - when the guide pass did not run - falls back to the
+        // constants, exactly as the source half does.
+        ID3D12Resource* depthGuide = nullptr;
+        ID3D12Resource* motionGuide = nullptr;
+        if (GuidesRequired()) {
+            depthGuide = m_depth.Get();
+            motionGuide = m_motion.Get();
+        }
         stretched = m_fsrUpscaleGenerated->Dispatch(
             cmd, m_fgLinearColor.Get(), m_fgUpscaleStretch.Get(),
-            m_fgUpsResetPending, m_fgFrameTimeMs);
+            m_fgUpsResetPending, m_fgFrameTimeMs,
+            depthGuide, motionGuide);
         if (stretched) m_fgUpsResetPending = false;
         Barrier(cmd, m_fgUpscaleStretch.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -3692,6 +3704,16 @@ void D3D12Renderer::ReadFrameGenDiagnostics()
     if (!m_fgGenUpscaleAllowed) {
         LOG("Playback frame generation: DLSS5_FG_GEN_UPSCALE=0 - the generated-frame "
             "upscale is forced off; generated frames keep the compositor stretch.");
+    }
+    // FSR 4's temporal inputs, 0/1. On (the default) the dispatch takes the
+    // playback guide estimator's real motion field and depth proxy; 0 puts the
+    // backend's zero-motion constants back, so an A/B pair needs no rebuild.
+    // Either way the guide pass itself runs exactly when GuidesRequired says
+    // something reads it - this only decides which pair FSR 4 is handed.
+    if (readFlag(L"DLSS5_FSR4_GUIDES") == 0) m_fsr4RealGuides = false;
+    if (!m_fsr4RealGuides) {
+        LOG("Playback upscale: DLSS5_FSR4_GUIDES=0 - FSR 4 reprojects against the "
+            "zero-motion constants (identity reprojection), not the guide field.");
     }
     // The engine choice, 0..3 (Auto / FSR 4 / FSR1 / CAS). The environment
     // outranks the persisted ini choice, so an A/B run is never overridden.
@@ -4300,8 +4322,19 @@ void D3D12Renderer::RecordUpscalePresent(ID3D12GraphicsCommandList* cmd)
     if (useFsr) {
         Barrier(cmd, m_upscaleStretch.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // The guide pair, when this frame has one: GuidesRequired is true
+        // whenever FSR 4 is in service (the guide pass above has then already
+        // written both textures), and null on the frames it did not run for -
+        // which is what sends the dispatch back to its constants.
+        ID3D12Resource* depthGuide = nullptr;
+        ID3D12Resource* motionGuide = nullptr;
+        if (GuidesRequired()) {
+            depthGuide = m_depth.Get();
+            motionGuide = m_motion.Get();
+        }
         stretched = m_fsrUpscale->Dispatch(cmd, m_dlssColor.Get(), m_upscaleStretch.Get(),
-                                           m_upsResetPending, m_upsFrameTimeMs);
+                                           m_upsResetPending, m_upsFrameTimeMs,
+                                           depthGuide, motionGuide);
         Barrier(cmd, m_upscaleStretch.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         if (stretched) {
