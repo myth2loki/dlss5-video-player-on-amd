@@ -7,6 +7,32 @@ text is in git history (this file at tag `dlss5-video-player-v0.25.0`), and the
 decisions that still shape the code are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## 0.29.2 - 2026-10-20
+
+An AMD render was finishing two seconds after it had finished: the neural pass
+was over, the encoder was closed, and the job then waited out a timeout for a
+log this backend never writes. Nothing it waited for could have arrived. The
+wait is gone and the video it writes is the same bytes.
+
+### Fixed
+
+- **An AMD job no longer waits for the neural add-on's receipt.** After the last
+  frame a job reads the runtime's session log to prove feature 18 was armed, and
+  that read gives ReShade up to two seconds to finish writing. AMD loads no
+  ReShade - this backend runs its own runtime, and the job's own log line says
+  `feature18-receipt=not-applicable` - so the file was never there, all twenty
+  attempts failed, and the whole budget ran out: 2.21 s on a 48-frame 1280x720
+  export whose neural pass took 3.36 s. A backend with no receipt now reads its
+  log once and moves on. The same export finishes in 6.6 s instead of 8.6 s, and
+  that 2.2 s comes off every job, including each of the segment renders a live
+  playback queues.
+- **Nothing else changed, which is why the cache revision stays at 0.29.1.** The
+  evidence read on this backend was already empty and an empty read is what the
+  job still records, so the receipt is unchanged and the encoded video of the
+  same source at the same rung is byte-identical. NVIDIA jobs are untouched: a
+  job that inherits an armed feature still skips the wait once, and every later
+  read still waits for the add-on to settle.
+
 ## 0.29.1 - 2026-10-20
 
 An AMD render now writes its video with AMD's own hardware encoder instead of

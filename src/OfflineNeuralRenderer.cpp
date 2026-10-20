@@ -1176,9 +1176,13 @@ private:
             if (stop_.stop_requested()) return Cancelled(L"Neural render was cancelled.");
             return Fail(NeuralRenderFailure::Source, sourceFailure);
         }
-        const NeuralRuntimeEvidence retryEvidence=
-            ParseNeuralRuntimeEvidence(evidenceProvider_());
-        if(NvidiaEvidenceRequired()&&!retryEvidence.Valid())return Fail(NeuralRenderFailure::Neural, evidenceFailure);
+        // Only asked where it decides something. A retry on a backend with no
+        // receipt has nothing to verify and nothing to wait for.
+        if (NvidiaEvidenceRequired()) {
+            const NeuralRuntimeEvidence retryEvidence=
+                ParseNeuralRuntimeEvidence(evidenceProvider_());
+            if(!retryEvidence.Valid())return Fail(NeuralRenderFailure::Neural, evidenceFailure);
+        }
         return std::nullopt;
     }
 
@@ -3502,6 +3506,18 @@ std::string ReadSessionLog(Resolve resolve, bool stabilize, SessionLogTail& tail
     return latest;
 }
 
+// One read and no wait at all. For a backend whose evidence source does not
+// exist: AMD loads no ReShade, so ResolveNeuralRuntimeLogPath has nothing to
+// name, and every one of ReadSessionLog's twenty attempts would be a sleep no
+// write can end - two seconds spent waiting for a file that is never going to
+// appear. What comes back is what was there, which on that backend is nothing.
+template <class Resolve>
+std::string ReadSessionLogOnce(Resolve resolve, SessionLogTail& tail)
+{
+    constexpr uintmax_t Limit=4u*1024u*1024u;
+    return tail.Refresh(resolve(),Limit)?tail.Text():std::string();
+}
+
 } // namespace
 
 std::string ReadNeuralRuntimeSessionLog(const std::filesystem::path& runtimeDirectory)
@@ -3616,15 +3632,30 @@ namespace {
 // that job's final read saw and the baseline it yields cannot be stale-low.
 // Every later read in the job - including the one the advance check is made
 // against - still waits.
+//
+// And it is skipped outright on a backend that writes no receipt at all. There
+// the wait is not a wait for anything slow, it is a wait for something that
+// cannot happen: ResolveNeuralRuntimeLogPath finds no ReShade.log, so the read
+// fails on every attempt and the twenty-attempt budget runs out in full. That
+// budget is two seconds of a job that spends three under the network.
 class SessionEvidence {
 public:
     explicit SessionEvidence(std::filesystem::path runtimeDirectory)
         : runtimeDirectory_(std::move(runtimeDirectory)) {}
 
-    void BeginJob(bool featureAlreadyArmed) { skipStabilityOnce_ = featureAlreadyArmed; }
+    // `addOnArming` is whether this job's runtime writes an add-on receipt whose
+    // asynchronous arming the settle wait exists to catch. It is false on a
+    // backend that loads no add-on (AMD): there the resolved log path is empty,
+    // nothing is ever appended to it, so settling is not slow but impossible.
+    void BeginJob(bool featureAlreadyArmed, bool addOnArming)
+    {
+        skipStabilityOnce_ = featureAlreadyArmed;
+        awaitsAddOnArming_ = addOnArming;
+    }
 
     std::string operator()()
     {
+        if (!awaitsAddOnArming_) return ReadSessionLogOnce([this] { return Pinned(); }, tail_);
         const bool stabilize = !skipStabilityOnce_;
         skipStabilityOnce_ = false;
         return ReadSessionLog([this] { return Pinned(); }, stabilize, tail_);
@@ -3665,6 +3696,7 @@ private:
     std::filesystem::path pinned_;
     SessionLogTail tail_;
     bool skipStabilityOnce_{};
+    bool awaitsAddOnArming_{true};
 };
 
 } // namespace
@@ -3808,7 +3840,7 @@ NeuralRenderResult OfflineNeuralRenderer::Run(const NeuralRenderRequest& request
     // Read before the reset, because the reset is allowed to drop the feature.
     const bool inheritedArmedFeature=state.evaluator.renderer&&state.evaluator.FeatureCreated();
     state.evaluator.ResetForJob(request.guides);
-    state.evidence.BeginJob(inheritedArmedFeature);
+    state.evidence.BeginJob(inheritedArmedFeature,true/*addOnArming*/);
     NeuralRenderResult result=RunJob(request,std::move(progress),stop,state.source,
         state.evaluator,state.encoder,std::ref(state.evidence),
         []{return SteadyClock::now();},
@@ -4060,7 +4092,12 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
     // the module load and the session arming every time. The reuse that exists
     // here is the device - AmdLmxxfEvaluatorAdapter::Reused reports it, and that
     // is what Residency reports below.
-    state.evidence.BeginJob(false);
+    //
+    // False for the second argument as well, and that one is about time rather
+    // than features: this backend writes no ReShade log, so there is nothing for
+    // the evidence read to settle and a settling read would wait out its whole
+    // budget. See SessionEvidence::BeginJob.
+    state.evidence.BeginJob(false/*featureAlreadyArmed*/,false/*addOnArming*/);
     NeuralRenderResult result=RunJob(request,std::move(progress),stop,state.source,
         state.amdEvaluator,state.encoder,std::ref(state.evidence),
         []{return SteadyClock::now();},
