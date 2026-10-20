@@ -2862,8 +2862,11 @@ struct ProductionEvaluatorAdapter {
 // detects cuts: a cut it accepts resets the runtime's history, and the job's
 // tally is that decision's only record.
 // Five are answered because the job reads them unconditionally:
-//   - CapturePixelFormat is Bgra: there is no NV12/P010 GPU conversion here, so
-//     a job that asked for one is asked to stop asking (see Retained::Run);
+//   - CapturePixelFormat is the evaluator's answer: P010 when the rung is
+//     10-bit and the accumulation can carry it, Bgra otherwise. What there is
+//     NOT is a GPU colour conversion - nothing here produces NV12 or a P010
+//     surface the encoder could take without a readback - so a job that asked
+//     for gpuColorConversion is asked to stop asking (see Retained::Run);
 //   - FeatureCreated is the runtime's own bring-up state. AmdLmxxfEvaluator
 //     documents why a prepared session IS the capability on this backend;
 //   - EvaluationCount and NeuralEvaluations are the SAME number here. They are
@@ -2939,6 +2942,12 @@ struct AmdLmxxfEvaluatorAdapter {
     // for another style, the evaluator is rebuilt, the module reloads and the
     // file is read again before the network is built.
     uint32_t broughtUpStyle{1};
+    // The capture's depth and its dither, which are bring-up state in the
+    // strongest sense: the format of three textures and the pixel shader of the
+    // encode pass are decided from them, so an evaluator brought up for 8 bits
+    // would write 8-bit bytes for a job that asked for 10 and report success.
+    bool broughtUpTenBit{false};
+    bool broughtUpDither{false};
     uint32_t broughtUpOutputW{},broughtUpOutputH{};
     uint32_t jobOutputW{},jobOutputH{};
     uint32_t jobPasses{1};
@@ -2992,11 +3001,14 @@ struct AmdLmxxfEvaluatorAdapter {
                broughtUpStability==config.stability&&broughtUpPasses==jobPasses&&
                broughtUpSkinProtect==jobSkinProtect&&broughtUpPredict==jobPredict&&
                broughtUpSkip==jobSkip&&broughtUpStyle==jobStyle&&broughtUpOutputW==jobOutputW&&
-               broughtUpOutputH==jobOutputH;
+               broughtUpOutputH==jobOutputH&&broughtUpTenBit==config.tenBitCapture&&
+               broughtUpDither==config.captureDither;
         if(reused)return true;
         captured.clear();
         evaluator=std::make_unique<AmdLmxxfEvaluator>(config);
         width=w;height=h;broughtUpTemporal=config.temporalHistory;
+        broughtUpTenBit=config.tenBitCapture;
+        broughtUpDither=config.captureDither;
         broughtUpStability=config.stability;
         broughtUpPasses=jobPasses;
         broughtUpSkinProtect=jobSkinProtect;
@@ -3005,7 +3017,26 @@ struct AmdLmxxfEvaluatorAdapter {
         broughtUpStyle=jobStyle;
         broughtUpOutputW=jobOutputW;
         broughtUpOutputH=jobOutputH;
-        if(evaluator->Initialize(nullptr,w,h,ow,oh,fps,controls))return true;
+        if(evaluator->Initialize(nullptr,w,h,ow,oh,fps,controls)){
+            // One line per bring-up, because the capture's depth is the one
+            // thing about this backend's bytes a reader cannot infer from the
+            // rung names: tenBitCapture is a REQUEST, and whether the capture
+            // could honour it depends on the accumulation and the size. The
+            // encoder's own choice of pixel format follows this answer, so a
+            // render that came out 8-bit has its reason right here.
+            LOG("AMD capture: "<<(evaluator->TenBitCapture()?"P010 10-bit 4:2:0":"8-bit BGRA")
+                <<" at "<<ow<<"x"<<oh
+                <<(evaluator->TenBitCapture()
+                       ?", BT.709 limited range from the accumulation's FP16 frame"
+                       :(config.tenBitCapture
+                             ?", which is where a 10-bit request falls back"
+                             :""))
+                // The dither is an 8-bit store's, and it is a cache-key term:
+                // a reader comparing two renders needs to know which one this
+                // was without re-deriving it from the encoder settings.
+                <<(config.captureDither?", bayer8 dither at the store":", no dither"));
+            return true;
+        }
         broughtUpFailure=evaluator->LastFailure();
         broughtUpError=evaluator->LastError();
         LOG("AMD neural runtime did not come up for "<<w<<"x"<<h<<": "<<broughtUpError);
@@ -3070,7 +3101,15 @@ struct AmdLmxxfEvaluatorAdapter {
     // The queue above, not a pool: this is how far the job may run ahead, and the
     // evaluator has already been paid for by the time an entry lands in it.
     static constexpr uint32_t MaxPending(){return 2u;}
-    static constexpr EncoderPixelFormat CapturePixelFormat(){return EncoderPixelFormat::Bgra;}
+    // What the evaluator resolved the capture to. P010 on a 10-bit job whose
+    // accumulation can carry the precision, BGRA everywhere else - and the
+    // answer has to come from the evaluator rather than from the config, because
+    // only it knows whether the capture size and the rung let the 10-bit store
+    // happen at all.
+    EncoderPixelFormat CapturePixelFormat()const{
+        return evaluator&&evaluator->TenBitCapture()?EncoderPixelFormat::P010
+                                                    :EncoderPixelFormat::Bgra;
+    }
     bool ResolveOldest(std::vector<uint8_t>& pixels,FrameIdentity& id,double& captureMs){
         if(captured.empty())return false;
         pixels=std::move(captured.front().bgra);id=captured.front().id;captured.pop_front();
@@ -3768,6 +3807,21 @@ bool AmdGuideEstimatorEnabled()
     return text[0] != L'0' || text[1] != L'\0';
 }
 
+// Whether the AMD backend may store its capture at 10 bits. On by default,
+// because it is what the High and Lossless rungs ask for and the precision is
+// already in hand - the accumulation writes FP16 and the encode was rounding it
+// to eight bits one pass before the YUV conversion. DLSS5_AMD_10BIT=0 is the
+// A/B arm: the same job, the same rung and the same encoder, with the capture
+// kept 8-bit, which is exactly what this backend did before.
+bool AmdTenBitCaptureEnabled()
+{
+    wchar_t text[8]{};
+    const DWORD length = ::GetEnvironmentVariableW(L"DLSS5_AMD_10BIT", text,
+                                                   static_cast<DWORD>(std::size(text)));
+    if (length == 0 || length >= std::size(text)) return true;
+    return text[0] != L'0' || text[1] != L'\0';
+}
+
 // One job on the AMD backend. A separate function rather than a branch inside
 // Run, because the two paths differ in more than a table of settings: this one
 // has no ReShade receipt to open, no feature-18 arming to wait for, no upscale
@@ -3886,6 +3940,17 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
     // made where the request is made, so that a job which asked for Off gets Off
     // and a job which said nothing gets Low.
     state.amdEvaluator.config.stability=request.temporal.stability;
+    // The encoder's rung decides the capture's depth, as it does on the NVIDIA
+    // path: High and Lossless are the 10-bit rungs, and on this backend the
+    // precision they carry has to come out of the accumulation's FP16 slot
+    // rather than out of a P010 surface the runtime would have to publish. The
+    // evaluator resolves the pair at Initialize - it also needs an even capture
+    // size - and logs the fallback when it cannot, so asking here is a request
+    // and the answer is what the receipt records.
+    state.amdEvaluator.config.tenBitCapture=EncoderQualityIsTenBit(request.quality)&&
+        AmdTenBitCaptureEnabled();
+    state.amdEvaluator.config.captureDither=request.captureDither&&
+        !state.amdEvaluator.config.tenBitCapture;
     // The count is the runtime's, not the evaluator's (the network stacks itself
     // when it is built); this only tells the adapter that a moved count is a
     // moved bring-up, so the next Initialize reloads the module and the runtime

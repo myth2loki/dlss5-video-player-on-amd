@@ -183,6 +183,27 @@ struct AmdLmxxfEvaluatorConfig {
     // rather than a bring-up fact, so it is not in the reuse question below.
     float upscaleSharpness{0.6f};
 
+    // Hand the capture to the encoder as P010 - 10-bit 4:2:0, BT.709 limited
+    // range - instead of 8-bit BGRA. This is what the EncoderQuality rungs above
+    // Standard ask the NVIDIA path for, and until now this backend answered by
+    // storing 8 bits and letting ffmpeg expand them, which carried no precision
+    // the picture did not already have.
+    //
+    // It needs the accumulation, and that is not an accident of the code. The
+    // runtime publishes 8-bit sRGB, so the only place this backend holds more
+    // than 8 bits is the FP16 history slot a rung keeps; without a rung there is
+    // nothing for a 10-bit store to carry, and the capture stays 8-bit. 4:2:0
+    // also needs an even capture size, the same rule the NVIDIA capture applies.
+    // Either way the fallback is logged rather than silent.
+    bool tenBitCapture{false};
+    // The ordered dither at the 8-bit capture store, the same Bayer map the
+    // NVIDIA capture uses (DitherPolicy.h states why Bayer there and blue noise
+    // in the window). It applies only to an 8-bit store: the rung that can carry
+    // the precision does not need the map, which is the rule the NVIDIA path
+    // applies too. Off by default so an evaluator built without saying anything
+    // writes the bytes it always did.
+    bool captureDither{false};
+
     // Per-stage trace, for the smoke test and for a receipt. Empty disables it.
     std::function<void(std::string_view)> log;
 };
@@ -232,6 +253,12 @@ public:
     // host colour texture was not the source. Null when nothing was produced.
     const void* LastOutputResource() const noexcept { return lastOutput_; }
     bool LastOutputWasPrivate() const noexcept { return lastOutputWasPrivate_; }
+    // Whether this session's capture is P010 rather than 8-bit BGRA, which is
+    // what the caller has to know to describe the bytes it is handed. Decided at
+    // Initialize from config_.tenBitCapture AND what the capture can honestly
+    // carry there (an accumulation to keep the precision in, an even size for
+    // 4:2:0), so asking is the only correct source for it.
+    bool TenBitCapture() const noexcept { return tenBitCapture_; }
     // Wall time of the last Submit, which is what a receipt's per-frame pacing
     // would carry. The runtime's own GetTimings network_ms is LastNeuralGpuMs.
     double LastSubmitMs() const noexcept { return lastSubmitMs_; }
@@ -356,6 +383,19 @@ private:
     bool RecordUpscale(ID3D12GraphicsCommandList* list, ID3D12Resource* from);
     bool Upscaling() const noexcept { return upscaleWidth_ != 0 && upscaleHeight_ != 0; }
     bool CreateUpscaleResources();
+    // The width and height the readback is at: the capture's when the job
+    // upscales, the frame's otherwise. Both because the four call sites that
+    // size a buffer need the same answer.
+    uint32_t CaptureWidth() const noexcept { return Upscaling() ? upscaleWidth_ : width_; }
+    uint32_t CaptureHeight() const noexcept { return Upscaling() ? upscaleHeight_ : height_; }
+    // The P010 planes and their readbacks (config_.tenBitCapture). Called from
+    // CreateTemporalResources, because the precision it stores is the
+    // accumulation's - see the config field for why there is nowhere else.
+    bool CreateCaptureResources();
+    // Records the two plane draws and their copies. `srvIndex` names the texture
+    // in captureSrvHeap_ the frame is read from, which arrives in
+    // PIXEL_SHADER_RESOURCE and is left there.
+    void RecordP010Capture(ID3D12GraphicsCommandList* list, uint32_t srvIndex);
     // Maps the readback buffer and copies the frame out of it. Shared by both
     // call orders, which differ only in which list the copy was recorded into.
     bool ReadBackProduced(std::vector<uint8_t>& out);
@@ -464,6 +504,40 @@ private:
     UINT upscaleSrvDescriptorSize_{};
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT outputFootprint_{};
     Microsoft::WRL::ComPtr<ID3D12Resource> outputReadback_;
+    // The same two targets at 16-bit, when the capture is 10-bit: the shaders
+    // are unchanged and only the store differs, so what this buys is the
+    // stretch and the CAS running without rounding the frame to eight bits
+    // between them - which is exactly where a gradient at 1:1 would band.
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> psoUpscale16_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> psoCas16_;
+
+    // ---- the 10-bit capture's own objects (config_.tenBitCapture) ---------
+    //
+    // Resolved at Initialize rather than taken from the config: it also needs
+    // the accumulation and an even capture size, and the answer decides the
+    // format of three textures above, so it has to be a bring-up fact.
+    bool tenBitCapture_{};
+    // The two P010 planes, at the capture's size and half of it. Separate
+    // resources rather than one interleaved texture because 4:2:0 is two
+    // different geometries, and the readback assembles them.
+    Microsoft::WRL::ComPtr<ID3D12Resource> lumaPlane_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> chromaPlane_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> lumaReadback_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> chromaReadback_;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT lumaFootprint_{};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT chromaFootprint_{};
+    // The two entry points of AmdTemporalAccumulationShader.h's capture
+    // program, and the encode's 16-bit store beside them.
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> psoCaptureLuma10_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> psoCaptureChroma10_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> psoEncode16_;
+    // The dithered 8-bit store (config_.captureDither), null when it was not
+    // asked for and always null on a 10-bit capture.
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> psoEncodeDithered_;
+    // Slot 0 is the encoded frame, slot 1 the upscaled one - the two textures a
+    // capture can read, both made once because neither is the runtime's.
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> captureSrvHeap_;
+    UINT captureSrvDescriptorSize_{};
 
     // The state the caller declared for color_ at the last RecordInputs and the
     // state the next transition must start from. The runtime reads the colour

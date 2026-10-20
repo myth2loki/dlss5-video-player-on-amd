@@ -67,7 +67,16 @@ constexpr UINT kSrvCount = 3 + 2 * kAccumulateTableSize;
 constexpr UINT kRtvStabilised = 0;
 constexpr UINT kRtvHistoryBase = 1;         // + the history slot being written
 constexpr UINT kRtvNeuralLinear = 3;
-constexpr UINT kRtvCount = 4;
+// The 10-bit capture's two planes, which no other pass touches.
+constexpr UINT kRtvCaptureLuma = 4;
+constexpr UINT kRtvCaptureChroma = 5;
+constexpr UINT kRtvCount = 6;
+
+// The 10-bit capture's own SRV heap: the encoded frame, then the upscaled one.
+// Two slots because a capture reads exactly one of them and which one is the
+// difference between a plain job and an upscaling one.
+constexpr UINT kSrvCaptureFrame = 0;
+constexpr UINT kSrvCaptureUpscaled = 1;
 
 std::string Narrow(const std::wstring& text)
 {
@@ -824,6 +833,21 @@ void AmdLmxxfEvaluator::TearDown()
     upscaleSrvHeap_.Reset();
     upscaleSrvDescriptorSize_ = 0;
     outputReadback_.Reset();
+    lumaReadback_.Reset();
+    chromaReadback_.Reset();
+    lumaPlane_.Reset();
+    chromaPlane_.Reset();
+    captureSrvHeap_.Reset();
+    psoCaptureLuma10_.Reset();
+    psoCaptureChroma10_.Reset();
+    psoEncode16_.Reset();
+    psoEncodeDithered_.Reset();
+    psoUpscale16_.Reset();
+    psoCas16_.Reset();
+    lumaFootprint_ = {};
+    chromaFootprint_ = {};
+    captureSrvDescriptorSize_ = 0;
+    tenBitCapture_ = false;
     fence_.Reset();
     consumerList_.Reset();
     consumerAllocator_.Reset();
@@ -881,6 +905,23 @@ bool AmdLmxxfEvaluator::Initialize(HWND, uint32_t width, uint32_t height, uint32
     height_ = height;
     upscaleWidth_ = wantedUpscaleW;
     upscaleHeight_ = wantedUpscaleH;
+    // The 10-bit capture, resolved here because two other things have to agree
+    // with it and both are bring-up facts: it needs an accumulation whose FP16
+    // slot is where the precision comes from, and 4:2:0 needs an even capture
+    // size. A job that asked for it and does not get it is told so rather than
+    // handed 8-bit bytes it believes are 10.
+    {
+        const uint32_t captureW = wantedUpscaleW ? wantedUpscaleW : width;
+        const uint32_t captureH = wantedUpscaleH ? wantedUpscaleH : height;
+        tenBitCapture_ = config_.tenBitCapture &&
+                         config_.stability != TemporalStability::Off &&
+                         (captureW % 2u) == 0 && (captureH % 2u) == 0;
+        if (config_.tenBitCapture && !tenBitCapture_)
+            Log("the 10-bit capture needs the temporal accumulation, whose FP16 slot is the "
+                "only place this backend holds more than 8 bits, and an even capture size for "
+                "4:2:0; capturing 8-bit BGRA at " + std::to_string(captureW) + "x" +
+                std::to_string(captureH));
+    }
     frameIndex_ = 0;
     evaluations_ = 0;
     neuralEvaluations_ = 0;
@@ -1040,15 +1081,21 @@ bool AmdLmxxfEvaluator::CreateUpscaleResources()
     D3D12_HEAP_PROPERTIES defaultHeap{};
     defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
 
-    // One description, two targets: both are capture-sized BGRA, both written
-    // by a draw and read by the next pass or the copy.
+    // One description, two targets: both are capture-sized, both written by a
+    // draw and read by the next pass or the copy. 16-bit when the capture is:
+    // the stretch and the CAS then run without rounding the frame to eight bits
+    // between them, which is where a gradient would band before the planes ever
+    // see it. The shaders are the same either way - they work in the
+    // gamma-encoded values both formats carry.
+    const DXGI_FORMAT targetFormat =
+        tenBitCapture_ ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
     D3D12_RESOURCE_DESC target{};
     target.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     target.Width = upscaleWidth_;
     target.Height = upscaleHeight_;
     target.DepthOrArraySize = 1;
     target.MipLevels = 1;
-    target.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    target.Format = targetFormat;
     target.SampleDesc.Count = 1;
     target.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (FAILED(device_->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &target,
@@ -1084,12 +1131,20 @@ bool AmdLmxxfEvaluator::CreateUpscaleResources()
     D3D12_SHADER_RESOURCE_VIEW_DESC view{};
     view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    view.Format = targetFormat;
     view.Texture2D.MipLevels = 1;
     device_->CreateShaderResourceView(
         upscaleTarget_.Get(), &view,
         OffsetHandle(upscaleSrvHeap_->GetCPUDescriptorHandleForHeapStart(),
                      upscaleSrvDescriptorSize_, 1));
+    // The 10-bit capture reads the sharpened target, which nothing else ever
+    // bound as a resource. Its slot in the capture heap is the second of two.
+    if (tenBitCapture_) {
+        device_->CreateShaderResourceView(
+            sharpenedTarget_.Get(), &view,
+            OffsetHandle(captureSrvHeap_->GetCPUDescriptorHandleForHeapStart(),
+                         captureSrvDescriptorSize_, kSrvCaptureUpscaled));
+    }
 
     // The static sampler is POINT because both passes sample at exact texel
     // centres: the Catmull-Rom weights are the whole filter, and the CAS taps
@@ -1166,7 +1221,7 @@ bool AmdLmxxfEvaluator::CreateUpscaleResources()
     pso.DepthStencilState.StencilEnable = FALSE;
     pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     pso.NumRenderTargets = 1;
-    pso.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    pso.RTVFormats[0] = targetFormat;
     pso.SampleDesc = {1, 0};
     pso.DSVFormat = DXGI_FORMAT_UNKNOWN;
     pso.pRootSignature = upscaleRootSig_.Get();
@@ -1176,6 +1231,18 @@ bool AmdLmxxfEvaluator::CreateUpscaleResources()
     pso.PS = {casPs->GetBufferPointer(), casPs->GetBufferSize()};
     if (FAILED(device_->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(psoCas_.GetAddressOf()))))
         return Refuse("CreateGraphicsPipelineState for the CAS pass failed");
+    // The same two passes at 16 bits, built beside the 8-bit pair rather than
+    // replacing it: which one a frame binds is the capture's format, and the
+    // other one costs a pipeline the driver builds once.
+    if (tenBitCapture_) {
+        pso.PS = {upscalePs->GetBufferPointer(), upscalePs->GetBufferSize()};
+        if (FAILED(device_->CreateGraphicsPipelineState(
+                &pso, IID_PPV_ARGS(psoUpscale16_.GetAddressOf()))))
+            return Refuse("CreateGraphicsPipelineState for the 16-bit upscale pass failed");
+        pso.PS = {casPs->GetBufferPointer(), casPs->GetBufferSize()};
+        if (FAILED(device_->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(psoCas16_.GetAddressOf()))))
+            return Refuse("CreateGraphicsPipelineState for the 16-bit CAS pass failed");
+    }
 
     // The capture's own readback: the frame one is sized to the source, and a
     // capture at another size is a different footprint with a different pitch.
@@ -1205,12 +1272,21 @@ bool AmdLmxxfEvaluator::RecordUpscale(ID3D12GraphicsCommandList* list, ID3D12Res
         return Fail(NeuralRenderFailure::Neural,
                     "the upscale capture was recorded with no frame to stretch");
     const D3D12_RESOURCE_DESC description = from->GetDesc();
-    if (description.Format != DXGI_FORMAT_B8G8R8A8_UNORM &&
-        description.Format != DXGI_FORMAT_B8G8R8X8_UNORM)
+    // The stretch reads gamma-encoded values, and both the 8-bit and the 16-bit
+    // store carry them; which one arrives is the capture's format, so both are
+    // legal here for exactly as long as the rest of the record agrees. A 16-bit
+    // frame on an 8-bit capture would be stretched into an 8-bit target and
+    // quantised twice, so it is refused rather than silently narrowed.
+    const bool layoutOk = tenBitCapture_
+                              ? description.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
+                              : description.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                                    description.Format == DXGI_FORMAT_B8G8R8X8_UNORM;
+    if (!layoutOk)
         return Fail(NeuralRenderFailure::Neural,
                     "the upscale capture's input format " +
                         std::to_string(static_cast<int>(description.Format)) +
-                        " is not a 32-bit BGRA layout this evaluator can read");
+                        " is not the layout this capture stores (" +
+                        (tenBitCapture_ ? "16-bit RGBA" : "32-bit BGRA") + ")");
 
     // The one descriptor that cannot be built once, for the same reason the
     // accumulation's is not: this backend's producer publishes a new texture
@@ -1257,7 +1333,8 @@ bool AmdLmxxfEvaluator::RecordUpscale(ID3D12GraphicsCommandList* list, ID3D12Res
     // ---- stretch: the frame into the capture's geometry -------------------
     Transition(list, upscaleTarget_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                D3D12_RESOURCE_STATE_RENDER_TARGET);
-    draw(psoUpscale_.Get(), upscaleRtvHeap_->GetCPUDescriptorHandleForHeapStart(), 0);
+    draw(tenBitCapture_ ? psoUpscale16_.Get() : psoUpscale_.Get(),
+         upscaleRtvHeap_->GetCPUDescriptorHandleForHeapStart(), 0);
     Transition(list, upscaleTarget_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
@@ -1265,13 +1342,22 @@ bool AmdLmxxfEvaluator::RecordUpscale(ID3D12GraphicsCommandList* list, ID3D12Res
     const UINT rtvSize = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     Transition(list, sharpenedTarget_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                D3D12_RESOURCE_STATE_RENDER_TARGET);
-    draw(psoCas_.Get(),
+    draw(tenBitCapture_ ? psoCas16_.Get() : psoCas_.Get(),
          OffsetHandle(upscaleRtvHeap_->GetCPUDescriptorHandleForHeapStart(), rtvSize, 1), 1);
     Transition(list, sharpenedTarget_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-               D3D12_RESOURCE_STATE_COPY_SOURCE);
-    CopyTextureToReadback(list, sharpenedTarget_.Get(), DXGI_FORMAT_B8G8R8A8_UNORM);
-    Transition(list, sharpenedTarget_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    // The capture's last step: the two P010 planes at 10 bits, or the 8-bit
+    // copy every earlier capture took.
+    if (tenBitCapture_) {
+        RecordP010Capture(list, kSrvCaptureUpscaled);
+    } else {
+        Transition(list, sharpenedTarget_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+        CopyTextureToReadback(list, sharpenedTarget_.Get(), DXGI_FORMAT_B8G8R8A8_UNORM);
+        Transition(list, sharpenedTarget_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
 
     // What a reader of this frame gets is the sharpened capture, not the
     // runtime's own 1:1 output - the same claim the accumulation's encode makes.
@@ -1326,10 +1412,13 @@ bool AmdLmxxfEvaluator::CreateTemporalResources()
                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, neuralLinear_,
                  L"AMD_Temporal_NeuralLinear"))
         return false;
-    if (!texture(DXGI_FORMAT_B8G8R8A8_UNORM, width_, height_,
-                 D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+    // The encoded frame. 8-bit BGRA is what the readback and the encoder take on
+    // the Standard rung; a 10-bit capture keeps it at FP16 so the accumulation's
+    // precision survives the encode and the YUV conversion can use it.
+    if (!texture(tenBitCapture_ ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM,
+                 width_, height_, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                  D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, stabilised_,
-                 L"AMD_Temporal_Stabilised"))
+                 tenBitCapture_ ? L"AMD_Temporal_Stabilised16" : L"AMD_Temporal_Stabilised"))
         return false;
     if (!texture(DXGI_FORMAT_R16G16_FLOAT, 1, 1, D3D12_RESOURCE_FLAG_NONE,
                  D3D12_RESOURCE_STATE_COPY_DEST, zeroMotion_, L"AMD_Temporal_ZeroMotion"))
@@ -1452,6 +1541,10 @@ bool AmdLmxxfEvaluator::CreateTemporalResources()
     makeView(sourceSlot_[0].Get(), DXGI_FORMAT_B8G8R8A8_UNORM, kSrvDecode);
 
     if (!CreateTemporalPipeline()) return false;
+    // Last, because the capture's pipelines are built on the conversion's root
+    // signature - it binds one texture and no constants, which is the whole of
+    // what a plane draw needs.
+    if (!CreateCaptureResources()) return false;
 
     Log("temporal accumulation " + std::string(TemporalStabilityName(config_.stability)) + " at " +
         std::to_string(width_) + "x" + std::to_string(height_) +
@@ -1588,6 +1681,33 @@ bool AmdLmxxfEvaluator::CreateTemporalPipeline()
     pso.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
     if (FAILED(device_->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(psoEncode_.GetAddressOf()))))
         return Refuse("CreateGraphicsPipelineState for the encode pass failed");
+    // The same pixel shader, a 16-bit store. What it buys is the accumulation's
+    // precision surviving the encode: the capture reads sRGB codes back out of
+    // an 8-bit target on the Standard rung, and a gradient the model lifted
+    // arrives at the encoder as a staircase one code apart.
+    if (tenBitCapture_) {
+        pso.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        if (FAILED(device_->CreateGraphicsPipelineState(
+                &pso, IID_PPV_ARGS(psoEncode16_.GetAddressOf()))))
+            return Refuse("CreateGraphicsPipelineState for the 16-bit encode pass failed");
+        pso.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    }
+    // The dithered 8-bit store, compiled only when it was asked for: the
+    // undithered program is what every render before it published, and a
+    // pipeline nobody binds is a compile and a shader cache entry for nothing.
+    // A 10-bit capture never asks: the store that can carry the precision does
+    // not need the map.
+    if (config_.captureDither && !tenBitCapture_) {
+        Microsoft::WRL::ComPtr<ID3DBlob> ditheredPs;
+        if (!compile(kAmdTemporalConvertHlsl, sizeof(kAmdTemporalConvertHlsl) - 1,
+                     "PSEncodeDithered", ditheredPs))
+            return false;
+        pso.PS = {ditheredPs->GetBufferPointer(), ditheredPs->GetBufferSize()};
+        if (FAILED(device_->CreateGraphicsPipelineState(
+                &pso, IID_PPV_ARGS(psoEncodeDithered_.GetAddressOf()))))
+            return Refuse("CreateGraphicsPipelineState for the dithered encode pass failed");
+        pso.PS = {encodePs->GetBufferPointer(), encodePs->GetBufferSize()};
+    }
 
     pso.pRootSignature = accumulationRootSig_.Get();
     pso.VS = {accumulateVs->GetBufferPointer(), accumulateVs->GetBufferSize()};
@@ -1596,6 +1716,206 @@ bool AmdLmxxfEvaluator::CreateTemporalPipeline()
     if (FAILED(device_->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(psoAccumulate_.GetAddressOf()))))
         return Refuse("CreateGraphicsPipelineState for the accumulation pass failed");
     return true;
+}
+
+bool AmdLmxxfEvaluator::CreateCaptureResources()
+{
+    if (!tenBitCapture_) return true;
+    const uint32_t width = CaptureWidth();
+    const uint32_t height = CaptureHeight();
+
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC description{};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.SampleDesc.Count = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    description.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    auto plane = [&](DXGI_FORMAT format, uint32_t w, uint32_t h,
+                     Microsoft::WRL::ComPtr<ID3D12Resource>& out, const wchar_t* name) -> bool {
+        D3D12_RESOURCE_DESC geometry = description;
+        geometry.Width = w;
+        geometry.Height = h;
+        geometry.Format = format;
+        if (FAILED(device_->CreateCommittedResource(
+                &defaultHeap, D3D12_HEAP_FLAG_NONE, &geometry,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(out.GetAddressOf()))))
+            return Refuse("CreateCommittedResource for " + Narrow(std::wstring(name)) + " failed");
+        out->SetName(name);
+        return true;
+    };
+    if (!plane(DXGI_FORMAT_R16_UNORM, width, height, lumaPlane_, L"AMD_Capture_Luma_R16"))
+        return false;
+    if (!plane(DXGI_FORMAT_R16G16_UNORM, width / 2u, height / 2u, chromaPlane_,
+               L"AMD_Capture_Chroma_R16G16"))
+        return false;
+
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtvBase =
+        accumulationRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    const UINT rtvSize = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    device_->CreateRenderTargetView(lumaPlane_.Get(), nullptr,
+                                    OffsetHandle(rtvBase, rtvSize, kRtvCaptureLuma));
+    device_->CreateRenderTargetView(chromaPlane_.Get(), nullptr,
+                                    OffsetHandle(rtvBase, rtvSize, kRtvCaptureChroma));
+
+    D3D12_DESCRIPTOR_HEAP_DESC srvHeap{};
+    srvHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    srvHeap.NumDescriptors = 2;  // the encoded frame, then the upscaled one
+    srvHeap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(device_->CreateDescriptorHeap(&srvHeap, IID_PPV_ARGS(captureSrvHeap_.GetAddressOf()))))
+        return Refuse("CreateDescriptorHeap for the 10-bit capture's input failed");
+    captureSrvDescriptorSize_ =
+        device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    // Slot 0, the frame the encode wrote. Slot 1 is the sharpened target and is
+    // filled by CreateUpscaleResources, which is the only place that target
+    // exists.
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        view.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(
+            stabilised_.Get(), &view,
+            OffsetHandle(captureSrvHeap_->GetCPUDescriptorHandleForHeapStart(),
+                         captureSrvDescriptorSize_, kSrvCaptureFrame));
+    }
+
+    // The readback buffers, one per plane: a copy region cannot convert, so
+    // each is sized to its own texture's footprint and the assembly into the
+    // P010 layout happens on the CPU in ReadBackProduced.
+    const D3D12_HEAP_PROPERTIES readbackHeap{D3D12_HEAP_TYPE_READBACK};
+    auto readback = [&](DXGI_FORMAT format, uint32_t w, uint32_t h,
+                        D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint,
+                        Microsoft::WRL::ComPtr<ID3D12Resource>& out, const wchar_t* name) -> bool {
+        D3D12_RESOURCE_DESC geometry = description;
+        geometry.Width = w;
+        geometry.Height = h;
+        geometry.Format = format;
+        geometry.Flags = D3D12_RESOURCE_FLAG_NONE;
+        device_->GetCopyableFootprints(&geometry, 0, 1, 0, &footprint, nullptr, nullptr, nullptr);
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = footprint.Footprint.RowPitch * static_cast<UINT64>(h);
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.SampleDesc = {1, 0};
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device_->CreateCommittedResource(
+                &readbackHeap, D3D12_HEAP_FLAG_NONE, &buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(out.GetAddressOf()))))
+            return Refuse("CreateCommittedResource for " + Narrow(std::wstring(name)) + " failed");
+        out->SetName(name);
+        return true;
+    };
+    if (!readback(DXGI_FORMAT_R16_UNORM, width, height, lumaFootprint_, lumaReadback_,
+                  L"AMD_Capture_Luma_Readback"))
+        return false;
+    if (!readback(DXGI_FORMAT_R16G16_UNORM, width / 2u, height / 2u, chromaFootprint_,
+                  chromaReadback_, L"AMD_Capture_Chroma_Readback"))
+        return false;
+
+    Microsoft::WRL::ComPtr<ID3DBlob> vs, lumaPs, chromaPs;
+    auto compile = [&](const char* entry, Microsoft::WRL::ComPtr<ID3DBlob>& blob) -> bool {
+        const char* profile = ShaderProfileFor(entry);
+        Microsoft::WRL::ComPtr<ID3DBlob> error;
+        const HRESULT hr = D3DCompile(kAmdCaptureHlsl, sizeof(kAmdCaptureHlsl) - 1, "amd-capture",
+                                      nullptr, nullptr, entry, profile,
+                                      D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob.GetAddressOf(),
+                                      error.GetAddressOf());
+        if (FAILED(hr))
+            return Refuse(std::string("the 10-bit capture's ") + entry + " (" + profile +
+                          ") would not compile: " + (error ? BlobText(error.Get()) : Hex32(hr)));
+        return true;
+    };
+    if (!compile("VS", vs)) return false;
+    if (!compile("PSCaptureLuma10", lumaPs)) return false;
+    if (!compile("PSCaptureChroma10", chromaPs)) return false;
+
+    // One description, two states: the pair differs in its pixel shader and in
+    // the width of the plane it writes, and in nothing else. The conversion's
+    // root signature is the one a plane draw needs - a table of one, no
+    // constants, because the shader addresses both planes by pixel index.
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+    pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pso.SampleMask = UINT_MAX;
+    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso.RasterizerState.DepthClipEnable = TRUE;
+    pso.DepthStencilState.DepthEnable = FALSE;
+    pso.DepthStencilState.StencilEnable = FALSE;
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.NumRenderTargets = 1;
+    pso.SampleDesc = {1, 0};
+    pso.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    pso.pRootSignature = convertRootSig_.Get();
+    pso.PS = {lumaPs->GetBufferPointer(), lumaPs->GetBufferSize()};
+    pso.RTVFormats[0] = DXGI_FORMAT_R16_UNORM;
+    if (FAILED(device_->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(psoCaptureLuma10_.GetAddressOf()))))
+        return Refuse("CreateGraphicsPipelineState for the 10-bit luma capture failed");
+    pso.PS = {chromaPs->GetBufferPointer(), chromaPs->GetBufferSize()};
+    pso.RTVFormats[0] = DXGI_FORMAT_R16G16_UNORM;
+    if (FAILED(device_->CreateGraphicsPipelineState(&pso,
+                                                    IID_PPV_ARGS(psoCaptureChroma10_.GetAddressOf()))))
+        return Refuse("CreateGraphicsPipelineState for the 10-bit chroma capture failed");
+
+    Log("10-bit capture: P010 4:2:0 at " + std::to_string(width) + "x" + std::to_string(height) +
+        ", BT.709 limited range, from the accumulation's FP16 frame");
+    return true;
+}
+
+void AmdLmxxfEvaluator::RecordP010Capture(ID3D12GraphicsCommandList* list, uint32_t srvIndex)
+{
+    const uint32_t width = CaptureWidth();
+    const uint32_t height = CaptureHeight();
+    ID3D12DescriptorHeap* heaps[] = {captureSrvHeap_.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetGraphicsRootSignature(convertRootSig_.Get());
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    const D3D12_GPU_DESCRIPTOR_HANDLE srvBase =
+        captureSrvHeap_->GetGPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtvBase =
+        accumulationRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    const UINT rtvSize = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    auto draw = [&](ID3D12PipelineState* pso, D3D12_CPU_DESCRIPTOR_HANDLE target, uint32_t w,
+                    uint32_t h) {
+        D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h), 0.0f, 1.0f};
+        D3D12_RECT scissor{0, 0, static_cast<LONG>(w), static_cast<LONG>(h)};
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->OMSetRenderTargets(1, &target, FALSE, nullptr);
+        list->SetPipelineState(pso);
+        list->SetGraphicsRootDescriptorTable(
+            0, OffsetHandle(srvBase, captureSrvDescriptorSize_, srvIndex));
+        list->DrawInstanced(3, 1, 0, 0);
+    };
+    auto copy = [&](ID3D12Resource* from, ID3D12Resource* buffer,
+                    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint) {
+        Transition(list, from, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION destination{};
+        destination.pResource = buffer;
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        destination.PlacedFootprint = footprint;
+        D3D12_TEXTURE_COPY_LOCATION source{};
+        source.pResource = from;
+        source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        source.SubresourceIndex = 0;
+        list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+        Transition(list, from, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    };
+
+    draw(psoCaptureLuma10_.Get(), OffsetHandle(rtvBase, rtvSize, kRtvCaptureLuma), width, height);
+    copy(lumaPlane_.Get(), lumaReadback_.Get(), lumaFootprint_);
+    draw(psoCaptureChroma10_.Get(), OffsetHandle(rtvBase, rtvSize, kRtvCaptureChroma),
+         width / 2u, height / 2u);
+    copy(chromaPlane_.Get(), chromaReadback_.Get(), chromaFootprint_);
 }
 
 bool AmdLmxxfEvaluator::RecordTemporalAccumulation(ID3D12GraphicsCommandList* list,
@@ -1697,18 +2017,29 @@ bool AmdLmxxfEvaluator::RecordTemporalAccumulation(ID3D12GraphicsCommandList* li
     Transition(list, historySlot_[write].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-    // ---- encode: back to the codes the readback and its readers carry -----
+    // ---- encode: back to the codes its readers want ------------------------
+    //
+    // Codes, not linear light: everything downstream - the P010 conversion, the
+    // stretch, the 8-bit store - works in the gamma-encoded values the runtime
+    // itself publishes, so the linearisation happens once, on the way in, and
+    // the encode undoes it here. The target is 16-bit on a 10-bit capture, and
+    // that is the only difference: no rounding to eight bits one pass before the
+    // planes are filled.
     list->SetGraphicsRootSignature(convertRootSig_.Get());
     Transition(list, stabilised_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                D3D12_RESOURCE_STATE_RENDER_TARGET);
-    draw(psoEncode_.Get(), OffsetHandle(rtvBase, rtvSize, kRtvStabilised),
-         kSrvEncodeBase + write, nullptr);
+    draw(tenBitCapture_ ? psoEncode16_.Get()
+                        : psoEncodeDithered_ ? psoEncodeDithered_.Get() : psoEncode_.Get(),
+         OffsetHandle(rtvBase, rtvSize, kRtvStabilised), kSrvEncodeBase + write, nullptr);
     Transition(list, stabilised_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     // An upscaling capture stretches the stabilised frame instead of copying
-    // it; the plain capture copies. Both leave the frame where it was.
+    // it; the plain capture copies - or fills the two P010 planes, which is the
+    // 10-bit store's whole content. All three leave the frame where it was.
     if (Upscaling()) {
         if (!RecordUpscale(list, stabilised_.Get())) return false;
+    } else if (tenBitCapture_) {
+        RecordP010Capture(list, kSrvCaptureFrame);
     } else {
         Transition(list, stabilised_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -1733,6 +2064,39 @@ bool AmdLmxxfEvaluator::RecordTemporalAccumulation(ID3D12GraphicsCommandList* li
 
 bool AmdLmxxfEvaluator::ReadBackProduced(std::vector<uint8_t>& out)
 {
+    // The 10-bit store: two planes, assembled into the one buffer P010 is. Y
+    // first, then the interleaved UV plane at half height, each 16 bits a
+    // sample - which is what `-pix_fmt p010le` takes on a pipe.
+    if (tenBitCapture_) {
+        const uint32_t width = CaptureWidth();
+        const uint32_t height = CaptureHeight();
+        const size_t rowBytes = static_cast<size_t>(width) * 2u;
+        out.assign(static_cast<size_t>(width) * height * 3u, 0);
+        // A plane is copied row by row because the footprint's row pitch is
+        // padded to the copy alignment while the destination is contiguous.
+        auto rows = [&](ID3D12Resource* buffer, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint,
+                        uint32_t planeRows, size_t offset, const char* what) -> bool {
+            void* mapped = nullptr;
+            // No read range, for the reason the 8-bit path states: the range is
+            // only a hint on a READBACK heap and a padded pitch overruns it.
+            if (FAILED(buffer->Map(0, nullptr, &mapped)))
+                return Fail(NeuralRenderFailure::Neural,
+                            std::string("the readback buffer for the ") + what + " plane would not map");
+            for (uint32_t row = 0; row < planeRows; ++row)
+                std::memcpy(out.data() + offset + static_cast<size_t>(row) * rowBytes,
+                            static_cast<const uint8_t*>(mapped) + footprint.Offset +
+                                static_cast<size_t>(row) * footprint.Footprint.RowPitch,
+                            rowBytes);
+            const D3D12_RANGE noWrite{0, 0};
+            buffer->Unmap(0, &noWrite);
+            return true;
+        };
+        if (!rows(lumaReadback_.Get(), lumaFootprint_, height, 0, "luma")) return false;
+        if (!rows(chromaReadback_.Get(), chromaFootprint_, height / 2u,
+                  static_cast<size_t>(width) * height * 2u, "chroma"))
+            return false;
+        return true;
+    }
     // An upscaling capture reads the capture's own buffer at the capture's
     // footprint; the plain path reads the frame one at the frame's.
     const bool upscaling = Upscaling();
@@ -2253,10 +2617,13 @@ bool AmdLmxxfEvaluator::Submit(const OfflineDecodedFrame& frame, const FrameIden
 
     if (capture) {
         // An upscaling capture reads back at the capture's size; the frame
-        // check is for the plain path, where the readback IS the frame.
-        const size_t readbackBytes = Upscaling()
-                                         ? static_cast<size_t>(upscaleWidth_) * upscaleHeight_ * 4u
-                                         : inputBytes;
+        // check is for the plain path, where the readback IS the frame. The
+        // bytes a frame takes is the format's: four a pixel for BGRA, three for
+        // P010's 4:2:0 with two bytes a sample.
+        const size_t pixels = Upscaling()
+                                  ? static_cast<size_t>(upscaleWidth_) * upscaleHeight_
+                                  : static_cast<size_t>(width_) * height_;
+        const size_t readbackBytes = tenBitCapture_ ? pixels * 3u : pixels * 4u;
         if (produced.size() != readbackBytes)
             return Fail(NeuralRenderFailure::Neural,
                         "the readback is " + std::to_string(produced.size()) +

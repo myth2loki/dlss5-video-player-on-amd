@@ -29,6 +29,22 @@
 // Both entry points write what their target format wants: PSDecode writes
 // linear light into an FP16 target, PSEncode writes sRGB-encoded codes into an
 // 8-bit UNORM target, which is exactly what the runtime's own output carries.
+//
+// PSEncode writes the same codes into an FP16 target under a second pipeline
+// when the capture is 10-bit. That is not a different picture: it is the same
+// encode with the store left at 16-bit precision, so the accumulation's own
+// precision survives as far as the YUV conversion instead of being rounded to
+// 8 bits one pass early.
+//
+// PSEncodeDithered is the 8-bit store with the ordered map in it. The map and
+// its arithmetic are the cache capture's own (D3D12Renderer.cpp's
+// DitherOffsetBayer8, measured in DitherPolicy.h): the value is quantised as
+// floor(v*255+t) with t in (0,1) over an 8x8 Bayer cell, so a smooth gradient
+// becomes a mix of its two codes in the proportion the unquantised value sits
+// between them rather than a staircase. Bayer rather than the window's blue
+// noise for the same reason the NVIDIA capture uses it - blue noise does not
+// survive the encode this buffer feeds. Static, not per frame: a moving pattern
+// is temporal noise, and it would make two renders of one source differ.
 inline constexpr char kAmdTemporalConvertHlsl[] = R"(
 Texture2D Input:register(t0);
 float3 SRGBToLinear(float3 c){float3 lo=c/12.92;float3 hi=pow(max((c+0.055)/1.055,0),2.4);return lerp(hi,lo,step(c,0.04045));}
@@ -41,22 +57,77 @@ struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;};
 V VS(uint id:SV_VertexID){float2 uv=float2((id<<1)&2,id&2);V o;o.uv=uv;o.p=float4(uv.x*2-1,1-uv.y*2,0,1);return o;}
 float4 PSDecode(V i):SV_Target{return float4(SRGBToLinear(Input.Load(int3(int2(i.p.xy),0)).rgb),1);}
 float4 PSEncode(V i):SV_Target{return float4(LinearToSRGB(Input.Load(int3(int2(i.p.xy),0)).rgb),1);}
+float DitherOffsetBayer8(float2 pixel){
+    uint2 p=uint2(pixel)&7u;uint d=p.x^p.y;
+    uint r=((d&1u)<<5)|((p.y&1u)<<4)|((d&2u)<<2)|((p.y&2u)<<1)|((d&4u)>>1)|((p.y&4u)>>2);
+    return ((float(r)+0.5)/64.0-0.5)/255.0;
+}
+float4 PSEncodeDithered(V i):SV_Target{
+    float3 c=LinearToSRGB(Input.Load(int3(int2(i.p.xy),0)).rgb);
+    return float4(c+DitherOffsetBayer8(i.p.xy),1);
+}
+)";
+
+// The 10-bit capture: the frame the encode just produced, in sRGB codes, taken
+// to BT.709 limited-range P010 - Y 64..940, chroma 512 +- 448 - so the encoder
+// is handed samples it can read rather than a BGRA frame it must convert on the
+// CPU. Two planes, one draw each, exactly as the NVIDIA capture does it.
+//
+// The code goes in the TOP TEN BITS of a 16-bit sample, which is what P010 is.
+// The R16 store rounds f*65535 to nearest, so the code is rounded here and the
+// low six bits are zero: an encoder reads the top ten bits and would truncate,
+// not round, whatever the low six held.
+//
+// Chroma is converted per sample and averaged after, which is what a CPU 4:2:0
+// conversion does; averaging the colours first would pull saturated edges
+// towards grey. The four taps are the 2x2 block this chroma sample owns, read
+// by index rather than by a UV offset because the block's own texels are what
+// is being averaged.
+//
+// Both entry points read a texture that already carries sRGB-encoded codes -
+// PSEncode's output, or the upscale capture's when the job upscales - so
+// neither converts from linear light. That is the whole reason the encode
+// leaves them in code space: one conversion, in one place, at the precision the
+// capture stores.
+inline constexpr char kAmdCaptureHlsl[] = R"(
+Texture2D Input:register(t0);
+float Luma709(float3 c){return dot(c,float3(0.2126,0.7152,0.0722));}
+float P010Store(float code){return round(code)*64.0/65535.0;}
+float2 ChromaCodes10(float3 c){
+    return float2(512.0+896.0*dot(c,float3(-0.114572,-0.385428,0.5)),
+                  512.0+896.0*dot(c,float3(0.5,-0.454153,-0.045847)));
+}
+float3 CodeAt(int2 p){return Input.Load(int3(p,0)).rgb;}
+struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;};
+V VS(uint id:SV_VertexID){float2 uv=float2((id<<1)&2,id&2);V o;o.uv=uv;o.p=float4(uv.x*2-1,1-uv.y*2,0,1);return o;}
+float PSCaptureLuma10(V i):SV_Target{
+    return P010Store(64.0+876.0*Luma709(CodeAt(int2(i.p.xy))));
+}
+float2 PSCaptureChroma10(V i):SV_Target{
+    int2 b=int2(i.p.xy)*2;
+    float2 c=ChromaCodes10(CodeAt(b));
+    c+=ChromaCodes10(CodeAt(b+int2(1,0)));
+    c+=ChromaCodes10(CodeAt(b+int2(0,1)));
+    c+=ChromaCodes10(CodeAt(b+int2(1,1)));
+    c*=0.25;
+    return float2(P010Store(c.x),P010Store(c.y));
+}
 )";
 
 // The profile the entry point `entry` compiles under, for either of the two
 // programs this backend compiles.
 //
 // Derived from the entry point's name instead of taken as an argument at the
-// call site, because the call sites compile five entry points in a row out of
+// call site, because the call sites compile several entry points in a row out of
 // two strings and the mistake is invisible until a device compiles one:
 // D3DCompile answers with X4502 about an invalid semantic on the shader's own
 // struct, naming neither the entry point nor the profile. Five lines that
 // cannot pair "VS" with ps_5_1 are cheaper than reading that.
 //
 // Both programs declare exactly one vertex entry point and spell it `VS`;
-// everything else - PSDecode, PSEncode, PSTemporalStability - is a pixel
-// shader. A new entry point under any other name is a pixel shader until
-// someone says otherwise here.
+// everything else - PSDecode, PSEncode, PSEncodeDithered, PSTemporalStability,
+// PSCaptureLuma10, PSCaptureChroma10 - is a pixel shader. A new entry point
+// under any other name is a pixel shader until someone says otherwise here.
 inline constexpr const char* ShaderProfileFor(std::string_view entry) noexcept
 {
     return entry == "VS" ? "vs_5_1" : "ps_5_1";

@@ -37,8 +37,11 @@ enum class NeuralCacheState {
 // output changed before the AMD backend's guides reached its estimator, which
 // changed what "mv=1,depth=1" produces on that backend - the same canonical
 // string, a different picture - so 0.28.3 reads its own renders and not 0.27.2's.
+// 0.29.0 is the 10-bit AMD capture: a High or Lossless rung on that backend now
+// writes P010 from an FP16 frame instead of 8-bit BGRA from the same rung's
+// name, so the entries those two rungs published describe different bytes.
 // A value past the player's own version is refused by PolicyTests.
-inline constexpr std::string_view kRenderCacheRevision = "0.28.3";
+inline constexpr std::string_view kRenderCacheRevision = "0.29.0";
 
 struct NeuralCacheIdentity {
     std::string sourceDigest;
