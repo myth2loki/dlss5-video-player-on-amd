@@ -894,36 +894,9 @@ float4 PSDepth(V i):SV_Target{float d=saturate(T.SampleLevel(S,i.uv,0).r);d=pow(
     float2 PSExpandGuides(V i):SV_Target{return T.SampleLevel(S,i.uv,0).xy;}
 )";
 
-namespace d3d12_renderer_detail {
-const SourceNv12Constants* SourceNv12ConstantsFor(SourceNv12Conversion conversion)
-{
-    // BT.709 limited range is the program every cached render on disk was made with,
-    // so its seven tokens are frozen: 2(1-Kr) and 2(1-Kb) for Kr=0.2126, Kb=0.0722,
-    // the two green terms, and the 8-bit studio-swing scalings. BT.601 is the same
-    // algebra at Kr=0.299, Kb=0.114. Full range drops the 16 offset and spans the
-    // whole byte in both planes.
-    static constexpr SourceNv12Constants kBt709Limited{
-        "16.0","219.0","224.0","1.5748","0.187324","0.468124","1.8556"};
-    static constexpr SourceNv12Constants kBt709Full{
-        "0.0","255.0","255.0","1.5748","0.187324","0.468124","1.8556"};
-    static constexpr SourceNv12Constants kBt601Limited{
-        "16.0","219.0","224.0","1.402","0.344136","0.714136","1.772"};
-    static constexpr SourceNv12Constants kBt601Full{
-        "0.0","255.0","255.0","1.402","0.344136","0.714136","1.772"};
-    switch(conversion){
-        case SourceNv12Conversion::Bt709Limited:return &kBt709Limited;
-        case SourceNv12Conversion::Bt709Full:return &kBt709Full;
-        case SourceNv12Conversion::Bt601Limited:return &kBt601Limited;
-        case SourceNv12Conversion::Bt601Full:return &kBt601Full;
-        case SourceNv12Conversion::Unsupported:break;
-    }
-    return nullptr;
-}
-} // namespace d3d12_renderer_detail
-
 bool D3D12Renderer::CompileSourceNv12(SourceNv12Conversion conversion,ComPtr<ID3DBlob>& blob)
 {
-    const auto* constants=d3d12_renderer_detail::SourceNv12ConstantsFor(conversion);
+    const auto* constants=SourceNv12ConstantsFor(conversion);
     if(!constants){
         LOG("NV12 source conversion has no coefficients for the source's colour description; "
             "refusing to guess a matrix.");

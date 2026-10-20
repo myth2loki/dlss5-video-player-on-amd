@@ -3848,6 +3848,11 @@ private:
         job.upscalingHistory=m_upscalingHistory;
         job.vsrQuality=m_comparison.vsrQuality;
         job.captureDither=m_captureDither;job.quality=m_cacheQuality;job.sourceDeband=m_sourceDeband;job.suppliedExposure=m_suppliedExposure;
+        // The menu's own switch, so an export writes with the settings the cache
+        // read. It was silently dropped before: the decode-side flag reached a
+        // live render and never an export, so an export of a file that had just
+        // played with it on was a different pipeline under the same settings.
+        job.gpuSourceConversion=m_gpuSourceConversion;
         job.holdDuplicates=m_frameGenHoldDuplicates;
         // Called on the export thread, which is safe for a helper that is not
         // thread-safe: RunStageExport calls it only while holding the runtime
@@ -14136,6 +14141,13 @@ static int RunRenderCommand(const render_command::Parsed& parsed,const std::vect
         if(!command.quality.empty())ParseEncoderQuality(command.quality,job.quality);
         job.sourceDeband=GetPrivateProfileIntW(L"Encoding",L"SourceDeband",0,settings.c_str())!=0;
         job.suppliedExposure=GetPrivateProfileIntW(L"Encoding",L"SuppliedExposure",0,settings.c_str())!=0;
+        // Read from the same saved setting the menu writes, for the reason the
+        // two above are: a scripted render asks for the machine's encoder
+        // settings, and this one decides what the model is shown as well as what
+        // the pipe carries. There is no command-line key for it - a batch run
+        // that wants the other arm saves the setting, exactly as it does for the
+        // deband and the exposure.
+        job.gpuSourceConversion=GetPrivateProfileIntW(L"Encoding",L"GpuSourceConversion",0,settings.c_str())!=0;
         // The upscaled capture's CAS strength, when the caller named one.
         if(command.upscaleSharpness)job.upscaleSharpness=*command.upscaleSharpness;
         // The temporal rung: the command line's, or what this machine has saved

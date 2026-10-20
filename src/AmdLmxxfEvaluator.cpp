@@ -78,6 +78,11 @@ constexpr UINT kRtvCount = 6;
 constexpr UINT kSrvCaptureFrame = 0;
 constexpr UINT kSrvCaptureUpscaled = 1;
 
+// The NV12 source conversion's own SRV heap: the Y plane, then the interleaved
+// UV plane, in the order kAmdSourceHlsl declares its two textures.
+constexpr UINT kSrvSourceLuma = 0;
+constexpr UINT kSrvSourceChroma = 1;
+
 std::string Narrow(const std::wstring& text)
 {
     if (text.empty()) return {};
@@ -210,8 +215,18 @@ bool AmdLmxxfEvaluator::Refuse(std::string detail)
 bool AmdLmxxfEvaluator::Ready() const noexcept
 {
     if (!(prepared_ && session_.has_value() && device_ != nullptr && queue_ != nullptr &&
-          color_ != nullptr && uploadMapped_ != nullptr && readback_ != nullptr))
+          color_ != nullptr && readback_ != nullptr))
         return false;
+    // One upload path or the other, never neither: BGRA fills the colour texture
+    // from a mapped buffer, NV12 fills it through the conversion, and a frame
+    // that got past this point with half of either would already be recording.
+    if (sourceNv12_) {
+        if (psoSourceNv12_ == nullptr || sourceRootSig_ == nullptr || sourceSrvHeap_ == nullptr ||
+            sourceRtvHeap_ == nullptr || sourceUploadMapped_ == nullptr)
+            return false;
+    } else if (uploadMapped_ == nullptr) {
+        return false;
+    }
     // A rung is not something this evaluator can attempt without its pass, and
     // Ready() is what every frame path asks before it starts: a frame that got
     // past this point and then found no pass would already have uploaded itself
@@ -365,11 +380,16 @@ bool AmdLmxxfEvaluator::CreateFrameResources()
 
     D3D12_HEAP_PROPERTIES uploadHeap{};
     uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-    if (FAILED(device_->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE,
-                                                &bufferDescription,
-                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                                                IID_PPV_ARGS(&upload_))))
-        return Refuse("CreateCommittedResource for the upload buffer failed");
+    if (!sourceNv12_) {
+        if (FAILED(device_->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE,
+                                                    &bufferDescription,
+                                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                    IID_PPV_ARGS(&upload_))))
+            return Refuse("CreateCommittedResource for the upload buffer failed");
+    }
+    // An NV12 source never fills this one: its bytes go into the two planes
+    // CreateSourceResources makes, so a BGRA copy of the frame would be a full
+    // frame's worth of video memory nothing reads.
 
     D3D12_HEAP_PROPERTIES readbackHeap{};
     readbackHeap.Type = D3D12_HEAP_TYPE_READBACK;
@@ -379,17 +399,245 @@ bool AmdLmxxfEvaluator::CreateFrameResources()
                                                 IID_PPV_ARGS(&readback_))))
         return Refuse("CreateCommittedResource for the readback buffer failed");
 
-    void* mapped = nullptr;
-    const D3D12_RANGE noRead{0, 0};
-    if (FAILED(upload_->Map(0, &noRead, &mapped)))
-        return Refuse("the upload buffer would not map");
-    uploadMapped_ = static_cast<uint8_t*>(mapped);
+    if (!sourceNv12_) {
+        void* mapped = nullptr;
+        const D3D12_RANGE noRead{0, 0};
+        if (FAILED(upload_->Map(0, &noRead, &mapped)))
+            return Refuse("the upload buffer would not map");
+        uploadMapped_ = static_cast<uint8_t*>(mapped);
+    }
 
     colorState_ = D3D12_RESOURCE_STATE_COPY_DEST;
     colorUploaded_ = false;
     Log("frame resources: " + std::to_string(width_) + "x" + std::to_string(height_) +
         " BGRA, row pitch " + std::to_string(footprint_.Footprint.RowPitch) + ", readback " +
         std::to_string(uploadBytes) + " bytes, one persistent colour texture");
+    return true;
+}
+
+bool AmdLmxxfEvaluator::CreateSourceResources()
+{
+    if (!sourceNv12_) return true;
+    const SourceNv12Constants* coefficients = SourceNv12ConstantsFor(sourceConversion_);
+    if (coefficients == nullptr)
+        return Refuse("the NV12 source conversion resolved to a description with no coefficients");
+    // 4:2:0 means half the rows for the chroma plane, so an odd height has no
+    // plane to put it in. The decoder's own gate refuses NV12 for odd geometry,
+    // so this is the same kind of caller mistake the conversion refusal above is.
+    if (((width_ | height_) & 1u) != 0u)
+        return Refuse("an NV12 source needs even dimensions for its half-resolution chroma plane, "
+                      "and this frame is " + std::to_string(width_) + "x" + std::to_string(height_));
+
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    // Created in the state the conversion reads them in and bracketed out of it
+    // by each frame's upload, because there is nothing to put in them here: the
+    // first frame is the first contents.
+    D3D12_RESOURCE_DESC luma{};
+    luma.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    luma.Width = width_;
+    luma.Height = height_;
+    luma.DepthOrArraySize = 1;
+    luma.MipLevels = 1;
+    luma.Format = DXGI_FORMAT_R8_UNORM;
+    luma.SampleDesc.Count = 1;
+    luma.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (FAILED(device_->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &luma,
+                                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                nullptr, IID_PPV_ARGS(&sourceLuma_))))
+        return Refuse("CreateCommittedResource for the NV12 luma plane failed");
+    D3D12_RESOURCE_DESC chroma = luma;
+    chroma.Width = width_ / 2u;
+    chroma.Height = height_ / 2u;
+    chroma.Format = DXGI_FORMAT_R8G8_UNORM;
+    if (FAILED(device_->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &chroma,
+                                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                nullptr, IID_PPV_ARGS(&sourceChroma_))))
+        return Refuse("CreateCommittedResource for the NV12 chroma plane failed");
+
+    // Both planes in one upload buffer, the second placed at the next alignment
+    // boundary - the same arrangement the two guide textures use, and for the
+    // same reason: one buffer, one Map, one pointer that never moves.
+    UINT rows = 0;
+    UINT64 rowBytes = 0;
+    UINT64 lumaBytes = 0;
+    device_->GetCopyableFootprints(&luma, 0, 1, 0, &lumaUploadFootprint_, &rows, &rowBytes,
+                                   &lumaBytes);
+    if (rowBytes < width_ || rows < height_)
+        return Refuse("GetCopyableFootprints reports a luma footprint too small for the frame");
+    const UINT64 chromaBase = (lumaBytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u) /
+                              D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT *
+                              D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT;
+    UINT64 chromaBytes = 0;
+    device_->GetCopyableFootprints(&chroma, 0, 1, chromaBase, &chromaUploadFootprint_, &rows,
+                                   &rowBytes, &chromaBytes);
+    // As the guide pair's own two footprints are: asked with the base offset, the
+    // call answers this subresource's bytes and not the buffer's total, so the
+    // buffer is the base plus this.
+    if (rowBytes < width_ || rows < height_ / 2u)
+        return Refuse("GetCopyableFootprints reports a chroma footprint too small for the plane");
+
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = chromaBase + chromaBytes;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.Format = DXGI_FORMAT_UNKNOWN;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES uploadHeap{};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    if (FAILED(device_->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                IID_PPV_ARGS(&sourceUpload_))))
+        return Refuse("CreateCommittedResource for the NV12 source upload buffer failed");
+    {
+        void* mapped = nullptr;
+        const D3D12_RANGE noRead{0, 0};
+        if (FAILED(sourceUpload_->Map(0, &noRead, &mapped)))
+            return Refuse("the NV12 source upload buffer would not map");
+        sourceUploadMapped_ = static_cast<uint8_t*>(mapped);
+        // Left mapped, as the colour and guide uploads are: every frame writes
+        // through this pointer rather than remapping it.
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC srvHeap{};
+    srvHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    srvHeap.NumDescriptors = 2;  // the Y plane, then the interleaved UV plane
+    srvHeap.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(device_->CreateDescriptorHeap(&srvHeap, IID_PPV_ARGS(&sourceSrvHeap_))))
+        return Refuse("CreateDescriptorHeap for the NV12 source conversion failed");
+    sourceSrvDescriptorSize_ =
+        device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Texture2D.MipLevels = 1;
+    view.Format = DXGI_FORMAT_R8_UNORM;
+    device_->CreateShaderResourceView(
+        sourceLuma_.Get(), &view,
+        OffsetHandle(sourceSrvHeap_->GetCPUDescriptorHandleForHeapStart(), sourceSrvDescriptorSize_,
+                     kSrvSourceLuma));
+    view.Format = DXGI_FORMAT_R8G8_UNORM;
+    device_->CreateShaderResourceView(
+        sourceChroma_.Get(), &view,
+        OffsetHandle(sourceSrvHeap_->GetCPUDescriptorHandleForHeapStart(), sourceSrvDescriptorSize_,
+                     kSrvSourceChroma));
+
+    // The colour texture is otherwise only ever copied into; the conversion is
+    // the one pass that draws it, and therefore the only owner of a view of it
+    // as a render target.
+    D3D12_DESCRIPTOR_HEAP_DESC rtvHeap{};
+    rtvHeap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rtvHeap.NumDescriptors = 1;
+    if (FAILED(device_->CreateDescriptorHeap(&rtvHeap, IID_PPV_ARGS(&sourceRtvHeap_))))
+        return Refuse("CreateDescriptorHeap(RTV) for the NV12 source conversion failed");
+    device_->CreateRenderTargetView(color_.Get(), nullptr,
+                                    sourceRtvHeap_->GetCPUDescriptorHandleForHeapStart());
+
+    // Two textures and one sampler. The sampler is LINEAR because the chroma
+    // plane is half size: the value at a luma pixel is the bilinear blend of the
+    // 2x2 chroma neighbours around it, which is what every 4:2:0 upsampler does
+    // and what the NVIDIA path's sampler does at the same uv.
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 2;
+    range.BaseShaderRegister = 0;
+    D3D12_ROOT_PARAMETER parameter{};
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameter.DescriptorTable.NumDescriptorRanges = 1;
+    parameter.DescriptorTable.pDescriptorRanges = &range;
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ShaderRegister = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    {
+        D3D12_ROOT_SIGNATURE_DESC description{};
+        description.NumParameters = 1;
+        description.pParameters = &parameter;
+        description.NumStaticSamplers = 1;
+        description.pStaticSamplers = &sampler;
+        description.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+        Microsoft::WRL::ComPtr<ID3DBlob> signature, error;
+        const HRESULT hr = D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+                                                       signature.GetAddressOf(),
+                                                       error.GetAddressOf());
+        if (FAILED(hr))
+            return Refuse("the NV12 source conversion's root signature would not serialize: " +
+                          (error ? BlobText(error.Get()) : Hex32(hr)));
+        if (FAILED(device_->CreateRootSignature(0, signature->GetBufferPointer(),
+                                                signature->GetBufferSize(),
+                                                IID_PPV_ARGS(&sourceRootSig_))))
+            return Refuse("CreateRootSignature for the NV12 source conversion failed");
+    }
+
+    // The coefficients are pasted in as tokens from the table the enumeration
+    // lives beside (MediaSource.h), which is what makes this the same algebra
+    // the NVIDIA renderer compiles rather than a second transcription of it.
+    const D3D_SHADER_MACRO defines[] = {
+        {"SOURCE_LUMA_OFFSET", coefficients->lumaOffset},
+        {"SOURCE_LUMA_SCALE", coefficients->lumaScale},
+        {"SOURCE_CHROMA_SCALE", coefficients->chromaScale},
+        {"SOURCE_RED_V", coefficients->redV},
+        {"SOURCE_GREEN_U", coefficients->greenU},
+        {"SOURCE_GREEN_V", coefficients->greenV},
+        {"SOURCE_BLUE_U", coefficients->blueU},
+        {nullptr, nullptr}};
+    Microsoft::WRL::ComPtr<ID3DBlob> vertexShader, pixelShader, error;
+    HRESULT hr = D3DCompile(kAmdSourceHlsl, sizeof(kAmdSourceHlsl) - 1, "amd-source-nv12", defines,
+                            nullptr, "VS", "vs_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                            vertexShader.GetAddressOf(), error.GetAddressOf());
+    if (FAILED(hr))
+        return Refuse("the NV12 source conversion's vertex shader would not compile: " +
+                      (error ? BlobText(error.Get()) : Hex32(hr)));
+    error.Reset();
+    hr = D3DCompile(kAmdSourceHlsl, sizeof(kAmdSourceHlsl) - 1, "amd-source-nv12", defines, nullptr,
+                    "PSSourceNv12", "ps_5_1", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                    pixelShader.GetAddressOf(), error.GetAddressOf());
+    if (FAILED(hr))
+        return Refuse("the NV12 source conversion's pixel shader would not compile: " +
+                      (error ? BlobText(error.Get()) : Hex32(hr)));
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = sourceRootSig_.Get();
+    pso.VS = {vertexShader->GetBufferPointer(), vertexShader->GetBufferSize()};
+    pso.PS = {pixelShader->GetBufferPointer(), pixelShader->GetBufferSize()};
+    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pso.SampleMask = UINT_MAX;
+    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso.RasterizerState.DepthClipEnable = TRUE;
+    pso.DepthStencilState.DepthEnable = FALSE;
+    pso.DepthStencilState.StencilEnable = FALSE;
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.NumRenderTargets = 1;
+    pso.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    pso.SampleDesc = {1, 0};
+    pso.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    if (FAILED(device_->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&psoSourceNv12_))))
+        return Refuse("CreateGraphicsPipelineState for the NV12 source conversion failed");
+
+    // The colour the conversion was compiled for, named as the tags the
+    // decoder's own "GPU source conversion accepted" line prints, so the two
+    // ends of one decision are one grep away from each other.
+    const bool bt709 = sourceConversion_ == SourceNv12Conversion::Bt709Limited ||
+                       sourceConversion_ == SourceNv12Conversion::Bt709Full;
+    const bool limited = sourceConversion_ == SourceNv12Conversion::Bt709Limited ||
+                         sourceConversion_ == SourceNv12Conversion::Bt601Limited;
+    Log("source: NV12 " + std::to_string(width_) + "x" + std::to_string(height_) +
+        " converted on the GPU (" + (bt709 ? "bt709" : "bt601") + " " +
+        (limited ? "limited" : "full") + "), one plane copy pair and one draw per frame, " +
+        std::to_string(static_cast<uint64_t>(PixelLayoutFrameBytes(PixelLayout::Nv12, width_,
+                                                                  height_))) +
+        " bytes a frame instead of " +
+        std::to_string(static_cast<uint64_t>(width_) * height_ * 4u) + " from ffmpeg");
     return true;
 }
 
@@ -848,6 +1096,22 @@ void AmdLmxxfEvaluator::TearDown()
     chromaFootprint_ = {};
     captureSrvDescriptorSize_ = 0;
     tenBitCapture_ = false;
+    // The NV12 source's objects, and the answer they were built for: a session
+    // that comes back up on a BGRA source must not keep a conversion pipeline
+    // it no longer has a use for, and the reuse question is asked of this value.
+    sourceUploadMapped_ = nullptr;
+    sourceLuma_.Reset();
+    sourceChroma_.Reset();
+    sourceUpload_.Reset();
+    sourceSrvHeap_.Reset();
+    sourceRtvHeap_.Reset();
+    sourceRootSig_.Reset();
+    psoSourceNv12_.Reset();
+    sourceSrvDescriptorSize_ = 0;
+    lumaUploadFootprint_ = {};
+    chromaUploadFootprint_ = {};
+    sourceNv12_ = false;
+    sourceConversion_ = SourceNv12Conversion::Unsupported;
     fence_.Reset();
     consumerList_.Reset();
     consumerAllocator_.Reset();
@@ -893,8 +1157,29 @@ bool AmdLmxxfEvaluator::Initialize(HWND, uint32_t width, uint32_t height, uint32
     const uint32_t wantedUpscaleW = (outputWidth != width || outputHeight != height) ? outputWidth : 0;
     const uint32_t wantedUpscaleH = wantedUpscaleW ? outputHeight : 0;
 
+    // The source's own layout. Resolved here rather than taken from the config
+    // because the conversion has to be one the coefficients above exist for, and
+    // only the colour description says which: a description no conversion
+    // implements is REFUSED rather than decoded under a guessed matrix, which
+    // would be silently wrong colour instead of a failed render. The decoder
+    // applies the same predicate before it agrees to deliver NV12, so reaching
+    // that refusal means a caller handed over bytes it never decoded.
+    const SourceNv12Conversion wantedConversion = config_.sourceLayout == PixelLayout::Nv12
+        ? SourceNv12ConversionFor(config_.sourceColor)
+        : SourceNv12Conversion::Unsupported;
+    if (config_.sourceLayout == PixelLayout::Nv12 &&
+        wantedConversion == SourceNv12Conversion::Unsupported)
+        return Refuse("the frames are submitted as NV12 under a colour description the source "
+                      "conversion has no coefficients for; it implements BT.709 and BT.601, limited "
+                      "or full, and refuses the rest rather than guessing a matrix");
+    const bool wantedNv12 = wantedConversion != SourceNv12Conversion::Unsupported;
+
+    // The conversion is in the reuse question, not just the layout: two sources
+    // that are both NV12 can declare different matrices, and a session kept
+    // across them would be showing the model the previous file's coefficients.
     const bool sameGeometry = prepared_ && width_ == width && height_ == height &&
-                              upscaleWidth_ == wantedUpscaleW && upscaleHeight_ == wantedUpscaleH;
+                              upscaleWidth_ == wantedUpscaleW && upscaleHeight_ == wantedUpscaleH &&
+                              sourceConversion_ == wantedConversion;
     if (sameGeometry) {
         Log("Initialize re-entered at the same geometry; the session is reused");
         return true;
@@ -905,6 +1190,8 @@ bool AmdLmxxfEvaluator::Initialize(HWND, uint32_t width, uint32_t height, uint32
     height_ = height;
     upscaleWidth_ = wantedUpscaleW;
     upscaleHeight_ = wantedUpscaleH;
+    sourceNv12_ = wantedNv12;
+    sourceConversion_ = wantedConversion;
     // The 10-bit capture, resolved here because two other things have to agree
     // with it and both are bring-up facts: it needs an accumulation whose FP16
     // slot is where the precision comes from, and 4:2:0 needs an even capture
@@ -929,6 +1216,9 @@ bool AmdLmxxfEvaluator::Initialize(HWND, uint32_t width, uint32_t height, uint32
 
     if (!BringUpDevice("the evaluator owns them; a stage C worker would hand its own")) return false;
     if (!CreateFrameResources()) return false;
+    // After the frame resources, whose colour texture it renders into, and
+    // before the passes that read it.
+    if (!CreateSourceResources()) return false;
     // Before the runtime, so a shader that will not compile is refused before a
     // session is armed for a job that could never run at its rung.
     if (!CreateTemporalResources()) return false;
@@ -969,41 +1259,53 @@ bool AmdLmxxfEvaluator::WaitForGpu()
     return true;
 }
 
-bool AmdLmxxfEvaluator::UploadColor(const std::vector<uint8_t>& bgra, int sourceSlot)
+bool AmdLmxxfEvaluator::UploadColor(const std::vector<uint8_t>& pixels, int sourceSlot)
 {
-    // The pointer never moves; only the contents do. The upload buffer is
-    // persistent and mapped, so a frame costs one memcpy per row and no
-    // allocation, which is what the "do not create a texture per frame" rule in
-    // the integration plan is about.
-    for (uint32_t row = 0; row < height_; ++row) {
-        std::memcpy(uploadMapped_ + footprint_.Offset +
-                        static_cast<size_t>(row) * footprint_.Footprint.RowPitch,
-                    bgra.data() + static_cast<size_t>(row) * width_ * 4u,
-                    static_cast<size_t>(width_) * 4u);
+    // Which upload this is depends on what the session was brought up for, and
+    // the two differ only in how the colour texture gets filled: one copy from
+    // the decoder's BGRA, or two plane copies and a conversion draw. Everything
+    // after that - the trust-test slot the accumulated path needs this frame in,
+    // the state the runtime is told about - is the same code, which is the point
+    // of converting on the GPU rather than at the readback.
+    D3D12_RESOURCE_STATES stateAfterUpload = D3D12_RESOURCE_STATE_COPY_DEST;
+    if (sourceNv12_) {
+        if (!UploadColorFromNv12(pixels)) return false;
+        // The conversion drew into the colour texture, so that is where it is.
+        stateAfterUpload = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    } else {
+        // The pointer never moves; only the contents do. The upload buffer is
+        // persistent and mapped, so a frame costs one memcpy per row and no
+        // allocation, which is what the "do not create a texture per frame" rule
+        // in the integration plan is about.
+        for (uint32_t row = 0; row < height_; ++row) {
+            std::memcpy(uploadMapped_ + footprint_.Offset +
+                            static_cast<size_t>(row) * footprint_.Footprint.RowPitch,
+                        pixels.data() + static_cast<size_t>(row) * width_ * 4u,
+                        static_cast<size_t>(width_) * 4u);
+        }
+
+        if (colorState_ != D3D12_RESOURCE_STATE_COPY_DEST)
+            Transition(list_.Get(), color_.Get(), colorState_, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        D3D12_TEXTURE_COPY_LOCATION destination{};
+        destination.pResource = color_.Get();
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION source{};
+        source.pResource = upload_.Get();
+        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        source.PlacedFootprint = footprint_;
+        list_->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
     }
-
-    if (colorState_ != D3D12_RESOURCE_STATE_COPY_DEST)
-        Transition(list_.Get(), color_.Get(), colorState_, D3D12_RESOURCE_STATE_COPY_DEST);
-
-    D3D12_TEXTURE_COPY_LOCATION destination{};
-    destination.pResource = color_.Get();
-    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    destination.SubresourceIndex = 0;
-    D3D12_TEXTURE_COPY_LOCATION source{};
-    source.pResource = upload_.Get();
-    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    source.PlacedFootprint = footprint_;
-    list_->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
 
     // The accumulation's trust test compares this frame's source with the frame
     // before it, so this frame has to be in the slot its own output will go into
     // before the pass reads either. It is taken from the colour texture rather
     // than uploaded a second time because they are the same bytes and this
     // texture already holds them.
-    D3D12_RESOURCE_STATES stateAfterUpload = D3D12_RESOURCE_STATE_COPY_DEST;
     if (sourceSlot == 0 || sourceSlot == 1) {
         ID3D12Resource* slot = sourceSlot_[static_cast<size_t>(sourceSlot)].Get();
-        Transition(list_.Get(), color_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+        Transition(list_.Get(), color_.Get(), stateAfterUpload,
                    D3D12_RESOURCE_STATE_COPY_SOURCE);
         Transition(list_.Get(), slot, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                    D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1017,6 +1319,79 @@ bool AmdLmxxfEvaluator::UploadColor(const std::vector<uint8_t>& bgra, int source
 
     colorState_ = kColorState;
     colorUploaded_ = true;
+    return true;
+}
+
+bool AmdLmxxfEvaluator::UploadColorFromNv12(const std::vector<uint8_t>& nv12)
+{
+    // Y plane, then the interleaved UV plane straight behind it; both rows are
+    // width bytes wide and the chroma plane has half the rows - exactly the
+    // buffer PixelLayout.h says the decoder delivers.
+    for (uint32_t row = 0; row < height_; ++row) {
+        std::memcpy(sourceUploadMapped_ + lumaUploadFootprint_.Offset +
+                        static_cast<size_t>(row) * lumaUploadFootprint_.Footprint.RowPitch,
+                    nv12.data() + static_cast<size_t>(row) * width_, width_);
+    }
+    const uint8_t* chroma = nv12.data() + static_cast<size_t>(width_) * height_;
+    for (uint32_t row = 0; row < height_ / 2u; ++row) {
+        std::memcpy(sourceUploadMapped_ + chromaUploadFootprint_.Offset +
+                        static_cast<size_t>(row) * chromaUploadFootprint_.Footprint.RowPitch,
+                    chroma + static_cast<size_t>(row) * width_, width_);
+    }
+
+    D3D12_RESOURCE_BARRIER planes[2]{};
+    for (int index = 0; index < 2; ++index) {
+        planes[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        planes[index].Transition.pResource = index == 0 ? sourceLuma_.Get() : sourceChroma_.Get();
+        planes[index].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        planes[index].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        planes[index].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    list_->ResourceBarrier(2, planes);
+
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = sourceUpload_.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+
+    destination.pResource = sourceLuma_.Get();
+    source.PlacedFootprint = lumaUploadFootprint_;
+    list_->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    destination.pResource = sourceChroma_.Get();
+    source.PlacedFootprint = chromaUploadFootprint_;
+    list_->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+
+    for (int index = 0; index < 2; ++index) {
+        planes[index].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        planes[index].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+    list_->ResourceBarrier(2, planes);
+
+    // One full-resolution draw into the colour texture, which is the whole of
+    // the conversion: the two planes come out as the same 8-bit sRGB BGRA the
+    // CPU conversion would have produced, so nothing downstream knows which
+    // path ran.
+    if (colorState_ != D3D12_RESOURCE_STATE_RENDER_TARGET)
+        Transition(list_.Get(), color_.Get(), colorState_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    ID3D12DescriptorHeap* heaps[] = {sourceSrvHeap_.Get()};
+    list_->SetDescriptorHeaps(1, heaps);
+    D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(width_), static_cast<float>(height_),
+                            0.0f, 1.0f};
+    D3D12_RECT scissor{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    list_->RSSetViewports(1, &viewport);
+    list_->RSSetScissorRects(1, &scissor);
+    const D3D12_CPU_DESCRIPTOR_HANDLE target =
+        sourceRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    list_->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list_->SetGraphicsRootSignature(sourceRootSig_.Get());
+    list_->SetPipelineState(psoSourceNv12_.Get());
+    list_->SetGraphicsRootDescriptorTable(
+        0, sourceSrvHeap_->GetGPUDescriptorHandleForHeapStart());
+    list_->DrawInstanced(3, 1, 0, 0);
     return true;
 }
 
@@ -2594,12 +2969,17 @@ bool AmdLmxxfEvaluator::Submit(const OfflineDecodedFrame& frame, const FrameIden
                                bool capture, OfflineEvaluation& out)
 {
     if (!Ready()) return Fail(NeuralRenderFailure::Neural, "Submit before a successful Initialize");
-    const size_t inputBytes = static_cast<size_t>(width_) * height_ * 4u;
+    // The bytes a frame takes is its layout's: four a pixel for BGRA, and the Y
+    // plane plus the interleaved half-height chroma plane for NV12.
+    const size_t inputBytes = sourceNv12_
+                                  ? PixelLayoutFrameBytes(PixelLayout::Nv12, width_, height_)
+                                  : static_cast<size_t>(width_) * height_ * 4u;
     if (frame.bgra.size() < inputBytes) {
         return Fail(NeuralRenderFailure::Source,
                     "the decoded frame is " + std::to_string(frame.bgra.size()) +
-                        " bytes, short of the " + std::to_string(inputBytes) +
-                        " the persistent colour texture needs");
+                        " bytes, short of the " + std::to_string(inputBytes) + " a " +
+                        (sourceNv12_ ? "NV12" : "BGRA") + " " + std::to_string(width_) + "x" +
+                        std::to_string(height_) + " frame takes");
     }
 
     const auto started = std::chrono::steady_clock::now();

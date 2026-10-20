@@ -2892,8 +2892,16 @@ struct AmdLmxxfEvaluatorAdapter {
     // is the only place it arrives.
     double fps{};
     // The layout the decoded frames arrive in, which Generate checks its buffer
-    // against. BGRA on every path that reaches this adapter today.
+    // against. BGRA unless the job asked for the GPU source conversion and the
+    // decoder could honour it, which is the same pair of conditions the NVIDIA
+    // path runs under.
     PixelLayout sourceLayout{PixelLayout::Bgra};
+    // The conversion the live evaluator's source pass was COMPILED for, which is
+    // Unsupported for a BGRA source because there is no such pass then. The
+    // program is specialised at bring-up and has no setter, so a job whose
+    // source declares a different matrix or range cannot inherit this evaluator -
+    // two NV12 sources with different matrices are two different pictures.
+    SourceNv12Conversion broughtUpSourceConversion{SourceNv12Conversion::Unsupported};
     // How readily the estimator calls a cut, and the benchmark's guide sources
     // (files that replace its field, a dump that records it). Set by the
     // bring-up before RunJob, because Initialize is not handed the request.
@@ -2986,13 +2994,21 @@ struct AmdLmxxfEvaluatorAdapter {
     void SetStyle(uint32_t style){jobStyle=amd_lmxxf::NormalizedAmdStyle(style);}
     bool Initialize(HWND,uint32_t w,uint32_t h,uint32_t ow,uint32_t oh,double rate,
                     const GuideControls& controls,PixelLayout layout,
-                    const SourceColorDescription&){
+                    const SourceColorDescription& color){
         if(!ow||!oh){ow=w;oh=h;}
         jobOutputW=ow;jobOutputH=oh;
         // Pure CPU state, taken before the reuse question so a job that moved
         // only its guide controls still takes effect on a reused evaluator.
         fps=rate;sourceLayout=layout;
         guides.SetControls(controls);guides.SetSceneCutSensitivity(cutSensitivity);
+        // The source's layout and colour are the evaluator's, too. They decide
+        // the upload path - a row copy or a conversion draw - and, for a
+        // conversion, which of the four programs gets compiled, so both are
+        // bring-up facts like the rest of the list below.
+        config.sourceLayout=layout;
+        config.sourceColor=color;
+        const SourceNv12Conversion conversion=layout==PixelLayout::Nv12
+            ?SourceNv12ConversionFor(color):SourceNv12Conversion::Unsupported;
         // The guides are per-frame inputs on this path rather than bring-up
         // state, so the size, the capture size, the job model, the accumulation
         // rung, the pass count and the style are the whole inheritance question
@@ -3002,13 +3018,15 @@ struct AmdLmxxfEvaluatorAdapter {
                broughtUpSkinProtect==jobSkinProtect&&broughtUpPredict==jobPredict&&
                broughtUpSkip==jobSkip&&broughtUpStyle==jobStyle&&broughtUpOutputW==jobOutputW&&
                broughtUpOutputH==jobOutputH&&broughtUpTenBit==config.tenBitCapture&&
-               broughtUpDither==config.captureDither;
+               broughtUpDither==config.captureDither&&
+               broughtUpSourceConversion==conversion;
         if(reused)return true;
         captured.clear();
         evaluator=std::make_unique<AmdLmxxfEvaluator>(config);
         width=w;height=h;broughtUpTemporal=config.temporalHistory;
         broughtUpTenBit=config.tenBitCapture;
         broughtUpDither=config.captureDither;
+        broughtUpSourceConversion=conversion;
         broughtUpStability=config.stability;
         broughtUpPasses=jobPasses;
         broughtUpSkinProtect=jobSkinProtect;
@@ -3035,6 +3053,15 @@ struct AmdLmxxfEvaluatorAdapter {
                 // a reader comparing two renders needs to know which one this
                 // was without re-deriving it from the encoder settings.
                 <<(config.captureDither?", bayer8 dither at the store":", no dither"));
+            // The other half of what a reader comparing two renders has to know
+            // about this backend's bytes: whether the frame that reached the
+            // model was converted on the GPU or by ffmpeg. It is a cache-key
+            // term too (NeuralCache.h), so a render that moved only this is a
+            // different render rather than a cache hit.
+            LOG("AMD source: "<<(evaluator->SourceIsNv12()
+                    ?"NV12, converted on the GPU into the colour texture"
+                    :"BGRA, converted on the CPU by ffmpeg")
+                <<" at "<<w<<"x"<<h);
             return true;
         }
         broughtUpFailure=evaluator->LastFailure();

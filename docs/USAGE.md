@@ -718,6 +718,14 @@ dither, both on by default, do:
   it on the GPU, which saves 2.6x on pipe traffic. It is part of the render
   identity - the key carries `nv12-source-v1` when it is on - so a render made
   with it on is not served for a request with it off, and changing it re-renders.
+  Both neural backends take it: on NVIDIA the renderer's own `PSSourceNv12` does
+  the conversion, on AMD the evaluator's copy of the same algebra does it into
+  the texture it feeds the runtime, and both log which path ran
+  (`AMD source: NV12, converted on the GPU ...` / `BGRA, converted on the CPU by
+  ffmpeg` in `neural-runtime/NeuralWorker.log`). An export honours the saved
+  setting for the same reason it honours `SourceDeband` and `SuppliedExposure`:
+  it changes what the model is shown, so an export that quietly ignored it would
+  be a different picture under the same settings.
   The open probe reads `color_space`, `color_range`, `color_primaries` and
   `color_transfer` off the stream, and the
   GPU path is taken only for a source whose matrix and range the conversion

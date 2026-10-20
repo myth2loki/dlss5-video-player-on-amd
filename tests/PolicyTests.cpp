@@ -9531,7 +9531,8 @@ void video_decoder_swap_carries_probe_derived_state_test()
 // the day it shipped. Changing one of them silently re-colours every cache hit.
 void source_nv12_conversion_constants_are_the_shipped_coefficients_test()
 {
-    using d3d12_renderer_detail::SourceNv12ConstantsFor;
+    // The table lives in MediaSource.h beside the enumeration, because both
+    // backends compile their conversion from it.
     const auto* limited709=SourceNv12ConstantsFor(SourceNv12Conversion::Bt709Limited);
     CHECK(limited709!=nullptr);
     if(limited709){

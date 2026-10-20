@@ -136,6 +136,7 @@ StageExportOutcome RunStageExport(const StageExportJob& job,std::stop_token stop
         request.quality=job.quality;
         request.sourceDeband=job.sourceDeband;
         request.suppliedExposure=job.suppliedExposure;
+        request.gpuSourceConversion=job.gpuSourceConversion;
         request.temporal=job.temporal;
         // The pass count and the skin switch, the panel values this backend
         // stacks the model with; the count is clamped again by ValidRequest.

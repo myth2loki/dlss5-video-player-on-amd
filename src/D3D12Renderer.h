@@ -57,28 +57,9 @@ inline constexpr UINT SwapchainFlags(bool allowTearing)
     return allowTearing ? UINT(DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) : 0u;
 }
 
-// The NV12 source conversion's numbers as the tokens CreatePipelines pastes into
-// the shader text, one set per conversion SourceNv12Conversion names. They are
-// strings because a float cannot be turned back into a token, and tokens are what
-// keeps the BT.709 limited-range arm compiling to the byte-identical program that
-// every cached render on disk was made with.
-//
-// Luma is (Y*255 - lumaOffset) / lumaScale and chroma is (UV*255 - 128) /
-// chromaScale; the four coefficients are the standard inverse matrix, R from V,
-// G from U and V, B from U.
-struct SourceNv12Constants {
-    const char* lumaOffset;
-    const char* lumaScale;
-    const char* chromaScale;
-    const char* redV;
-    const char* greenU;
-    const char* greenV;
-    const char* blueU;
-};
-
-// Null for Unsupported, which is the whole gate: there is no nearest-variant
-// branch to fall into.
-const SourceNv12Constants* SourceNv12ConstantsFor(SourceNv12Conversion conversion);
+// The NV12 source conversion's numbers moved to MediaSource.h, beside the
+// enumeration that names them: the AMD backend compiles the same algebra from
+// the same table, and one table is what keeps the two decoding identically.
 } // namespace d3d12_renderer_detail
 
 // A resource whose destruction a test wants to observe, handed to the renderer

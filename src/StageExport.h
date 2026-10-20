@@ -141,6 +141,12 @@ struct StageExportJob {
     EncoderQuality quality{EncoderQuality::Standard};
     bool sourceDeband{false};
     bool suppliedExposure{false};
+    // Decode the source to NV12 and convert it on the GPU rather than letting
+    // ffmpeg convert every frame on the CPU (Encoder settings, "GPU source
+    // conversion"). Carried for the same reason as the two above: the neural
+    // stage is handed the encoder settings the cache would use, and this one
+    // changes what the model is shown as well as what the pipe carries.
+    bool gpuSourceConversion{false};
     // Ends the player's idle resident helper before this export's helper
     // starts in the same runtime directory. Empty for `--render`, which runs in
     // a process of its own and has none.

@@ -94,3 +94,55 @@ inline SourceNv12Conversion SourceNv12ConversionFor(const SourceColorDescription
     }
     return SourceNv12Conversion::Unsupported;
 }
+
+// The conversions' numbers as the tokens each backend pastes into its shader
+// text, one set per conversion SourceNv12Conversion names. They are strings
+// because a float cannot be turned back into a token, and tokens are what keeps
+// the BT.709 limited-range arm compiling to the byte-identical program every
+// cached render on disk was made with.
+//
+// Luma is (Y*255 - lumaOffset) / lumaScale and chroma is (UV*255 - 128) /
+// chromaScale; the four coefficients are the standard inverse matrix, R from V,
+// G from U and V, B from U.
+//
+// It lives beside the enum rather than in one backend because both backends
+// implement exactly this list: the NVIDIA renderer compiles PSSourceNv12 from
+// it and the AMD evaluator compiles its own copy of the same algebra, and a
+// source that plays on one has to decode identically on the other.
+struct SourceNv12Constants {
+    const char* lumaOffset;
+    const char* lumaScale;
+    const char* chromaScale;
+    const char* redV;
+    const char* greenU;
+    const char* greenV;
+    const char* blueU;
+};
+
+// Null for Unsupported, which is the whole gate: there is no nearest-variant
+// branch to fall into.
+//
+// BT.709 limited range is the program every cached render on disk was made
+// with, so its seven tokens are frozen: 2(1-Kr) and 2(1-Kb) for Kr=0.2126,
+// Kb=0.0722, the two green terms, and the 8-bit studio-swing scalings. BT.601 is
+// the same algebra at Kr=0.299, Kb=0.114. Full range drops the 16 offset and
+// spans the whole byte in both planes.
+inline const SourceNv12Constants* SourceNv12ConstantsFor(SourceNv12Conversion conversion)
+{
+    static constexpr SourceNv12Constants kBt709Limited{
+        "16.0", "219.0", "224.0", "1.5748", "0.187324", "0.468124", "1.8556"};
+    static constexpr SourceNv12Constants kBt709Full{
+        "0.0", "255.0", "255.0", "1.5748", "0.187324", "0.468124", "1.8556"};
+    static constexpr SourceNv12Constants kBt601Limited{
+        "16.0", "219.0", "224.0", "1.402", "0.344136", "0.714136", "1.772"};
+    static constexpr SourceNv12Constants kBt601Full{
+        "0.0", "255.0", "255.0", "1.402", "0.344136", "0.714136", "1.772"};
+    switch (conversion) {
+        case SourceNv12Conversion::Bt709Limited: return &kBt709Limited;
+        case SourceNv12Conversion::Bt709Full: return &kBt709Full;
+        case SourceNv12Conversion::Bt601Limited: return &kBt601Limited;
+        case SourceNv12Conversion::Bt601Full: return &kBt601Full;
+        case SourceNv12Conversion::Unsupported: break;
+    }
+    return nullptr;
+}

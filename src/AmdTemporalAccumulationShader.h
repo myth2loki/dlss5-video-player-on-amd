@@ -114,6 +114,48 @@ float2 PSCaptureChroma10(V i):SV_Target{
 }
 )";
 
+// The NV12 source conversion: the frame the decoder delivers - Y at full size,
+// interleaved UV at half - taken to the 8-bit sRGB BGRA the runtime's input
+// texture carries.
+//
+// This is the same picture the CPU conversion would have produced, and the same
+// algebra D3D12Renderer's PSSourceNv12 runs: the decoder only asks for NV12 for
+// a description SourceNv12ConversionFor accepted, and the pair of programs
+// implements the same four (matrix, range) pairs, so a source that plays on one
+// backend decodes identically on the other.
+//
+// SOURCE_* are supplied at compile time from the colour description the source
+// declared - never from a default - and they are preprocessor tokens rather
+// than constant-buffer values for the reason CompileSourceNv12 records on the
+// NVIDIA side: fxc folds each one into the multiply-add it appears in, so a
+// parameterised version would be a different program with a different rounding,
+// and a source that declared a matrix the pass cannot honour is refused at
+// compile time rather than rounded to BT.709.
+//
+// The guard is what makes that refusal mechanical: HLSL compiles the whole text
+// for whichever entry point is asked for, so a build of this string with no
+// SOURCE_* defines has no PSSourceNv12 at all, and the caller's Compile fails
+// instead of silently decoding YUV under a guessed matrix.
+inline constexpr char kAmdSourceHlsl[] = R"(
+Texture2D Luma:register(t0);
+Texture2D Chroma:register(t1);
+SamplerState S:register(s0);
+struct V{float4 p:SV_Position;float2 uv:TEXCOORD0;};
+V VS(uint id:SV_VertexID){float2 uv=float2((id<<1)&2,id&2);V o;o.uv=uv;o.p=float4(uv.x*2-1,1-uv.y*2,0,1);return o;}
+#ifdef SOURCE_LUMA_OFFSET
+float4 PSSourceNv12(V i):SV_Target{
+    // Sampled rather than loaded: the chroma plane is half size, so its value at
+    // a luma pixel is the bilinear blend of the 2x2 chroma neighbours that pixel
+    // sits among - which is what every 4:2:0 upsampler does and what the NVIDIA
+    // path's linear sampler does at the same uv.
+    float y=(Luma.SampleLevel(S,i.uv,0).r*255.0-SOURCE_LUMA_OFFSET)/SOURCE_LUMA_SCALE;
+    float2 c=(Chroma.SampleLevel(S,i.uv,0).rg*255.0-128.0)/SOURCE_CHROMA_SCALE;
+    float3 rgb=float3(y+SOURCE_RED_V*c.y,y-SOURCE_GREEN_U*c.x-SOURCE_GREEN_V*c.y,y+SOURCE_BLUE_U*c.x);
+    return float4(saturate(rgb),1);
+}
+#endif
+)";
+
 // The profile the entry point `entry` compiles under, for either of the two
 // programs this backend compiles.
 //
@@ -126,8 +168,9 @@ float2 PSCaptureChroma10(V i):SV_Target{
 //
 // Both programs declare exactly one vertex entry point and spell it `VS`;
 // everything else - PSDecode, PSEncode, PSEncodeDithered, PSTemporalStability,
-// PSCaptureLuma10, PSCaptureChroma10 - is a pixel shader. A new entry point
-// under any other name is a pixel shader until someone says otherwise here.
+// PSCaptureLuma10, PSCaptureChroma10, PSSourceNv12 - is a pixel shader. A new
+// entry point under any other name is a pixel shader until someone says
+// otherwise here.
 inline constexpr const char* ShaderProfileFor(std::string_view entry) noexcept
 {
     return entry == "VS" ? "vs_5_1" : "ps_5_1";

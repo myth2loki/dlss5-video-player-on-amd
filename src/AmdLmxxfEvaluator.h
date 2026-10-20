@@ -40,7 +40,9 @@
 
 #include "AmdLmxxfRuntime.h"
 #include "AmdLmxxfSession.h"
+#include "MediaSource.h"
 #include "OfflineNeuralRenderer.h"
+#include "PixelLayout.h"
 #include "TemporalStabilityPolicy.h"
 
 #include <d3d12.h>
@@ -206,6 +208,30 @@ struct AmdLmxxfEvaluatorConfig {
 
     // Per-stage trace, for the smoke test and for a receipt. Empty disables it.
     std::function<void(std::string_view)> log;
+
+    // ---- the source's own layout ------------------------------------------
+    //
+    // The bytes the caller submits, in PixelLayout's terms, and the colour
+    // description they are encoded under when they are NV12. BGRA is the
+    // default because it is what every caller before this one handed over, and
+    // an evaluator built without saying anything reads exactly that.
+    //
+    // NV12 is not a different picture, it is a different number of bytes on the
+    // wire: the decoder can hand Y+UV straight from its own pipe instead of
+    // paying an ffmpeg conversion per frame, and this evaluator converts it on
+    // the GPU into the same persistent colour texture - one full-screen draw
+    // (kAmdSourceHlsl) in place of the row-by-row upload. The colour texture the
+    // runtime is told about does not change: same size, same format, same
+    // pointer, so nothing downstream of the upload knows which path ran.
+    //
+    // The conversion is resolved at Initialize from SourceNv12ConversionFor,
+    // which is the same predicate the decoder uses to decide it may deliver
+    // NV12 at all - so a pair that reaches here is one the pass implements. A
+    // description it does not implement is REFUSED rather than converted under
+    // a guessed matrix: this is the one place where a wrong guess would be
+    // silently wrong colour rather than a failed render.
+    PixelLayout sourceLayout{PixelLayout::Bgra};
+    SourceColorDescription sourceColor{};
 };
 
 class AmdLmxxfEvaluator final : public INeuralFrameEvaluator
@@ -259,6 +285,12 @@ public:
     // carry there (an accumulation to keep the precision in, an even size for
     // 4:2:0), so asking is the only correct source for it.
     bool TenBitCapture() const noexcept { return tenBitCapture_; }
+    // Whether the frames this session is fed are NV12 and converted on the GPU,
+    // which is what the caller has to know to describe the bytes it submits -
+    // and what the job logs so a render says which of the two upload paths it
+    // paid for. Resolved at Initialize from config_.sourceLayout and the colour
+    // description's conversion, so asking is the only correct source for it.
+    bool SourceIsNv12() const noexcept { return sourceNv12_; }
     // Wall time of the last Submit, which is what a receipt's per-frame pacing
     // would carry. The runtime's own GetTimings network_ms is LastNeuralGpuMs.
     double LastSubmitMs() const noexcept { return lastSubmitMs_; }
@@ -327,8 +359,21 @@ private:
     // accumulation's trust test should find this frame in, or -1 when it is not
     // running and the copy is skipped. It is the same slot the frame's output
     // goes into, which is what makes the pair the test compares the pair of
-    // consecutive frames it means to compare.
-    bool UploadColor(const std::vector<uint8_t>& bgra, int sourceSlot);
+    // consecutive frames it means to compare. `pixels` is BGRA or NV12,
+    // whichever this session was brought up for.
+    bool UploadColor(const std::vector<uint8_t>& pixels, int sourceSlot);
+    // The same upload for an NV12 frame: the two planes go into their own
+    // persistent pair and one full-screen draw decodes them into `color_`, which
+    // is what the row-by-row memcpy above would otherwise have filled. Leaves
+    // `color_` where UploadColor's copy branch leaves it, so the source-slot
+    // copy that follows is the same code either way.
+    bool UploadColorFromNv12(const std::vector<uint8_t>& nv12);
+    // The NV12 planes, their upload buffer, the conversion's signature and
+    // pipeline, and the render target view `color_` needs to be a draw's output.
+    // A no-op that answers true when the source is BGRA. Called from
+    // Initialize before the temporal resources, because the frame path picks
+    // its upload branch from what this resolved.
+    bool CreateSourceResources();
     // The motion and depth textures, plus the upload buffer that fills them. The
     // pointers and the sizes are fixed for the life of the session - the runtime
     // rebuilds its chain around a pointer that moves - and only the contents
@@ -538,6 +583,33 @@ private:
     // capture can read, both made once because neither is the runtime's.
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> captureSrvHeap_;
     UINT captureSrvDescriptorSize_{};
+
+    // ---- the NV12 source's own objects (config_.sourceLayout) --------------
+    //
+    // Resolved at Initialize, because the conversion has to be one of the four
+    // SourceNv12ConversionFor names and only the colour description says which.
+    // Everything below exists only when it resolved to NV12.
+    bool sourceNv12_{};
+    SourceNv12Conversion sourceConversion_{SourceNv12Conversion::Unsupported};
+    // The two planes as the decoder delivers them: R8 at full size, interleaved
+    // R8G8 at half. Separate resources because 4:2:0 is two geometries, and
+    // because a copy region needs both sides to be the same format.
+    Microsoft::WRL::ComPtr<ID3D12Resource> sourceLuma_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> sourceChroma_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> sourceUpload_;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> sourceSrvHeap_;
+    // One render target view, for the colour texture: the conversion writes it
+    // and nothing else ever does, so it is the only view of it that exists.
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> sourceRtvHeap_;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> sourceRootSig_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> psoSourceNv12_;
+    UINT sourceSrvDescriptorSize_{};
+    // Both footprints and the mapped base of the one upload buffer that carries
+    // them, kept for the same reason the guide pair's are: every frame rewrites
+    // the same bytes in place.
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT lumaUploadFootprint_{};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT chromaUploadFootprint_{};
+    uint8_t* sourceUploadMapped_{};
 
     // The state the caller declared for color_ at the last RecordInputs and the
     // state the next transition must start from. The runtime reads the colour

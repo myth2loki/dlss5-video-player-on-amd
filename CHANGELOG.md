@@ -7,6 +7,46 @@ text is in git history (this file at tag `dlss5-video-player-v0.25.0`), and the
 decisions that still shape the code are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## 0.29.0 - 2026-10-20
+
+The AMD backend now writes the frames the encoder asks for and reads the source
+the way the rest of the player does. Both were places where a setting the
+NVIDIA path has always honoured did nothing on an AMD card: a 10-bit rung
+stored eight bits and said nothing, and turning on the GPU source conversion
+failed the render outright.
+
+### Fixed
+
+- **High and Lossless were 8-bit on AMD.** The runtime publishes 8-bit sRGB, so
+  the capture stored 8 bits and let the encoder expand them - bytes with no
+  precision the picture did not already have. The precision was always there, one
+  pass earlier: the temporal accumulation's history slot is FP16, so the capture
+  now takes its planes from that slot as P010 (10-bit 4:2:0, BT.709 limited
+  range) instead of rounding it to 8 bits first. The stretch and the CAS of an
+  upscaling capture run at 16 bits for the same reason. It needs a temporal rung
+  and an even capture size; a job that asks without them keeps the 8-bit capture
+  and `neural-runtime/NeuralWorker.log` says so on one line
+  (`AMD capture: ...`). High and Lossless renders on AMD are made again once -
+  the cache revision moved to 0.29.0 because the bytes differ.
+- **GPU source conversion failed the render on AMD.** Encoder settings > GPU
+  source conversion decodes the source to NV12 and converts it on the GPU, and
+  the AMD evaluator refused anything that was not BGRA, so a job with the switch
+  on died with "The neural renderer could not be initialized." It now converts
+  the two planes itself, with the same BT.709/BT.601, limited/full algebra the
+  NVIDIA renderer compiles, into the same colour texture the runtime is told
+  about - so nothing downstream knows which path ran. A source that declares a
+  matrix the conversion has no coefficients for is still refused there, which is
+  the same gate the decoder applies before it agrees to deliver NV12; such a
+  source keeps ffmpeg's CPU conversion and never reaches the model mis-decoded.
+
+### Changed
+
+- **An export honours the saved `GpuSourceConversion` setting.** It reached a
+  live render and never an export, so an export of a file that had just played
+  with it on was a different pipeline under the same settings. `--render` reads
+  it from the saved settings like `SourceDeband` and `SuppliedExposure`, because
+  it changes what the model is shown and is part of the render key.
+
 ## 0.28.2 - 2026-10-04
 
 Neural settings now do what they say, and say what they do. Renders made with the
