@@ -4,12 +4,14 @@
 #include "AmdTemporalAccumulationShader.h"
 #include "AmdUpscaleShader.h"
 #include "GuideFiles.h"
+#include "Log.h"
 #include "TemporalStabilityShader.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <d3dcompiler.h>
+#include <iterator>
 #include <system_error>
 #include <vector>
 
@@ -47,6 +49,24 @@ constexpr D3D12_RESOURCE_STATES kGuideState = D3D12_RESOURCE_STATE_NON_PIXEL_SHA
 // so the first answer is normally OK. The bound is so a runtime that never
 // releases cannot spin this frame loop forever.
 constexpr int kCollectAttempts = 64;
+
+// Whether the AMD backend carries the motion field at the analysis grid's extent
+// instead of resampling it onto the frame every frame. Off by default: the
+// equivalence the arithmetic promises - a grid-pixel vector declared at the
+// grid's width is the same displacement a frame-pixel vector declared at the
+// frame's width is - is measured by this arm, not assumed by it. What it buys
+// when it holds is the whole motion half of the per-frame guide upload: 12.6 MB
+// at 1920x822 becomes 57 KB, and the resample that filled those 12.6 MB is gone
+// with it. DLSS5_AMD_GRID_GUIDES=1 is the arm; the constant-guide arm
+// (DLSS5_AMD_GUIDES=0) stays the baseline it is measured against.
+bool AmdGridGuidesEnabled()
+{
+    wchar_t text[8]{};
+    const DWORD length = ::GetEnvironmentVariableW(L"DLSS5_AMD_GRID_GUIDES", text,
+                                                   static_cast<DWORD>(std::size(text)));
+    if (length == 0 || length >= std::size(text)) return false;
+    return text[0] == L'1' && text[1] == L'\0';
+}
 
 // The temporal accumulation's descriptor layout, laid out by hand because the
 // heap is small and a wrong index here reads somebody else's texture without
@@ -643,26 +663,66 @@ bool AmdLmxxfEvaluator::CreateSourceResources()
 
 bool AmdLmxxfEvaluator::CreateGuideTextures()
 {
+    return CreateGuideResources(width_, height_);
+}
+
+// The grid's size is only known when the first frame that carries a field
+// arrives, so the motion texture the session was armed with is the frame-sized
+// one and this swaps it for the field's own extent exactly once. Called before
+// the frame's lists are reset: recreating waits the queue out and records its
+// initial fill through the same list the frame is about to use.
+bool AmdLmxxfEvaluator::EnsureGuideGeometry(const GuideFrame* guides)
+{
+    if (!gridGuides_ || guides == nullptr) return true;
+    if (!guides->gridW || !guides->gridH)
+        return true;  // UploadGuides refuses an empty grid with the frame number in the text.
+    if (motionW_ == guides->gridW && motionH_ == guides->gridH) return true;
+    LOG("motion field moves to the analysis grid's extent: " << guides->gridW << "x" << guides->gridH
+        << " from " << motionW_ << "x" << motionH_
+        << " (DLSS5_AMD_GRID_GUIDES=1); depth stays at the frame's " << width_ << "x" << height_);
+    return CreateGuideResources(guides->gridW, guides->gridH);
+}
+
+bool AmdLmxxfEvaluator::CreateGuideResources(uint32_t motionWidth, uint32_t motionHeight)
+{
+    if (!motionWidth || !motionHeight) return Refuse("a guide extent of zero pixels is not a field");
+    // The buffer is released below, so the mapping that points into it goes first.
+    if (guideUpload_ && guideUploadMapped_) {
+        guideUpload_->Unmap(0, nullptr);
+        guideUploadMapped_ = nullptr;
+    }
+    motion_.Reset();
+    depth_.Reset();
+    guideUpload_.Reset();
+    motionW_ = motionWidth;
+    motionH_ = motionHeight;
     // Motion is sampled as a pair and depth as one channel, and both formats are
     // in the runtime's whitelist, so neither is a conversion it has to do.
     //
-    // They are FULL FRAME rather than the analysis grid a video host would
-    // naturally compute. The runtime normalises the stored vector against
-    // motion_width/height and the kernel divides by motion_width, so handing it
-    // the frame's own width is the reading that needs no calibration: the scale
-    // comes out at 1 and the stored value IS the frame-pixel displacement. An
-    // analysis grid would put a second unknown on top of an unmeasured one.
+    // The field they carry is FULL FRAME by default. The runtime normalises the
+    // stored vector against motion_width/height and the kernel divides by
+    // motion_width, so handing it the frame's own width is the reading that needs
+    // no calibration: the scale comes out at 1 and the stored value IS the
+    // frame-pixel displacement.
     //
-    // A file source therefore arrives at this size too, not at whatever size it
-    // was written: UploadGuides resamples each frame's field onto this texture
-    // before the runtime sees it, so the frame info can declare the same
-    // motion_width/height and the same scale every frame whichever source the
-    // guides came from.
+    // `motionWidth`/`motionHeight` are the one exception, and they are the same
+    // arithmetic rather than a second contract: a field carried at the grid's
+    // extent, with its vectors in grid pixels and motion_width = the grid's own
+    // width, normalises to exactly the displacement the frame-pixel field did.
+    // The field occupies the top-left corner of a frame-sized texture, because
+    // the runtime refuses a guide texture smaller than the job. It is the
+    // DLSS5_AMD_GRID_GUIDES arm, and it is off by default because the
+    // equivalence is measured, not assumed.
     D3D12_HEAP_PROPERTIES defaultHeap{};
     defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
 
     D3D12_RESOURCE_DESC motionDescription{};
     motionDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    // The TEXTURE is the frame's size even when the field inside it is not. The
+    // runtime refuses a guide whose texture is smaller than the job
+    // (history=guide-extent), and the field is a subrect of it - which is the
+    // same thing its own kernel reads: GetMotion clamps to
+    // (motionWidth, motionHeight), so only the top-left field is ever sampled.
     motionDescription.Width = width_;
     motionDescription.Height = height_;
     motionDescription.DepthOrArraySize = 1;
@@ -691,11 +751,18 @@ bool AmdLmxxfEvaluator::CreateGuideTextures()
     // session: the initial fill below is the constant answer, and every frame
     // after it rewrites the same bytes in place when a guide directory was
     // configured, so nothing here allocates per frame.
+    //
+    // The motion footprint is the FIELD's, not the texture's: the copy of it
+    // lands in the texture's top-left corner, so what the per-frame rewrite moves
+    // is the field's bytes whatever the texture is sized at.
+    D3D12_RESOURCE_DESC motionField = motionDescription;
+    motionField.Width = motionW_;
+    motionField.Height = motionH_;
     UINT rows = 0;
     UINT64 rowBytes = 0;
     UINT64 motionBytes = 0;
     UINT64 depthBytes = 0;
-    device_->GetCopyableFootprints(&motionDescription, 0, 1, 0, &motionFootprint_, &rows, &rowBytes,
+    device_->GetCopyableFootprints(&motionField, 0, 1, 0, &motionFootprint_, &rows, &rowBytes,
                                    &motionBytes);
     const UINT64 depthBase = (motionBytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1u) /
                              D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT *
@@ -729,18 +796,26 @@ bool AmdLmxxfEvaluator::CreateGuideTextures()
         guideUploadMapped_ = static_cast<uint8_t*>(mapped);
         auto* base = guideUploadMapped_;
         std::fill_n(base, static_cast<size_t>(bufferDescription.Width), uint8_t{0});
-        for (uint32_t row = 0; row < height_; ++row) {
+        // The constant is a displacement in frame pixels, and the field it lands
+        // in may be measured in the grid's. Scaling it here is what keeps "one
+        // pixel per frame" meaning the same motion at either extent.
+        const float constantX = config_.motionPixelsPerFrameX * float(motionW_) / float(width_);
+        const float constantY = config_.motionPixelsPerFrameY * float(motionH_) / float(height_);
+        for (uint32_t row = 0; row < motionH_; ++row) {
             auto* motionRow = reinterpret_cast<float*>(
                 base + motionFootprint_.Offset +
                 static_cast<size_t>(row) * motionFootprint_.Footprint.RowPitch);
+            for (uint32_t column = 0; column < motionW_; ++column) {
+                motionRow[column * 2u + 0] = constantX;
+                motionRow[column * 2u + 1] = constantY;
+            }
+        }
+        for (uint32_t row = 0; row < height_; ++row) {
             auto* depthRow = reinterpret_cast<float*>(
                 base + depthFootprint_.Offset +
                 static_cast<size_t>(row) * depthFootprint_.Footprint.RowPitch);
-            for (uint32_t column = 0; column < width_; ++column) {
-                motionRow[column * 2u + 0] = config_.motionPixelsPerFrameX;
-                motionRow[column * 2u + 1] = config_.motionPixelsPerFrameY;
+            for (uint32_t column = 0; column < width_; ++column)
                 depthRow[column] = config_.depthValue;
-            }
         }
         // Deliberately left mapped. The per-frame rewrite writes through this
         // same pointer, and unmapping between frames would only add a pair of
@@ -793,9 +868,10 @@ bool AmdLmxxfEvaluator::CreateGuideTextures()
                            ? "no depth directory (depth stays constant)"
                            : NarrowPath(config_.depthGuideDirectory);
     }
-    Log("temporal guides: motion " + std::to_string(width_) + "x" + std::to_string(height_) +
+    Log("temporal guides: motion " + std::to_string(motionW_) + "x" + std::to_string(motionH_) +
         " R32G32_FLOAT carrying (" + std::to_string(config_.motionPixelsPerFrameX) + ", " +
-        std::to_string(config_.motionPixelsPerFrameY) + ") px/frame, depth R32_FLOAT = " +
+        std::to_string(config_.motionPixelsPerFrameY) + ") px/frame, depth R32_FLOAT at " +
+        std::to_string(width_) + "x" + std::to_string(height_) + " = " +
         std::to_string(config_.depthValue) + ", " + guideSource +
         "; one upload buffer and one texture pair, pointers and sizes fixed for the life of the "
         "session");
@@ -818,6 +894,16 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
     if (!wantsMotion && !wantsDepth) return true;
     if (guideUploadMapped_ == nullptr)
         return Refuse("the guide upload buffer is not mapped, so a per-frame guide cannot be written");
+
+    // Whether the motion field is carried at an extent of its own, and the unit
+    // change that goes with it: everything here computes the field in the
+    // frame's pixels, and a field measured in the grid's is that displacement
+    // times grid/frame. The runtime then normalises against motion_width, so the
+    // ratio cancels and the reprojection is the one the frame-pixel field gave.
+    const bool gridField = gridGuides_ && motionW_ && motionH_ &&
+                           (motionW_ != width_ || motionH_ != height_);
+    const float motionUnitX = gridField ? float(motionW_) / float(width_) : 1.0f;
+    const float motionUnitY = gridField ? float(motionH_) / float(height_) : 1.0f;
 
     // Both guides go through one pass, so the failure text names the guide and
     // the source rather than only the frame.
@@ -846,7 +932,18 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
                 plane.values[cell * 2u + 0u] = guides->guideGridRGBA32F[cell * 4u + 0u];
                 plane.values[cell * 2u + 1u] = guides->guideGridRGBA32F[cell * 4u + 1u];
             }
-            motionValues = guide_files::ResampleArea(plane, width_, height_).values;
+            const bool atGrid = gridField && guides->gridW == motionW_ && guides->gridH == motionH_;
+            if (atGrid) {
+                // The field already is the texture: no resample, no temporary of
+                // the frame's size, only the unit change into grid pixels.
+                for (size_t cell = 0; cell < cells; ++cell) {
+                    plane.values[cell * 2u + 0u] *= motionUnitX;
+                    plane.values[cell * 2u + 1u] *= motionUnitY;
+                }
+                motionValues = std::move(plane.values);
+            } else {
+                motionValues = guide_files::ResampleArea(plane, width_, height_).values;
+            }
             updated[updatedCount++] = {motion_.Get(), &motionFootprint_};
         }
         if (wantsDepth) {
@@ -859,6 +956,7 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
         }
     } else {
         auto read = [&](const std::filesystem::path& directory, uint32_t channels, const char* what,
+                        uint32_t targetWidth, uint32_t targetHeight,
                         std::vector<float>& values) {
             const std::filesystem::path path = guide_files::FramePath(directory, sourceFrameNumber);
             std::string why;
@@ -875,14 +973,14 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
             // the same area average the renderer's own expansion pass applies, so a
             // file at the grid size blocks out exactly the way the estimator's own
             // field does. At equal size it copies rather than averages.
-            values = guide_files::ResampleArea(*plane, width_, height_).values;
+            values = guide_files::ResampleArea(*plane, targetWidth, targetHeight).values;
             // The motion PFM's third channel is padding the texture does not have.
             // Repacking here, rather than striding around it in the writer below,
             // is what keeps every row after the first reading the pixels it belongs
             // to: a uniform field hid the difference, because every value a
             // mis-strided row reads is the same one.
             if (channels == 3u) {
-                const size_t pixels = size_t(width_) * height_;
+                const size_t pixels = size_t(targetWidth) * targetHeight;
                 for (size_t pixel = 0; pixel < pixels; ++pixel) {
                     values[pixel * 2u + 0u] = values[pixel * 3u + 0u];
                     values[pixel * 2u + 1u] = values[pixel * 3u + 1u];
@@ -892,11 +990,18 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
             return true;
         };
         if (wantsMotion) {
-            if (!read(config_.motionGuideDirectory, 3, "motion", motionValues)) return false;
+            if (!read(config_.motionGuideDirectory, 3, "motion", motionW_, motionH_, motionValues))
+                return false;
+            if (gridField)
+                for (size_t cell = 0; cell < motionValues.size(); cell += 2u) {
+                    motionValues[cell + 0u] *= motionUnitX;
+                    motionValues[cell + 1u] *= motionUnitY;
+                }
             updated[updatedCount++] = {motion_.Get(), &motionFootprint_};
         }
         if (wantsDepth) {
-            if (!read(config_.depthGuideDirectory, 1, "depth", depthValues)) return false;
+            if (!read(config_.depthGuideDirectory, 1, "depth", width_, height_, depthValues))
+                return false;
             updated[updatedCount++] = {depth_.Get(), &depthFootprint_};
         }
     }
@@ -906,17 +1011,18 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
     // that was not written this frame has an empty vector behind it and is
     // skipped, which is what leaves its constant in place.
     auto write = [&](const std::vector<float>& values,
-                     const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, uint32_t channels) {
-        for (uint32_t row = 0; row < height_; ++row) {
+                     const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, uint32_t channels,
+                     uint32_t rowWidth, uint32_t rowCount) {
+        for (uint32_t row = 0; row < rowCount; ++row) {
             auto* target = reinterpret_cast<float*>(
                 guideUploadMapped_ + footprint.Offset +
                 static_cast<size_t>(row) * footprint.Footprint.RowPitch);
-            std::copy_n(values.data() + static_cast<size_t>(row) * width_ * channels,
-                        static_cast<size_t>(width_) * channels, target);
+            std::copy_n(values.data() + static_cast<size_t>(row) * rowWidth * channels,
+                        static_cast<size_t>(rowWidth) * channels, target);
         }
     };
-    if (!motionValues.empty()) write(motionValues, motionFootprint_, 2u);
-    if (!depthValues.empty()) write(depthValues, depthFootprint_, 1u);
+    if (!motionValues.empty()) write(motionValues, motionFootprint_, 2u, motionW_, motionH_);
+    if (!depthValues.empty()) write(depthValues, depthFootprint_, 1u, width_, height_);
 
     // Out of the read state, in with the copy, back into the read state - all in
     // this frame's producer list, which is what the runtime runs behind on the
@@ -1048,6 +1154,9 @@ void AmdLmxxfEvaluator::TearDown()
     guideUpload_.Reset();
     depth_.Reset();
     motion_.Reset();
+    // No field of any extent is alive now; the next bring-up creates one and says
+    // what size it is.
+    motionW_ = motionH_ = 0;
     readback_.Reset();
     upload_.Reset();
     color_.Reset();
@@ -1213,6 +1322,11 @@ bool AmdLmxxfEvaluator::Initialize(HWND, uint32_t width, uint32_t height, uint32
     evaluations_ = 0;
     neuralEvaluations_ = 0;
     accumulationFrames_ = 0;
+    // Another bring-up fact, resolved here with the rest: which extent this
+    // session's motion field is carried at. The first frame that carries a field
+    // is what settles the grid's size (EnsureGuideGeometry), so nothing below
+    // depends on knowing it yet.
+    gridGuides_ = AmdGridGuidesEnabled();
 
     if (!BringUpDevice("the evaluator owns them; a stage C worker would hand its own")) return false;
     if (!CreateFrameResources()) return false;
@@ -2536,6 +2650,21 @@ void AmdLmxxfEvaluator::RefreshHistoryStatus()
     const size_t end = status.find(' ', begin);
     lastHistoryStatus_ =
         status.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+    // A history that did not engage is the only place the runtime says why, and
+    // the reason is a token in a line whose other tokens carry the geometry it
+    // judged. Printing just the token threw that away. It goes to the worker's
+    // log rather than this evaluator's sink because the sink is a per-call
+    // transcript a job deliberately does not keep (see the adapter's config), and
+    // a degraded render is exactly the thing that has to survive the job.
+    //
+    // "priming" is the first frame of an engaging history rather than a refusal,
+    // so it is not one of these.
+    static std::string lastDiagnosed;
+    const bool refusal = lastHistoryStatus_ != "active" && lastHistoryStatus_ != "priming";
+    if (refusal && lastHistoryStatus_ != lastDiagnosed) {
+        lastDiagnosed = lastHistoryStatus_;
+        LOG("runtime status (history did not engage): " << status);
+    }
 }
 
 bool AmdLmxxfEvaluator::SubmitFrameLease(const std::vector<uint8_t>& bgra, bool resetRequested,
@@ -2576,6 +2705,10 @@ bool AmdLmxxfEvaluator::SubmitFrameLease(const std::vector<uint8_t>& bgra, bool 
 
     if (resetRequested && !session.ResetHistory())
         return Fail(NeuralRenderFailure::Neural, "ResetHistory: " + session.LastError());
+
+    // Before any list of this frame is reset: moving the field's extent recreates
+    // the textures, which waits the queue out and records through that same list.
+    if (!EnsureGuideGeometry(guides)) return Fail(NeuralRenderFailure::Neural, lastError_);
 
     // ---- record both lists before submitting either ----------------------
     //
@@ -2637,20 +2770,21 @@ bool AmdLmxxfEvaluator::SubmitFrameLease(const std::vector<uint8_t>& bgra, bool 
     temporalGuides.depth = depth_.Get();
     temporalGuides.motionState = static_cast<uint32_t>(kGuideState);
     temporalGuides.depthState = static_cast<uint32_t>(kGuideState);
-    temporalGuides.motionWidth = width_;
-    temporalGuides.motionHeight = height_;
-    // The stored vector is already a frame-pixel displacement, so the value that
-    // maps it onto the frame is the frame's own width. The kernel divides by
-    // motion_width, which leaves the scale at 1 and this quantity with nothing
-    // left to calibrate - see CreateGuideTextures for why that was the point.
+    temporalGuides.motionWidth = motionW_;
+    temporalGuides.motionHeight = motionH_;
+    // The field's own extent, not the frame's: equal unless the grid arm moved
+    // it. The stored vector is a displacement in whichever pixels the field is
+    // measured in, so passing the field's own width is what leaves the kernel's
+    // scale at 1 and this quantity with nothing left to calibrate - see
+    // CreateGuideResources.
     //
     // That holds for the file source too, and it is why it holds: GuideFiles.h
     // defines its motion in DLSS input pixels, the same unit, so whatever size a
-    // field file arrives at, ResampleArea turns it into frame pixels before this
-    // pair ever sees it. A host that stored normalised vectors instead would pass
-    // 1.0f here and nothing else in this function would change.
-    temporalGuides.motionScaleX = static_cast<float>(width_);
-    temporalGuides.motionScaleY = static_cast<float>(height_);
+    // field file arrives at, ResampleArea turns it into the field's pixels before
+    // this pair ever sees it. A host that stored normalised vectors instead would
+    // pass 1.0f here and nothing else in this function would change.
+    temporalGuides.motionScaleX = static_cast<float>(motionW_);
+    temporalGuides.motionScaleY = static_cast<float>(motionH_);
     temporalGuides.jitterX = 0.0f;
     temporalGuides.jitterY = 0.0f;
     temporalGuides.flags = amd_lmxxf::kTemporalVideoFlags;

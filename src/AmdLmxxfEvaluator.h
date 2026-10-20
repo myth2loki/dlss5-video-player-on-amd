@@ -380,6 +380,20 @@ private:
     // ever change. This fills the two constants; UploadGuides replaces them per
     // frame when a guide directory was configured.
     bool CreateGuideTextures();
+    // The same, with the motion field carried at an extent of its own. The
+    // runtime normalises the stored vector against motion_width, so a field in
+    // grid pixels declared at the grid's own width is the same displacement a
+    // frame-pixel field declared at the frame's width is - and the per-frame
+    // upload is kilobytes instead of megabytes. Depth has no such extent (the
+    // runtime requires the colour to fit inside it), so it stays at frame size.
+    // Reached only through the DLSS5_AMD_GRID_GUIDES arm, and only before this
+    // session's first frame: the runtime rebuilds its chain around a pointer
+    // that moves, so this recreates rather than resizes.
+    bool CreateGuideResources(uint32_t motionWidth, uint32_t motionHeight);
+    // Swaps the motion texture to the extent this frame's field arrived at, once
+    // per session. Called before the frame's command list is reset, because
+    // creating the resources waits the queue out and reuses that same list.
+    bool EnsureGuideGeometry(const GuideFrame* guides);
     // Rewrites the guide textures for this frame and records the copy into
     // `list`. Three sources, in precedence order: `guides` when the caller
     // computed a field (the player's estimator, or a benchmark's files already
@@ -492,6 +506,13 @@ private:
     // is about to overwrite it is the one that just finished reading it.
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT motionFootprint_{};
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT depthFootprint_{};
+    // The motion FIELD's extent, which is what the frame info declares and what
+    // the kernel normalises the stored vectors against. Equal to the frame's own
+    // size unless the grid arm moved it, and never larger than motion_'s texture.
+    uint32_t motionW_{}, motionH_{};
+    // DLSS5_AMD_GRID_GUIDES: carry the motion field at the analysis grid's
+    // extent rather than resampling it onto the frame every frame.
+    bool gridGuides_{};
     uint8_t* guideUploadMapped_{};
     uint8_t* uploadMapped_{};
 
