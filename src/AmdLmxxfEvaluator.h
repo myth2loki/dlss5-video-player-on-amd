@@ -394,6 +394,20 @@ private:
     // per session. Called before the frame's command list is reset, because
     // creating the resources waits the queue out and reuses that same list.
     bool EnsureGuideGeometry(const GuideFrame* guides);
+    // Depth has no extent of its own: the runtime's kernel indexes it by
+    // renderWidth/renderHeight over the whole texture, so the frame-sized
+    // resample cannot be skipped the way motion's can. It can be moved off the
+    // CPU, which is where the 6.3 MB per frame was going - this pass stretches
+    // the analysis grid into the frame-sized depth texture with one draw over
+    // 43 KB of upload. See AmdDepthExpandShader.h for why that is the same
+    // resample ResampleArea performs and not a different one.
+    bool CreateDepthExpansion();
+    // Sizes the grid texture and its upload buffer to this frame's field, once
+    // per session, and rebuilds the depth texture's render-target view - which a
+    // guide recreation invalidates, because it recreates the texture.
+    bool EnsureDepthGrid(uint32_t gridWidth, uint32_t gridHeight);
+    // Records this frame's grid copy and the draw that expands it into `depth_`.
+    bool RecordDepthExpansion(ID3D12GraphicsCommandList* list);
     // Rewrites the guide textures for this frame and records the copy into
     // `list`. Three sources, in precedence order: `guides` when the caller
     // computed a field (the player's estimator, or a benchmark's files already
@@ -515,6 +529,30 @@ private:
     bool gridGuides_{};
     uint8_t* guideUploadMapped_{};
     uint8_t* uploadMapped_{};
+
+    // ---- the depth guide's expansion (DLSS5_AMD_DEPTH_EXPAND) ---------------
+    bool depthExpand_{};
+    // The FIELD's extent, which is the grid texture's size - not the frame's.
+    uint32_t depthGridW_{}, depthGridH_{};
+    // The field as uploaded (43 KB at 1920x822) and as the expand pass reads it.
+    // The frame-sized depth texture the runtime samples is `depth_`, unchanged.
+    Microsoft::WRL::ComPtr<ID3D12Resource> depthGrid_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> depthGridUpload_;
+    uint8_t* depthGridMapped_{};
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT depthGridFootprint_{};
+    // The state depthGrid_ was last left in. The second frame's copy transitions
+    // from what the first one actually left behind; without this the first copy
+    // of a session would ask for COPY_DEST -> COPY_DEST.
+    D3D12_RESOURCE_STATES depthGridState_{D3D12_RESOURCE_STATE_COPY_DEST};
+    // Which resource the render-target view in depthRtvHeap_ was made for. A
+    // guide rebuild replaces depth_, and a view into a released resource is not
+    // something the debug layer has to catch - comparing the pointer is cheaper
+    // than rebuilding a view per frame.
+    ID3D12Resource* depthRtvOwner_{};
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> depthSrvHeap_;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> depthRtvHeap_;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> depthExpandRootSig_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> psoDepthExpand_;
 
     // ---- the temporal accumulation's own objects (config_.stability) -------
     //

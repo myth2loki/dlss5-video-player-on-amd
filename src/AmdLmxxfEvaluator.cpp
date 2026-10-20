@@ -1,5 +1,6 @@
 #include "AmdLmxxfEvaluator.h"
 
+#include "AmdDepthExpandShader.h"
 #include "AmdLmxxfPolicy.h"
 #include "AmdTemporalAccumulationShader.h"
 #include "AmdUpscaleShader.h"
@@ -66,6 +67,22 @@ bool AmdGridGuidesEnabled()
                                                    static_cast<DWORD>(std::size(text)));
     if (length == 0 || length >= std::size(text)) return false;
     return text[0] == L'1' && text[1] == L'\0';
+}
+
+// Whether the depth guide is expanded onto the frame by a draw instead of by a
+// CPU resample. On by default, because it is not a different resample: it is the
+// same integer floor division ResampleArea performs on the upscale branch, done
+// once per output pixel by a shader over a 43 KB upload rather than 6.3 MB of
+// area averages through a write-combined heap. DLSS5_AMD_DEPTH_EXPAND=0 keeps
+// the CPU path - the one an older build shipped - for an A/B that needs it.
+bool AmdDepthExpandEnabled()
+{
+    wchar_t text[8]{};
+    const DWORD length = ::GetEnvironmentVariableW(L"DLSS5_AMD_DEPTH_EXPAND", text,
+                                                   static_cast<DWORD>(std::size(text)));
+    if (length == 0) return true;
+    if (length >= std::size(text)) return true;
+    return !(text[0] == L'0' && text[1] == L'\0');
 }
 
 // The temporal accumulation's descriptor layout, laid out by hand because the
@@ -673,14 +690,18 @@ bool AmdLmxxfEvaluator::CreateGuideTextures()
 // initial fill through the same list the frame is about to use.
 bool AmdLmxxfEvaluator::EnsureGuideGeometry(const GuideFrame* guides)
 {
-    if (!gridGuides_ || guides == nullptr) return true;
-    if (!guides->gridW || !guides->gridH)
-        return true;  // UploadGuides refuses an empty grid with the frame number in the text.
-    if (motionW_ == guides->gridW && motionH_ == guides->gridH) return true;
-    LOG("motion field moves to the analysis grid's extent: " << guides->gridW << "x" << guides->gridH
-        << " from " << motionW_ << "x" << motionH_
-        << " (DLSS5_AMD_GRID_GUIDES=1); depth stays at the frame's " << width_ << "x" << height_);
-    return CreateGuideResources(guides->gridW, guides->gridH);
+    if (guides == nullptr || !guides->gridW || !guides->gridH) return true;
+    if (gridGuides_ && (motionW_ != guides->gridW || motionH_ != guides->gridH)) {
+        LOG("motion field moves to the analysis grid's extent: " << guides->gridW << "x"
+            << guides->gridH << " from " << motionW_ << "x" << motionH_
+            << " (DLSS5_AMD_GRID_GUIDES=1); depth stays at the frame's " << width_ << "x"
+            << height_);
+        if (!CreateGuideResources(guides->gridW, guides->gridH)) return false;
+    }
+    // The depth expansion needs no arm of its own: the field arrives at the grid's
+    // extent whoever asked for it, and the pass that stretches it is the CPU
+    // resample's replacement rather than an alternative to it.
+    return EnsureDepthGrid(guides->gridW, guides->gridH);
 }
 
 bool AmdLmxxfEvaluator::CreateGuideResources(uint32_t motionWidth, uint32_t motionHeight)
@@ -741,11 +762,20 @@ bool AmdLmxxfEvaluator::CreateGuideResources(uint32_t motionWidth, uint32_t moti
 
     D3D12_RESOURCE_DESC depthDescription = motionDescription;
     depthDescription.Format = DXGI_FORMAT_R32_FLOAT;
+    // The expand pass renders into this texture, and D3D12 will not bind a
+    // resource as a target unless it was created saying so: without the flag the
+    // view is created, the draw goes through, and the device is removed for the
+    // invalid call rather than refused at the call that was invalid.
+    if (depthExpand_) depthDescription.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if (FAILED(device_->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
                                                 &depthDescription,
                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                                 IID_PPV_ARGS(&depth_))))
         return Refuse("CreateCommittedResource for the depth guide failed");
+    // The depth expansion's render-target view was made for the texture this one
+    // replaces; EnsureDepthGrid rebuilds it on the next frame. Clearing the owner
+    // rather than relying on the allocator handing out a different address.
+    depthRtvOwner_ = nullptr;
 
     // One upload buffer carrying both. It stays mapped for the life of the
     // session: the initial fill below is the constant answer, and every frame
@@ -878,6 +908,242 @@ bool AmdLmxxfEvaluator::CreateGuideResources(uint32_t motionWidth, uint32_t moti
     return true;
 }
 
+bool AmdLmxxfEvaluator::CreateDepthExpansion()
+{
+    if (!depthExpand_) return true;
+    if (depthExpandRootSig_ && psoDepthExpand_ && depthSrvHeap_ && depthRtvHeap_) return true;
+
+    // One texture in, one constant pair out, and no sampler: the shader loads by
+    // integer texel, which is the arithmetic that makes this the same resample
+    // the CPU path performs rather than a filtered one that resembles it.
+    D3D12_DESCRIPTOR_RANGE range{};
+    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    range.NumDescriptors = 1;
+    range.BaseShaderRegister = 0;
+
+    D3D12_ROOT_PARAMETER parameters[2]{};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[0].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[0].DescriptorTable.pDescriptorRanges = &range;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].Constants.Num32BitValues = 2;
+    parameters[1].Constants.ShaderRegister = 0;
+
+    D3D12_ROOT_SIGNATURE_DESC description{};
+    description.NumParameters = 2;
+    description.pParameters = parameters;
+    description.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+    {
+        Microsoft::WRL::ComPtr<ID3DBlob> signature, error;
+        const HRESULT hr =
+            D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+                                        signature.GetAddressOf(), error.GetAddressOf());
+        if (FAILED(hr))
+            return Refuse("the depth expand root signature would not serialize: " +
+                          (error ? BlobText(error.Get()) : Hex32(hr)));
+        if (FAILED(device_->CreateRootSignature(0, signature->GetBufferPointer(),
+                                                signature->GetBufferSize(),
+                                                IID_PPV_ARGS(depthExpandRootSig_.GetAddressOf()))))
+            return Refuse("CreateRootSignature for the depth expand failed");
+    }
+
+    Microsoft::WRL::ComPtr<ID3DBlob> vs, ps;
+    auto compile = [&](const char* entry, Microsoft::WRL::ComPtr<ID3DBlob>& blob) -> bool {
+        const char* profile = DepthExpandShaderProfileFor(entry);
+        Microsoft::WRL::ComPtr<ID3DBlob> error;
+        const HRESULT hr = D3DCompile(kAmdDepthExpandHlsl, sizeof(kAmdDepthExpandHlsl) - 1,
+                                      "amd-depth-expand", nullptr, nullptr, entry, profile,
+                                      D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, blob.GetAddressOf(),
+                                      error.GetAddressOf());
+        if (FAILED(hr))
+            return Refuse(std::string("the depth expand's ") + entry + " (" + profile +
+                          ") would not compile: " + (error ? BlobText(error.Get()) : Hex32(hr)));
+        return true;
+    };
+    if (!compile("VS", vs)) return false;
+    if (!compile("PSDepthExpand", ps)) return false;
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso{};
+    pso.pRootSignature = depthExpandRootSig_.Get();
+    pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+    pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+    // No blending: the pass writes the sampled value, and a blend against the
+    // constant it is replacing would make the result depend on what the previous
+    // frame left in the target.
+    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pso.SampleMask = UINT_MAX;
+    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pso.RasterizerState.DepthClipEnable = TRUE;
+    pso.DepthStencilState.DepthEnable = FALSE;
+    pso.DepthStencilState.StencilEnable = FALSE;
+    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pso.NumRenderTargets = 1;
+    pso.RTVFormats[0] = DXGI_FORMAT_R32_FLOAT;
+    pso.SampleDesc = {1, 0};
+    pso.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    if (FAILED(device_->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(psoDepthExpand_.GetAddressOf()))))
+        return Refuse("CreateGraphicsPipelineState for the depth expand failed");
+
+    // Two heaps of one descriptor each, rather than a slice of the accumulation's:
+    // this pass's bindings have nothing to do with the accumulation's table, and
+    // borrowing a slot would put that table's fixed indices on a shared budget.
+    D3D12_DESCRIPTOR_HEAP_DESC srv{};
+    srv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    srv.NumDescriptors = 1;
+    srv.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(device_->CreateDescriptorHeap(&srv, IID_PPV_ARGS(depthSrvHeap_.GetAddressOf()))))
+        return Refuse("CreateDescriptorHeap for the depth grid failed");
+    D3D12_DESCRIPTOR_HEAP_DESC rtv{};
+    rtv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rtv.NumDescriptors = 1;
+    if (FAILED(device_->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(depthRtvHeap_.GetAddressOf()))))
+        return Refuse("CreateDescriptorHeap for the depth guide's target failed");
+    return true;
+}
+
+bool AmdLmxxfEvaluator::EnsureDepthGrid(uint32_t gridWidth, uint32_t gridHeight)
+{
+    if (!depthExpand_) return true;
+    if (!gridWidth || !gridHeight) return true;
+    if (!depth_) return Refuse("the depth guide's texture does not exist, so nothing can expand into it");
+
+    if (!depthGrid_ || gridWidth != depthGridW_ || gridHeight != depthGridH_) {
+        // The mapping points into the buffer about to be released, so it goes
+        // first - the same order the guide upload's own rebuild uses.
+        if (depthGridUpload_ && depthGridMapped_) {
+            depthGridUpload_->Unmap(0, nullptr);
+            depthGridMapped_ = nullptr;
+        }
+        depthGrid_.Reset();
+        depthGridUpload_.Reset();
+
+        D3D12_RESOURCE_DESC field{};
+        field.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        field.Width = gridWidth;
+        field.Height = gridHeight;
+        field.DepthOrArraySize = 1;
+        field.MipLevels = 1;
+        field.Format = DXGI_FORMAT_R32_FLOAT;
+        field.SampleDesc.Count = 1;
+        field.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+        D3D12_HEAP_PROPERTIES defaultHeap{};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        if (FAILED(device_->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &field,
+                                                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                    IID_PPV_ARGS(depthGrid_.GetAddressOf()))))
+            return Refuse("CreateCommittedResource for the depth grid failed");
+
+        UINT rows = 0;
+        UINT64 rowBytes = 0, bytes = 0;
+        device_->GetCopyableFootprints(&field, 0, 1, 0, &depthGridFootprint_, &rows, &rowBytes,
+                                       &bytes);
+        D3D12_RESOURCE_DESC buffer{};
+        buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer.Width = bytes;
+        buffer.Height = 1;
+        buffer.DepthOrArraySize = 1;
+        buffer.MipLevels = 1;
+        buffer.Format = DXGI_FORMAT_UNKNOWN;
+        buffer.SampleDesc.Count = 1;
+        buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        D3D12_HEAP_PROPERTIES uploadHeap{};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        if (FAILED(device_->CreateCommittedResource(&uploadHeap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                                    IID_PPV_ARGS(depthGridUpload_.GetAddressOf()))))
+            return Refuse("CreateCommittedResource for the depth grid upload failed");
+        void* mapped = nullptr;
+        const D3D12_RANGE noRead{0, 0};
+        if (FAILED(depthGridUpload_->Map(0, &noRead, &mapped)))
+            return Refuse("the depth grid upload would not map");
+        depthGridMapped_ = static_cast<uint8_t*>(mapped);
+        // Left mapped for the same reason the guide upload is: the per-frame
+        // rewrite writes through this pointer and unmapping between frames would
+        // only add a pair of calls to a path waiting on the queue.
+        depthGridW_ = gridWidth;
+        depthGridH_ = gridHeight;
+        depthGridState_ = D3D12_RESOURCE_STATE_COPY_DEST;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32_FLOAT;
+        view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        view.Texture2D.MostDetailedMip = 0;
+        view.Texture2D.MipLevels = 1;
+        device_->CreateShaderResourceView(depthGrid_.Get(), &view,
+                                          depthSrvHeap_->GetCPUDescriptorHandleForHeapStart());
+        LOG("depth guide expands on the GPU: " << gridWidth << "x" << gridHeight
+            << " R32_FLOAT = " << ((bytes < 1024u) ? std::to_string(bytes) + " B"
+                                                   : std::to_string(bytes / 1024u) + " KB")
+            << " uploaded per frame into the " << width_ << "x" << height_
+            << " texture the runtime samples");
+    }
+
+    if (depthRtvOwner_ != depth_.Get()) {
+        D3D12_RENDER_TARGET_VIEW_DESC view{};
+        view.Format = DXGI_FORMAT_R32_FLOAT;
+        view.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        view.Texture2D.MipSlice = 0;
+        view.Texture2D.PlaneSlice = 0;
+        device_->CreateRenderTargetView(depth_.Get(), &view,
+                                        depthRtvHeap_->GetCPUDescriptorHandleForHeapStart());
+        depthRtvOwner_ = depth_.Get();
+    }
+    return true;
+}
+
+bool AmdLmxxfEvaluator::RecordDepthExpansion(ID3D12GraphicsCommandList* list)
+{
+    if (!depthGrid_ || depthGridMapped_ == nullptr || depthRtvOwner_ != depth_.Get())
+        return Refuse("the depth expansion is not set up for this frame's field");
+
+    // The caller has already written the grid through depthGridMapped_, so all
+    // that is left is to get it onto the GPU and stretch it.
+    if (depthGridState_ != D3D12_RESOURCE_STATE_COPY_DEST)
+        Transition(list, depthGrid_.Get(), depthGridState_, D3D12_RESOURCE_STATE_COPY_DEST);
+    D3D12_TEXTURE_COPY_LOCATION destination{};
+    destination.pResource = depthGrid_.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION source{};
+    source.pResource = depthGridUpload_.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint = depthGridFootprint_;
+    list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    Transition(list, depthGrid_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+               D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    depthGridState_ = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+    // Out of the read state the runtime will find it in, drawn over, back into it:
+    // the same bracket the CPU path puts around its copy, so the frame info's
+    // kGuideState is the truth before and after this list either way.
+    Transition(list, depth_.Get(), kGuideState, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    ID3D12DescriptorHeap* heaps[] = {depthSrvHeap_.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetGraphicsRootSignature(depthExpandRootSig_.Get());
+    list->SetPipelineState(psoDepthExpand_.Get());
+    list->SetGraphicsRootDescriptorTable(0, depthSrvHeap_->GetGPUDescriptorHandleForHeapStart());
+    const UINT32 frame[2] = {width_, height_};
+    list->SetGraphicsRoot32BitConstants(1, 2, frame, 0);
+    D3D12_CPU_DESCRIPTOR_HANDLE target = depthRtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    list->OMSetRenderTargets(1, &target, FALSE, nullptr);
+    D3D12_VIEWPORT viewport{0.0f, 0.0f, static_cast<float>(width_), static_cast<float>(height_), 0.0f,
+                            1.0f};
+    D3D12_RECT scissor{0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    list->RSSetViewports(1, &viewport);
+    list->RSSetScissorRects(1, &scissor);
+    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list->DrawInstanced(3, 1, 0, 0);
+
+    Transition(list, depth_.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, kGuideState);
+    return true;
+}
+
 bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t sourceFrameNumber,
                                      const GuideFrame* guides)
 {
@@ -915,6 +1181,7 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
     uint32_t updatedCount = 0;
     std::vector<float> motionValues;
     std::vector<float> depthValues;
+    bool depthExpanded = false;
 
     if (guides) {
         // The field the caller computed for this frame - the player's estimator
@@ -947,12 +1214,30 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
             updated[updatedCount++] = {motion_.Get(), &motionFootprint_};
         }
         if (wantsDepth) {
-            guide_files::Plane plane{guides->gridW, guides->gridH, 1u, {}};
-            plane.values.resize(cells);
-            for (size_t cell = 0; cell < cells; ++cell)
-                plane.values[cell] = guides->guideGridRGBA32F[cell * 4u + 2u];
-            depthValues = guide_files::ResampleArea(plane, width_, height_).values;
-            updated[updatedCount++] = {depth_.Get(), &depthFootprint_};
+            if (depthExpand_ && depthGridMapped_ && depthGridW_ == guides->gridW &&
+                depthGridH_ == guides->gridH) {
+                // Straight from the grid into the 43 KB upload: no temporary of the
+                // frame's size, no area average, and the expansion itself is the draw
+                // recorded below. One row at a time because the footprint's pitch is
+                // the aligned one the copy needs and not the tight row.
+                for (uint32_t row = 0; row < guides->gridH; ++row) {
+                    auto* target = reinterpret_cast<float*>(
+                        depthGridMapped_ + depthGridFootprint_.Offset +
+                        static_cast<size_t>(row) * depthGridFootprint_.Footprint.RowPitch);
+                    const float* source = guides->guideGridRGBA32F.data() +
+                                          static_cast<size_t>(row) * guides->gridW * 4u + 2u;
+                    for (uint32_t column = 0; column < guides->gridW; ++column)
+                        target[column] = source[column * 4u];
+                }
+                depthExpanded = true;
+            } else {
+                guide_files::Plane plane{guides->gridW, guides->gridH, 1u, {}};
+                plane.values.resize(cells);
+                for (size_t cell = 0; cell < cells; ++cell)
+                    plane.values[cell] = guides->guideGridRGBA32F[cell * 4u + 2u];
+                depthValues = guide_files::ResampleArea(plane, width_, height_).values;
+                updated[updatedCount++] = {depth_.Get(), &depthFootprint_};
+            }
         }
     } else {
         auto read = [&](const std::filesystem::path& directory, uint32_t channels, const char* what,
@@ -1054,6 +1339,11 @@ bool AmdLmxxfEvaluator::UploadGuides(ID3D12GraphicsCommandList* list, uint64_t s
     for (uint32_t index = 0; index < updatedCount; ++index)
         std::swap(barriers[index].Transition.StateBefore, barriers[index].Transition.StateAfter);
     list->ResourceBarrier(updatedCount, barriers);
+
+    // After the copies rather than among them: this one brackets the depth
+    // texture with its own transition pair around a draw, which is a different
+    // shape from the copy the loop above would otherwise have made.
+    if (depthExpanded && !RecordDepthExpansion(list)) return false;
 
     ++guideFrames_;
     return true;
@@ -1327,6 +1617,9 @@ bool AmdLmxxfEvaluator::Initialize(HWND, uint32_t width, uint32_t height, uint32
     // is what settles the grid's size (EnsureGuideGeometry), so nothing below
     // depends on knowing it yet.
     gridGuides_ = AmdGridGuidesEnabled();
+    // The same decision for depth, which has no extent to shrink but does have a
+    // resample to move: 160x68 averaged onto 1920x822 on the CPU, every frame.
+    depthExpand_ = AmdDepthExpandEnabled();
 
     if (!BringUpDevice("the evaluator owns them; a stage C worker would hand its own")) return false;
     if (!CreateFrameResources()) return false;
@@ -1337,6 +1630,9 @@ bool AmdLmxxfEvaluator::Initialize(HWND, uint32_t width, uint32_t height, uint32
     // session is armed for a job that could never run at its rung.
     if (!CreateTemporalResources()) return false;
     if (!CreateUpscaleResources()) return false;
+    // Its shader compiles here for the same reason the others do: a program that
+    // will not compile should not be discovered on the first frame of a job.
+    if (!CreateDepthExpansion()) return false;
     if (!BringUpRuntime()) return false;
     // After the runtime, so a guide failure reports with the session's context
     // already in the log. Only the lease path has a consumer list to build.
@@ -2719,10 +3015,19 @@ bool AmdLmxxfEvaluator::SubmitFrameLease(const std::vector<uint8_t>& bgra, bool 
     // between them - where in the default order the output recording sits
     // *after* the first submission because the producer's marker, not a Begin
     // call, is what advances that machine.
-    if (FAILED(allocator_->Reset()) || FAILED(list_->Reset(allocator_.Get(), nullptr)) ||
-        FAILED(consumerAllocator_->Reset()) ||
-        FAILED(consumerList_->Reset(consumerAllocator_.Get(), nullptr)))
-        return Fail(NeuralRenderFailure::Neural, "a command list would not reset");
+    {
+        const HRESULT producerAllocator = allocator_->Reset();
+        const HRESULT producerList = FAILED(producerAllocator) ? E_FAIL : list_->Reset(allocator_.Get(), nullptr);
+        const HRESULT consumerAllocator = consumerAllocator_->Reset();
+        const HRESULT consumerList = FAILED(consumerAllocator) ? E_FAIL : consumerList_->Reset(consumerAllocator_.Get(), nullptr);
+        if (FAILED(producerAllocator) || FAILED(producerList) || FAILED(consumerAllocator) ||
+            FAILED(consumerList))
+            return Fail(NeuralRenderFailure::Neural,
+                        "a command list would not reset: allocator " + Hex32(producerAllocator) +
+                            ", list " + Hex32(producerList) + ", consumer allocator " +
+                            Hex32(consumerAllocator) + ", consumer list " + Hex32(consumerList) +
+                            ", device removed reason " + Hex32(UINT(device_->GetDeviceRemovedReason())));
+    }
 
     // Where this frame sits in the accumulation's history, decided before the
     // upload because the upload is what puts this frame's source into the slot
