@@ -386,9 +386,9 @@ private:
     // frame-pixel field declared at the frame's width is - and the per-frame
     // upload is kilobytes instead of megabytes. Depth has no such extent (the
     // runtime requires the colour to fit inside it), so it stays at frame size.
-    // Reached only through the DLSS5_AMD_GRID_GUIDES arm, and only before this
-    // session's first frame: the runtime rebuilds its chain around a pointer
-    // that moves, so this recreates rather than resizes.
+    // Reached by the default grid-extent arm (DLSS5_AMD_GRID_GUIDES=0 opts out),
+    // and only before this session's first frame: the runtime rebuilds its chain
+    // around a pointer that moves, so this recreates rather than resizes.
     bool CreateGuideResources(uint32_t motionWidth, uint32_t motionHeight);
     // Swaps the motion texture to the extent this frame's field arrived at, once
     // per session. Called before the frame's command list is reset, because
@@ -524,8 +524,9 @@ private:
     // the kernel normalises the stored vectors against. Equal to the frame's own
     // size unless the grid arm moved it, and never larger than motion_'s texture.
     uint32_t motionW_{}, motionH_{};
-    // DLSS5_AMD_GRID_GUIDES: carry the motion field at the analysis grid's
-    // extent rather than resampling it onto the frame every frame.
+    // DLSS5_AMD_GRID_GUIDES, on unless set to 0: carry the motion field at the
+    // analysis grid's extent rather than resampling it onto the frame every
+    // frame.
     bool gridGuides_{};
     uint8_t* guideUploadMapped_{};
     uint8_t* uploadMapped_{};

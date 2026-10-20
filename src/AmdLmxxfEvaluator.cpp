@@ -52,21 +52,23 @@ constexpr D3D12_RESOURCE_STATES kGuideState = D3D12_RESOURCE_STATE_NON_PIXEL_SHA
 constexpr int kCollectAttempts = 64;
 
 // Whether the AMD backend carries the motion field at the analysis grid's extent
-// instead of resampling it onto the frame every frame. Off by default: the
-// equivalence the arithmetic promises - a grid-pixel vector declared at the
+// instead of resampling it onto the frame every frame. On by default, because
+// the equivalence the arithmetic promises - a grid-pixel vector declared at the
 // grid's width is the same displacement a frame-pixel vector declared at the
-// frame's width is - is measured by this arm, not assumed by it. What it buys
-// when it holds is the whole motion half of the per-frame guide upload: 12.6 MB
-// at 1920x822 becomes 57 KB, and the resample that filled those 12.6 MB is gone
-// with it. DLSS5_AMD_GRID_GUIDES=1 is the arm; the constant-guide arm
-// (DLSS5_AMD_GUIDES=0) stays the baseline it is measured against.
+// frame's width is - has now been measured rather than assumed: the grid field
+// matched the frame-extent one at 54.50 dB, and the 60 s live session ran at
+// 2.52x real time on it. What it buys is the whole motion half of the per-frame
+// guide upload: 12.6 MB at 1920x822 becomes 57 KB, and the resample that filled
+// those 12.6 MB is gone with it. DLSS5_AMD_GRID_GUIDES=0 restores the
+// frame-extent field, the baseline this arm is measured against.
 bool AmdGridGuidesEnabled()
 {
     wchar_t text[8]{};
     const DWORD length = ::GetEnvironmentVariableW(L"DLSS5_AMD_GRID_GUIDES", text,
                                                    static_cast<DWORD>(std::size(text)));
-    if (length == 0 || length >= std::size(text)) return false;
-    return text[0] == L'1' && text[1] == L'\0';
+    if (length == 0) return true;
+    if (length >= std::size(text)) return true;
+    return !(text[0] == L'0' && text[1] == L'\0');
 }
 
 // Whether the depth guide is expanded onto the frame by a draw instead of by a
@@ -694,7 +696,7 @@ bool AmdLmxxfEvaluator::EnsureGuideGeometry(const GuideFrame* guides)
     if (gridGuides_ && (motionW_ != guides->gridW || motionH_ != guides->gridH)) {
         LOG("motion field moves to the analysis grid's extent: " << guides->gridW << "x"
             << guides->gridH << " from " << motionW_ << "x" << motionH_
-            << " (DLSS5_AMD_GRID_GUIDES=1); depth stays at the frame's " << width_ << "x"
+            << " (default; DLSS5_AMD_GRID_GUIDES=0 keeps the frame's); depth stays at the frame's " << width_ << "x"
             << height_);
         if (!CreateGuideResources(guides->gridW, guides->gridH)) return false;
     }
@@ -731,9 +733,9 @@ bool AmdLmxxfEvaluator::CreateGuideResources(uint32_t motionWidth, uint32_t moti
     // extent, with its vectors in grid pixels and motion_width = the grid's own
     // width, normalises to exactly the displacement the frame-pixel field did.
     // The field occupies the top-left corner of a frame-sized texture, because
-    // the runtime refuses a guide texture smaller than the job. It is the
-    // DLSS5_AMD_GRID_GUIDES arm, and it is off by default because the
-    // equivalence is measured, not assumed.
+    // the runtime refuses a guide texture smaller than the job. This is the
+    // default arm; DLSS5_AMD_GRID_GUIDES=0 carries the field at the frame's own
+    // extent and resamples it there instead.
     D3D12_HEAP_PROPERTIES defaultHeap{};
     defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
 
