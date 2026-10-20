@@ -760,6 +760,28 @@ std::vector<std::wstring> BuildEncoderArguments(const EncoderSpec& spec,
         // NVENC takes NV12 and P010 as they stand, so an already-converted capture
         // reaches the encoder without ffmpeg touching a single pixel.
         else arguments.insert(arguments.end(), {L"-pix_fmt", nv12 ? L"nv12" : L"yuv420p"});
+    } else if (spec.kind == EncoderKind::HevcAmf) {
+        // AMD's hardware encoder. What it is fed is the rung's capture as the
+        // evaluator resolved it: P010 on a 10-bit rung, BGRA on Standard, where the
+        // filter graph below performs the one conversion (see the `-vf` block).
+        //
+        // `-rc cqp` and no rate-control ceiling, because that is the whole of what
+        // this encoder offers that measures as constant quality here: `-rc qvbr`,
+        // the close analogue of NVENC's VBR, refuses to initialise on this driver
+        // (`encoder->Init() failed with error 10`, at levels 20, 24 and 28 alike), and
+        // `-rc cbr`/`-rc vbr_peak` would put the bitrate back in charge of quality -
+        // the exact defect the NVENC path spent 2026-09-23 removing.
+        //
+        // No `-init_hw_device`: unlike NVENC, AMF does not defer its device to the
+        // first frame in a way that landed inside a segment (measured: 782 ms for 48
+        // frames at 720p, against libx264's 1408 ms for the same work).
+        arguments.insert(arguments.end(), {
+            L"-c:v", L"hevc_amf", L"-rc", L"cqp",
+            L"-qp_i", std::to_wstring(tenBit ? kAmfHighRungQp : kAmfStandardRungQp),
+            L"-qp_p", std::to_wstring(tenBit ? kAmfHighRungQp : kAmfStandardRungQp),
+            L"-quality", L"quality"});
+        if (tenBit) arguments.insert(arguments.end(), {L"-profile:v", L"main10", L"-pix_fmt", L"p010le"});
+        else arguments.insert(arguments.end(), {L"-pix_fmt", L"nv12"});
     } else {
         arguments.insert(arguments.end(), {
             L"-c:v", L"libx264", L"-preset", L"slow", L"-crf", tenBit ? highCq : std::wstring(L"16"),
@@ -805,8 +827,16 @@ std::vector<std::wstring> BuildEncoderArguments(const EncoderSpec& spec,
     if (nv12 || p010) {
         arguments.insert(arguments.end(), {L"-vf", kSetColorParams});
     } else {
+        // The AMF branch is the one path whose encoder is handed a format the capture
+        // never arrives in: Standard captures BGRA, and HEVC cannot carry packed 4:4:4
+        // in the profile this writes. So the pack to NV12 is stated in the graph rather
+        // than inferred from -pix_fmt, which keeps the matrix conversion and the chroma
+        // interleave in one pass. NVENC's packed-input path (frame generation, VSR) has
+        // the same shape but leaves the interleave to ffmpeg, because NVENC accepts
+        // yuv420p directly and there is nothing to state.
         arguments.insert(arguments.end(), {
-            L"-vf", std::wstring(L"scale=out_color_matrix=bt709:out_range=tv,") + kSetColorParams});
+            L"-vf", std::wstring(L"scale=out_color_matrix=bt709:out_range=tv,") +
+                        (spec.kind == EncoderKind::HevcAmf ? L"format=nv12," : L"") + kSetColorParams});
     }
     arguments.insert(arguments.end(), {
         L"-colorspace", L"bt709", L"-color_primaries", L"bt709",
@@ -917,7 +947,12 @@ size_t ExpectedFrameBytes(const EncoderSpec& spec)
 
 bool ShouldRetryWithSoftware(EncoderKind attempted, EncodeError error)
 {
-    if (attempted != EncoderKind::HevcNvenc) return false;
+    // The two hardware encoders are the only ones with a software encoder behind them:
+    // FFV1 and libx264 already are it. Both retry for the same reasons - a vendor
+    // encoder fails when its driver, its GPU or its ffmpeg build is missing, which is
+    // exactly the case the fallback exists for. An AMF retry lands on libx264 too, and
+    // that path's own claim is that it writes the same picture.
+    if (attempted != EncoderKind::HevcNvenc && attempted != EncoderKind::HevcAmf) return false;
     return error == EncodeError::StartFailed || error == EncodeError::WriteFailed ||
            error == EncodeError::FinishFailed;
 }

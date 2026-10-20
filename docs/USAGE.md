@@ -676,6 +676,14 @@ dither, both on by default, do:
   every rung: MKV copies the stream, MP4 carries High's HEVC as it is and turns
   Lossless's FFV1 into lossless 10-bit H.264. The numbers are in
   `docs/measurements/cache-quality-20260923/`.
+  On an AMD render the two lossy rungs are written by AMD's own encoder
+  (`hevc_amf`) rather than libx264, at the same measured quality: HEVC 8-bit at
+  QP 18 for Standard, HEVC Main10 at QP 16 from the same P010 capture for High.
+  `NvencPreset` does not apply there, and the encode is several times faster -
+  48 frames at 3840x2160 took 6045 ms and 8813 KiB through libx264 against
+  1569 ms and 4677 KiB through AMF. An odd capture size still uses libx264 on
+  both backends, because HEVC in 8-bit 4:2:0 cannot describe it, and a machine
+  whose FFmpeg or driver has no AMF falls back to libx264 as well.
 - `SourceDeband` (default off). Runs libplacebo's deband (1 iteration,
   threshold 3, radius 16, grain 4, with a fixed pattern) on the decoded source
   before the model. Measured on seven clips the model already removes almost

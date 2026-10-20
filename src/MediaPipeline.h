@@ -18,6 +18,12 @@ enum class EncoderKind {
     // The Lossless rung's encoder (EncoderQuality::Lossless). CPU-only, so there is
     // no NVENC attempt to fall back from and nothing to fall back to.
     Ffv1,
+    // AMD's hardware encoder, ffmpeg's `hevc_amf`. Appended rather than placed beside
+    // HevcNvenc because this enum is a wire value - a helper's command line and the
+    // worker protocol's encoder byte both carry it - and the three above already have
+    // their positions. Falls back to H264Software exactly as HevcNvenc does, which is
+    // what makes it safe on a machine whose ffmpeg has no AMF or whose GPU is not AMD.
+    HevcAmf,
 };
 
 // Which encoder writes an NVENC render (NvencDirectPolicy.h). Auto is every
@@ -132,14 +138,19 @@ constexpr uint64_t EncoderFrameBytes(EncoderPixelFormat format, uint32_t width, 
 // export made from it. A named rung rather than free encoder options, so the choice is
 // one cache-key term (NeuralRenderPipelineIdentity) and one line in Encoder settings.
 //
-//  * Standard - HEVC 8-bit at CQ 16 through NVENC, libx264 CRF 16 when NVENC is
-//    unavailable. The default. Before 2026-09-23 NVENC's hidden VBR ceiling held it
+//  * Standard - HEVC 8-bit at CQ 16 through NVENC, or at QP 18 through AMF on an AMD
+//    render (see kAmfStandardRungQp), libx264 CRF 16 when neither hardware encoder is
+//    available. The default. Before 2026-09-23 NVENC's hidden VBR ceiling held it
 //    near 10.7 Mbit/s at 1080p whatever the CQ; the ceiling is lifted now (see
 //    BuildEncoderArguments), so CQ 16 is what sets its quality.
-//  * High - HEVC Main10 through NVENC from a 10-bit P010 capture (libx264 High 10 when
-//    NVENC is unavailable), at kHighRungCq.
+//  * High - HEVC Main10 from a 10-bit P010 capture: through NVENC at kHighRungCq, or
+//    through AMF at kAmfHighRungQp (libx264 High 10 when neither is available).
 //  * Lossless - FFV1 10-bit, every frame intra, from the same P010 capture: exact to the
 //    10-bit 4:2:0 capture, and the reference the other two rungs are scored against.
+//
+// Which hardware encoder a rung lands on is decided by the render's backend, not by
+// this value: an NVIDIA render asks NVENC, an AMD render asks AMF. The rung is still
+// the cache-key term, because the backend already is one.
 //
 // The measured cost of each rung is recorded beside kHighRungCq.
 enum class EncoderQuality { Standard, High, Lossless };
@@ -193,6 +204,34 @@ constexpr bool ParseEncoderQuality(std::string_view text, EncoderQuality& qualit
 // the long pole, and NVENC took 3.4-5.3 ms a frame at either CQ.
 // docs/measurements/cache-quality-20260923/ has the per-clip numbers.
 inline constexpr uint32_t kHighRungCq = 14;
+
+// AMF's constant QP for the two lossy rungs, for `hevc_amf -rc cqp`. Separate from
+// kHighRungCq because the two encoders do not mean the same thing by a number: NVENC's
+// -cq is a quality target under VBR, AMF's -qp is the quantiser, and 14 under AMF was
+// measurably worse value than 16.
+//
+// Measured 2026-10-20 on an RX 9070 XT, 48 frames of external/test-media/
+// bumblebee-fight-20s.mkv, every arm encoding the same Lossless (FFV1 10-bit) render
+// and scored with PSNR against the 1280x720 source; the 2160p rows are the same clip
+// upscaled with lanczos and re-wrapped lossless first, so the clips are identical
+// between arms and only the encoder differs:
+//
+//   arm (720p)                              bytes      time     PSNR
+//   High: libx264 -crf 14 (was AMD's)      1177 KiB   1408 ms  52.06
+//   High: hevc_amf cqp 14 -quality quality 1413 KiB    782 ms  53.02
+//   High: hevc_amf cqp 16 -quality quality 1082 KiB    782 ms  52.36  <- shipped
+//   Standard: libx264 -crf 16 (was AMD's)   941 KiB    ~500 ms  49.28
+//   Standard: hevc_amf cqp 17              1294 KiB    ~800 ms  50.13
+//   Standard: hevc_amf cqp 18 quality       721 KiB    ~800 ms  49.04  <- shipped
+//
+// At 3840x2160 the same comparison is the reason this exists at all: libx264 -crf 14
+// wrote 8813 KiB in 6045 ms, hevc_amf cqp 16 -quality quality 4677 KiB in 1569 ms -
+// 4.1x the speed for 47 % fewer bytes at the same measured quality. `-quality quality`
+// is stated rather than left at its `balanced` default because the default is
+// measurably softer at the same QP; `-rc qvbr`, which would have been the closer
+// analogue of NVENC's VBR, fails to initialise on this driver.
+inline constexpr uint32_t kAmfHighRungQp = 16;
+inline constexpr uint32_t kAmfStandardRungQp = 18;
 
 struct EncoderSpec {
     uint32_t width{};

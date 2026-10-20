@@ -2434,6 +2434,39 @@ void encoder_quality_ladder_arguments_test()
     CHECK_EQ((std::vector<std::wstring>{L"bgra", L"yuv444p10le"}), value(highOddArguments, L"-pix_fmt"));
     CHECK(value(highOddArguments, L"-vf").front().starts_with(L"scale=out_color_matrix=bt709:out_range=tv,"));
 
+    // AMD's encoder, on the same two rungs. Standard arrives as the same 8-bit BGRA
+    // capture and leaves as NV12: HEVC has no packed 4:4:4 in the profile this writes,
+    // so the pack is stated in the graph rather than left to -pix_fmt, and the matrix
+    // conversion stays in that one pass. Rate control is constant QP because it is the
+    // only one this driver initialises - `-rc qvbr` fails encoder open outright - and
+    // there is no bitrate ceiling to lift because there is no bitrate target.
+    EncoderSpec amfStandard{1920, 1080, 30.0, EncoderKind::HevcAmf};
+    const auto amfStandardArguments = BuildEncoderArguments(amfStandard, output);
+    CHECK_EQ((std::vector<std::wstring>{L"hevc_amf"}), value(amfStandardArguments, L"-c:v"));
+    CHECK_EQ((std::vector<std::wstring>{L"cqp"}), value(amfStandardArguments, L"-rc"));
+    CHECK_EQ((std::vector<std::wstring>{L"quality"}), value(amfStandardArguments, L"-quality"));
+    CHECK_EQ((std::vector<std::wstring>{std::to_wstring(kAmfStandardRungQp)}),
+             value(amfStandardArguments, L"-qp_i"));
+    CHECK_EQ((std::vector<std::wstring>{std::to_wstring(kAmfStandardRungQp)}),
+             value(amfStandardArguments, L"-qp_p"));
+    CHECK_EQ((std::vector<std::wstring>{L"bgra", L"nv12"}), value(amfStandardArguments, L"-pix_fmt"));
+    CHECK_EQ((std::vector<std::wstring>{L"scale=out_color_matrix=bt709:out_range=tv,format=nv12,"
+                                        L"setparams=color_primaries=bt709:color_trc=bt709:"
+                                        L"colorspace=bt709:range=tv"}),
+             value(amfStandardArguments, L"-vf"));
+    CHECK(!has(amfStandardArguments, L"-maxrate") && !has(amfStandardArguments, L"-cq"));
+    CHECK(!has(amfStandardArguments, L"-init_hw_device"));
+    // High arrives as the P010 capture and is handed over untouched, exactly as NVENC's
+    // is: no filter beyond the metadata, and Main10 at the rung's own QP.
+    EncoderSpec amfHigh{1920, 1080, 30.0, EncoderKind::HevcAmf, EncoderPixelFormat::P010};
+    amfHigh.quality = EncoderQuality::High;
+    const auto amfHighArguments = BuildEncoderArguments(amfHigh, output);
+    CHECK_EQ((std::vector<std::wstring>{L"p010le", L"p010le"}), value(amfHighArguments, L"-pix_fmt"));
+    CHECK_EQ((std::vector<std::wstring>{L"main10"}), value(amfHighArguments, L"-profile:v"));
+    CHECK_EQ((std::vector<std::wstring>{std::to_wstring(kAmfHighRungQp)}), value(amfHighArguments, L"-qp_i"));
+    CHECK_EQ((std::vector<std::wstring>{L"setparams=color_primaries=bt709:color_trc=bt709:"
+                                        L"colorspace=bt709:range=tv"}), value(amfHighArguments, L"-vf"));
+
     // Lossless: FFV1, every frame intra, 10-bit, no rate control at all.
     EncoderSpec lossless{1920, 1080, 30.0, EncoderKind::Ffv1, EncoderPixelFormat::P010};
     lossless.quality = EncoderQuality::Lossless;
@@ -2492,6 +2525,13 @@ void encoder_frame_contract_and_fallback_policy_are_fail_closed_test()
     CHECK(ShouldRetryWithSoftware(EncoderKind::HevcNvenc, EncodeError::WriteFailed));
     CHECK(ShouldRetryWithSoftware(EncoderKind::HevcNvenc, EncodeError::FinishFailed));
     CHECK(!ShouldRetryWithSoftware(EncoderKind::HevcNvenc, EncodeError::Cancelled));
+    // AMD's encoder falls back the same way and onto the same software encoder: a
+    // machine with no AMD GPU or an ffmpeg without hevc_amf reaches libx264 rather
+    // than failing the job.
+    CHECK(ShouldRetryWithSoftware(EncoderKind::HevcAmf, EncodeError::StartFailed));
+    CHECK(ShouldRetryWithSoftware(EncoderKind::HevcAmf, EncodeError::WriteFailed));
+    CHECK(ShouldRetryWithSoftware(EncoderKind::HevcAmf, EncodeError::FinishFailed));
+    CHECK(!ShouldRetryWithSoftware(EncoderKind::HevcAmf, EncodeError::Cancelled));
     CHECK(!ShouldRetryWithSoftware(EncoderKind::H264Software, EncodeError::StartFailed));
 }
 

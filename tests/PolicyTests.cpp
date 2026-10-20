@@ -15645,8 +15645,12 @@ void neural_job_checks_the_range_and_what_a_cached_entry_must_agree_with_test()
     CHECK(!neural_job::CachedRenderEvidence(manifest, probe, ranged).durationMatches);
 
     CHECK(std::string(neural_job::CacheEncoderName(EncoderKind::HevcNvenc)) == "hevc_nvenc");
+    CHECK(std::string(neural_job::CacheEncoderName(EncoderKind::HevcAmf)) == "hevc_amf");
     CHECK(std::string(neural_job::CacheEncoderName(EncoderKind::Ffv1)) == "ffv1");
     CHECK(std::string(neural_job::CacheEncoderName(EncoderKind::H264Software)) == "h264_software");
+    // The AMF kind was appended, not inserted: its byte is the worker protocol's
+    // encoder value and a helper may be running an older build's wire format.
+    CHECK_EQ(3, static_cast<int>(EncoderKind::HevcAmf));
 }
 
 // A resumed session's index holds earlier runs' coverage beside this run's,

@@ -7,6 +7,37 @@ text is in git history (this file at tag `dlss5-video-player-v0.25.0`), and the
 decisions that still shape the code are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## 0.29.1 - 2026-10-20
+
+An AMD render now writes its video with AMD's own hardware encoder instead of
+libx264 on the CPU. Nothing in the settings changed, nothing in the cache key
+changed, and the picture is the same one the rung always asked for - the file is
+smaller and the export finishes sooner.
+
+### Changed
+
+- **AMD renders encode on the GPU.** Both lossy rungs went through libx264 -
+  H.264, 8-bit, single-threaded per frame - on every backend, because NVENC was
+  the only hardware encoder the pipeline knew. An AMD job now starts on
+  `hevc_amf` at the same constant-quality setting: HEVC 8-bit for Standard, HEVC
+  Main10 from the same P010 capture for High. Measured on the same 720p neural
+  render, 48 frames, PSNR against the Lossless render of those frames:
+  High went from 1232 KiB / 51.94 dB / 1430 ms to 1146 KiB / 52.07 dB /
+  775 ms, and Standard from 978 KiB / 49.09 dB / 1181 ms to 751 KiB /
+  48.84 dB / 759 ms. On a 3840x2160 render the encode alone went from 6045 ms
+  to 1569 ms. Standard trades a quarter of a decibel for a quarter of the bytes;
+  at 49 dB that is well below anything visible, and the rung is the one chosen
+  for size.
+- **Odd capture sizes still go to libx264**, on both backends: HEVC in 8-bit
+  4:2:0 cannot describe an odd height or width, and NVENC pads such a frame
+  rather than failing, which would break source/neural pairing. Lossless is
+  still FFV1. If the AMD encoder cannot start - no AMD driver, or an FFmpeg
+  built without AMF - the job falls back to libx264 exactly as an NVENC job
+  does, so a machine without the hardware loses nothing but the speed.
+- Renders made on AMD are made again once: the cache revision moved to 0.29.1
+  because the same key now names different packets. An NVIDIA render's key and
+  bytes are untouched.
+
 ## 0.29.0 - 2026-10-20
 
 The AMD backend now writes the frames the encoder asks for and reads the source

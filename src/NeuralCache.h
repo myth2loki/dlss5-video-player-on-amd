@@ -40,8 +40,11 @@ enum class NeuralCacheState {
 // 0.29.0 is the 10-bit AMD capture: a High or Lossless rung on that backend now
 // writes P010 from an FP16 frame instead of 8-bit BGRA from the same rung's
 // name, so the entries those two rungs published describe different bytes.
+// 0.29.1 is AMD's encoder: those rungs are written by hevc_amf rather than libx264,
+// so the same key now names different packets. Nothing else moved - an NVIDIA
+// entry's key and bytes are unchanged.
 // A value past the player's own version is refused by PolicyTests.
-inline constexpr std::string_view kRenderCacheRevision = "0.29.0";
+inline constexpr std::string_view kRenderCacheRevision = "0.29.1";
 
 struct NeuralCacheIdentity {
     std::string sourceDigest;

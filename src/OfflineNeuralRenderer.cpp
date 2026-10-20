@@ -228,6 +228,7 @@ void ReportStageTimings(EncoderKind kind, const StageTimers& stages,
     line << std::fixed << std::setprecision(2)
          << "Neural export stage cost per frame ("
          << (kind == EncoderKind::HevcNvenc ? (attempt.direct ? "hevc_nvenc direct" : "hevc_nvenc")
+             : kind == EncoderKind::HevcAmf ? "hevc_amf"
              : kind == EncoderKind::Ffv1 ? "ffv1" : "libx264") << ", "
          << frames << " frames): total " << MillisPerFrame(accounted, frames)
          << " ms = source " << MillisPerFrame(stages.source, frames)
@@ -2187,17 +2188,24 @@ NeuralRenderResult RunJob(const NeuralRenderRequest& request,
 
     // NVENC accepts odd dimensions but silently pads them to an even size,
     // which breaks exact source/neural pairing and cache validation. libx264's
-    // yuv444p path preserves odd image dimensions. The Lossless rung is FFV1 at
-    // any size, and ShouldRetryWithSoftware never retries it.
+    // yuv444p path preserves odd image dimensions.
     //
-    // An AMD job starts on libx264 for a blunter reason: NVENC is NVIDIA's
-    // encoder, so the hevc_nvenc attempt could only ever fail, and the retry
-    // ladder below would then re-read the source from frame zero to reach the
-    // encoder it could have started on. One attempt instead of two, and the same
-    // packets - the retry path's own claim is that it writes the same output.
+    // An AMD job starts on AMF, and an NVIDIA one on NVENC, for the same reason
+    // neither starts on the other's encoder: a vendor encoder the machine cannot
+    // run could only ever fail, and the retry ladder below would then re-read the
+    // source from frame zero to reach the encoder it could have started on. The
+    // retry is still the net under both - an ffmpeg without hevc_amf, a driver
+    // that cannot open it, a GPU that is not what the backend believes.
+    //
+    // Odd dimensions skip both hardware encoders rather than only NVENC: HEVC
+    // 8-bit cannot describe an odd size either, so AMF would pad by the same
+    // mechanism. libx264's 4:4:4 path is the one that keeps the geometry exact.
+    // The Lossless rung is FFV1 at any size, and ShouldRetryWithSoftware never
+    // retries it.
     EncoderKind selected = request.quality == EncoderQuality::Lossless ? EncoderKind::Ffv1
-        : (request.backend == NeuralBackend::Amd || request.width % 2 || request.height % 2)
-            ? EncoderKind::H264Software : EncoderKind::HevcNvenc;
+        : (request.width % 2 || request.height % 2) ? EncoderKind::H264Software
+        : (request.backend == NeuralBackend::Amd) ? EncoderKind::HevcAmf
+                                                  : EncoderKind::HevcNvenc;
     AttemptResult attempt = job.RunAttempt(selected);
     // A direct NVENC session that failed mid-render goes to the ffmpeg child
     // first (P3.7); a benchmark that named a path gets no fallback at all.

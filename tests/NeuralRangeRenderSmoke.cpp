@@ -538,8 +538,9 @@ int wmain(int argc, wchar_t** argv)
         // Told rather than resolved by the helper, exactly as the player tells it:
         // the tree this test checked the lock of is the tree the render must load,
         // and letting the helper resolve its own would make those two facts
-        // unconnected. Standard quality is stated for the same reason the player
-        // states it - the NVENC rungs are not on this backend.
+        // unconnected. Standard rather than a 10-bit rung keeps this smoke on the
+        // 8-bit BGRA capture, which is the path a live session takes by default;
+        // the rungs above it are covered by the player's own export, not here.
         request.amdRuntimeDirectory = amdRuntime;
         request.quality = EncoderQuality::Standard;
     }

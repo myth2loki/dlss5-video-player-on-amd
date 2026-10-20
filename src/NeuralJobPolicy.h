@@ -85,7 +85,8 @@ inline cached_render::Evidence CachedRenderEvidence(const NeuralCacheManifest& m
 // The encoder a render entry's manifest names.
 inline const char* CacheEncoderName(EncoderKind encoder)
 {
-    return encoder == EncoderKind::HevcNvenc ? "hevc_nvenc" : encoder == EncoderKind::Ffv1 ? "ffv1" : "h264_software";
+    return encoder == EncoderKind::HevcNvenc ? "hevc_nvenc" : encoder == EncoderKind::HevcAmf ? "hevc_amf"
+         : encoder == EncoderKind::Ffv1 ? "ffv1" : "h264_software";
 }
 
 // The files one live run published, in timeline order.
