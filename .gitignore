@@ -35,6 +35,15 @@
 # SHA256SUMS manifests that ship inside it). Never redistributed, never committed.
 /amd-neural-runtime/
 
+# The same pack copied aside for a second experiment ("- 副本" and friends). It is the
+# same 600 MB of binaries the rule above keeps out; a copy is not a different argument.
+/amd-neural-runtime - 副本/
+/amd-neural-runtime copy/
+/amd-neural-runtime.backup/
+
+# Screenshot dumps from manual A/B eyeballing.
+/_style-shots/
+
 # Runtime files that should not be committed
 *.dll
 *.exe
