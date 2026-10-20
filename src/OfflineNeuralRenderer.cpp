@@ -224,6 +224,19 @@ void ReportStageTimings(EncoderKind kind, const StageTimers& stages,
         detail = evaluator.StageDetail(frames);
     const SteadyClock::duration accounted =
         stages.source + stages.submit + stages.resolve + stages.write;
+    // The runtime's own network_ms, printed next to the submit it lives inside.
+    // A submit that is slower than the model can only be blamed on the envelope -
+    // the guide upload, the copies, the gate - if the model's own number is
+    // beside it, and nothing else reports that on a render to a file.
+    double networkP50 = 0.0;
+    double networkMean = 0.0;
+    if (!attempt.neuralGpuMs.empty()) {
+        std::vector<double> samples = attempt.neuralGpuMs;
+        std::sort(samples.begin(), samples.end());
+        networkP50 = samples[samples.size() / 2];
+        for (double sample : samples) networkMean += sample;
+        networkMean /= double(samples.size());
+    }
     std::ostringstream line;
     line << std::fixed << std::setprecision(2)
          << "Neural export stage cost per frame ("
@@ -238,7 +251,7 @@ void ReportStageTimings(EncoderKind kind, const StageTimers& stages,
          // The stage accumulators and the loop clock are independent measurements of the
          // same rate. They should agree; a gap is work no stage is counting.
          << " ms, measured loop " << Mean(attempt.stages.loop)
-         << " ms." << detail;
+         << " ms; network p50 " << networkP50 << " mean " << networkMean << " ms." << detail;
     LOG(line.str());
 }
 
