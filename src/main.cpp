@@ -8103,10 +8103,12 @@ private:
         else if(m_guideReset||m_dlssReset)reason=HistoryReset::Seek;
         else if(resetGuide)reason=f.discontinuity?HistoryReset::Seek:HistoryReset::Drop;
         const auto guideStart=Clock::now();
-        // Nothing reads motion or depth unless the NGX evaluate runs or a guide
-        // debug view is up, and SetDLSS(false) runs on every media load - so on
-        // the default path this whole estimator produced a grid with no
-        // consumer. It reads every source pixel and allocates about eight
+        // The motion and depth textures are read by the NGX evaluate, by a
+        // guide debug view, and - since the playback guides reached FSR 4 - by
+        // FSR 4's reprojection while it is the engine in service. SetDLSS(false)
+        // runs on every media load, and the FSR rungs read GuidesRequired()
+        // themselves, so the default path no longer estimates a grid nobody
+        // consumes. It reads every source pixel and allocates about eight
         // vectors per call; measured at 0.84 ms per frame at 2560x1440 against
         // a 41.7 ms budget, and 7.2% of one at 119.88 fps.
         const bool guidesNeeded=m_renderer->GuidesRequired();
