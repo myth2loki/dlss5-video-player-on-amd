@@ -10,6 +10,14 @@ convert files or filter the desktop live; this one renders the whole video
 progressively, keeps every frame, and shows you what the model changed, and where
 it didn't help. [How it compares](docs/RELATED_PROJECTS.md).
 
+Special thanks to **lmxxf** for porting DLSS 5 to AMD Radeon (9070 XT) — this AMD
+backend would not exist without their work. See the porting project at
+[github.com/lmxxf/dlss5-on-amd-9070xt-porting](https://github.com/lmxxf/dlss5-on-amd-9070xt-porting).
+
+The AMD backend's neural runtime payload currently ships **`OptiScaler-DLSS5-AMD-0.44`**
+(host DLL `OptScaler-NR-1.13.0-alpha8`); the upgrade is byte-identical to the
+previous payload — see [the runtime package](third_party/lmxxf/README.md).
+
 ![The player on an AMD card, whole window: Bumblebee in Split, neural rendering and FSR 4 upscaling on, interpolation on at 48 of 24 fps, a subtitle under the picture, and the render filling in behind the playhead](docs/media/amd/overview.png)
 
 The whole window, on an AMD card: *Bumblebee* at 1280x720 in **Split**, source
