@@ -2471,6 +2471,45 @@ struct PlayerAppTestAccess {
         app.SyncFeatureMenuState();
     }
 
+    // An open now puts the original on screen and identifies the source behind
+    // it (Load), so the completion of that identify has a picture to protect.
+    // Every outcome it can have - a cache entry, a plain miss, a cancel, a
+    // failure - is a report while the original of its own source is up, and only
+    // a job naming something else may open media.
+    static void prepare_behind_playback_never_takes_the_picture_test()
+    {
+        PlayerApp& app = fixture->app;
+        const bool loaded = app.m_loaded;
+        const bool cached = app.m_cachedPlayback;
+        const bool live = app.m_liveSession;
+        const std::wstring path = app.m_path;
+
+        app.m_loaded = true; app.m_cachedPlayback = false; app.m_liveSession = false;
+        app.m_path = L"F:\\media\\film.mkv";
+        NeuralJobCompletion job;
+        job.sourcePath = L"F:\\media\\film.mkv";
+        CHECK(app.OriginalOfJobIsPlaying(job));
+        // The job names its source absolute while the open keeps the spelling it
+        // was handed: a command line's forward slashes are the same film.
+        app.m_path = L"F:/media/film.mkv";
+        CHECK(app.OriginalOfJobIsPlaying(job));
+        app.m_path = L"F:\\media\\film.mkv";
+        // Another source: whatever is on screen is not this job's to replace.
+        job.sourcePath = L"F:\\media\\other.mkv";
+        CHECK(!app.OriginalOfJobIsPlaying(job));
+        job.sourcePath = L"F:\\media\\film.mkv";
+        // Nothing on screen, a cached pair already up, and a live session
+        // rendering behind the picture are each somebody else's case.
+        app.m_loaded = false;
+        CHECK(!app.OriginalOfJobIsPlaying(job));
+        app.m_loaded = true; app.m_cachedPlayback = true;
+        CHECK(!app.OriginalOfJobIsPlaying(job));
+        app.m_cachedPlayback = false; app.m_liveSession = true;
+        CHECK(!app.OriginalOfJobIsPlaying(job));
+
+        app.m_loaded = loaded; app.m_cachedPlayback = cached; app.m_liveSession = live; app.m_path = path;
+    }
+
     // A live retarget stops the running job and returns: the worker is retired
     // by its own completion message rather than joined on the UI thread, and
     // nothing else starts until it has gone.
@@ -3038,6 +3077,7 @@ struct PlayerAppTestAccess {
         UI_CASE(loading_feedback_test),
         UI_CASE(modal_loops_keep_ticking_test),
         UI_CASE(settings_window_drags_keep_ticking_test),
+        UI_CASE(prepare_behind_playback_never_takes_the_picture_test),
         UI_CASE(retarget_retires_the_worker_test),
         UI_CASE(playback_frames_are_shared_not_copied_test),
         UI_CASE(paused_frame_presents_on_invalidation_test),

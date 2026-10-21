@@ -7970,7 +7970,15 @@ private:
         // when one exists, otherwise open the original and let the user choose
         // what to render. Opening a file never starts a whole-video render.
         if(sourceKind==MediaSourceKind::LocalFile&&NeuralPreRenderEnabled()){
-            StartNeuralJob(source,{},displayTitle,{},sourceKind,m_youtubeSourceQuality,{},0.0,{},true);
+            // The picture comes first. Identifying the source is a digest of the
+            // whole file, and identifying the runtime is a digest of its 707
+            // files: 15.4 s measured on a 5004 s film, all of it in front of the
+            // open, to find out what the cache holds - and for a film with no
+            // entry (every film, the first time) the answer was "nothing". The
+            // original is now opened on its own, and that same work runs behind
+            // it; what it finds it reports rather than taking the picture over.
+            if(!LoadOriginal(source,displayTitle,sourceKind))return false;
+            StartNeuralJob(source,{},displayTitle,{},sourceKind,m_youtubeSourceQuality,{},0.0,{},true,NeuralJobKind::Offline,/*keepsLoadedMedia=*/true);
             return true;
         }
         return LoadOriginal(source,displayTitle,sourceKind);
@@ -12109,12 +12117,15 @@ private:
     // probe so the player can open the original for range selection.
     // A Live or Preview job renders behind the loaded media instead of
     // replacing it: Live streams segments, Preview renders one paused frame.
+    // `keepsLoadedMedia` is the prepare that runs behind the original an open
+    // has already put on screen (see Load): it must not unload it, and its
+    // completion must not take the picture over either.
     // False when no worker was started: the lifecycle is back to idle, and the
     // caller must not count the job as running.
-    bool StartNeuralJob(const std::wstring& mediaUrl,const std::wstring& audioUrl,const std::wstring& displayTitle,const std::wstring& pageUrl,MediaSourceKind sourceKind,YouTubeSourceQuality sourceQuality,const std::string& reuseSourceKey={},double expectedDurationSeconds=0.0,NeuralRenderRange range={},bool prepareOnly=false,NeuralJobKind kind=NeuralJobKind::Offline){
+    bool StartNeuralJob(const std::wstring& mediaUrl,const std::wstring& audioUrl,const std::wstring& displayTitle,const std::wstring& pageUrl,MediaSourceKind sourceKind,YouTubeSourceQuality sourceQuality,const std::string& reuseSourceKey={},double expectedDurationSeconds=0.0,NeuralRenderRange range={},bool prepareOnly=false,NeuralJobKind kind=NeuralJobKind::Offline,bool keepsLoadedMedia=false){
         if(mediaUrl.empty()){LOG("Neural job refused: the source has no path to render.");return false;}
         CancelNeuralJob(false);
-        if(kind==NeuralJobKind::Offline)Unload();
+        if(kind==NeuralJobKind::Offline&&!keepsLoadedMedia)Unload();
         const uint64_t generation=m_neuralLifecycle.Begin();m_neuralProgress={};m_neuralProgress.phase=NeuralRenderPhase::CheckingCache;m_pendingNeuralTitle=DisplayTitleForSource(sourceKind,displayTitle);m_neuralSourceWidth=0;m_neuralSourceHeight=0;if(m_neuralPauseEvent)ResetEvent(m_neuralPauseEvent);
         SyncSourceActionAvailability();InvalidateRect(m_hwnd,nullptr,FALSE);
         try{
@@ -12340,6 +12351,25 @@ private:
         HandleNeuralCompletion(completion);
         ReportNeuralColdStart();
     }
+    // The original of the job's own source is what is on screen: the prepare an
+    // open now runs behind the picture (Load, keepsLoadedMedia). Such a job has
+    // nothing to open, and taking the picture over would restart the film -
+    // LoadCachedPlayback begins at the cache entry's own range start - so every
+    // outcome below is a report, not a reload.
+    bool OriginalOfJobIsPlaying(const NeuralJobCompletion& completion)const{
+        if(!m_loaded||m_cachedPlayback||m_liveSession||completion.sourcePath.empty()||m_path.empty())return false;
+        // The job names its source by absolute path (NeuralJobRun::IdentifySource),
+        // while the open keeps the spelling it was handed - "F:/films/a.mkv" from
+        // a command line, a drop or the recents menu. Compare what the two would
+        // name, not how they spell it: the first run of this guard missed for
+        // exactly that reason and reloaded the film it was supposed to protect.
+        std::error_code error;
+        const auto opened=std::filesystem::weakly_canonical(std::filesystem::path(m_path),error);
+        if(error)return false;
+        const auto rendered=std::filesystem::weakly_canonical(completion.sourcePath,error);
+        if(error)return false;
+        return _wcsicmp(opened.c_str(),rendered.c_str())==0;
+    }
     void HandleNeuralCompletion(const std::unique_ptr<NeuralJobCompletion>& completion){
         if(m_neuralWorker.joinable()){m_neuralWorker.join();m_neuralWorker=std::jthread{};}m_neuralProgressMessages.Clear();m_pendingNeuralTitle.clear();m_neuralCancelBounds={};
         // An active session already plays what the job produced: keep the media
@@ -12347,13 +12377,28 @@ private:
         if(m_previewJob)return CompletePausedPreview(*completion);
         if(m_liveSession)return CompleteLiveNeuralJob(*completion);
         if(completion->cachedSourceUnavailable){m_neuralLifecycle.Transition(NeuralPlaybackState::Failed);StartYouTubeResolution(completion->pageUrl,completion->displayTitle,completion->sourceQuality,0.0,true,NetworkCommitKind::InitialOpen,false);return;}
-        if(completion->result.cancelled){m_neuralLifecycle.Transition(NeuralPlaybackState::OriginalOnly);if(!completion->sourcePath.empty()&&std::filesystem::is_regular_file(completion->sourcePath))LoadOriginalFallback(*completion);else InvalidateRect(m_hwnd,nullptr,FALSE);SyncSourceActionAvailability();return;}
+        if(completion->result.cancelled){m_neuralLifecycle.Transition(NeuralPlaybackState::OriginalOnly);if(OriginalOfJobIsPlaying(*completion)){LOG("Neural identify cancelled; the original stays open.");SyncSourceActionAvailability();return;}if(!completion->sourcePath.empty()&&std::filesystem::is_regular_file(completion->sourcePath))LoadOriginalFallback(*completion);else InvalidateRect(m_hwnd,nullptr,FALSE);SyncSourceActionAvailability();return;}
         // Prepared: the source is cached and identified, no render exists yet.
         // Play the original so In/Out, previews and range renders are available.
-        if(completion->preparedOnly){m_neuralLifecycle.Transition(NeuralPlaybackState::OriginalOnly);if(!LoadOriginalFallback(*completion))InvalidateRect(m_hwnd,nullptr,FALSE);SyncSourceActionAvailability();return;}
-        if(completion->result.ok&&!completion->neuralPath.empty()&&LoadCachedPlayback(*completion)){m_neuralLifecycle.Transition(NeuralPlaybackState::Ready);RecordRecent(*completion);m_neuralNotice.clear();SyncSourceActionAvailability();if(completion->cacheHit)LOG("Verified neural cache hit opened without re-rendering.");else LOG("Verified neural cache playback opened.");return;}
+        if(completion->preparedOnly){m_neuralLifecycle.Transition(NeuralPlaybackState::OriginalOnly);if(OriginalOfJobIsPlaying(*completion)){LOG("Neural source identified behind playback; no cache entry, the original stays open.");SyncSourceActionAvailability();return;}if(!LoadOriginalFallback(*completion))InvalidateRect(m_hwnd,nullptr,FALSE);SyncSourceActionAvailability();return;}
+        if(completion->result.ok&&!completion->neuralPath.empty()){
+            if(OriginalOfJobIsPlaying(*completion)){
+                // The entry is real, but the film the user opened is already
+                // playing: swapping media now would restart it at the range
+                // start. The digest the prepare just computed stays in hand, so
+                // the neural switch replays this entry as a cache read instead.
+                m_neuralLifecycle.Transition(NeuralPlaybackState::OriginalOnly);
+                RecordRecent(*completion);
+                LOG("Verified neural cache entry found behind playback; the original stays open and the neural switch replays it.");
+                SyncSourceActionAvailability();UpdateCachedStatus();InvalidateRect(m_hwnd,nullptr,FALSE);return;
+            }
+            if(LoadCachedPlayback(*completion)){m_neuralLifecycle.Transition(NeuralPlaybackState::Ready);RecordRecent(*completion);m_neuralNotice.clear();SyncSourceActionAvailability();if(completion->cacheHit)LOG("Verified neural cache hit opened without re-rendering.");else LOG("Verified neural cache playback opened.");return;}
+        }
         TransitionToFailure(completion->result.failure);const bool noticeShown=NoteNeuralFailure(*completion);LOG("Neural pre-render failed: kind="<<NeuralRenderFailureName(completion->result.failure)<<" state="<<WideToUtf8(NeuralPlaybackStateName(m_neuralLifecycle.state))<<" detail="<<WideToUtf8(completion->result.detail));
         SyncSourceActionAvailability();
+        // A probe that failed behind a playing picture does not get to replace
+        // that picture with a dialog's aftermath; the status note above says it.
+        if(OriginalOfJobIsPlaying(*completion)){InvalidateRect(m_hwnd,nullptr,FALSE);return;}
         if(!completion->sourcePath.empty()&&std::filesystem::is_regular_file(completion->sourcePath)){m_neuralLifecycle.Transition(NeuralPlaybackState::OriginalOnly);LoadOriginalFallback(*completion);}
         else if(!noticeShown){std::wstring detail=completion->result.detail.empty()?L"Neural pre-render failed before playback could start.":completion->result.detail;if(const wchar_t* kind=NeuralFailureTextKey(completion->result.failure))detail=T(kind)+L"\n\n"+detail;MessageBoxW(m_hwnd,detail.c_str(),T(L"app.title").c_str(),MB_OK|MB_ICONERROR);InvalidateRect(m_hwnd,nullptr,FALSE);}
         else InvalidateRect(m_hwnd,nullptr,FALSE);
