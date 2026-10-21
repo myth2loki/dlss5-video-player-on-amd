@@ -2955,10 +2955,14 @@ void AmdLmxxfEvaluator::RefreshHistoryStatus()
     // transcript a job deliberately does not keep (see the adapter's config), and
     // a degraded render is exactly the thing that has to survive the job.
     //
-    // "priming" is the first frame of an engaging history rather than a refusal,
-    // so it is not one of these.
+    // Which tokens mean "running" is the policy's question, and it is answered
+    // on the ending rather than the whole word: 0.44 qualifies the two the older
+    // runtime used with what the model decided about the source, so a session
+    // can alternate between `low-freq-priming` and `low-freq-active` every frame
+    // and still be one healthy history. Reading those as refusals logged a line
+    // per frame of a render that was working.
     static std::string lastDiagnosed;
-    const bool refusal = lastHistoryStatus_ != "active" && lastHistoryStatus_ != "priming";
+    const bool refusal = !amd_lmxxf::HistoryStatusEngaged(lastHistoryStatus_);
     if (refusal && lastHistoryStatus_ != lastDiagnosed) {
         lastDiagnosed = lastHistoryStatus_;
         LOG("runtime status (history did not engage): " << status);

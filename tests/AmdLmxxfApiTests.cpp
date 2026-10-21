@@ -775,6 +775,39 @@ void amd_pass_count_reaches_the_runtime_through_its_own_config_file_test()
     fs::remove_all(root, ec);
 }
 
+// The history token is a family, and reading it is what decides whether a
+// healthy session gets logged as a refusal on every frame of it. 0.44 qualifies
+// the two words 0.43 used with what the model decided about the source, so a
+// source the runtime reads as low frequency alternates between low-freq-priming
+// and low-freq-active - both the answer priming and active used to be - and a
+// reader that matches whole words calls a render that is working a refusal on
+// every frame. Measured on this machine: one session, ~1900 lines, none of them
+// a real refusal.
+void amd_history_status_reads_the_qualified_tokens_as_engaged_test()
+{
+    CHECK(amd_lmxxf::HistoryStatusEngaged("active"));
+    CHECK(amd_lmxxf::HistoryStatusEngaged("priming"));
+    CHECK(amd_lmxxf::HistoryStatusEngaged("low-freq-active"));
+    CHECK(amd_lmxxf::HistoryStatusEngaged("low-freq-priming"));
+    CHECK(amd_lmxxf::HistoryStatusEngaged("enhance-active"));
+    CHECK(amd_lmxxf::HistoryStatusEngaged("enhance-priming"));
+    // A refusal stays one whatever it is qualified with.
+    CHECK(!amd_lmxxf::HistoryStatusEngaged("off"));
+    CHECK(!amd_lmxxf::HistoryStatusEngaged("reset-after-discard"));
+    CHECK(!amd_lmxxf::HistoryStatusEngaged("reset-requested"));
+    CHECK(!amd_lmxxf::HistoryStatusEngaged("low-freq-requires-mp1"));
+    // The caller's own substitutes for a reading that never arrived: an empty
+    // status line, and one with no history= token in it.
+    CHECK(!amd_lmxxf::HistoryStatusEngaged("unreadable"));
+    CHECK(!amd_lmxxf::HistoryStatusEngaged("absent"));
+    CHECK(!amd_lmxxf::HistoryStatusEngaged(""));
+    // Shorter than the ending, or carrying the word without ending in it: not
+    // the token, and not a qualified one either.
+    CHECK(!amd_lmxxf::HistoryStatusEngaged("act"));
+    CHECK(!amd_lmxxf::HistoryStatusEngaged("active-ish"));
+    CHECK(!amd_lmxxf::HistoryStatusEngaged("priming-x"));
+}
+
 void Run(std::string_view only)
 {
     const struct {
@@ -809,6 +842,8 @@ void Run(std::string_view only)
          stability_rung_is_remembered_under_a_key_per_backend_test},
         {"amd_pass_count_reaches_the_runtime_through_its_own_config_file_test",
          amd_pass_count_reaches_the_runtime_through_its_own_config_file_test},
+        {"amd_history_status_reads_the_qualified_tokens_as_engaged_test",
+         amd_history_status_reads_the_qualified_tokens_as_engaged_test},
     };
     for (const auto& test : cases) {
         if (!only.empty() && std::string_view(test.name).find(only) == std::string_view::npos)

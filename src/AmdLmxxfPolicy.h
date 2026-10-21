@@ -222,6 +222,38 @@ inline bool IsAmdStyleConfigLine(std::string_view line) noexcept
     return IsAmdConfigLine(line, "DLSS5_STYLE");
 }
 
+// Whether a `history=` token from the runtime's own GetStatus line means the
+// temporal model is fusing.
+//
+// The token is a family rather than a pair of words. 0.43 said `active` and
+// `priming`; 0.44 qualifies them with what the model decided about the source -
+// `enhance-active` and `enhance-priming` when the temporal enhance feature is
+// on, `low-freq-active` and `low-freq-priming` on a source it reads as low
+// frequency (which is also the judgement that turns the Small model back into
+// the Original one, and the only place that is ever said). A qualified token is
+// the same answer given differently: the history is fusing, and the prefix
+// says what it is fusing under.
+//
+// The match is therefore on the ending and not on the whole word, because the
+// endings are the part the runtime has never changed and a prefix it has not
+// invented yet is not a reason to call a running history a refusal -
+// misreading one is exactly the failure this replaced, where `low-freq-priming`
+// and `low-freq-active` alternating frame by frame were logged as a refusal on
+// every frame of a healthy session.
+//
+// Everything else is a refusal or a reading that went missing: `off`,
+// `reset-after-discard`, `reset-requested`, `low-freq-requires-mp1`, and the
+// `unreadable`/`absent` a caller substitutes for a token that never arrived.
+inline bool HistoryStatusEngaged(std::string_view token) noexcept
+{
+    constexpr std::string_view kActive = "active";
+    constexpr std::string_view kPriming = "priming";
+    if (token.size() < kActive.size()) return false;
+    if (token.substr(token.size() - kActive.size()) == kActive) return true;
+    if (token.size() < kPriming.size()) return false;
+    return token.substr(token.size() - kPriming.size()) == kPriming;
+}
+
 // What the player owns inside the runtime's configuration file: which model
 // the count selects (DLSS5_MULTI_PASS: 0.5 Small, 1..3 Original stacked),
 // whether later passes keep skin-coloured pixels pinned to the first pass

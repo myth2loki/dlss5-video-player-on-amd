@@ -297,8 +297,14 @@ public:
     // The history= token from the runtime's own GetStatus, refreshed after every
     // lease frame. "off" means the frame rendered spatially and says so nowhere
     // else. "priming" is the first frame of a run, which has no history to fuse
-    // with yet. "active" is the temporal model actually fusing. Empty when no
-    // lease frame has run, which is every frame of a non-temporal evaluator.
+    // with yet, and "active" is the temporal model actually fusing - both since
+    // 0.44 qualified with what the model decided about the source, so a healthy
+    // session reads "low-freq-priming"/"low-freq-active" on a source the runtime
+    // reads as low frequency, or "enhance-priming"/"enhance-active" with the
+    // temporal enhance feature on. amd_lmxxf::HistoryStatusEngaged() is what
+    // reads a token; matching the two words themselves would call all four a
+    // refusal. Empty when no lease frame has run, which is every frame of a
+    // non-temporal evaluator.
     const std::string& HistoryStatus() const noexcept { return lastHistoryStatus_; }
     // How many frames went through the lease path, so a run can tell "the
     // temporal model was engaged and reported off" apart from "the lease path
