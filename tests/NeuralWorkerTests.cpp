@@ -1,5 +1,6 @@
 #include "CrashDump.h"
 #include "GuideFiles.h"
+#include "AmdLmxxfRuntime.h"
 #include "NarrowText.h"
 #include "NeuralWorker.h"
 #include "NeuralWorkerProtocol.h"
@@ -525,8 +526,14 @@ int RunFakeWorker(int argc, wchar_t** argv)
     NeuralRenderResult result;
     result.ok = true;
     result.encoder = EncoderKind::H264Software;
-    result.feature18ArmedBeforeCapture = true;
-    result.evidence = {true, true, true, true, false, 75};
+    // The verification set a neural result is judged by is the backend's own
+    // (DecodeResult): an AMD helper has no add-on to arm, so its result states
+    // that absence and proves the render with the evaluation tally and the
+    // verified frames instead. The NVIDIA shape below would be refused on that
+    // backend as the other one's.
+    const bool amd = parsed->request.backend == NeuralBackend::Amd;
+    result.feature18ArmedBeforeCapture = !amd;
+    result.evidence = {true, true, !amd, !amd, false, amd ? uint64_t{0} : uint64_t{75}};
     result.frameCount = 60;
     result.duration100ns = 10'000'000;
     result.nativeEvaluations = 60;
@@ -3295,6 +3302,62 @@ void a_helper_that_throws_mid_job_is_relaunched_as_a_crash_test()
     ResetFailureInjection(L"threw-once");
 }
 
+// The AMD backend's relaunch probe. A helper that threw mid-job is relaunched
+// on this backend too - not through the NVIDIA feature-18 probe, which has
+// nothing to arm here, but through the pack check: the tree the job was
+// started on is still the tree that was verified, so the one relaunch is spent
+// on a render rather than on an add-on file this backend never loads.
+void amd_helper_that_threw_is_relaunched_after_the_pack_verifies_test()
+{
+    // The pack is a staged tree the repository does not carry; without it
+    // there is nothing to verify and nothing to relaunch into.
+    if (amd_lmxxf::ResolveRuntimeDirectory({}).empty()) {
+        std::wcerr << L"SKIPPED: no amd-neural-runtime beside this checkout.\n";
+        return;
+    }
+    ResetFailureInjection(L"threw-once");
+    std::vector<NeuralRenderProgress> progress;
+    size_t restarts = 0;
+    NeuralSegmentSink sink;
+    sink.onRestart = [&] { ++restarts; };
+    NeuralRenderRequest request = ResidentRequest(L"threw-once-source.mkv", 43);
+    request.backend = NeuralBackend::Amd;
+    const NeuralRenderResult single = RunNeuralWorker(CurrentExecutable(), request,
+        [&](const NeuralRenderProgress& update) { progress.push_back(update); }, {}, sink);
+    CHECK(single.ok);
+    CHECK(single.failure == NeuralRenderFailure::None);
+    CHECK_EQ(uint64_t{43}, single.jobId);
+    CHECK_EQ(uint64_t{2}, FailureInjectionAttempts(L"threw-once"));
+    CHECK_EQ(size_t{1}, restarts);
+    ResetFailureInjection(L"threw-once");
+}
+
+// The same crash with the pack gone: the relaunch is refused, in words that
+// name the pack, and the job is not spent a second time on a render that
+// cannot start. This is the AMD answer to the probe's question - there is no
+// feature to re-arm and no add-on to configure, so the other backend's probe
+// has nothing to say about this machine.
+void amd_helper_is_not_relaunched_when_the_pack_is_gone_test()
+{
+    ResetFailureInjection(L"threw-once");
+    std::vector<NeuralRenderProgress> progress;
+    size_t restarts = 0;
+    NeuralSegmentSink sink;
+    sink.onRestart = [&] { ++restarts; };
+    NeuralRenderRequest request = ResidentRequest(L"threw-once-source.mkv", 44);
+    request.backend = NeuralBackend::Amd;
+    request.amdRuntimeDirectory = std::filesystem::temp_directory_path() / L"dlss5-no-such-amd-pack";
+    const NeuralRenderResult refused = RunNeuralWorker(CurrentExecutable(), request,
+        [&](const NeuralRenderProgress& update) { progress.push_back(update); }, {}, sink);
+    CHECK(!refused.ok);
+    CHECK(!refused.cancelled);
+    CHECK(refused.failure == NeuralRenderFailure::Preflight);
+    CHECK(refused.detail.find(L"AMD runtime pack") != std::wstring::npos);
+    CHECK_EQ(uint64_t{1}, FailureInjectionAttempts(L"threw-once"));
+    CHECK_EQ(size_t{0}, restarts);
+    ResetFailureInjection(L"threw-once");
+}
+
 // The same exception between jobs. A resident helper that threw while idle
 // wrote an unsolicited Result with job id 0 and exited 0, and the next job -
 // sent while it was still tearing down - read that Result as its own failure.
@@ -3514,6 +3577,8 @@ int wmain(int argc, wchar_t** argv)
     recovery_probe_refusal_fails_closed_instead_of_relaunching_test();
     a_terminal_message_of_the_wrong_kind_is_malformed_on_every_path_test();
     a_helper_that_throws_mid_job_is_relaunched_as_a_crash_test();
+    amd_helper_that_threw_is_relaunched_after_the_pack_verifies_test();
+    amd_helper_is_not_relaunched_when_the_pack_is_gone_test();
     a_resident_helper_that_throws_while_idle_does_not_fail_the_next_job_test();
     a_helper_that_fails_after_its_result_is_judged_on_its_exit_code_test();
     a_throwing_progress_callback_still_ends_the_helper_test();

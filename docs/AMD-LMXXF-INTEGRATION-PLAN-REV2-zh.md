@@ -562,6 +562,12 @@ Queue:
 > - **该陷阱已从构建上消除（2026-10-21）**：`NeuralWorker` 目标加了 POST_BUILD，
 >   每次链接后自动 `copy_if_different` 到 `<build>/neural-runtime/`，播放器
 >   启动的 helper 从此与播放器同代，不必再"先比 worker 的时间戳"。
+> - **同天仍踩了一次更尖的版本（2026-10-21，已修）**：新播放器给旧 worker 传
+>   `--amd-small-model 1`，旧 worker 参数表里没有这个键、直接 exit 2；重启探测
+>   `ProbeBeforeRelaunch` 又默认跑 NVIDIA 的 feature-18 预检，去读 AMD 机没有的
+>   ReShade.ini，把真正的 exit 2 掩盖成"预检失败"、拒绝重启。预检现已按 backend
+>   分流：AMD 不再问 NVIDIA 的 feature-18，改为进程内复核 runtime 包对自带
+>   SHA256SUMS 的锁（导出路径同一函数），缺失/漂移都以导出路径的同一句措辞点名。
 >
 > **量过了（2026-10-20，RX 9070 XT）**：上面那条 A/B 只回答"场被读到"；这一轮
 > 回答"画质是否更好"。四档 × 两臂共 8 条受控导出（720p 实拍 2 s / 48 帧，

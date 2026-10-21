@@ -1,8 +1,10 @@
 #include "NeuralWorker.h"
 #include "AmdLmxxfPolicy.h"
+#include "AmdLmxxfRuntime.h"
 #include "NarrowText.h"
 #include "PlatformPaths.h"
 #include "NeuralWorkerProtocol.h"
+#include "RuntimeLock.h"
 #include "HardErrorSuppression.h"
 #include "AtomicFile.h"
 #include "Utf8Text.h"
@@ -1226,9 +1228,50 @@ NeuralRenderRequest ForLaunch(const NeuralRenderRequest& request, uint32_t launc
     return relaunched;
 }
 
+// The AMD backend's half of the relaunch question: the pack, not a feature.
+// What a relaunch would spend a process on here is whether the tree the job
+// was started on is still the tree that was verified - the lock check the
+// export path already runs against the manifests the runtime ships with
+// itself, answered in process for the price of one walk. It is asked in the
+// words the offline path refuses them in, so a pack that drifted or vanished
+// is named at the recovery instead of surfacing as an opaque launch error one
+// attempt later. std::nullopt is the verified answer: relaunch.
+std::optional<NeuralRenderResult> ProbeAmdPackBeforeRelaunch(const NeuralRenderRequest& request,
+                                                             std::stop_token stop,
+                                                             const NeuralRenderResult& failed)
+{
+    NeuralRenderResult closed;
+    closed.jobId = failed.jobId;
+    closed.coldStart = failed.coldStart;
+    closed.timing = failed.timing;
+    if (stop.stop_requested()) {
+        closed.cancelled = true;
+        closed.failure = NeuralRenderFailure::Cancelled;
+        closed.detail = L"Neural rendering was cancelled while the helper was recovering.";
+        return closed;
+    }
+    const std::filesystem::path runtime = amd_lmxxf::ResolveRuntimeDirectory(request.amdRuntimeDirectory);
+    if (runtime.empty()) {
+        closed.failure = NeuralRenderFailure::Preflight;
+        closed.detail = L"The neural helper did not survive the render (" + failed.detail +
+                        L") and the AMD runtime pack it renders with could not be found, so it was not "
+                        L"restarted.";
+        return closed;
+    }
+    if (const std::wstring refusal = AmdRuntimeLockRefusal(VerifyAmdRuntimeLock(runtime, stop));
+        !refusal.empty()) {
+        closed.failure = NeuralRenderFailure::Preflight;
+        closed.detail = L"The neural helper did not survive the render (" + failed.detail +
+                        L") and its runtime no longer matches the pack it verified, so it was not "
+                        L"restarted: " + refusal;
+        return closed;
+    }
+    return std::nullopt;
+}
+
 // The one controlled recovery between a helper that died and the relaunch that
-// replaces it: re-run the feature-18 probe in a fresh process, and relaunch
-// only if it still passes.
+// replaces it: ask the runtime the question the crash put in doubt, and
+// relaunch only if the answer still holds.
 //
 // A crash or a device removal invalidates the verdict the job was started on.
 // A TDR restarts the display driver, so the adapter this process probed is not
@@ -1237,10 +1280,21 @@ NeuralRenderRequest ForLaunch(const NeuralRenderRequest& request, uint32_t launc
 // instead of a reason. The probe costs one process on a path that has already
 // lost a render, and it is bounded by the same relaunch limit, so there is
 // nothing here that can spin.
+//
+// What the question is depends on the backend, because what a crash can take
+// away does: the NVIDIA arm re-runs the feature-18 probe in a fresh process,
+// and the AMD one - which loads no proxy and arms no feature - re-reads the
+// pack the job was started on. Asking the NVIDIA question on the AMD backend
+// asked a helper to configure a ReShade.ini that backend never loads; the
+// answer failed on a machine with no reason to carry the file, and every AMD
+// relaunch was then refused for a reason that had nothing to do with the
+// crash.
 std::optional<NeuralRenderResult> ProbeBeforeRelaunch(const std::filesystem::path& executable,
+                                                      const NeuralRenderRequest& request,
                                                       std::stop_token stop,
                                                       const NeuralRenderResult& failed)
 {
+    if (request.backend == NeuralBackend::Amd) return ProbeAmdPackBeforeRelaunch(request, stop, failed);
     const NeuralPreflightResult preflight = RunNeuralPreflight(executable, stop);
     if (preflight.ok) return std::nullopt;
     NeuralRenderResult closed;
@@ -1877,7 +1931,7 @@ NeuralRenderResult RunNeuralWorker(const std::filesystem::path& executable,
         return RunNeuralWorkerAttempt(executable, ForLaunch(request, launch), progress, segments, stop,
                                       false, processCreated, helperTimeline);
     }, [&](const NeuralRenderResult& failed) {
-        return ProbeBeforeRelaunch(executable, stop, failed);
+        return ProbeBeforeRelaunch(executable, request, stop, failed);
     });
 }
 
@@ -2079,7 +2133,7 @@ NeuralRenderResult ResidentNeuralHelper::RunJob(const std::filesystem::path& exe
         [&](const NeuralRenderResult& failed) {
             // The dead helper's session is already dropped by the attempt that
             // judged it, so the probe gets the runtime directory to itself.
-            return ProbeBeforeRelaunch(executable, stop, failed);
+            return ProbeBeforeRelaunch(executable, request, stop, failed);
         });
 }
 
