@@ -783,6 +783,118 @@ void amd_pass_count_reaches_the_runtime_through_its_own_config_file_test()
 // reader that matches whole words calls a render that is working a refusal on
 // every frame. Measured on this machine: one session, ~1900 lines, none of them
 // a real refusal.
+// The temporal mode is the panel's key now, and it is written into the same
+// file the renderer writes its five into. Neither writer may take the other's
+// lines with it: the mode's writer keeps the comments and the switches it does
+// not own, and drops earlier lines of its own key so the reader - which takes
+// the last one - cannot be given two answers.
+// A mode lives at exactly one point of the ladder. Every active mode requires
+// DLSS5_MULTI_PASS=1 - the Original model at one pass - so the Small rung takes
+// it away (the runtime renders the Original and says low-frequency-requires-
+// original) and so does a stacked count (it runs no mode and says history=low-
+// freq-requires-mp1). Both of those read like a judgement about the source and
+// are the name of mode 2, which is why the ladder is answered here rather than
+// handed over as a pair the runtime resolves by itself.
+void amd_temporal_mode_runs_only_at_one_pass_with_the_original_model_test()
+{
+    CHECK_EQ(uint32_t{2}, amd_lmxxf::EffectiveAmdTemporalMode(2, false, 1));
+    CHECK_EQ(uint32_t{3}, amd_lmxxf::EffectiveAmdTemporalMode(3, false, 1));
+    CHECK_EQ(uint32_t{0}, amd_lmxxf::EffectiveAmdTemporalMode(0, false, 1));
+    // The Small model beside any rung.
+    CHECK_EQ(uint32_t{0}, amd_lmxxf::EffectiveAmdTemporalMode(2, true, 1));
+    CHECK_EQ(uint32_t{0}, amd_lmxxf::EffectiveAmdTemporalMode(0, true, 1));
+    // A stacked count beside any rung.
+    CHECK_EQ(uint32_t{0}, amd_lmxxf::EffectiveAmdTemporalMode(2, false, 2));
+    CHECK_EQ(uint32_t{0}, amd_lmxxf::EffectiveAmdTemporalMode(2, false, 3));
+    // The rung itself is still normalised, so a hand-edited value out of range
+    // cannot reach the runtime.
+    CHECK_EQ(uint32_t{0}, amd_lmxxf::EffectiveAmdTemporalMode(9, false, 1));
+}
+
+void amd_temporal_mode_is_written_without_touching_the_rest_of_the_file_test()
+{
+    namespace fs = std::filesystem;
+    const auto CountOf = [](const std::string& text, const std::string& needle) {
+        size_t found = 0, at = 0;
+        while ((at = text.find(needle, at)) != std::string::npos) { ++found; at += needle.size(); }
+        return found;
+    };
+    std::error_code ec;
+    const fs::path root = fs::temp_directory_path() / L"dlss5-amd-temporal-mode";
+    fs::remove_all(root, ec);
+    fs::create_directories(root, ec);
+    const fs::path file = root / L"DLSS5-AMD" / L"custom-config.txt";
+    const auto read = [&] {
+        std::ifstream in(file, std::ios::binary);
+        std::ostringstream buffer;
+        buffer << in.rdbuf();
+        return buffer.str();
+    };
+
+    // The rungs, and what happens to one that is not a rung.
+    CHECK_EQ(std::string("DLSS5_TEMPORAL_MODE=0"), amd_lmxxf::AmdTemporalModeConfigLine(0));
+    CHECK_EQ(std::string("DLSS5_TEMPORAL_MODE=2"), amd_lmxxf::AmdTemporalModeConfigLine(2));
+    CHECK_EQ(std::string("DLSS5_TEMPORAL_MODE=0"), amd_lmxxf::AmdTemporalModeConfigLine(7));
+    CHECK(std::string_view(amd_lmxxf::AmdTemporalModeName(2)) == std::string_view("low-frequency-ema"));
+    CHECK(std::string_view(amd_lmxxf::AmdTemporalModeName(0)) == std::string_view("off"));
+    // A line that merely starts with the key's characters is not the key: the
+    // runtime's own switch names share prefixes.
+    CHECK(amd_lmxxf::IsAmdTemporalModeConfigLine("DLSS5_TEMPORAL_MODE=1"));
+    CHECK(!amd_lmxxf::IsAmdTemporalModeConfigLine("DLSS5_TEMPORAL_MODE_EXTRA=1"));
+    CHECK(!amd_lmxxf::IsAmdTemporalModeConfigLine("DLSS5_STYLE=1"));
+
+    // A file with a hand-written mode and other keys: the mode is rewritten in
+    // place and everything else survives, comments included.
+    {
+        fs::create_directories(file.parent_path(), ec);
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out << "# hand written\n"
+               "DLSS5_TEMPORAL_MODE=2\n"
+               "DLSS5_MULTI_PASS=1\n"
+               "# a comment about the mode\n"
+               "DLSS5_TEMPORAL_MODE=1\n"
+               "DLSS5_STYLE=0\n";
+    }
+    // What a player taking the key over reads first: the value a hand edit left,
+    // not its own default, and the last line rather than the first.
+    const std::optional<uint32_t> adopted = amd_lmxxf::ReadAmdTemporalMode(root);
+    CHECK(adopted.has_value());
+    CHECK_EQ(uint32_t{1}, adopted.value_or(0));
+
+    std::string error;
+    CHECK(amd_lmxxf::WriteAmdTemporalMode(root, 3, error));
+    CHECK(read() == "# hand written\n"
+                    "DLSS5_MULTI_PASS=1\n"
+                    "# a comment about the mode\n"
+                    "DLSS5_STYLE=0\n"
+                    "DLSS5_TEMPORAL_MODE=3\n");
+    // And the renderer's five can be written over it without taking the mode
+    // with them - the other direction of the same rule.
+    CHECK(amd_lmxxf::WriteAmdRuntimeConfig(root, 1, false, false, true, false, 1, error));
+    const std::string after = read();
+    CHECK(after.find("DLSS5_TEMPORAL_MODE=3\n") != std::string::npos);
+    CHECK(after.find("DLSS5_MULTI_PASS=1\n") != std::string::npos);
+    // Switching the mode back off leaves one line, not two, and drops the
+    // earlier ones the same way.
+    CHECK(amd_lmxxf::WriteAmdTemporalMode(root, 0, error));
+    const std::string off = read();
+    // One line, and it is the new one: an earlier line left behind would be the
+    // answer the reader takes on some runtimes and not others.
+    CHECK_EQ(size_t{1}, CountOf(off, "DLSS5_TEMPORAL_MODE="));
+    CHECK(off.find("DLSS5_TEMPORAL_MODE=0") != std::string::npos);
+    CHECK(off.find("DLSS5_TEMPORAL_MODE=3") == std::string::npos);
+    // A tree with no file at all: nothing to adopt, which is the runtime's off
+    // rather than a migration to invent.
+    const fs::path bare = fs::temp_directory_path() / L"dlss5-amd-temporal-mode-bare";
+    fs::remove_all(bare, ec);
+    CHECK(!amd_lmxxf::ReadAmdTemporalMode(bare).has_value());
+    // And the write creates the folder, the same way the other writer does.
+    CHECK(amd_lmxxf::WriteAmdTemporalMode(bare, 2, error));
+    CHECK_EQ(uint32_t{2}, amd_lmxxf::ReadAmdTemporalMode(bare).value_or(99));
+    fs::remove_all(root, ec);
+    fs::remove_all(bare, ec);
+}
+
 void amd_history_status_reads_the_qualified_tokens_as_engaged_test()
 {
     CHECK(amd_lmxxf::HistoryStatusEngaged("active"));
@@ -844,6 +956,10 @@ void Run(std::string_view only)
          amd_pass_count_reaches_the_runtime_through_its_own_config_file_test},
         {"amd_history_status_reads_the_qualified_tokens_as_engaged_test",
          amd_history_status_reads_the_qualified_tokens_as_engaged_test},
+        {"amd_temporal_mode_runs_only_at_one_pass_with_the_original_model_test",
+         amd_temporal_mode_runs_only_at_one_pass_with_the_original_model_test},
+        {"amd_temporal_mode_is_written_without_touching_the_rest_of_the_file_test",
+         amd_temporal_mode_is_written_without_touching_the_rest_of_the_file_test},
     };
     for (const auto& test : cases) {
         if (!only.empty() && std::string_view(test.name).find(only) == std::string_view::npos)

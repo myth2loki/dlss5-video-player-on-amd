@@ -176,6 +176,14 @@ struct NeuralRenderRequest {
     // construction: the runtime's ladder is 0.5/1/2/3, so ValidRequest holds
     // this beside a count of exactly one.
     bool amdSmallModel{false};
+    // The runtime's own temporal mode (DLSS5_TEMPORAL_MODE, 0..3), AMD only.
+    // Unlike the other five keys on this request, this one is not handed to the
+    // helper: the runtime reads it from its own file once, when the network is
+    // built, so the player writes the file before the render and the request
+    // carries the value only so the job can be described - its cache key, its
+    // receipt, the line a script reads back - in the terms it actually ran
+    // under. It travels no further than the player's own process.
+    uint32_t amdTemporalMode{0};
     // Whether the runtime's later passes keep skin-coloured pixels pinned to the
     // first pass (DLSS5_MULTI_PASS_SKIN_PROTECT). Off by default, and it changes
     // nothing at one pass - the runtime only blends it when the count is above

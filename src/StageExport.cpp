@@ -6,6 +6,7 @@
 #include <string_view>
 #include <system_error>
 
+#include "AmdLmxxfPolicy.h"
 #include "AmdLmxxfRuntime.h"
 #include "FrameGenerationPass.h"
 #include "Log.h"
@@ -150,6 +151,7 @@ StageExportOutcome RunStageExport(const StageExportJob& job,std::stop_token stop
         request.amdMultiPassPredict=job.amdMultiPassPredict;
         request.amdMultiPassSkip=job.amdMultiPassSkip;
         request.amdStyle=job.amdStyle;
+        request.amdTemporalMode=job.amdTemporalMode;
         request.upscaleSharpness=job.upscaleSharpness;
         request.requireNeural=plan.requireNeural;
         request.backend=plan.backend;
@@ -175,6 +177,24 @@ StageExportOutcome RunStageExport(const StageExportJob& job,std::stop_token stop
         // one resolution is what keeps "what was verified" and "what was loaded"
         // the same directory rather than two that agree today.
         request.amdRuntimeDirectory=plan.backend==NeuralBackend::Amd?runtimeDirectory:std::filesystem::path{};
+        // The runtime's temporal key, written before the render and not by it:
+        // the runtime reads the file once when the network is built, and this
+        // is the path a command line takes - no dialog, no loaded settings, so
+        // a file last written by something else is what the render would run
+        // under. Written after the directory is resolved, because writing it
+        // before puts a DLSS5-AMD folder beside the player instead of inside
+        // the runtime it is meant for. The renderer's own five keys leave this
+        // line alone.
+        if(request.backend==NeuralBackend::Amd){
+            const uint32_t mode=amd_lmxxf::EffectiveAmdTemporalMode(request.amdTemporalMode,
+                                                                    request.amdSmallModel,
+                                                                    request.amdPasses);
+            std::string modeError;
+            if(!amd_lmxxf::WriteAmdTemporalMode(request.amdRuntimeDirectory,mode,modeError))
+                LOG("AMD temporal mode "<<mode<<" not handed to the runtime: "<<modeError);
+            else
+                LOG("AMD temporal mode set to "<<mode<<" ("<<amd_lmxxf::AmdTemporalModeName(mode)<<").");
+        }
         // Refused on what refuses a live render, before anything is written:
         // a file that drifted from the lock, or a module the lock does not
         // name beside feature 18. A Super Resolution-only pass too (P1.33): it

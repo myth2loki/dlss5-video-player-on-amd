@@ -404,6 +404,7 @@ static constexpr int IDC_NS_STABILITY = 7341;
 static constexpr int IDC_NS_SKIN_PROTECT = 7351;
 static constexpr int IDC_NS_MP_PREDICT = 7352;
 static constexpr int IDC_NS_MP_SKIP = 7353;
+static constexpr int IDC_NS_TEMPORAL_MODE = 7354;
 // The preset strip, the line that says what the preset does, the line that
 // says what Apply will do, and the way across to Image adjustments.
 static constexpr int IDC_NS_PRESET = 7342;
@@ -2418,6 +2419,25 @@ static bool ReadSavedAmdSmallModel(const std::filesystem::path& settingsPath)
     return GetPrivateProfileIntW(L"AmdMultiPass",L"SmallModel",0,settingsPath.c_str())!=0;
 }
 
+// The runtime's temporal mode, as this machine has saved it - or, the first
+// time, as the runtime's own file already had it.
+//
+// That adoption is the whole reason the directory is a parameter: the panel
+// takes this key over from hand edits, and a player that started from its own
+// default would quietly switch off a mode someone chose. A file that never
+// mentioned the key has always meant off, so an absent reading is off rather
+// than a migration to perform.
+static uint32_t ReadSavedAmdTemporalMode(const std::filesystem::path& settingsPath,
+                                         const std::filesystem::path& runtimeDirectory)
+{
+    const int saved = GetPrivateProfileIntW(L"AmdNeural",L"TemporalMode",-1,settingsPath.c_str());
+    if (saved >= 0)
+        return amd_lmxxf::NormalizedAmdTemporalMode(static_cast<uint32_t>(saved));
+    const std::optional<uint32_t> inFile = runtimeDirectory.empty()
+        ? std::nullopt : amd_lmxxf::ReadAmdTemporalMode(runtimeDirectory);
+    return amd_lmxxf::NormalizedAmdTemporalMode(inFile.value_or(amd_lmxxf::kAmdTemporalModeDefault));
+}
+
 // Playback frame generation as this machine has saved it. Off unless saved on:
 // the shipped product path for a doubled cadence is the offline conversion
 // (progress, a file, then play), because presentation pacing is entangled with
@@ -2487,6 +2507,13 @@ struct NeuralJobInputs {
     // 0.5/1/2/3, so when this is set the count is forced to 1 and the
     // stacking switches render nothing.
     bool amdSmallModel{false};
+    // The runtime's own temporal mode (DLSS5_TEMPORAL_MODE, 0..3), the value
+    // the job was started under and the one its frames were rendered with. It
+    // rides along for the same reason the count does - the runtime reads the
+    // key once, when the network is built, so a session is restarted for a
+    // moved mode rather than relabelled - and it is a key term because a mode
+    // that runs is a different picture out of the same model.
+    uint32_t amdTemporalMode{0};
     HANDLE pauseEvent{};
     bool prepareOnly{};
     // The background acquisition of this very source, when one is in flight.
@@ -2717,7 +2744,7 @@ private:
         // named mutex derived from the directory, so it costs the tree nothing.
         lease_.emplace(runtimeDirectory_);
         if(!lease_->Held()){completion_->result.failure=NeuralRenderFailure::Preflight;completion_->result.detail=L"Another neural render is using the experimental runtime. Wait for it to finish, then try again.";LOG("AMD neural runtime is in use by another render; refusing to share it.");return false;}
-        settingsSnapshot_=AmdNeuralSettingsDocument(in_.temporal.stability,in_.amdPasses,in_.amdSmallModel,in_.amdSkinProtect,in_.amdMultiPassPredict,in_.amdMultiPassSkip,in_.amdStyle);
+        settingsSnapshot_=AmdNeuralSettingsDocument(in_.temporal.stability,in_.amdPasses,in_.amdSmallModel,in_.amdSkinProtect,in_.amdMultiPassPredict,in_.amdMultiPassSkip,in_.amdStyle,in_.amdTemporalMode);
         settingsDigest_=Sha256Bytes(*settingsSnapshot_);
         if(!settingsDigest_){completion_->result.detail=L"The neural settings digest could not be computed.";return false;}
         return true;
@@ -2913,6 +2940,22 @@ private:
         // reason the export gives: one binary serves both backends and always
         // comes from the helper package, while the module is the backend's.
         request.backend=in_.backend;request.amdRuntimeDirectory=in_.amdRuntimeDirectory;
+        request.amdTemporalMode=in_.amdTemporalMode;
+        // The runtime reads this key once, when the network is built, so it is
+        // written before the job rather than into it - and written here rather
+        // than when the settings were loaded, because a command-line render
+        // never loads them and would otherwise run under whatever the file last
+        // said. The five keys the renderer writes per job leave this line alone.
+        if(request.backend==NeuralBackend::Amd){
+            const uint32_t mode=amd_lmxxf::EffectiveAmdTemporalMode(request.amdTemporalMode,
+                                                                    request.amdSmallModel,
+                                                                    request.amdPasses);
+            std::string modeError;
+            if(!amd_lmxxf::WriteAmdTemporalMode(request.amdRuntimeDirectory,mode,modeError))
+                LOG("AMD temporal mode "<<mode<<" not handed to the runtime: "<<modeError);
+            else
+                LOG("AMD temporal mode set to "<<mode<<" ("<<amd_lmxxf::AmdTemporalModeName(mode)<<").");
+        }
         receipt_.emplace(NeuralRenderReceiptInputs{preflightJson_,lockChecks_,request,{},renderKey_,*settingsDigest_,*runtimeDigest_,std::chrono::system_clock::now(),{},runtimeLockNote_});
         NeuralSegmentSink sink{};
         if(liveIndex){
@@ -5388,7 +5431,11 @@ private:
         m_amdMultiPassSkip=ReadSavedAmdMultiPassSkip(SettingsPath());
         m_amdStyle=ReadSavedAmdStyle(SettingsPath());
         m_amdSmallModel=ReadSavedAmdSmallModel(SettingsPath());
+        m_amdTemporalMode=ReadSavedAmdTemporalMode(SettingsPath(),m_opt.amdRuntimeDirectory);
         }
+        // The runtime's file, not just this player's: a command-line render
+        // reads the same one, and it has no dialog to apply from.
+        WriteAmdTemporalModeToRuntime();
         m_gpuColorConversion=GetPrivateProfileIntW(L"Encoding",L"GpuColorConversion",0,SettingsPath().c_str())!=0;
         m_gpuSourceConversion=GetPrivateProfileIntW(L"Encoding",L"GpuSourceConversion",0,SettingsPath().c_str())!=0;
         m_nvencPreset=std::clamp<uint32_t>(uint32_t(GetPrivateProfileIntW(L"Encoding",L"NvencPreset",5,SettingsPath().c_str())),1,7);
@@ -5564,6 +5611,11 @@ private:
         // (which LoadNeuralSettings reads from [NeuralSettings] Style).
         WritePrivateProfileStringW(L"AmdNeural",L"Style",
             std::to_wstring(amd_lmxxf::NormalizedAmdStyle(m_amdStyle)).c_str(),SettingsPath().c_str());
+        // The temporal mode, in the same section: it is not a multi-pass
+        // switch, and it is the one set of rungs whose value decides whether
+        // the model above is the one that runs.
+        WritePrivateProfileStringW(L"AmdNeural",L"TemporalMode",
+            std::to_wstring(amd_lmxxf::NormalizedAmdTemporalMode(m_amdTemporalMode)).c_str(),SettingsPath().c_str());
         WritePrivateProfileStringW(L"Encoding",L"GpuColorConversion",m_gpuColorConversion?L"1":L"0",SettingsPath().c_str());
         WritePrivateProfileStringW(L"Encoding",L"GpuSourceConversion",m_gpuSourceConversion?L"1":L"0",SettingsPath().c_str());
         WritePrivateProfileStringW(L"Encoding",L"NvencPreset",std::to_wstring(m_nvencPreset).c_str(),SettingsPath().c_str());
@@ -6945,6 +6997,7 @@ private:
         check(IDC_NS_SKIN_PROTECT,m_amdSkinProtect);
         check(IDC_NS_MP_PREDICT,m_amdMultiPassPredict);
         select(IDC_NS_MP_SKIP,m_amdMultiPassSkip?1:0);
+        select(IDC_NS_TEMPORAL_MODE,static_cast<int>(amd_lmxxf::NormalizedAmdTemporalMode(m_amdTemporalMode)));
         // Chained history only governs passes 2+, so it is dead UI at one
         // pass rather than a setting that quietly does nothing.
         if(HWND chained=GetDlgItem(h,IDC_NS_CHAINED))EnableWindow(chained,m_neuralSettings.passes>1);
@@ -6978,6 +7031,11 @@ private:
         m_amdSkinProtect=checked(IDC_NS_SKIN_PROTECT);
         m_amdMultiPassPredict=checked(IDC_NS_MP_PREDICT);
         m_amdMultiPassSkip=sel(IDC_NS_MP_SKIP,m_amdMultiPassSkip?1:0)!=0;
+        // Read as the rung it is, including while the control is greyed out by
+        // the Small model: the value is kept for when the Small rung is left,
+        // the way the skin slider keeps its value behind the mask.
+        m_amdTemporalMode=amd_lmxxf::NormalizedAmdTemporalMode(
+            static_cast<uint32_t>(sel(IDC_NS_TEMPORAL_MODE,static_cast<int>(m_amdTemporalMode))));
         if(HWND chained=GetDlgItem(h,IDC_NS_CHAINED))EnableWindow(chained,m_neuralSettings.passes>1);
         // Same dependency the Enable path states: the switch renders nothing at
         // one pass, so moving the pass combo has to move its greyed state too.
@@ -7014,6 +7072,14 @@ private:
         // the backend whose runtime has the list.
         if(HWND skip=GetDlgItem(h,IDC_NS_MP_SKIP))
             EnableWindow(skip,m_opt.neuralBackend==NeuralBackend::Amd&&m_neuralSettings.passes>1);
+        // The temporal mode is dead beside the Small model, and dead for a
+        // reason the runtime will not say where a reader can see it: an active
+        // mode requires the Original network, so a Small request under one is
+        // answered with the Original and the status line's reason for it reads
+        // like a judgement about the source. Greyed rather than switched, so
+        // the rung comes back when the Small rung is left.
+        if(HWND mode=GetDlgItem(h,IDC_NS_TEMPORAL_MODE))
+            EnableWindow(mode,m_opt.neuralBackend==NeuralBackend::Amd&&AmdTemporalModeCanRun());
     }
 
     // The persisted guide switches also drive the live (non-cached) guide
@@ -7134,17 +7200,27 @@ private:
         // the dialog is wide) and a third box on it was drawn off the window.
         CreateNeuralCheck(h,IDC_NS_MP_PREDICT,L"neural.settings.mp_predict",12+right,96+top,200,L"neural.tip.mp_predict");
         CreateNeuralCombo(h,IDC_NS_MP_SKIP,L"neural.settings.mp_skip",96+top,{L"Off",L"Skip ViT + C512"},L"neural.tip.mp_skip",212+right,180);
-        CreateSettingsGroupHeading(h,L"neural.settings.group_guides",112+top,right,400);
-        CreateNeuralCheck(h,IDC_NS_GUIDE_MV,L"neural.settings.guide_mv",132+right,138+top,116,L"neural.tip.guide_mv");
-        CreateNeuralCheck(h,IDC_NS_GUIDE_DEPTH,L"neural.settings.guide_depth",252+right,138+top,80,L"neural.tip.guide_depth");
+        // The runtime's own temporal mode, in this group because it is the one
+        // setting here that decides which network runs rather than how much the
+        // run costs: an active mode requires the Original model, so the Small
+        // rung above and this one are two spellings of the same choice. The
+        // panel owns the key - it used to be a hand edit in the runtime's file,
+        // where it silently outranked whatever the pass ladder asked for.
+        if(m_opt.neuralBackend==NeuralBackend::Amd)
+            CreateNeuralCombo(h,IDC_NS_TEMPORAL_MODE,L"neural.settings.temporal_mode",118+top,
+                              {L"Off",L"Fast history",L"Low-frequency EMA",L"Low-frequency + detail"},
+                              L"neural.tip.temporal_mode",right);
+        CreateSettingsGroupHeading(h,L"neural.settings.group_guides",138+top,right,400);
+        CreateNeuralCheck(h,IDC_NS_GUIDE_MV,L"neural.settings.guide_mv",132+right,164+top,116,L"neural.tip.guide_mv");
+        CreateNeuralCheck(h,IDC_NS_GUIDE_DEPTH,L"neural.settings.guide_depth",252+right,164+top,80,L"neural.tip.guide_depth");
         // What the render does across time rather than to one frame: when a cut
         // resets the history. A ladder, not a slider - every rung is a measured
         // point (SceneCut.h), and Default is the one labelled recommended.
-        CreateSettingsGroupHeading(h,L"neural.settings.group_temporal",176+top,right,400);
+        CreateSettingsGroupHeading(h,L"neural.settings.group_temporal",202+top,right,400);
         {
             const std::wstring cuts[]={T(L"neural.scene_cuts.default"),T(L"neural.scene_cuts.more"),
                                        T(L"neural.scene_cuts.less"),T(L"neural.scene_cuts.off")};
-            CreateNeuralCombo(h,IDC_NS_SCENE_CUTS,L"neural.settings.scene_cuts",204+top,
+            CreateNeuralCombo(h,IDC_NS_SCENE_CUTS,L"neural.settings.scene_cuts",230+top,
                               {cuts[0].c_str(),cuts[1].c_str(),cuts[2].c_str(),cuts[3].c_str()},L"neural.tip.scene_cuts",right);
             // A ladder with Off first and the default, for the reason the policy
             // header gives: it trades detail in motion for steadiness, and a
@@ -7158,7 +7234,7 @@ private:
             const std::wstring stability[]={
                 T(amdStability?L"neural.stability.off.amd":L"neural.stability.off"),
                 T(L"neural.stability.low"),T(L"neural.stability.medium"),T(L"neural.stability.high")};
-            CreateNeuralCombo(h,IDC_NS_STABILITY,L"neural.settings.stability",238+top,
+            CreateNeuralCombo(h,IDC_NS_STABILITY,L"neural.settings.stability",264+top,
                               {stability[0].c_str(),stability[1].c_str(),stability[2].c_str(),stability[3].c_str()},
                               amdStability?L"neural.tip.stability.amd":L"neural.tip.stability",right);
         }
@@ -7297,9 +7373,17 @@ private:
         // construction - when set, the count is forced to 1 and the stacking
         // switches render nothing.
         bool amdSmallModel{false};
+        // The runtime's own temporal mode (DLSS5_TEMPORAL_MODE, 0..3). A key
+        // term rather than a viewing one: every mode that runs replaces the
+        // network's own output with a temporally smoothed one, so the same
+        // model and count render two different pictures under two modes and a
+        // cache that did not carry the mode would serve one for the other. It
+        // is also the reason the Small rung above can be taken away, so the
+        // two are read together everywhere they matter.
+        uint32_t amdTemporalMode{amd_lmxxf::kAmdTemporalModeDefault};
         friend bool operator==(const RenderSettings&,const RenderSettings&)=default;
     };
-    RenderSettings CurrentRenderSettings()const{return {m_neuralSettings,m_renderGuides,m_temporalSettings,m_amdSkinProtect,m_amdMultiPassPredict,m_amdMultiPassSkip,m_amdStyle,m_amdSmallModel};}
+    RenderSettings CurrentRenderSettings()const{return {m_neuralSettings,m_renderGuides,m_temporalSettings,m_amdSkinProtect,m_amdMultiPassPredict,m_amdMultiPassSkip,m_amdStyle,m_amdSmallModel,EffectiveAmdTemporalMode()};}
 
     // The render the picture came from is not what the dialog now holds. Only the
     // export path noticed this before, so a settings change made during playback
@@ -7337,8 +7421,54 @@ private:
     // Apply changes what the player is showing now: an active session restarts
     // at the playhead with the new settings, a paused frame is re-previewed at
     // once. Writing a converted file is a separate, explicit action.
+    // The mode the runtime will actually be told to run. Small and a running
+    // mode cannot both be had: every active mode requires DLSS5_MULTI_PASS=1,
+    // and the runtime answers a Small request under one by rendering the
+    // Original network and saying so in a status line. So the panel's rung
+    // stands down beside the Small model rather than being handed over as a
+    // pair the runtime is going to resolve by itself.
+    uint32_t EffectiveAmdTemporalMode()const{
+        if(m_opt.neuralBackend!=NeuralBackend::Amd)return amd_lmxxf::kAmdTemporalModeDefault;
+        return amd_lmxxf::EffectiveAmdTemporalMode(m_amdTemporalMode,m_amdSmallModel,
+                                                   m_neuralSettings.passes);
+    }
+    // Whether a mode has anything to run under. Every active mode requires
+    // DLSS5_MULTI_PASS=1, and 1 means the Original model at one pass: beside the
+    // Small model the runtime renders the Original instead, and above one pass
+    // it reports history=low-freq-requires-mp1 and runs no mode at all - the
+    // "2x/3x suspend mode 1, back to 0.5x/1x resumes" of the runtime's own
+    // notes. So the rung is live at exactly one point of the ladder, and the
+    // panel says that rather than letting the runtime decide quietly.
+    bool AmdTemporalModeCanRun()const{
+        return !m_amdSmallModel&&m_neuralSettings.passes==1;
+    }
+
+    // This key is the panel's, so the panel writes it - into the runtime's own
+    // file, beside the five the renderer writes per job. Both writers leave the
+    // other's lines alone, so the order they run in does not matter.
+    //
+    // Where it lands matters more: the runtime reads the file once, when the
+    // network is built, so this is written before a render rather than into
+    // one. A mode change therefore reaches the next render, and a session whose
+    // runtime is already built keeps the mode it started with until it restarts
+    // - which is the same answer the panel gives for the pass count.
+    void WriteAmdTemporalModeToRuntime(){
+        if(m_opt.neuralBackend!=NeuralBackend::Amd)return;
+        std::filesystem::path directory=m_opt.amdRuntimeDirectory;
+        if(directory.empty())directory=amd_lmxxf::ResolveRuntimeDirectory({});
+        if(directory.empty())return;
+        std::string error;
+        const uint32_t mode=EffectiveAmdTemporalMode();
+        if(!amd_lmxxf::WriteAmdTemporalMode(directory,mode,error)){
+            LOG("AMD temporal mode "<<mode<<" not handed to the runtime: "<<error);
+            return;
+        }
+        LOG("AMD temporal mode set to "<<mode<<" ("<<amd_lmxxf::AmdTemporalModeName(mode)<<").");
+    }
+
     void ApplyNeuralSettings(){
         SaveVideoSettings();
+        WriteAmdTemporalModeToRuntime();
         if(m_liveSession){
             // A restart is worth its cost exactly when it can change a frame,
             // and on this backend that is a different question than on NVIDIA.
@@ -7369,7 +7499,8 @@ private:
                                m_amdMultiPassPredict!=m_liveRenderSettings.amdMultiPassPredict||
                                m_amdMultiPassSkip!=m_liveRenderSettings.amdMultiPassSkip||
                                m_amdStyle!=m_liveRenderSettings.amdStyle||
-                               m_amdSmallModel!=m_liveRenderSettings.amdSmallModel;
+                               m_amdSmallModel!=m_liveRenderSettings.amdSmallModel||
+                               EffectiveAmdTemporalMode()!=m_liveRenderSettings.amdTemporalMode;
             if(!restart){
                 LOG("Neural settings applied at "<<Position()<<" s; this backend's render reads the accumulation rung and the pass count and nothing else in the dialog, and neither moved, so the active session is left running.");
                 return;
@@ -10943,7 +11074,7 @@ private:
     // takes the rung from the temporal term instead - hashing the panel there
     // would retire coverage a restart would have rendered identically.
     std::string RetentionKeyFor(const RenderSettings& render)const{
-        return LiveSourceGeometryKey()+"|"+CanonicalNeuralSettingsForBackend(m_opt.neuralBackend,render.neural,render.amdSkinProtect,render.amdMultiPassPredict,render.amdMultiPassSkip,render.amdStyle,render.amdSmallModel)+"|"+CanonicalGuideControls(render.guides)+
+        return LiveSourceGeometryKey()+"|"+CanonicalNeuralSettingsForBackend(m_opt.neuralBackend,render.neural,render.amdSkinProtect,render.amdMultiPassPredict,render.amdMultiPassSkip,render.amdStyle,render.amdSmallModel,render.amdTemporalMode)+"|"+CanonicalGuideControls(render.guides)+
                "|"+CanonicalTemporalSettings(render.temporal);
     }
     std::string LiveRetentionKey()const{return RetentionKeyFor(CurrentRenderSettings());}
@@ -12006,8 +12137,12 @@ private:
             // AMD, the add-on's 1..4 on NVIDIA. The model switch is AMD's own
             // and is dropped for the other backend.
             job.amdPasses=render.amdSmallModel?1u:std::clamp(render.neural.passes,1,job.backend==NeuralBackend::Amd?3:4);
-            job.amdSkinProtect=render.amdSkinProtect;job.amdMultiPassPredict=render.amdMultiPassPredict;job.amdMultiPassSkip=render.amdMultiPassSkip;job.amdStyle=render.amdStyle;
+            job.amdSkinProtect=render.amdSkinProtect;job.amdMultiPassPredict=render.amdMultiPassPredict;job.amdMultiPassSkip=render.amdMultiPassSkip;job.amdStyle=render.amdStyle;job.amdTemporalMode=render.amdTemporalMode;
             job.amdSmallModel=job.backend==NeuralBackend::Amd&&render.amdSmallModel;
+            // The mode the job will run under, which is the panel's rung unless
+            // Small takes it: the runtime will not run both, so a job carrying
+            // both is a job that renders the Original network.
+            job.amdTemporalMode=job.backend==NeuralBackend::Amd?render.amdTemporalMode:0u;
             job.pauseEvent=m_neuralPauseEvent;
             job.gpuColorConversion=m_gpuColorConversion;job.gpuSourceConversion=m_gpuSourceConversion;job.nvencPreset=m_nvencPreset;job.processingScale=m_processingScale;job.captureDither=m_captureDither;job.cacheQuality=m_cacheQuality;job.sourceDeband=m_sourceDeband;job.suppliedExposure=m_suppliedExposure;
             job.reuseSourceKey=reuseSourceKey;job.expectedDurationSeconds=expectedDurationSeconds;job.range=range;job.prepareOnly=prepareOnly;
@@ -13735,6 +13870,15 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // that never touched the switch keeps the picture it always rendered. See
     // RenderSettings::amdSmallModel and ReadSavedAmdSmallModel.
     bool m_amdSmallModel{false};
+    // The runtime's own temporal mode, DLSS5_TEMPORAL_MODE, 0..3. This one is
+    // the panel's rather than a hand edit's because of what it does to the
+    // model: every active mode requires DLSS5_MULTI_PASS=1, so a mode running
+    // takes the Small model away and the runtime says so in a status line whose
+    // reason reads like a judgement about the source. Taken over so the pairing
+    // can be made where it is visible. Read once per process by the runtime, so
+    // a change reaches the next render and needs a restart for the session
+    // already on screen.
+    uint32_t m_amdTemporalMode{amd_lmxxf::kAmdTemporalModeDefault};
     // The preset the Look settings were last taken from, so Custom can say
     // which one it departed from. kPresetCount when none is known yet.
     size_t m_lastNeuralPreset=neural_presets::kPresetCount;
@@ -14313,6 +14457,11 @@ static int RunRenderCommand(const render_command::Parsed& parsed,const std::vect
         // for it (the menu is the surface), so a scripted --render uses this
         // machine's value.
         job.amdStyle=ReadSavedAmdStyle(settings);
+        // The temporal mode, saved the same way and, like the style, with no
+        // command-line key of its own. Read for the backend that has the key
+        // and left at off for the one that does not.
+        job.amdTemporalMode=plan.backend==NeuralBackend::Amd
+            ?ReadSavedAmdTemporalMode(settings,amd_lmxxf::ResolveRuntimeDirectory({})):0u;
         // The model the count selects: the command line's, or what this
         // machine has saved. AMD's own switch - the NVIDIA add-on has no such
         // model - so the saved value is only read for the backend that has
@@ -14330,7 +14479,8 @@ static int RunRenderCommand(const render_command::Parsed& parsed,const std::vect
         // line a script reads back.
         if(plan.requireNeural)say(L"neural: "+Utf8ToWide(plan.backend==NeuralBackend::Amd
             ?CanonicalNeuralSettingsForBackend(plan.backend,neuralSettings,job.amdSkinProtect,
-                job.amdMultiPassPredict,job.amdMultiPassSkip,job.amdStyle,job.amdSmallModel)
+                job.amdMultiPassPredict,job.amdMultiPassSkip,job.amdStyle,job.amdSmallModel,
+                job.amdSmallModel?0u:job.amdTemporalMode)
             :CanonicalNeuralSettings(neuralSettings)));
         say(StageExportEncodeSummary(plan,width,job.quality,job.upscalingHistory));
         say(L"writing "+output.wstring());

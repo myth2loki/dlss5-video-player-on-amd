@@ -394,6 +394,25 @@ count are the two spellings of the one `DLSS5_MULTI_PASS` key, and the render
 identity carries `model=small` so a Small render is never served for an Original
 one.
 
+**Temporal mode**, in the same group, is the AMD runtime's own temporal
+algorithm over the network's output: **Off** leaves the network's own frame,
+**Fast history** is TheAutomatic's approximation, and the two low-frequency rungs
+smooth the residual that changes slowly while keeping this frame's detail. It is
+the one setting there that decides which network runs rather than what the run
+costs. Every mode that runs requires `DLSS5_MULTI_PASS=1` — the Original model
+at one pass — so the mode is live at exactly one point of the ladder: beside the
+Small rung the runtime would render the Original instead (its status line says
+`low-frequency-requires-original`, which reads like a judgement about the clip
+and is the name of mode 2), and above one pass it runs no mode at all
+(`history=low-freq-requires-mp1`, the runtime's own "2x/3x suspend the mode"
+behaviour). The control is greyed out at both, and keeps its value for when you
+come back to one pass with the Original model. The runtime reads the key once, when the network is built, so a
+change reaches the next render; a session already on screen needs a restart, the
+same as the pass count. The value lives in the settings file as
+`[AmdNeural] TemporalMode` and is written into the runtime's own
+`custom-config.txt` — where it used to be a hand edit that silently outranked
+the pass ladder.
+
 **DLSS > Processing scale** sets the resolution the model runs at. **Source,
 100%** is the default and the recommended rung: the model sees the decoded
 frame. **75%** and **50%** show the model an area-reduced picture and let DLSS
@@ -1070,6 +1089,13 @@ What to render, as the dialog's ticks and settings choose it:
   model, and asking for it there is refused rather than ignored. For example, a
   fast Small pass of the strong look: `dlss5-convert clip.mp4
   --neural-backend amd --preset strong --small-model`.
+  **It cannot be combined with a temporal mode.** Every mode that runs requires
+  `DLSS5_MULTI_PASS=1`, so the runtime answers a Small request under one by
+  rendering the Original network instead - it says so only in its own status
+  line, as `low-frequency-requires-original`, a name that reads like a
+  judgement about the clip and is actually the name of mode 2. The panel greys
+  the mode out beside the Small rung for that reason; from the command line,
+  set the mode to Off (below) as well.
 - `--processing-scale` is `100`, `75` or `50`, the rungs of **DLSS >
   Processing scale**, for `nr` without `sr`. Without it, the saved rung.
 - `--encode` is the **Encoder settings** quality ladder: `standard` (8-bit

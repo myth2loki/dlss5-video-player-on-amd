@@ -63,7 +63,8 @@ inline constexpr uint32_t PassesSettingsDefault(NeuralBackend backend) noexcept
 inline std::string AmdNeuralSettingsDocument(TemporalStability accumulation, uint32_t passes = 1,
                                              bool smallModel = false,
                                              bool skinProtect = false, bool multiPassPredict = true,
-                                             bool laterPassSkip = false, uint32_t style = 1)
+                                             bool laterPassSkip = false, uint32_t style = 1,
+                                             uint32_t temporalMode = 0)
 {
     std::string document = "backend=amd-lmxxf\n"
                            "temporal=off\n"
@@ -104,6 +105,14 @@ inline std::string AmdNeuralSettingsDocument(TemporalStability accumulation, uin
     // default this backend keyed before the switch existed.
     if (!smallModel && passes > 1 && laterPassSkip)
         document += "mp-skip=1\n";
+    // The temporal mode last, and only when one is running: off has always been
+    // the absent key's answer, so a document that does not mention it is the
+    // one every render before this switch existed carried. A mode is also the
+    // only term here that changes the picture without changing the model or the
+    // count - it smooths across frames rather than restyling one - so it is
+    // named as what it is rather than as another pass.
+    if (temporalMode != 0)
+        document += "temporal-mode=" + std::to_string(temporalMode) + "\n";
     return document;
 }
 
@@ -162,7 +171,8 @@ inline std::string CanonicalNeuralSettingsForBackend(NeuralBackend backend,
                                                      bool amdMultiPassPredict = true,
                                                      bool amdMultiPassSkip = false,
                                                      uint32_t amdStyle = 1,
-                                                     bool amdSmallModel = false)
+                                                     bool amdSmallModel = false,
+                                                     uint32_t amdTemporalMode = 0)
 {
     if (backend == NeuralBackend::Amd) {
         // Small is single-pass by construction and a different network from
@@ -183,6 +193,15 @@ inline std::string CanonicalNeuralSettingsForBackend(NeuralBackend backend,
         if (!amdSmallModel && passes == 3 && !amdMultiPassPredict) term += " mp-predict=0";
         if (!amdSmallModel && passes > 1 && amdMultiPassSkip) term += " mp-skip=1";
         if (amdStyle != 1) term += " style=" + std::to_string(amdStyle);
+        // The temporal mode, the one term here that is neither a pass count nor
+        // a look: a mode that runs replaces the network's own frame with a
+        // temporally smoothed one, so two modes are two pictures out of the
+        // same model and count. It is off its default like the style, and for
+        // the same reason - an absent key has always meant off - but unlike the
+        // style it is never the Small model's to carry: an active mode takes
+        // the Small model away, so the pair cannot occur and a caller that
+        // hands both is handing a mode that will not run.
+        if (amdTemporalMode != 0) term += " temporal-mode=" + std::to_string(amdTemporalMode);
         return term;
     }
     return CanonicalNeuralSettings(settings);

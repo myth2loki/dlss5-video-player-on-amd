@@ -122,6 +122,15 @@ struct StageExportJob {
     // Whether later passes skip the heavy block group; see
     // RenderSettings::amdMultiPassSkip in the player.
     bool amdMultiPassSkip{false};
+    // The runtime's own temporal mode (DLSS5_TEMPORAL_MODE, 0..3), 0 by
+    // default - off, which is what an absent key has always meant. It travels
+    // with the job rather than being read back off the runtime's file at export
+    // time because it is a term of the picture: a mode that runs replaces the
+    // network's own frame with a smoothed one, so the same model and count are
+    // two different exports under two modes. Nothing to hand to the runtime
+    // here - the player writes the key before the render - but the export's own
+    // key and its printed plan have to say which mode the file was made under.
+    uint32_t amdTemporalMode{0};
     // The AMD runtime's own style (DLSS5_STYLE, 0..2); see
     // RenderSettings::amdStyle in the player.
     uint32_t amdStyle{1};
