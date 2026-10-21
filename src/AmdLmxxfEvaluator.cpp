@@ -2931,6 +2931,7 @@ bool AmdLmxxfEvaluator::SignalFence(uint64_t& value, int32_t& status)
 void AmdLmxxfEvaluator::RefreshHistoryStatus()
 {
     const std::string status = runtime_.Status();
+    lastStatusLine_ = status;
     // GetStatus is one flat line of space-separated key=value tokens and history=
     // is one of them. It is the only place the temporal model's decision is ever
     // published: no return code says whether history engaged, and no error text

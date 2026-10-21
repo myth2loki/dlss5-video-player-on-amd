@@ -306,6 +306,11 @@ public:
     // refusal. Empty when no lease frame has run, which is every frame of a
     // non-temporal evaluator.
     const std::string& HistoryStatus() const noexcept { return lastHistoryStatus_; }
+    // The runtime's own status line as it last answered, empty before the first
+    // lease frame. One line of space-separated key=value tokens; which of them
+    // exist is the runtime's business, so this is handed over whole rather than
+    // parsed into a struct a newer runtime would leave half empty.
+    const std::string& RuntimeStatusLine() const noexcept { return lastStatusLine_; }
     // How many frames went through the lease path, so a run can tell "the
     // temporal model was engaged and reported off" apart from "the lease path
     // never ran" - two things whose logs look identical otherwise.
@@ -716,6 +721,12 @@ private:
     // the token is only ever printed into a status string.
     uint64_t temporalFrames_{};
     std::string lastHistoryStatus_;
+    // The whole status line the token was read out of, kept for the same reason
+    // the token is: it is the only place the runtime says what it actually ran
+    // with - the model it answered a requested one with, and why - and a job
+    // that never needed a diagnosis still deserves to say which model rendered
+    // it.
+    std::string lastStatusLine_;
     // Frames whose guides came from a per-frame field. See GuideFrames().
     uint64_t guideFrames_{};
     // The per-guide switches this session was brought up under, from the same

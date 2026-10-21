@@ -3242,7 +3242,14 @@ struct AmdLmxxfEvaluatorAdapter {
     // rather than copies, and empty rather than a dummy value with no evaluator:
     // a caller that logs them gets nothing to print, which is the truth.
     std::string_view HistoryStatus()const{return evaluator?evaluator->HistoryStatus():std::string_view{};}
-    std::string_view LiveRuntimeStatus()const{return evaluator?evaluator->LiveRuntimeStatus():std::string_view{};}
+    // A copy, not a view: the evaluator builds this string on demand, so a view
+    // of it would outlive what it points at. Empty rather than a dummy value
+    // with no evaluator, like the rest.
+    std::string LiveRuntimeStatus()const{return evaluator?evaluator->LiveRuntimeStatus():std::string{};}
+    // The status line as the last lease frame left it, which is not the same
+    // question as LiveRuntimeStatus: that one asks the runtime now, and a render
+    // that has released its session asks an unloaded one and gets nothing back.
+    std::string_view RuntimeStatusLine()const{return evaluator?evaluator->RuntimeStatusLine():std::string_view{};}
     uint64_t TemporalFrames()const{return evaluator?evaluator->TemporalFrames():0;}
     uint64_t GuideFrames()const{return evaluator?evaluator->GuideFrames():0;}
     std::string LocalVideoMemoryNote()const{
@@ -4164,5 +4171,12 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
         <<" lease-frames="<<state.amdEvaluator.TemporalFrames()
         <<" guide-frames="<<state.amdEvaluator.GuideFrames()
         <<" local-vram="<<state.amdEvaluator.LocalVideoMemoryNote());
+    // The runtime's own account of what it ran, once per render rather than once
+    // per frame. model= and requested_model= are in it, and a render that asked
+    // for one model and was given the other is the thing a reader cannot infer
+    // from the picture - two models that both ran look alike, and a fallback the
+    // runtime chose silently is only ever said here.
+    if (!state.amdEvaluator.RuntimeStatusLine().empty())
+        LOG("AMD neural runtime: "<<state.amdEvaluator.RuntimeStatusLine());
     return result;
 }
