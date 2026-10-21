@@ -95,6 +95,52 @@ runtime，同一段 8 帧 `deadpool-s0.mkv` 的 `--render --stages nr` 输出
 **PSNR = inf（逐比特一致）**。这同时说明 ABI 6 追加字段留零就是正确的中性默认值——
 如果它们在被读作“未设置”时有别的含义，两版输出不可能相同。
 
+## 升级到 0.44 载荷（相对 0.43，2026-10-21）
+
+把上一套载荷（0.43）换成 `OptiScaler-DLSS5-AMD-0.44` 时，**神经 pass 的输出逐比特不变**，
+所以这是一次纯载荷/默认形态升级，不引入画面回归。逐项变化如下。
+
+### 换了什么
+
+- **宿主 DLL**：`OptScaler-NR-1.13.0-alpha8`，1,804,576 字节，
+  sha256 `fdc98b823f77cd7b9a88394c66946a234dd737e3a7bee5fabe3a36b07c84330b`
+  （与 `OptiScaler-NR-1.12.1` / `1.11.0` / `1.10.5-alpha-gai` 同源，ABI 仍是 `(6, 176)`，
+  `kAcceptedAbiVersions = {6, 3}` 不用动）。
+- **载荷包**：`OptiScaler-DLSS5-AMD-0.44`，`release.json` 读数
+  `modules=80`、`small_weights=93`、`default_mode=0.5`、`bit_exact_vs_previous=false`、
+  `source_commit=4764e4f1`。
+- **模块**：`lmxxf-modules/gfx1200` + `gfx1201` 各 40 个 hsaco，与 0.44 逐字节一致
+  （80 条 SHA-256 全通过）。
+- **权重**：`native-game-tiled-assets/` 464 项——452 个 block 张量与 0.43 **完全相同**，
+  8 个 `.hlsl` 变也相同；**新增** `post70-history-head.f16` 与 `small/`(94)。
+- **W16 布局确认**：`AmdLmxxfRuntimeProbe` 实到 `w16_blocks=96`、`c32_w16_calls=60`、
+  `vit_w16_calls=48`、`vit_inter_byte_calls=108`，说明 0.43 引入的 W16 权重路径真的在用。
+
+### 默认形态改了，但我们没跟
+
+0.44 把默认形态改成 **31 块 Small 0.5×（单 pass）**：它的 `default-config.txt` 写
+`DLSS5_MULTI_PASS=0.5` + `DLSS5_STYLE=1`，并明确 `bit_exact_vs_previous=false`。
+
+我们的 `DLSS5-AMD/custom-config.txt` **故意不随 0.44 包更新**，仍
+`MULTI_PASS=2` / `STYLE=0` / `TEMPORAL_MODE=2`：custom 压过 default，所以行为保持
+**Original 2-pass**，与升级前逐比特一致。要评估 0.44 的默认 Small 形态，得连
+`default-config.txt` 一起换，并预期输出**不**逐位复现。
+
+### A/B 验证（升级后逐比特一致）
+
+升级到 0.44 载荷后，对同一段 `bumblebee-fight-20s.mkv`（f0–f48，1280×720，passes=2，
+hevc_amf）与上一套模块比对：
+
+- ffmpeg `psnr` = **inf**（逐比特一致）；抽帧 PIL 比对 **MAD = 0.000000**。
+- 对源 MAD = 3.45，确认神经 pass 真的在改写画面（不是退化成直通）。
+- network 耗时差落在 48 帧噪声内，不下性能结论。
+
+### 版本键来历（备查）
+
+- `0.42` 加 `DLSS5_TEMPORAL_MODE` / `DLSS5_TEMPORAL_ENHANCE_STRENGTH`（统一时序开关）。
+- `0.43` 加 `DLSS5_HIP_C32_W16` 等 W16 权重布局键。
+- `0.44` 把默认形态改成 31 块 Small 0.5×（见上）。
+
 未实测过的版本（4 / 5 / 7 …）仍按未知布局拒绝：版本号是唯一无法从尺寸反推的东西。
 
 ## 使用约束
