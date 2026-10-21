@@ -434,6 +434,21 @@ target_link_libraries(NeuralWorker PRIVATE player_media player_render player_neu
 dlss_video_player_harden(NeuralWorker)
 dlss_video_player_symbols(NeuralWorker)
 set_target_properties(NeuralWorker PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/$<CONFIG>/neural-runtime")
+# The player resolves its helper one directory below itself -
+# <player>/neural-runtime/NeuralWorker.exe - which is not where this target
+# lands, and a player launched beside the previous build's helper hands it
+# arguments that helper predates: it refuses the command line and exits 2, the
+# relaunch probe then fails on the other backend's missing add-on file, and the
+# session never restarts with the log blaming the runtime. Staged here on every
+# build of this target, so the two binaries one launch pairs are the same
+# generation. The $<CONFIG>/neural-runtime layout is unchanged: the runtime
+# files are still staged into it, and the measurement reports read them there.
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/neural-runtime")
+add_custom_command(TARGET NeuralWorker POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "$<TARGET_FILE:NeuralWorker>"
+        "${CMAKE_BINARY_DIR}/neural-runtime/NeuralWorker.exe"
+    COMMENT "Staging NeuralWorker.exe beside the player")
 
 # dlss5-convert.exe: the console front end for the player's --render and
 # --probe (ConvertCommandLine.h). A console program, so a shell waits for it,

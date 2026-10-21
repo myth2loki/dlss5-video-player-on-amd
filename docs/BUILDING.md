@@ -97,8 +97,11 @@ Visual Studio installation under
 `Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin`.
 
 Launch `build-upscaling/Release/DLSSVideoPlayer.exe`. Its neural worker is built
-as `build-upscaling/Release/neural-runtime/NeuralWorker.exe`. Without the
-experimental runtime, a source build uses the native playback path.
+as `build-upscaling/Release/neural-runtime/NeuralWorker.exe`, and every build of
+that target also stages a copy at `build-upscaling/neural-runtime/NeuralWorker.exe`
+- the path the player actually launches the helper from, so the two are always
+the same generation. Without the experimental runtime, a source build uses the
+native playback path.
 
 The nineteen portable tests (PolicyTests is registered twice, as its quick and
 `slow` tiers) cover recent history, settings/cache integrity,

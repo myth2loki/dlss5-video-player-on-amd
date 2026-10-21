@@ -559,6 +559,9 @@ Queue:
 >   被播放器调用的路径。换了播放器却忘了拷 worker，日志里会出现旧文案
 >   （"this backend has no guide estimator"）却发现不了——验证前先比 worker 的
 >   时间戳。
+> - **该陷阱已从构建上消除（2026-10-21）**：`NeuralWorker` 目标加了 POST_BUILD，
+>   每次链接后自动 `copy_if_different` 到 `<build>/neural-runtime/`，播放器
+>   启动的 helper 从此与播放器同代，不必再"先比 worker 的时间戳"。
 >
 > **量过了（2026-10-20，RX 9070 XT）**：上面那条 A/B 只回答"场被读到"；这一轮
 > 回答"画质是否更好"。四档 × 两臂共 8 条受控导出（720p 实拍 2 s / 48 帧，
