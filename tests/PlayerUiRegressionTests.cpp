@@ -2612,6 +2612,51 @@ struct PlayerAppTestAccess {
         app.m_loaded = loaded;
     }
 
+    // The settings windows are their own top-level windows, so a drag of one of
+    // them starts its modal loop there and the player's WndProc never hears
+    // WM_ENTERSIZEMOVE: the picture froze for the length of the drag while the
+    // sound played on, then dropped the backlog in one Tick. The chrome all
+    // four settings windows share arms the same timer for them, and still
+    // leaves the prompts that are raised mid-command alone.
+    static void settings_window_drags_keep_ticking_test()
+    {
+        PlayerApp& app = fixture->app;
+        const bool loaded = app.m_loaded;
+        app.m_loaded = false;
+        app.ShowAdjustments();
+        CHECK(app.m_adjustWnd != nullptr);
+        if (!app.m_adjustWnd) { app.m_loaded = loaded; return; }
+        const HWND dialog = app.m_adjustWnd;
+        CHECK_EQ(app.m_modalTickTimer, UINT_PTR{0});
+        // Dragged: the loop the drag runs dispatches the timer, and the timer
+        // runs the same Tick a pending seek is consumed by.
+        app.AdjustWndProc(dialog, WM_ENTERSIZEMOVE, 0, 0);
+        CHECK(app.m_modalTickTimer != 0);
+        app.m_seekPending = true;
+        app.WndProc(app.m_hwnd, WM_TIMER, PlayerApp::kModalTickTimerId, 0);
+        CHECK(!app.m_seekPending);
+        app.AdjustWndProc(dialog, WM_EXITSIZEMOVE, 0, 0);
+        CHECK_EQ(app.m_modalTickTimer, UINT_PTR{0});
+        // A menu loop this window opens - its system menu, a drop-down - is the
+        // same block on the same thread and is treated the same way.
+        app.AdjustWndProc(dialog, WM_ENTERMENULOOP, TRUE, 0);
+        CHECK(app.m_modalTickTimer != 0);
+        app.AdjustWndProc(dialog, WM_EXITMENULOOP, TRUE, 0);
+        CHECK_EQ(app.m_modalTickTimer, UINT_PTR{0});
+        // A prompt raised from inside a command handler still does not tick.
+        app.AdjustWndProc(dialog, WM_ENTERIDLE, MSGF_DIALOGBOX, 0);
+        CHECK_EQ(app.m_modalTickTimer, UINT_PTR{0});
+        // The timer belongs to the player's window, so a Tick from the main pump
+        // ends it exactly the way it ends the player's own.
+        app.AdjustWndProc(dialog, WM_ENTERSIZEMOVE, 0, 0);
+        CHECK(app.m_modalTickTimer != 0);
+        app.Tick();
+        CHECK_EQ(app.m_modalTickTimer, UINT_PTR{0});
+        app.AdjustWndProc(dialog, WM_COMMAND, MAKEWPARAM(IDC_ADJ_CLOSE, BN_CLICKED), 0);
+        CHECK(!IsWindow(dialog));
+        app.m_loaded = loaded;
+    }
+
     static void window_and_menu_teardown_test()
     {
         PlayerApp& app = fixture->app;
@@ -2992,6 +3037,7 @@ struct PlayerAppTestAccess {
         UI_CASE(source_menus_return_after_a_cancelled_job_test),
         UI_CASE(loading_feedback_test),
         UI_CASE(modal_loops_keep_ticking_test),
+        UI_CASE(settings_window_drags_keep_ticking_test),
         UI_CASE(retarget_retires_the_worker_test),
         UI_CASE(playback_frames_are_shared_not_copied_test),
         UI_CASE(paused_frame_presents_on_invalidation_test),

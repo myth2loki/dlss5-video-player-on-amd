@@ -6714,6 +6714,20 @@ private:
     // colours, the owner-drawn buttons, a change of dpi, and the font they own.
     bool SettingsDialogChrome(HWND h,UINT m,WPARAM w,LPARAM l,LRESULT& result){
         switch(m){
+        // A settings window's own drag, or a menu loop it opens (its system
+        // menu, a drop-down), runs its modal loop on this thread and never
+        // returns to the main pump - but WM_ENTERSIZEMOVE and
+        // WM_ENTERMENULOOP go to the window that started the loop, which here
+        // is the settings window, not the player. WndProc's handlers therefore
+        // never ran, the modal tick that keeps the video alive through a drag
+        // of the main window was never armed, and the picture froze for the
+        // length of the drag while the sound played on - then the backlog was
+        // dropped in one Tick on release, and a neural pair re-anchored. Ticking
+        // is safe from these windows, which are modeless and stay up beside
+        // playback; the message boxes and owned prompts raised inside a command
+        // handler deliberately do not tick.
+        case WM_ENTERSIZEMOVE:case WM_ENTERMENULOOP:StartModalTick();return false;
+        case WM_EXITSIZEMOVE:case WM_EXITMENULOOP:StopModalTick();return false;
         case WM_CTLCOLORSTATIC:case WM_CTLCOLOREDIT:case WM_CTLCOLORBTN:case WM_CTLCOLORLISTBOX:case WM_CTLCOLORDLG:
             result=reinterpret_cast<LRESULT>(DarkControlColor(m,w,dark_mode::Text));return true;
         case WM_DRAWITEM:{
