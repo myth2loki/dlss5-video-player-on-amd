@@ -196,8 +196,9 @@ HMENU CreateMenuBar(const Localizer& localizer, bool youtubeAvailable)
     add(neuralWindow, IDM_NEURAL_WINDOW_90, L"menu.neural_window_90");
     add(neuralWindow, IDM_NEURAL_WINDOW_120, L"menu.neural_window_120");
     add(neuralWindow, IDM_NEURAL_WINDOW_180, L"menu.neural_window_180");
-    CheckMenuRadioItem(neuralWindow,IDM_NEURAL_WINDOW_OFF,IDM_NEURAL_WINDOW_180,
-                       IDM_NEURAL_WINDOW_120,MF_BYCOMMAND);
+    add(neuralWindow, IDM_NEURAL_WINDOW_300, L"menu.neural_window_300");
+    CheckMenuRadioItem(neuralWindow,IDM_NEURAL_WINDOW_OFF,IDM_NEURAL_WINDOW_300,
+                       IDM_NEURAL_WINDOW_300,MF_BYCOMMAND);
     AppendMenuW(dlss,MF_POPUP,reinterpret_cast<UINT_PTR>(neuralWindow),
                 localizer.Get(L"menu.neural_window").c_str());
     // Pausing the background render is a neural command, so it belongs to the

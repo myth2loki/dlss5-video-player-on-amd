@@ -124,7 +124,7 @@ rather than a failed one.
 
 A plain open asks the cache for exactly one entry: the whole-video render, whose
 log line reads `range=[0,0)`. A live session publishes an entry per chunk it
-rendered (120 s of video by default), and neither those entries nor a set of
+rendered (300 s of video by default), and neither those entries nor a set of
 them answers that request — so the video renders again, which is the cache
 working as built rather than a lost render. **DLSS > Convert & export > Convert
 whole video to neural video** writes the whole-video entry once; every open after

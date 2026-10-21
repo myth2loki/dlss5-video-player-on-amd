@@ -5397,6 +5397,12 @@ private:
         // (the whole of what the session set out to render); anything else is
         // a window, snapped to a rung the menu can show.
         m_liveWindowSeconds=SnapLiveWindowSeconds(ReadIniFloat(L"Playback",L"NeuralWindowSeconds",float(kLiveWindowSeconds)));
+        // Where that window's buffer drains to before the session keeps
+        // rendering. 0 is the measured formula (a chunk's own wall clock,
+        // LiveSessionPolicy.h); anything else is the drain point in seconds,
+        // clamped to the window when it is read - see WindowLowWater.
+        m_liveWindowLowWaterSeconds=std::max(0.0,double(ReadIniFloat(L"Playback",L"NeuralWindowLowWaterSeconds",
+                                                                    float(kLiveWindowLowWaterSeconds))));
         m_upscalingHistory=ReadUpscalingHistory(SettingsPath());
         m_exportSelection.engine=ReadSuperResolutionEngine(SettingsPath());
         m_captureDither=GetPrivateProfileIntW(L"Encoding",L"CaptureDither",1,SettingsPath().c_str())!=0;
@@ -5512,6 +5518,8 @@ private:
         // Written as the rung itself, so the file says "120" and reads as the
         // seconds it is; 0 is off.
         WriteIniFloat(L"Playback",L"NeuralWindowSeconds",static_cast<float>(m_liveWindowSeconds));
+        // The window's drain point, in seconds; 0 is the measured formula.
+        WriteIniFloat(L"Playback",L"NeuralWindowLowWaterSeconds",static_cast<float>(m_liveWindowLowWaterSeconds));
         WriteIniFloat(L"Playback",L"SuperResolution",m_upscalingRequested?1.0f:0.0f);
         WriteIniFloat(L"Playback",L"FrameGenerationPlayback",m_playbackFrameGenRequested?1.0f:0.0f);
         WriteIniFloat(L"Playback",L"UpscaleEngine",
@@ -6234,8 +6242,9 @@ private:
             const UINT windowCommand=m_liveWindowSeconds<=0.0?IDM_NEURAL_WINDOW_OFF
                 :(m_liveWindowSeconds<=75.0?IDM_NEURAL_WINDOW_60
                  :(m_liveWindowSeconds<=105.0?IDM_NEURAL_WINDOW_90
-                  :(m_liveWindowSeconds<=150.0?IDM_NEURAL_WINDOW_120:IDM_NEURAL_WINDOW_180)));
-            app_menu::CheckRadioCommand(menu,IDM_NEURAL_WINDOW_OFF,IDM_NEURAL_WINDOW_180,windowCommand);
+                  :(m_liveWindowSeconds<=150.0?IDM_NEURAL_WINDOW_120
+                   :(m_liveWindowSeconds<=240.0?IDM_NEURAL_WINDOW_180:IDM_NEURAL_WINDOW_300))));
+            app_menu::CheckRadioCommand(menu,IDM_NEURAL_WINDOW_OFF,IDM_NEURAL_WINDOW_300,windowCommand);
             // Custom ends the block, so a settings edit that leaves every preset
             // shows as Custom rather than leaving the last one checked.
             const size_t presetIndex=neural_presets::IndexOf(m_neuralSettings);
@@ -6486,7 +6495,7 @@ private:
             if(m_liveSession&&m_liveRange.end100ns>m_liveRange.start100ns){
                 // The tooltip's "of <length>" is whatever the chip's percentage
                 // is measured over, so a windowed session names its ceiling -
-                // the whole job - rather than the two minutes in hand.
+                // the whole job - rather than the window in hand.
                 const int64_t total=m_liveWindowSeconds>0.0
                     ?std::max<int64_t>(m_liveRangeCeiling100ns,m_liveRange.end100ns)
                     :m_liveRange.end100ns-m_liveRange.start100ns;
@@ -10758,6 +10767,9 @@ private:
     // chunk is that many seconds from the render head, started when the buffer
     // has drained to WindowLowWater() of it.
     static constexpr double kLiveWindowSeconds=live_session::kDefaultWindowSeconds;
+    // Where the window's buffer drains to before the session keeps rendering,
+    // in seconds. Hand-set; 0 asks the measured formula instead.
+    static constexpr double kLiveWindowLowWaterSeconds=live_session::kDefaultLowWaterSeconds;
     // A session now renders the whole video by default, so its range chip named
     // the entire clip on every session - which reads as a user selection when
     // there was none. Only a range narrower than the source is worth saying.
@@ -11010,8 +11022,13 @@ private:
         // - see LiveRenderThroughput - and the forecast is only there until
         // the first job has measured anything.
         const double throughput=LiveRenderThroughput();
+        // The drain point: the hand-set mark when there is one, otherwise the
+        // measured formula priced on the render's own pace (never the session
+        // average, which charges the window for its own idleness).
         const double lowWater=live_session::WindowLowWater(m_liveWindowSeconds,
-                                                           throughput>0.0?throughput:LivePaceRatio());
+                                                           throughput>0.0?throughput:LivePaceRatio(),
+                                                           live_session::kColdStartSeconds,
+                                                           m_liveWindowLowWaterSeconds);
         const auto end=live_session::WindowEndAfterChunk(m_liveRange.end100ns,at,m_liveRangeCeiling100ns,
                                                          m_liveWindowSeconds,LiveLeadSeconds(),lowWater);
         if(!end)return;
@@ -13166,6 +13183,7 @@ private:
         case IDM_NEURAL_WINDOW_90:SetLiveWindowSeconds(90.0);break;
         case IDM_NEURAL_WINDOW_120:SetLiveWindowSeconds(120.0);break;
         case IDM_NEURAL_WINDOW_180:SetLiveWindowSeconds(180.0);break;
+        case IDM_NEURAL_WINDOW_300:SetLiveWindowSeconds(300.0);break;
         case IDM_AUDIO_PASSTHROUGH:SetAudioPassthrough(!m_audioPassthrough);break;
         case IDM_EXPORT_CACHED_VIDEO:ExportCachedVideo();break;
         case IDM_VIEW_FINAL:SetDebug(D3D12Renderer::DebugView::Final);break;case IDM_VIEW_INPUT:SetDebug(D3D12Renderer::DebugView::Input);break;case IDM_VIEW_MV:SetDebug(D3D12Renderer::DebugView::MotionVectors);break;case IDM_VIEW_DEPTH:SetDebug(D3D12Renderer::DebugView::Depth);break;case IDM_VIEW_FRAME_GENERATED:SetDebug(D3D12Renderer::DebugView::FrameGenerated);break;case IDM_VIDEO_ADJUSTMENTS:ShowAdjustments();break;case IDM_ASPECT_FIT:SetAspect(false,false);break;case IDM_ASPECT_FILL:SetAspect(true,false);break;case IDM_FULLSCREEN:ToggleFullscreen();break;case IDM_ADVANCED_SAFE_MODE:RestartInSafeMode();break;case IDM_CLEAR_NEURAL_CACHE:ClearNeuralCache();break;
@@ -13674,6 +13692,12 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // Seconds of video kept rendered ahead of the playhead; 0 renders the whole
     // of what the session set out to (the pre-2026-10-18 behaviour).
     double m_liveWindowSeconds=kLiveWindowSeconds;
+    // Where the window's buffer has to drain to before the session keeps
+    // rendering - the next chunk starts below this. Hand-set in seconds; 0
+    // asks the measured formula instead (LiveSessionPolicy.h's WindowLowWater),
+    // which prices a chunk's own wall clock and on a slow card pins the mark at
+    // the window, so the render stops with a full buffer.
+    double m_liveWindowLowWaterSeconds=kLiveWindowLowWaterSeconds;
     // What every job of the session renders with, and so what its segments
     // are retained under (TakeLiveRenderSettings).
     RenderSettings m_liveRenderSettings{};

@@ -146,17 +146,22 @@ struct SessionView {
 // helpers. So the end moves in whole chunks from the RENDER HEAD, and only
 // once the buffer has drained to its low-water mark.
 //
-// Why 120 s: what a chunk costs is a cold start plus its own render, and the
+// Why 300 s: what a chunk costs is a cold start plus its own render, and the
 // startup overhead as a share of a chunk is S/(S + N/ratio). Measured on an
 // RX 9070 XT, S x ratio is ~14 seconds of video at 720p and at 1080p alike
 // (the startup slows down in the same proportion the render does), so the
-// share is 14/(N + 14): 19% at 60 s, 13% at 90, 10% at 120, 7% at 180. 120 is
-// where another 60 s of window stops buying anything worth the extra video
-// rendered past a pause.
-inline constexpr double kDefaultWindowSeconds = 120.0;
+// share is 14/(N + 14): 19% at 60 s, 13% at 90, 10% at 120, 7% at 180, 4% at
+// 300. Past 120 s the curve is flat, and the default moved there on
+// 2026-10-21 because the viewer-side cost the comment above worries about -
+// video rendered past a pause - is bounded by the low-water mark below, not
+// by the window: with the mark at three minutes the GPU keeps working while
+// the viewer watches and goes quiet only once five minutes sit in front of
+// them. Hand-edit `[Playback] NeuralWindowSeconds` for another size; the menu
+// rungs are the values that survive snapping.
+inline constexpr double kDefaultWindowSeconds = 300.0;
 
 // The rungs the menu offers, in seconds. Off (0) is a separate command.
-inline constexpr double kWindowChoices[] = {60.0, 90.0, 120.0, 180.0};
+inline constexpr double kWindowChoices[] = {60.0, 90.0, 120.0, 180.0, 300.0};
 
 // Where the buffer has to drain to before the next chunk is worth starting.
 // A chunk takes `coldStart + N/ratio` of wall clock to render, and the buffer
@@ -164,10 +169,24 @@ inline constexpr double kWindowChoices[] = {60.0, 90.0, 120.0, 180.0};
 // would begin by stalling. Capped at the window itself, because a GPU that
 // cannot keep up still has to render - the player warns about that case before
 // the session starts, and refusing to start chunks would only freeze it.
+//
+// A hand-set mark overrides the arithmetic. The formula prices the chunk's
+// own wall clock, which on a card that cannot keep up pins the mark at the
+// window itself: the session renders its window, goes quiet with a full
+// buffer, and the viewer who wanted the render to keep going watches it stop.
+// `[Playback] NeuralWindowLowWaterSeconds` says the drain point in seconds
+// instead - three minutes by default - and 0 puts the formula back. The mark
+// never rises above the window whatever either says, and a window smaller
+// than the mark simply drains fully before the next chunk starts.
+inline constexpr double kDefaultLowWaterSeconds = 180.0;
+
 inline double WindowLowWater(double windowSeconds, double realtimeRatio,
-                             double coldStartSeconds = kColdStartSeconds)
+                             double coldStartSeconds = kColdStartSeconds,
+                             double lowWaterSeconds = 0.0)
 {
     if (!(windowSeconds > 0.0)) return 0.0;
+    if (lowWaterSeconds > 0.0)
+        return std::clamp(lowWaterSeconds, kStartLead + 1.0, windowSeconds);
     const double ratio = (std::isfinite(realtimeRatio) && realtimeRatio > 0.05) ? realtimeRatio : 1.0;
     return std::clamp(coldStartSeconds + windowSeconds / ratio + 5.0, kStartLead + 1.0, windowSeconds);
 }

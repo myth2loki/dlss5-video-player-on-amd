@@ -84,8 +84,9 @@ private:
         {L"menu.neural_window_off", L"Off \u2014 render the whole video"},
         {L"menu.neural_window_60", L"1:00 ahead"},
         {L"menu.neural_window_90", L"1:30 ahead"},
-        {L"menu.neural_window_120", L"2:00 ahead (default)"},
+        {L"menu.neural_window_120", L"2:00 ahead"},
         {L"menu.neural_window_180", L"3:00 ahead"},
+        {L"menu.neural_window_300", L"5:00 ahead (default)"},
         {L"menu.dlss_upscaling", L"DLSS Upscaling"},
         {L"menu.rtx_vsr_upscaling", L"RTX VSR Upscaling (recommended)"},
         // The keep-up guard (VsrPolicy.h). %s is the quality's menu name.

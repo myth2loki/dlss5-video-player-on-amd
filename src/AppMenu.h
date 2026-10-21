@@ -125,6 +125,7 @@ inline constexpr UINT IDM_NEURAL_WINDOW_60 = 352;
 inline constexpr UINT IDM_NEURAL_WINDOW_90 = 353;
 inline constexpr UINT IDM_NEURAL_WINDOW_120 = 354;
 inline constexpr UINT IDM_NEURAL_WINDOW_180 = 355;
+inline constexpr UINT IDM_NEURAL_WINDOW_300 = 356;
 inline constexpr UINT IDM_ASPECT_FIT = 400;
 inline constexpr UINT IDM_ASPECT_FILL = 401;
 inline constexpr UINT IDM_ASPECT_ONE_TO_ONE = 404;

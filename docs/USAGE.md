@@ -94,16 +94,19 @@ behind playback; `Space` pauses playback rather than the render.
 
 The session's job is the whole video — or the marked range, when the playhead
 sits inside one — but **it renders ahead of the playhead rather than through the
-file**. **DLSS ▸ Render ahead** keeps two minutes of video rendered in front of
+file**. **DLSS ▸ Render ahead** keeps five minutes of video rendered in front of
 you by default: the part before the toggle point is never rendered (unless you
-seek back into it), and the GPU goes quiet about two minutes past where you are
+seek back into it), and the GPU goes quiet about five minutes past where you are
 watching instead of converting a film to its end. Inside that window the stretch
 you are watching comes first and what is left is filled nearest-first; when the
-lookahead has drained to what the next chunk needs to produce — about 50 s at
-720p on this card, 80 s at 1080p, both measured — the next two-minute chunk is
-rendered. Off is the older behaviour — the whole video — and 1:00, 1:30 and 3:00
-are the other rungs; a change applies to the next chunk rather than cancelling
-the job in flight.
+lookahead has drained to three minutes — the mark, not a measured estimate —
+the next five-minute chunk is rendered, so the render keeps working for as long
+as you keep watching. Off is the older behaviour — the whole video — and 1:00,
+1:30, 2:00 and 3:00 are the other rungs; a change applies to the next chunk
+rather than cancelling the job in flight. Both numbers are in the settings file
+and need no dialog: `[Playback] NeuralWindowSeconds` (the window, 300 by
+default; 0 is off) and `[Playback] NeuralWindowLowWaterSeconds` (the drain
+point, 180 by default; 0 asks the measured formula back).
 
 The **Render** chip at the right of the status line measures how much of that
 job is done: rendered video over everything the session set out to render — the
@@ -622,7 +625,7 @@ which is how a payload rewritten at the same size, with its write time put back,
 is still caught.
 
 A plain open asks for the whole-video entry, and only for it; its log line reads
-`range=[0,0)`. A live session publishes an entry per chunk it rendered (120 s of
+`range=[0,0)`. A live session publishes an entry per chunk it rendered (300 s of
 video by default, `[Playback] NeuralWindowSeconds`), and those do not answer that
 request, so the video renders again — expected, not a lost cache. **DLSS >
 Convert & export > Convert whole video to neural video** writes the entry a

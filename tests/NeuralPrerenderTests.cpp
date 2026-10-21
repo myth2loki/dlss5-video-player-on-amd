@@ -5802,6 +5802,28 @@ void live_session_window_renders_whole_chunks_and_holds_at_the_lookahead_test()
     CHECK(live_session::WindowLowWater(120.0,0.6,7.3)==120.0);          // slower than real time
     CHECK(live_session::WindowLowWater(60.0,0.0,7.3)<=60.0);             // unmeasured ratio
 
+    // A hand-set drain point wins over the arithmetic: three minutes by
+    // default, whatever the pace says. This is the case the formula gets
+    // wrong on a card that cannot keep up - it pins the mark at the window,
+    // the session renders its window and goes quiet with a full buffer.
+    CHECK(std::abs(live_session::WindowLowWater(300.0,2.3,5.8,180.0)-180.0)<1e-9);
+    CHECK(std::abs(live_session::WindowLowWater(300.0,0.6,7.3,180.0)-180.0)<1e-9);
+    // 0 keeps the formula, which is how a file that predates the key reads.
+    CHECK(std::abs(live_session::WindowLowWater(300.0,2.3,5.8,0.0)
+                   -live_session::WindowLowWater(300.0,2.3,5.8))<1e-9);
+    // Never above the window, never below the start cushion: a window smaller
+    // than the mark drains fully before the next chunk starts.
+    CHECK(std::abs(live_session::WindowLowWater(120.0,2.3,5.8,180.0)-120.0)<1e-9);
+    CHECK(live_session::WindowLowWater(300.0,2.3,5.8,1.0)>=live_session::kStartLead+1.0);
+    // The default the player reads, and that a hand-edited 300 survives the
+    // snap: a rung the menu cannot show would read back as 180.
+    CHECK(std::abs(live_session::kDefaultWindowSeconds-300.0)<1e-9);
+    CHECK(std::abs(live_session::kDefaultLowWaterSeconds-180.0)<1e-9);
+    double nearest=live_session::kWindowChoices[0];
+    for(const double choice:live_session::kWindowChoices)
+        if(std::abs(choice-300.0)<std::abs(nearest-300.0))nearest=choice;
+    CHECK(std::abs(nearest-300.0)<1e-9);
+
     // The ratio it is priced on has to be the render's own, and the difference
     // is not academic. Measured on a 1920x802 film: the jobs themselves ran at
     // 1.78x while the session AVERAGE - idle between chunks included - decayed
