@@ -992,6 +992,19 @@ std::optional<std::string> Sha256Bytes(std::string_view bytes)
     return HashBytes(bytes);
 }
 
+namespace {
+// How many files this process has actually read end to end. The memo above only
+// pays off if this stops growing across requests, and no assertion on
+// wall-clock time says that as plainly: a test can hash a set twice and check
+// that the second pass read nothing.
+std::atomic<uint64_t> g_sha256FileHashes{0};
+} // namespace
+
+uint64_t Sha256FileHashCount()
+{
+    return g_sha256FileHashes.load(std::memory_order_relaxed);
+}
+
 std::optional<std::string> Sha256File(const std::filesystem::path& path, std::stop_token stop)
 {
     std::error_code error;
@@ -1006,6 +1019,7 @@ std::optional<std::string> Sha256File(const std::filesystem::path& path, std::st
                                     OPEN_EXISTING,
                                     FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (file == INVALID_HANDLE_VALUE) return std::nullopt;
+    g_sha256FileHashes.fetch_add(1, std::memory_order_relaxed);
     Sha256Hasher hasher;
     std::vector<uint8_t> buffer(4 * 1024 * 1024);
     for (;;) {
@@ -1086,11 +1100,17 @@ std::optional<std::string> Sha256FileCached(const std::filesystem::path& path, s
     auto digest = Sha256File(path, stop);
     if (!digest) return digest;
     std::lock_guard lock(mutex);
-    // The locked runtime is thirteen files and the model store adds a listing
-    // of its own, all of which the render identity hashes once per request; a
-    // cap below that set would clear the memo mid-pass and re-read every byte
-    // on the next request in the same process.
-    if (memo.size() >= 256) memo.clear();
+    // One render request hashes the whole identity set of the runtime it renders
+    // with: thirteen files for the locked NVIDIA runtime, but 707 for the AMD
+    // pack (565 MiB of weights and 80 hsaco), plus the 208 the pack's own lock
+    // names. A cap below that set cleared the memo mid-pass and left the tail of
+    // it behind, so the next request in the same process re-read every byte it
+    // had just forgotten - measured at 1.2-2.9 s per job on the AMD backend,
+    // twice in one session. The cap only exists to bound memory: an entry is a
+    // path, six identity fields and a 64-character digest, so 4096 of them cost
+    // a few hundred kilobytes and leave room for both runtimes at once.
+    constexpr size_t kMemoCapacity = 4096;
+    if (memo.size() >= kMemoCapacity) memo.erase(memo.begin());
     memo.emplace_back(key, *digest);
     return digest;
 }

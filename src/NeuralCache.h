@@ -213,9 +213,15 @@ std::optional<std::string> Sha256File(const std::filesystem::path& path,
 // runtime set is hashed three times per session otherwise (226 MB each pass,
 // ~0.5 s). Never use it for user content: a file rewritten with an identical
 // size and timestamp would keep the stale digest.
+// The memo holds the largest identity set a single request hashes - the AMD
+// pack's 707 files - so one request never clears what it is still filling; see
+// kMemoCapacity in the definition.
 std::optional<std::string> Sha256FileCached(const std::filesystem::path& path,
                                             std::stop_token stop = {});
 std::optional<std::string> Sha256Bytes(std::string_view bytes);
+// Files this process has read end to end, for the one assertion the memo above
+// exists to satisfy: a second pass over the same set reads none of them again.
+uint64_t Sha256FileHashCount();
 std::string BuildNeuralCacheKey(const NeuralCacheIdentity& identity);
 // The pipeline term of a render key: what the renderer and the encoder promise
 // about the pixels, as against the source, the geometry and the settings.

@@ -834,10 +834,66 @@ void hash_memo_sees_a_same_size_swap_with_the_write_time_restored_test()
     std::filesystem::remove_all(directory, error);
 }
 
+// One render request hashes a runtime's whole identity set before it can look a
+// cache entry up: thirteen files for the locked NVIDIA runtime, 707 for the AMD
+// pack. A memo that caps below the set clears itself mid-pass, and the next
+// request in the same process re-reads every byte it just forgot - 1.2 to 2.9 s
+// per job on the AMD backend, twice within one session. 300 files is the
+// smallest set that failed under the old 256-entry cap.
+void hash_memo_holds_an_identity_set_larger_than_its_old_cap_test()
+{
+    const auto directory = std::filesystem::temp_directory_path() /
+        (L"RuntimeLockTests-set-" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code error;
+    std::filesystem::remove_all(directory, error);
+    std::filesystem::create_directories(directory, error);
+    CHECK(!error);
+
+    FILETIME now{};
+    GetSystemTimePreciseAsFileTime(&now);
+    const int64_t twoHoursAgo =
+        static_cast<int64_t>((uint64_t{now.dwHighDateTime} << 32) | now.dwLowDateTime) - 7'200'000'000LL;
+
+    std::vector<std::wstring> names;
+    names.reserve(300);
+    for (int index = 0; index < 300; ++index) {
+        std::wstring name = L"weights" + std::to_wstring(index) + L".bin";
+        WriteFile(directory / name, std::string(4096, static_cast<char>('a' + index % 26)));
+        // Only a settled change time is remembered, as an installed runtime's
+        // is; the memo refuses anything written in the last few seconds.
+        const HANDLE file = CreateFileW((directory / name).c_str(),
+                                        FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ, nullptr,
+                                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        CHECK(file != INVALID_HANDLE_VALUE);
+        FILE_BASIC_INFO basic{};
+        CHECK(GetFileInformationByHandleEx(file, FileBasicInfo, &basic, sizeof(basic)) != FALSE);
+        basic.LastWriteTime.QuadPart = twoHoursAgo;
+        basic.ChangeTime.QuadPart = twoHoursAgo;
+        CHECK(SetFileInformationByHandle(file, FileBasicInfo, &basic, sizeof(basic)) != FALSE);
+        CloseHandle(file);
+        names.push_back(std::move(name));
+    }
+
+    const uint64_t before = Sha256FileHashCount();
+    const auto first = BuildRuntimeDigest(directory, names, {});
+    CHECK(first.has_value());
+    const uint64_t hashedOnce = Sha256FileHashCount();
+    // Every file of the set, read once - the size a single request has to hold.
+    CHECK_EQ(hashedOnce - before, uint64_t{300});
+
+    const auto second = BuildRuntimeDigest(directory, names, {});
+    CHECK(second == first);
+    // And the same set again, served entirely from the memo: no file reopened.
+    CHECK_EQ(Sha256FileHashCount(), hashedOnce);
+
+    std::filesystem::remove_all(directory, error);
+}
+
 int wmain()
 {
     parse_accepts_the_lock_shape_and_normalizes_hashes_test();
     hash_memo_sees_a_same_size_swap_with_the_write_time_restored_test();
+    hash_memo_holds_an_identity_set_larger_than_its_old_cap_test();
     parse_rejects_malformed_documents_test();
     parse_rejects_missing_fields_and_wrong_schema_test();
     embedded_lock_parses_and_names_the_locked_runtime_files_test();
