@@ -15,8 +15,13 @@ backend would not exist without their work. See the porting project at
 [github.com/lmxxf/dlss5-on-amd-9070xt-porting](https://github.com/lmxxf/dlss5-on-amd-9070xt-porting).
 
 The AMD backend's neural runtime payload currently ships **`OptiScaler-DLSS5-AMD-0.44`**
-(host DLL `OptScaler-NR-1.13.0-alpha8`); the upgrade is byte-identical to the
-previous payload — see [the runtime package](third_party/lmxxf/README.md).
+(host DLL `OptScaler-NR-1.13.0-alpha8`, ABI `(6, 176)`). Its neural pass is
+bit-exact against 0.43's — ffmpeg reads `psnr = inf` — as long as the custom
+config keeps `DLSS5_MULTI_PASS=2`, because the package's own default is now the
+31-block **Small** model at 0.5x. The two things 0.44 adds to the weights
+(`small/` and `post70-history-head.f16`) are what this build's Small rung and the
+fast-history mode read. See
+[the runtime package](third_party/lmxxf/README.md).
 
 ![The player on an AMD card, whole window: Bumblebee in Split, neural rendering and FSR 4 upscaling on, interpolation on at 48 of 24 fps, a subtitle under the picture, and the render filling in behind the playhead](docs/media/amd/overview.png)
 
@@ -65,12 +70,13 @@ offered on it. It is not a menu choice, because a machine has one of the two.
 | Stages it can run | All three: neural rendering (`nr`), upscaling (`sr`) and frame generation (`fg`). Not NVIDIA's engines: no RTX VSR, no DLSS Super Resolution, no DLSS-G — this backend brings its own |
 | Upscaler | FSR 4 (FidelityFX upscaler 4.1.1), else FSR 1's EASU, else Catmull-Rom, the last two sharpened with CAS. One setting, **DLSS > Upscaled by**, serves the source frames and the interpolated ones alike |
 | Frame generation | FidelityFX frame generation: live at 2x during playback (**Frame Generation during playback**, `Ctrl+Alt+G`, off by default), or a 2x–5x offline conversion (**DLSS > Generate frames**) that writes a new file |
+| Encoder | AMD's `hevc_amf` on the GPU for the two lossy rungs — HEVC 8-bit at QP 18 for Standard, Main10 at QP 16 off the 10-bit capture for High — with libx264 kept as the fallback for an odd frame size or a machine without the encoder. Lossless is FFV1 10-bit on the CPU. `-rc qvbr` refuses to initialise on this driver, so the rungs use constant QP |
 | Input size | The runtime admits up to 1920×1080 by pixel budget. A 1440p or 4K source has to be scaled down before it reaches the runtime |
 | Processing scale | Must be 100%. The runtime returns the frame at the size it was given, so a reduction would be silently ignored; this player refuses instead. The upscaler runs after the model, on the frame it returned |
-| Passes | 1 to 4, stacked, with switches for the later ones only: keep skin tones, predict the third pass instead of running the network, and skip the later passes' block group. Every extra pass is another full network run |
-| Temporal model | The neural pass has none: no guide estimator, so its motion and depth guides are constants and the render is spatial. FSR 4 is a temporal upscaler, but it is handed constants too — no jitter, depth, exposure or motion vectors — so it upsamples the frame as given |
-| Colour | SDR. 10-bit and HDR are not wired on this path |
-| Speed | ≈21 ms a frame end-to-end at 1080p for the neural pass alone, against a 33.3 ms budget at 30 fps. As a whole-video throughput, measured live on an RX 9070 XT: **2.6–2.7× real time at 720p, 1.5× at 1080p-class** (3.2–3.4× and 1.7× while a chunk is actually rendering — the rest is the window idling on purpose), with **zero dropped frames**. Every job pays a cold start of 5.6–8.8 s. [Measured speeds](#render-speed-and-the-render-ahead-window) has the numbers, what they cost, and which of them are measured rather than derived. The upscale's and the interpolation's own cost is unmeasured, and so are 900, 1440 and 4K |
+| Passes | The ladder's first rung is the 0.44 **Small** model at 0.5x — 31 blocks, a differently trained network, single-pass by construction — and 1, 2 and 3 stack the Original 71-block one (the runtime's own F9 ladder), with switches for the later passes only: keep skin tones, predict the third pass instead of running the network, and skip the later passes' block group. Every extra pass is another full network run. 4 is NVIDIA's ladder; this runtime reads a count it does not know as Small, so the player clamps it |
+| Temporal model | Three layers, and the panel owns all three. **The runtime's own temporal mode** (**Neural settings > Temporal mode**: off, fast history, low-frequency EMA, low-frequency + detail) makes the network fuse history. It is off unless the runtime's own config file already set it — the panel migrates that value on first read rather than overwriting a hand edit — and it runs only beside the Original model at one pass: beside Small the runtime renders the Original instead, and above one pass it runs no mode at all and says so in a status line. The panel greys the control out at both of those rungs rather than handing over a pair the runtime would resolve by itself, and the key is read once when the network is built, so a change reaches the next render and a running session keeps the mode it started with. **The guides are no longer constants**: the player runs its own estimator (CPU block matching on a 128x72 grid at 720p, 160x90 at 1080p, 0.8–1.4 ms a frame, no optical flow on an AMD card) and hands the field to the runtime, which is what gives it anything to fuse. **The player's own accumulation** (**Temporal stability**, AMD default Low) then blends the previous output through that same field, so it reprojects instead of smearing. FSR 4 reads the field too: see [Upscaling](#upscaling-and-frame-generation) |
+| Colour | SDR. The cache capture is 8-bit with ordered dither at Standard, and 10-bit at High and Lossless — P010 out of the FP16 history slot, written as HEVC Main10 at High and FFV1 at Lossless — which needs a Temporal stability rung on, because that is where the FP16 slot comes from. HDR is not wired on this path |
+| Speed | **≈10 ms a frame at 720p and ≈21 ms at 1080p** for the neural pass alone — one pass of the Original model with the guide pair on, submit p50 on an RX 9070 XT, of which the network itself is 4.6 and 8.5 ms. That is 4.0x and 1.9x a 24 fps frame's budget before a live session's own decode, present and encode. Every job pays a cold start of **6.9–10.0 s**. [Measured speeds](#render-speed-and-the-render-ahead-window) has the numbers, what they cost, and which of them are measured rather than derived. The upscale's and the interpolation's own cost is unmeasured, and so are 900 and 4K |
 | What it needs | The `amd-neural-runtime/` package (≈600 MiB, not in this repository) beside the module directory, or named by `DLSS5_AMD_RUNTIME_DIR`. For the two newer stages, FidelityFX's `amd_fidelityfx_loader_dx12.dll` beside the exe, with `amd_fidelityfx_upscaler_dx12.dll` and `amd_fidelityfx_framegeneration_dx12.dll` — three files, in the packaged build, that [the notices](docs/THIRD-PARTY-NOTICES.md) list |
 | Add-on, ReShade, `dxgi.dll` | None. This backend loads no proxy and registers no add-on |
 
@@ -81,15 +87,30 @@ with its audio and its duration, and the upscaler takes a 1280x720 source to
 2560x1440 through the tier it starts on. Generated frames were also measured
 frame by frame against the two frames they sit between, which is how the
 brightness strobe in the interpolated cadence was found and then fixed. The
-captures below are a live session's compare views, so `D` has since been driven
-end to end on the same card. Half an hour of continuous playback has now been
-walked through as well — 33 minutes of a 1280x720 film in 120-second chunks,
+capture has been measured at both of its bit depths — P010 at High and Lossless,
+8-bit with the cache's own dither at Standard, 10-bit differing from 8-bit by
+58.37 dB, which is that rounding and nothing else — and the two lossy rungs are
+written on the GPU by `hevc_amf` now (Lossless is still FFV1 on the CPU): 1146
+KiB at 52.07 dB in 775 ms against libx264's 1232 KiB at 51.94 dB in 1430 ms on
+the same 48 frames. The captures below are a
+live session's compare views, so `D` has since been driven end to end on the same
+card. Half an hour of continuous playback has now been walked through as well —
+33 minutes of a 1280x720 film in chunks (120 s each then, five minutes now),
 six published cache entries; each of its three session starts waited 6–7 s for
 its first chunk and then never waited again — and **a cache hit after a session
 is verified**: a reopened source asked for its whole-video entry, the entry
 answered from the record its promotion had written — the payload's size, times
 and file id — rather than reading the payload again (3 ms), and playback opened
 it without rendering a frame.
+
+Opening a source no longer waits for that identity either. The original is opened
+and drawn first, and the identify runs behind it: 72 ms to `Opening local file`
+and 3.8 s to the picture on an 80 MB clip, where the same open used to spend
+15.4 s hashing a 5,004 s film and 707 runtime files before the first frame —
+for an answer that was "nothing in the cache" anyway. What the identify finds is
+a report, not a takeover: a hit stays in hand for the neural switch, and the
+original keeps playing either way, because opening a cached playback starts at
+its own range and would restart the film.
 
 That hit used to be impossible, and the reason was not the one it looked like.
 The runtime's identity digest covered every file in the runtime tree, including
@@ -103,55 +124,76 @@ what was measured, on what, and what was not.
 
 ### Render speed and the render-ahead window
 
-The neural pass is the whole cost, and it is linear in pixels: **≈21 ms a frame
-end-to-end at 1080p** on an RX 9070 XT — 63% of a 30 fps frame's budget spent
-converting, before the player decodes, upscales and presents anything. Two
-resolutions a factor of two apart in pixels confirm it, to within 2%:
+The neural pass is the whole cost, and it is linear in pixels. Measured on an RX
+9070 XT, one pass of the Original model with the guide pair on — the shipped
+default — submit p50 is the frame's guide upload, network evaluate and gate end
+to end:
 
-| | 1280×720 @ 23.976 fps | 1920×966 @ 25 fps |
+| | 1280×720 | 1920×1080 |
 | --- | --- | --- |
-| Pixels | 921,600 | 1,854,720 |
-| Render, first segment to last | **3.18–3.37× real time** | **1.70–1.73× real time** |
-| One 120 s chunk, dispatch to published | **44.3 s and 45.7 s → 2.62–2.71×** | **78.9 s and 79.4 s → 1.51–1.52×** |
-| Buffer left when the next chunk starts | 48.0 s, 50.1 s of the 120 s window | 81.8 s, 82.8 s |
-| Frames dropped once playing | 0 | 0 (2, both in the first second) |
+| Pixels | 921,600 | 2,073,600 |
+| Guide estimator, CPU | 0.8 ms | 1.4 ms |
+| Submit p50 | **10.3 ms** | **21.4 ms** |
+| — of which the network | 4.6 ms | 8.5 ms |
+| A 24 fps frame's budget | 41.7 ms | 41.7 ms |
+| The render alone | **4.0× real time** | **1.9× real time** |
 
-The third row is the one a viewer feels, and it is lower than the second on
-purpose: a chunk also pays its cold start and the join-and-validate step that
-turns its segments into a cache entry, neither of which is render time. Same
-card, same window, 2.0× the pixels costs 1.98× the throughput — the model is
-the pixels and nothing else.
+2.25× the pixels costs 2.08× the frame, and the envelope around the network
+grows with it as well: it is 5.7 ms of 10.3 at 720p and 12.9 of 21.4 at 1080p.
+At 30 fps the same 1080p frame is 1.6× the budget, not 1.9× — 64% of it spent
+converting, before the player decodes, upscales and presents anything.
 
-**What that join-and-validate step costs.** On a 49–73 MB block it took
-996–1653 ms: about 460 ms joining 61 segments and 432–459 ms probing the joined
-file. Segments are 3 s now, so a 120 s block holds 41 and joins in 289–397 ms,
-and the join reports the frame count it muxed through FFmpeg's progress stream,
-so the probe reads a header instead of demuxing and decoding the whole file —
-124–128 ms on real publishes. A block publishes in ≈590–780 ms, on the critical
-path between two chunks. None of it changes what playback shows; the chunk
-times above predate it and shorten by about 0.4 s (≈1%).
+**That envelope used to be four times its size.** The guide field is computed as
+a block-matching grid and was resampled onto the frame before every upload:
+12.6 MB of area averages a frame for motion and 6.3 MB more for depth at
+1920×822. The runtime reads motion at the extent the field declares
+(`motionWidth`/`motionHeight`, and clamps to it), so the grid can travel as
+itself — 57 KB — and the depth expansion, which cannot shrink because the
+kernel indexes the whole texture by the render size, moved from a CPU resample
+to a draw over a 43 KB upload. 1920×822, 96 frames, submit p50:
 
-**Two paces, and they are not the same number.** One is measured from a job's
-first segment to its last: the speed the render itself achieves. The other is
-the session's average, which also counts the time the window spends
-deliberately idle between chunks. On 720p those read 3.18× and **1.25×** at the
-same moment, because a 2.6× GPU only has to render 39% of the time to hold two
-minutes of buffer — a falling average there is the feature working, not the
-card slowing down. The status line's ETA uses the session average, since a
-viewer waiting on the film does experience the idle; the scheduler that decides
-when to start the next chunk uses the render's own pace. Pricing the schedule
-on the average would have forced the mark from 50 s to 108 s of the 120 s
-window, starting every chunk twice as early and doubling the GPU time for an
-identical result.
+| Guide arm | Submit p50 | Real time at 23.976 fps |
+| --- | --- | --- |
+| constant guides (the floor) | 14.78 ms | 2.82× |
+| full-frame motion, CPU depth | 39.06 ms | 1.07× |
+| full-frame motion, GPU depth | 28.78 ms | 1.45× |
+| **grid motion, GPU depth** | **15.08 ms** | **2.77×** |
+
+A live session on the last arm read 16.57 ms p50, rendered its whole 53 s tail
+28 s in, and dropped nothing. The grid field and the frame-extent field it
+replaced agree at 54.50 dB, so the bytes were the only thing lost:
+`DLSS5_AMD_GRID_GUIDES=0` and `DLSS5_AMD_DEPTH_EXPAND=0` restore either
+baseline for an A/B.
+
+**What a chunk adds.** A chunk also pays its cold start and the
+join-and-validate step that turns its segments into a cache entry, neither of
+which is render time. On a 49–73 MB block that step took 996–1653 ms: about
+460 ms joining 61 segments and 432–459 ms probing the joined file. Segments are
+3 s now, so a 120 s block holds 41 and joins in 289–397 ms, and the join reports
+the frame count it muxed through FFmpeg's progress stream, so the probe reads a
+header instead of demuxing and decoding the whole file — 124–128 ms on real
+publishes. A block publishes in ≈590–780 ms, on the critical path between two
+chunks; a five-minute block holds 100 segments and scales with them. None of it
+changes what playback shows.
+
+**Two paces, and they are not the same number.** One is how fast the render
+itself goes: the submit p50 above. The other is the session's average, which
+also counts the time the window spends deliberately idle between chunks. At
+720p those read ≈4× and about **1.2×** on a half-hour film — that second number
+is arithmetic, not a stopwatch: 33 minutes watched plus the five-minute window
+it keeps ahead, over the 33 minutes, is 1.15×, and it is the fall a viewer
+notices as the chip idling on purpose. The status line's ETA uses the session
+average, since a viewer waiting on the film does experience the idle; the
+scheduler that decides when to start the next chunk uses the render's own pace.
+Pricing the schedule on the average would put the drain point at ~260 s of a
+300 s window instead of 180 s, which leaves a chunk no room to overrun.
 
 Every job also pays a **cold start** — helper launch, runtime bring-up, the
-first output — measured at **5.6–8.8 s** end to end, of which 2.5–4.8 s is
-before the first frame comes back, at 720p and at 1080p alike. (Four runs took
-18–20 s; every one of those had waited 12–19 s for the request to be admitted,
-which is a busy player rather than a slower startup.) A window pays that once
-per chunk, which is the whole reason for the next table.
+first output — measured at **6.9–10.0 s** end to end on this card, of which
+4.2 s is before the first frame comes back, at 720p and at 1080p alike. A window
+pays that once per chunk, which is the whole reason for the next table.
 
-**Why the window is 120 seconds.** A chunk costs one cold start plus its own
+**Why the window is five minutes.** A chunk costs one cold start plus its own
 render, so the overhead as a share of a chunk is `S/(S + N/ratio)`, and on this
 card `S × ratio` is about 14 seconds of video at 720p and at 1080p alike — the
 startup slows down in the same proportion the render does:
@@ -160,37 +202,43 @@ startup slows down in the same proportion the render does:
 | --- | --- |
 | 1:00 | 19% |
 | 1:30 | 13% |
-| **2:00** | **10%** |
+| 2:00 | 10% |
 | 3:00 | 7% |
+| **5:00** | **4%** |
 
-120 s is where another minute of window stops buying anything worth the extra
-video rendered past a pause. At 2.6× a 120 s chunk lands in about 45 s of wall
-clock, 6–7 s of it cold start; at 1.5×, 79 s.
+Past two minutes the curve is flat, and the window moved to five for the other
+end of the trade: what a viewer pays for video rendered past a pause is bounded
+by the drain point below, not by the window. At 4× a 300 s chunk lands in about
+75 s of wall clock, 7–10 s of it cold start; at 1.9×, 160 s. **DLSS > Render
+ahead** carries the same five rungs and Off; the drain point is settings-file
+only.
 
 **When the next chunk starts.** The trigger is the buffer, not the playhead:
 the next chunk starts once the lookahead has drained to
-`coldStart + window/ratio + 5` seconds — **48–50 s of a 120 s window at 720p,
-82 s at 1080p-class**. That is derived, not tuned: a chunk needs
-`7.3 + 120/ratio` seconds to produce, and the buffer has to stay above zero for
-exactly that long, so a faster GPU is allowed to sit idle longer. In practice
-the chip's percentage climbs one chunk at a time and playback never waits — the
-two sessions above dropped no frames once they were playing.
+`[Playback] NeuralWindowLowWaterSeconds` — **three minutes by default**, clamped
+to the window whatever it says. That mark is stated rather than derived, and
+deliberately: the formula it replaced priced a chunk's own wall clock
+(`coldStart + window/ratio + 5`), which is right about not starting a refill
+that stalls immediately and wrong about a card that cannot keep up — there it
+pinned the mark at the window itself, the session rendered its window, and the
+render went quiet with a full buffer while the viewer kept watching. Set the
+key to 0 to get the formula back; a window smaller than the mark simply drains
+fully before the next chunk starts.
 
-Two cases break that arithmetic, and both are handled rather than hidden. If a
-chunk overruns — one measured here finished with 31 s of buffer left where its
-mark expected 67 — the next one simply starts later, and coverage keeps landing
-every second or two while it runs, so the buffer grows through a chunk rather
-than draining. And a GPU slower than the video (this card is not, at any
-resolution the runtime admits) has its low-water mark clamped to the window's
-own length, which turns the rule into "render whenever the buffer is not
-full": converting past a pause is better than a session that freezes.
+Two cases still bend it, and both are handled rather than hidden. If a chunk
+overruns — one measured here finished with 31 s of buffer left where its mark
+expected 67 — the next one simply starts later, and coverage keeps landing every
+second or two while it runs, so the buffer grows through a chunk rather than
+draining. And a GPU slower than the video (this card is not, at any resolution
+the runtime admits) renders as soon as the buffer is below the mark, because
+converting past a pause is better than a session that freezes.
 
-**What that costs over a film.** Rendering all of a two-hour film costs about
-45 minutes of GPU at 720p and 80 at 1080p-class, and that is what the old
-default did whether or not anyone was watching. With a 120 s window the render
-follows the playhead: ten minutes watched is ten minutes of video converted —
-under four minutes of GPU at 720p, seven at 1080p-class, plus one cold start
-per two-minute chunk — and nothing beyond the last two minutes is touched.
+**What that costs over a film.** Rendering all of a two-hour film costs about 30
+minutes of GPU at 720p and an hour at 1080p-class, and a session that renders
+ahead of the playhead never spends that. With a five-minute window the
+render follows the viewer: ten minutes watched is ten minutes of video
+converted — about two and a half minutes of GPU at 720p, five at 1080p-class,
+plus two cold starts — and nothing beyond the last five minutes is touched.
 
 ### Upscaling and frame generation
 
@@ -212,6 +260,17 @@ shows — and the upscale happens after the model, on the frame it returned: a
 an export, the Super Resolution stage writes with the same stretch-and-sharpen
 that is the playback chain's last resort, Catmull-Rom then CAS; FSR 4 is the
 playback present, not the export's writer.
+
+**What FSR 4 is fed.** A decoded frame has no camera, so two of the four inputs
+a game supplies are honestly absent: jitter stays zero and exposure stays
+constant at 1.0, because a per-frame jitter with nothing to compensate it is a
+visible wobble and a metered luminance is not the auto-exposure FSR means. The
+other two are measured now. The same estimator that feeds the neural chain hands
+FSR 4 backward motion vectors in output pixels and a [0,1] depth proxy (0 near,
+1 far), so its history reprojects against real motion instead of the identity;
+on a frame the guide pass did not run for — Super Resolution off, or the cascade
+stepped below FSR 4 — the constants come back, and `DLSS5_FSR4_GUIDES=0` puts
+the identity reprojection back for an A/B.
 
 **Frame generation.** Two different things, both FidelityFX's frame generation.
 **Frame Generation during playback** (`Ctrl+Alt+G`, the **Interpolate** pill)
@@ -322,7 +381,10 @@ reader knows where the other one lives.
    has no signed builds to check against, so if you did not build it yourself,
    know where the binary came from.
 3. Open a file (`Ctrl+O`), paste a public YouTube link (`Ctrl+L`), or pick
-   something from **File > Game trailers**.
+   something from **File > Game trailers**. The picture comes up first, and the
+   player works out what the file is — source digest, runtime identity, whether
+   a render of it is already cached — behind the playback rather than in front
+   of it.
 4. Press `D`. It buffers for a few seconds, then plays the render.
 5. The compare bar under the picture switches between DLSS 5, Original, Split,
    Wipe, Difference, Side by side and 2 × 2.
@@ -330,8 +392,9 @@ reader knows where the other one lives.
 
 **File > Recent videos** reopens a video with its render, if the render covers
 the whole video. A live session publishes entries for the chunks it rendered —
-120 s of video each by default, `[Playback] NeuralWindowSeconds` — even one that
-runs to the end leaves a set of them, and none of those answers a plain open:
+five minutes of video each by default, `[Playback] NeuralWindowSeconds` — even
+one that runs to the end leaves a set of them, and none of those answers a plain
+open:
 **DLSS > Convert & export > Convert whole video to neural video** writes the one
 that does.
 
@@ -375,7 +438,13 @@ that does.
   animation, PNG or JPEG for a photo, from the player or the command line. See
   [Save the result](#save-the-result).
 - **Tunes the model.** Change a neural setting (`Ctrl+N`) while paused and that
-  frame re-renders. ~~**DLSS > Processing scale** runs the model at 75% or 50%
+  frame re-renders. On the AMD backend that dialog also carries the three
+  questions this backend adds: which model and how many passes (**Neural
+  passes** — Small at 0.5x, or one to three Original passes), whether the
+  network fuses history at all (**Temporal mode**, the runtime's own key, at the
+  one rung where it can run), and how much of its own output the player's
+  accumulation holds on to (**Temporal stability**). ~~**DLSS > Processing
+  scale** runs the model at 75% or 50%
   of the source, for speed. Where the window shows a video larger than it is,
   NVIDIA's RTX Video Super Resolution upscales it, on by default: it measured
   well above a plain scaler and DLSS Super Resolution on video
@@ -423,8 +492,11 @@ Two ways under **DLSS > Convert & export**, and one from the command line:
   the upscaler that measured best - or on DLSS Super Resolution if you choose
   it under **Upscaler**.~~ On the AMD backend all three stages run too; there the
   Super Resolution stage writes with the player's own stretch-and-sharpen,
-  Catmull-Rom then CAS, and frame generation at 2x to 5x runs on FidelityFX's
-  runtime.
+  Catmull-Rom then CAS, frame generation at 2x to 5x runs on FidelityFX's
+  runtime, and the lossy rungs are written on the GPU by AMD's `hevc_amf` —
+  HEVC 8-bit at QP 18 for Standard, Main10 at QP 16 off the 10-bit capture for
+  High — falling back to libx264 only for an odd frame size or a machine
+  without the encoder. At 3840x2160 the encode alone went 6045 ms → 1569 ms.
 - **From the command line**, `dlss5-convert` runs the same export without
   opening the player, waits for it and shows its progress. Give it files,
   folders or wildcards; this writes `clip-dlss.mkv` beside the input:
@@ -461,7 +533,9 @@ Two ways under **DLSS > Convert & export**, and one from the command line:
   The AMD runtime also has a second, smaller network: `--small-model` runs its
   0.44 Small model (31 blocks at 0.5x, single-pass by construction, so it forces
   `--passes` to 1) instead of the Original 71-block one — a faster pass whose
-  output differs:
+  output differs. It also suspends the runtime's temporal mode, which only runs
+  beside the Original model at one pass; the panel greys that control out under
+  the same rule:
 
   ```bat
   dlss5-convert clip.mp4 --neural-backend amd --preset strong --small-model
@@ -521,9 +595,12 @@ malware. This fork publishes nothing — see [Download](#download).
 ## What's new in 0.28.2
 
 Upstream's release notes for the player this fork is built on. They are about
-the NVIDIA backend, which this fork does not support; the fork itself has no
-release and no version of its own yet, and its changes are the AMD backend above,
-in no numbered release.
+the NVIDIA backend, which this fork does not support. This fork still publishes
+no release, but its tree carries a version: `VERSION` reads **0.29.2**, moved
+there by the AMD backend — 0.28.3 for the guide field, 0.29.0 for the ten-bit
+capture, 0.29.1 for the AMF encoder, 0.29.2 for a receipt wait this backend
+never writes — and its changes are the ones described above, in no numbered
+release.
 
 **0.28.2** (2026-10-04). Neural settings now do what they say, and say what they
 do. Renders made with the default settings are reused.
@@ -670,7 +747,20 @@ how the toggle works, not what every source will gain.
   card](#on-an-amd-card) has its own table, and the rest of this list holds for
   it unless it says otherwise.
 - **Depth is estimated from the picture**, and so is motion on cards without
-  the optical flow engine. Expect some artifacts.
+  the optical flow engine — on an AMD card there is no optical flow, so both come
+  from the player's CPU block matcher, at about 10–12 source pixels a cell.
+  Expect some artifacts at occlusions, on small objects and past either end of
+  its search range.
+- **Ghosting has three sources on this backend, and they are separable.** The
+  player's own accumulation (now reprojected through the guide field; it is Low
+  by default for exactly this reason), frame generation's interpolated
+  midpoints, and FSR 4's history. [Troubleshooting](docs/TROUBLESHOOTING.md#the-amd-render-looks-smeared-or-doubled-ghosting)
+  has the order to switch them off in, one at a time. A guide field that is
+  *wrong* is not a fourth one on the accumulation rung: its trust test compares
+  the source at the reprojected position, so a mis-measured vector closes the
+  gate and loses stability there rather than smearing. FSR 4 has no such test —
+  a bad vector puts its history in the wrong place, which is what
+  `DLSS5_FSR4_GUIDES=0` is for.
 - ~~**DLSS Super Resolution doesn't beat a plain scaler on video.** Against
   bicubic on six clips, it scored lower on all of them. It is built for games;
   use it for its look, not for detail. RTX VSR, the default upscaler, is the
@@ -686,19 +776,21 @@ how the toggle works, not what every source will gain.
   ghosts. Interpolating during playback needs the runtime, and is the cheap way
   to see the effect: nothing is written, and it is the same engine.
 - **An upscale is an upscale, whichever engine writes it.** On the AMD backend
-  FSR 4 is fed constants where a game would feed jitter, depth and motion
-  vectors, so it behaves like a spatial upscaler with a learned filter, and its
-  temporal history can only be as good as a decoded frame allows. FSR 1 and CAS
-  are pure spatial filters. None of the three invents detail the neural pass did
-  not produce — they present that frame larger, with CAS adding edge acutance on
-  the way.
+  FSR 4 has no jitter to work with and a constant exposure — a decoded frame is
+  one fixed sample grid and has no camera — and while it does now reproject
+  against the guide estimator's motion and depth, that field is a block matcher's,
+  not a renderer's: its history can only be as good as a decoded frame and a
+  ten-pixel cell allow. FSR 1 and CAS are pure spatial filters. None of the three
+  invents detail the neural pass did not produce — they present that frame
+  larger, with CAS adding edge acutance on the way.
 - **The two new stages cost time the neural pass did not.** On this backend both
   are extra passes over the same frame, so a machine already near its frame
   budget at 1080p will feel them; the figures in [On an AMD
   card](#on-an-amd-card) measure the neural pass alone.
 - **Save converted video copies the cached render as it is**: 8-bit at the
-  default Standard quality, 10-bit at High or Lossless, without adjustments,
-  upscaling or HDR. Use **Export with DLSS stages** to bake in a larger size.
+  default Standard quality, 10-bit at High or Lossless once a Temporal stability
+  rung is on, without adjustments, upscaling or HDR. Use **Export with DLSS
+  stages** to bake in a larger size.
 - **Not supported:** burning subtitles into an export, a render queue in the
   player (`dlss5-convert` converts a list or a folder in turn), or resuming an
   interrupted render after a restart.
@@ -729,7 +821,8 @@ stages.
 
 - [Build and test](docs/BUILDING.md), [runtime setup](docs/DLSS5_SETUP.md)
 - [Architecture](docs/ARCHITECTURE.md), [technical overview](TECHNICAL_OVERVIEW.md)
-- The AMD backend: [integration plan and status](docs/AMD-LMXXF-INTEGRATION-PLAN-REV2-zh.md) (Chinese), and [the runtime package](third_party/lmxxf/README.md)
+- The AMD backend: [integration plan and status](docs/AMD-LMXXF-INTEGRATION-PLAN-REV2-zh.md) (Chinese), [what the temporal accumulation costs and how it is measured](docs/AMD-TEMPORAL-ACCUMULATION-zh.md), and [the runtime package](third_party/lmxxf/README.md)
+- **Before changing the AMD backend**, read [the pitfalls list](docs/AMD-BACKEND-PITFALLS-zh.md) (Chinese): the shared files that may not be touched, the guide field's units and extents, the runtime config's write order, and the traps that have already cost an afternoon each
 - Hardware test records: the `VERIFICATION-*.md` files in [docs](docs/) — upstream's, on the NVIDIA backend
 - [Contributing](CONTRIBUTING.md): the checks a pull request must pass
 
