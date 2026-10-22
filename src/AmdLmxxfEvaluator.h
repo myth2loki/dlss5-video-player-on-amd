@@ -158,17 +158,15 @@ struct AmdLmxxfEvaluatorConfig {
     // that one asks the runtime to fuse its own model under the lease lifecycle
     // and needs guides, while this one needs nothing from the runtime at all.
     //
-    // No motion estimator is behind it: the pass decides trust from the two
-    // source frames themselves, and this backend hands it a zero motion field, so
-    // it accumulates where the source held still and returns the frame untouched
-    // everywhere else. That is the whole of "P1" in
-    // docs/AMD-TEMPORAL-ACCUMULATION-zh.md, and it is why the default here can be
-    // a rung at all on a backend with no flow at all.
-    //
-    // Off rather than a rung is the struct's own default so that an evaluator
-    // built without saying anything renders the picture it always did; the
-    // caller that wants the default accumulation the backend ships with asks for
-    // it by name (kAmdDefaultStability in AmdLmxxfPolicy.h).
+    // The motion this pass reprojects with is the guide field the runtime is
+    // already given (motion_), copied per frame to its own extent - the player's
+    // CPU matcher on this backend, which has no flow. It was a zero field when
+    // this pass first landed, and a zero field makes the history a same-position
+    // EMA that ghosts on anything that moves; RecordAccumulationMotion now binds
+    // the field and the MotionToUv pair that goes with it. The trust test still
+    // comes from the two source frames, so a wrong vector there means no blend
+    // rather than a wrong blend. Which rung to run is the caller's question, and
+    // the backend's default is kAmdDefaultStability in AmdLmxxfPolicy.h.
     TemporalStability stability{TemporalStability::Off};
 
     // The capture size, when the export asked to upscale (UpscalingTarget's
@@ -456,6 +454,17 @@ private:
     bool RecordTemporalAccumulation(ID3D12GraphicsCommandList* list,
                                     const temporal_stability::Plan& plan,
                                     const FrameIdentity& frame);
+    // The accumulation's own copy of the motion field, at the extent the pass
+    // samples it at. `motion_` carries the field in its top-left corner of a
+    // frame-sized texture - the runtime's own contract - while the pass reads
+    // t2 over the whole of whatever texture is bound, so binding the guide
+    // directly would sample the field's corner as if it were the frame.
+    bool CreateAccumulationMotion();
+    // Fills that copy from `motion_` on `list` and points both accumulate tables
+    // at it. Sets the MotionToUv pair the pass converts a vector with: the field
+    // is sampled over its own extent, so one field texel is 1/extent of the
+    // frame in UV, whatever the frame's size is.
+    bool RecordAccumulationMotion(ID3D12GraphicsCommandList* list);
     // The copy both the plain and the accumulated path end with: `from` into the
     // readback buffer at the frame's own footprint, in `format`.
     void CopyTextureToReadback(ID3D12GraphicsCommandList* list, ID3D12Resource* from,
@@ -593,10 +602,27 @@ private:
     Microsoft::WRL::ComPtr<ID3D12Resource> neuralLinear_;
     Microsoft::WRL::ComPtr<ID3D12Resource> stabilised_;
     // One texel of zero motion. The pass needs a motion texture bound and reads
-    // it as a vector; a zero field is what makes it a filter over the source's
-    // own agreement rather than a motion-compensated one, which is the whole of
-    // what this backend can honestly supply without an estimator.
+    // it as a vector; this is what t2 falls back to when the session has no
+    // guide field at all - no estimator, no directory - so that the pass is a
+    // filter over the source's own agreement rather than a motion-compensated
+    // one. When a field does exist, `accumulateMotion_` is bound instead.
     Microsoft::WRL::ComPtr<ID3D12Resource> zeroMotion_;
+    // The field at the extent the pass samples, R32G32_FLOAT, motionW_ x
+    // motionH_, recreated with the guides when the grid moves. Its contents are
+    // a per-frame copy of `motion_`'s top-left field, so what the pass reprojects
+    // with is the same field the runtime fuses history with - the player's
+    // estimator on AMD, where no optical flow exists - instead of a zero field
+    // that made this a same-position EMA and ghosted everything that moved.
+    Microsoft::WRL::ComPtr<ID3D12Resource> accumulateMotion_;
+    // Which texture the accumulated pass's t2 descriptors currently name. The
+    // heap outlives the resources, and rewriting eighteen descriptors per frame
+    // to say the same thing is what this pointer is for.
+    ID3D12Resource* accumulateMotionOwner_{};
+    // The MotionToUv pair for the texture last bound: 1/extent when it is the
+    // field, zero when it is the one-texel fallback (where the vector it reads is
+    // already zero and the scale would only be multiplying it).
+    float accumulateMotionUvX_{};
+    float accumulateMotionUvY_{};
     temporal_stability::History accumulationHistory_{};
     uint64_t accumulationFrames_{};
 

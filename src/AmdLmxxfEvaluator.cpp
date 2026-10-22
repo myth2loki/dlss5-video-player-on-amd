@@ -889,6 +889,10 @@ bool AmdLmxxfEvaluator::CreateGuideResources(uint32_t motionWidth, uint32_t moti
     queue_->ExecuteCommandLists(1, lists);
     if (!WaitForGpu()) return false;
 
+    // After the fill, because the accumulation's copy is a copy of this texture's
+    // field and needs the extent that was just settled.
+    if (!CreateAccumulationMotion()) return false;
+
     std::string guideSource = "held for the whole run";
     if (!config_.motionGuideDirectory.empty() || !config_.depthGuideDirectory.empty()) {
         guideSource = "initial contents only, rewritten every frame from ";
@@ -907,6 +911,49 @@ bool AmdLmxxfEvaluator::CreateGuideResources(uint32_t motionWidth, uint32_t moti
         std::to_string(config_.depthValue) + ", " + guideSource +
         "; one upload buffer and one texture pair, pointers and sizes fixed for the life of the "
         "session");
+    return true;
+}
+
+bool AmdLmxxfEvaluator::CreateAccumulationMotion()
+{
+    // The heap is rebuilt only when the guides are, and a stale owner pointer into
+    // a released texture is what the comparison in RecordAccumulationMotion must
+    // never be allowed to match.
+    accumulateMotion_.Reset();
+    accumulateMotionOwner_ = nullptr;
+    accumulateMotionUvX_ = 0.0f;
+    accumulateMotionUvY_ = 0.0f;
+    // A pass that does not run has no field to read, and 43 KB is not worth
+    // allocating to prove it.
+    if (config_.stability == TemporalStability::Off) return true;
+    if (!motionW_ || !motionH_)
+        return Refuse("the accumulation's motion field was asked for at a guide extent of zero");
+
+    D3D12_HEAP_PROPERTIES defaultHeap{};
+    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    // The field's own extent, not the frame's: the pass reads t2 over the whole
+    // texture it is given, so the texture has to BE the field. R32G32_FLOAT
+    // rather than the R16G16 the zero field uses, because this one is filled by a
+    // copy out of `motion_` and CopyTextureRegion wants the same format on both
+    // ends - a conversion would need a pass of its own to buy precision nobody
+    // needs on a displacement that is already a float.
+    D3D12_RESOURCE_DESC description{};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    description.Width = motionW_;
+    description.Height = motionH_;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Format = DXGI_FORMAT_R32G32_FLOAT;
+    description.SampleDesc.Count = 1;
+    description.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    // In the state every frame's copy leaves it in, so the first frame's
+    // transition pair describes the truth without a special case for it.
+    if (FAILED(device_->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE, &description,
+                                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                                                IID_PPV_ARGS(accumulateMotion_.GetAddressOf()))))
+        return Refuse("CreateCommittedResource for the accumulation's motion field failed");
+    accumulateMotion_->SetName(L"AMD_Temporal_MotionField");
     return true;
 }
 
@@ -1458,6 +1505,12 @@ void AmdLmxxfEvaluator::TearDown()
     // size it no longer is.
     accumulationHistory_ = {};
     zeroMotion_.Reset();
+    // The accumulation's motion field is sized to the guide extent that just went
+    // away, and its owner pointer names a texture this Reset released.
+    accumulateMotion_.Reset();
+    accumulateMotionOwner_ = nullptr;
+    accumulateMotionUvX_ = 0.0f;
+    accumulateMotionUvY_ = 0.0f;
     stabilised_.Reset();
     neuralLinear_.Reset();
     historySlot_[0].Reset();
@@ -2314,6 +2367,11 @@ bool AmdLmxxfEvaluator::CreateTemporalResources()
         const UINT base = kSrvAccumulateBase + read * kAccumulateTableSize;
         makeView(neuralLinear_.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, base + 0);
         makeView(historySlot_[read].Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, base + 1);
+        // t2 is provisional here: the field it must name is not known until a
+        // frame arrives with one, so RecordAccumulationMotion rewrites this slot
+        // on the first frame and whenever the guide extent moves. Until then the
+        // one-texel zero field is a bound, valid texture, which is what a debug
+        // layer wants to see rather than a null descriptor.
         makeView(zeroMotion_.Get(), DXGI_FORMAT_R16G16_FLOAT, base + 2);
         // t3 is this frame's source and t4 the frame before it. The slot this
         // frame's output goes into is the slot its source goes into, so when the
@@ -2335,7 +2393,7 @@ bool AmdLmxxfEvaluator::CreateTemporalResources()
 
     Log("temporal accumulation " + std::string(TemporalStabilityName(config_.stability)) + " at " +
         std::to_string(width_) + "x" + std::to_string(height_) +
-        ": two FP16 history slots, two source frames, one zero motion field");
+        ": two FP16 history slots, two source frames, motion reprojection from the guide field");
     return true;
 }
 
@@ -2705,6 +2763,76 @@ void AmdLmxxfEvaluator::RecordP010Capture(ID3D12GraphicsCommandList* list, uint3
     copy(chromaPlane_.Get(), chromaReadback_.Get(), chromaFootprint_);
 }
 
+bool AmdLmxxfEvaluator::RecordAccumulationMotion(ID3D12GraphicsCommandList* list)
+{
+    // Which texture the table's t2 ends up naming, and what one of its texels is
+    // worth in UV. The fallback is the one-texel zero field with a zero scale: a
+    // vector of zero times zero is still zero, and a pass that reprojects by
+    // nothing is the honest answer for a session with no field at all.
+    ID3D12Resource* target = zeroMotion_.Get();
+    DXGI_FORMAT format = DXGI_FORMAT_R16G16_FLOAT;
+    float uvX = 0.0f;
+    float uvY = 0.0f;
+
+    if (accumulateMotion_ != nullptr && motion_ != nullptr) {
+        // `motion_` is the runtime's guide and sits in the state its frame info
+        // declares for the whole frame; the copy leaves it there, so the runtime's
+        // own command list - earlier in this same submission - and the next
+        // frame's barriers both still describe it correctly.
+        Transition(list, motion_.Get(), kGuideState, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(list, accumulateMotion_.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION destination{};
+        destination.pResource = accumulateMotion_.Get();
+        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        destination.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION source{};
+        source.pResource = motion_.Get();
+        source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        source.SubresourceIndex = 0;
+        // The field is the top-left motionW_ x motionH_ of the guide, whatever the
+        // guide texture's own size is: that corner is the whole of what the
+        // runtime's kernel reads by index, and it is the whole of what is bound
+        // here.
+        const D3D12_BOX field{0, 0, 0, motionW_, motionH_, 1};
+        list->CopyTextureRegion(&destination, 0, 0, 0, &source, &field);
+        Transition(list, motion_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, kGuideState);
+        Transition(list, accumulateMotion_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        target = accumulateMotion_.Get();
+        format = DXGI_FORMAT_R32G32_FLOAT;
+        // One field texel is one extent-worth of the frame in UV. The stored
+        // vector is a displacement in the field's own pixels - the grid arm scales
+        // it into those, CreateGuideResources says why - so this is the same
+        // normalisation the runtime applies with motion_width, and a field carried
+        // at the frame's extent gets 1/frame out of it either way.
+        uvX = motionW_ ? 1.0f / static_cast<float>(motionW_) : 0.0f;
+        uvY = motionH_ ? 1.0f / static_cast<float>(motionH_) : 0.0f;
+    }
+
+    accumulateMotionUvX_ = uvX;
+    accumulateMotionUvY_ = uvY;
+    if (target == accumulateMotionOwner_) return true;
+    accumulateMotionOwner_ = target;
+
+    // Both tables carry their own copy of t2 - the pass reads one or the other
+    // depending on which history slot it is reading - so the rewrite is the same
+    // view made twice.
+    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+    view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    view.Format = format;
+    view.Texture2D.MipLevels = 1;
+    const D3D12_CPU_DESCRIPTOR_HANDLE srvBase =
+        accumulationSrvHeap_->GetCPUDescriptorHandleForHeapStart();
+    for (UINT read = 0; read < 2; ++read)
+        device_->CreateShaderResourceView(
+            target, &view,
+            OffsetHandle(srvBase, accumulationSrvDescriptorSize_,
+                         kSrvAccumulateBase + read * kAccumulateTableSize + 2));
+    return true;
+}
+
 bool AmdLmxxfEvaluator::RecordTemporalAccumulation(ID3D12GraphicsCommandList* list,
                                                    const temporal_stability::Plan& plan,
                                                    const FrameIdentity& frame)
@@ -2748,6 +2876,12 @@ bool AmdLmxxfEvaluator::RecordTemporalAccumulation(ID3D12GraphicsCommandList* li
                          accumulationSrvDescriptorSize_, kSrvDecode));
     }
 
+    // The pass's motion input: this frame's field, at the extent the pass samples
+    // it at, and the pair of constants that turns one of its texels into UV. Both
+    // are settled immediately before the accumulate draw because both depend on
+    // the extent the guides happened to arrive at.
+    if (!RecordAccumulationMotion(list)) return false;
+
     ID3D12DescriptorHeap* heaps[] = {accumulationSrvHeap_.Get()};
     list->SetDescriptorHeaps(1, heaps);
 
@@ -2760,9 +2894,13 @@ bool AmdLmxxfEvaluator::RecordTemporalAccumulation(ID3D12GraphicsCommandList* li
         accumulationSrvHeap_->GetGPUDescriptorHandleForHeapStart();
 
     // Weight is zero on a reset, where the pass returns the neural pixel before
-    // its first history fetch. Everything else in the block is the rung's own.
+    // its first history fetch. Everything else in the block is the rung's own -
+    // except the first pair, which is this frame's field: one texel of it is
+    // 1/extent of the frame in UV, so the pass's `previous = uv + motion*scale`
+    // lands on the surface the vector names rather than on the same pixel it
+    // started from.
     float constants[8] = {
-        0.0f, 0.0f,  // the motion field is one texel of zero, in texel units
+        accumulateMotionUvX_, accumulateMotionUvY_,
         plan.blend ? blend->historyWeight : 0.0f,
         blend->trustLow,
         blend->trustHigh,
