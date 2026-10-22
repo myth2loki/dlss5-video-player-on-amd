@@ -114,6 +114,20 @@ kGuideState → COPY_SOURCE → 拷贝 → kGuideState
 `kSearch` 二次方缩放，而当前一次 submit 已 ~15ms、网络 3-7ms——实时播不动，只适合离线导出。
 上游那句注释也值得记住：更细的场"on screen it did not"去掉鬼影，这是他们后来转向 FidelityFX 的原因。
 
+### 2.8 场估不出来时，重投影修不了拖影（2026-10-23 复核）
+
+平坦/低纹理画面（渐变背景、纯色墙面、模糊焦外）上，CPU 块匹配**一个向量都不给**。
+`smooth-pan`（渐变 + 柔和亮斑，−3 px/帧）实测每帧场值都是 `min=0 max=0 mean=0`；
+场为零 → `previous = uv` → 又退回"同位置 EMA"，而这类画面同位置差异本来就小、trust 门大开
+——**拖影最容易被看见的地方，恰好是重投影帮不上的地方**。
+
+同一条链上有纹理的素材（`pan`，−10 px/帧）场是 `max=1 mean=0.446`（1 格 = 10 px @720p），
+修好的绑定立刻见效：自身项 0.913→0.972、细节 92.5%→97.9%。
+
+**诊断顺序**：先抓场值分布（`UploadGuides` 里把 `motionValues` 的 min/max/mean 落盘），
+`全零 = 估计器没输出`，不是绑定错、更不是 pass 没跑。这也说明"要不要更准的场"的真正动机
+不是精度而是**覆盖率**：让低纹理区的向量从"没有"变成"有"。
+
 
 ### 3.1 环境变量到不了 runtime
 
@@ -180,6 +194,18 @@ runtime 和播放器都是 **/MT 静态 CRT**，环境变量在进程之间传�
 
 改 `AmdLmxxfEvaluator` / `OfflineNeuralRenderer` 之后只拷播放器 exe = 改动完全不生效，而且看起来像"改了没用"。
 **判断顺序**：先看 `run-fg/neural-runtime/NeuralWorker.exe` 的时间戳，再看日志里有没有新加的那行 `Log(...)`。
+
+**A/B 时尤其致命**（2026-10-23 又踩一次）：两臂只换 `DLSSVideoPlayer.exe`、worker 保持同一个，
+两次渲染必然**逐帧相同**，于是"修复无效"这个错误结论看起来证据确凿——实际是同一个 worker 跑了两遍。
+所以：
+
+- 两套二进制（`NeuralWorker.exe` + `DLSSVideoPlayer.exe`）**成套换**，换完 `md5sum` 两臂各存一份。
+- **看到 A/B 输出逐帧相同，第一反应是"worker 没换"，不是"改动无效"。** 先比
+  `git diff <旧提交> HEAD --stat -- src tests` 看差异落在哪个文件，再确认那个文件属于哪个目标
+  （`AmdLmxxfEvaluator.cpp` → `player_neural` 对象库 → worker）。
+- 加诊断日志时也要认准这个边界：写在 evaluator 里的日志只会在 worker 进程里打印，
+  而 `DLSSVideoPlayer.exe` 是 WIN32 子系统，`fprintf(stderr)` 在管道里可能一个字都看不到——
+  落盘到文件（`F:/tmp/xxx.txt` 追加）最稳。
 
 ### 5.2 重建会自动同步，但手拷后要验
 
