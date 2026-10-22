@@ -380,6 +380,39 @@ player entirely (issue #14). The automatic load above replaces that. To remove
 the add-on, delete `version.dll`, `dlssg_sm86.ini` and
 `dlssg_sm86-THIRD_PARTY_NOTICES.txt` from beside the player.
 
+## The AMD render looks smeared or doubled (ghosting)
+
+Ghosting is a trail of the previous frames left where the picture is moving, and
+on the AMD backend it can come from three places. They are separable in the
+order below, cheapest first.
+
+**1. Temporal stability.** Neural settings > Temporal stability (`[Temporal]
+AmdStability`) blends each frame with the one before it, at 0.30 / 0.50 / 0.70
+of the history for Low / Medium / High. The blend is reprojected by the motion
+field the runtime is given - the player's own CPU block matcher on AMD, since
+the vendor optical-flow library is an NVIDIA component and is not there. A
+vector that is wrong at an occlusion edge is what puts a copy of the previous
+frame in the wrong place. Set the rung to `off` and the pass does not run at
+all; `low` is the least it can move the picture. Before 2026-10-22 the pass was
+bound to a zero field on this backend, which made it a blend of the same screen
+position and ghosted at every rung; that is fixed and High is usable again.
+
+**2. Frame generation (Interpolate).** The generated frame is built from the two
+neural frames around it, and its motion is inferred from their colour - so a
+neural pass that changes a surface's colour from frame to frame (more passes,
+more style) makes that inference worse. Interpolate is also downstream of the
+stability pass, so turning it off cannot fix ghosting that the rung added, and
+turning the rung off cannot fix ghosting the interpolation added. Try them one
+at a time, not both at once, or the result says nothing.
+
+**3. FSR 4 on the source frames.** Its history is reprojected with the same
+field, so a bad vector ghosts there too, and `DLSS5_FSR4_GUIDES=0` (start the
+player with it) makes it reproject by nothing instead - softer, but no trail.
+
+`DLSS5_AMD_GRID_GUIDES=0` is **not** one of these three: it changes the extent
+the field is uploaded to the neural runtime at, which affects the runtime's own
+history fuse and nothing in the player's stability, interpolation or FSR 4.
+
 ## A neural session keeps stopping to buffer
 
 A live session plays rendered frames while the rest is still being rendered, so
