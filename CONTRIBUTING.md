@@ -12,6 +12,10 @@ and the canonical `build-upscaling` commands.
   warning fails the build.
 - Do not commit NVIDIA SDK checkouts, FFmpeg binaries, ReShade binaries, experimental DLSS 5 DLLs or other third-party runtime packages.
 - Keep temporal-resource state transitions explicit and documented.
+- Before touching the AMD backend, read [AMD backend pitfalls](docs/AMD-BACKEND-PITFALLS-zh.md)
+  (Chinese). It is a list of traps already paid for: zero-motion guide bindings, when the
+  runtime config may be written, the evaluator living in `NeuralWorker.exe` rather than the
+  player, the `TTM_GETTEXTW` length limit, and what each ghosting knob does *not* do.
 - Avoid adding a per-frame `WaitGPU()` to the normal playback path.
 - When changing seek/audio lifetime code, test repeated forward/backward seeking.
 - When changing UI strings, add or update the built-in English defaults.
