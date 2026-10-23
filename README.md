@@ -77,7 +77,7 @@ offered on it. It is not a menu choice, because a machine has one of the two.
 | Temporal model | Three layers, and the panel owns all three. **The runtime's own temporal mode** (**Neural settings > Temporal mode**: off, fast history, low-frequency EMA, low-frequency + detail) makes the network fuse history. It is off unless the runtime's own config file already set it — the panel migrates that value on first read rather than overwriting a hand edit — and it runs only beside the Original model at one pass: beside Small the runtime renders the Original instead, and above one pass it runs no mode at all and says so in a status line. The panel greys the control out at both of those rungs rather than handing over a pair the runtime would resolve by itself, and the key is read once when the network is built, so a change reaches the next render and a running session keeps the mode it started with. **The guides are no longer constants**: the player runs its own estimator (CPU block matching on a 128x72 grid at 720p, 160x90 at 1080p, 0.8–1.4 ms a frame, no optical flow on an AMD card) and hands the field to the runtime, which is what gives it anything to fuse. **The player's own accumulation** (**Temporal stability**, AMD default Low) then blends the previous output through that same field, so it reprojects instead of smearing. FSR 4 reads the field too: see [Upscaling](#upscaling-and-frame-generation) |
 | Colour | SDR. The cache capture is 8-bit with ordered dither at Standard, and 10-bit at High and Lossless — P010 out of the FP16 history slot, written as HEVC Main10 at High and FFV1 at Lossless — which needs a Temporal stability rung on, because that is where the FP16 slot comes from. HDR is not wired on this path |
 | Speed | **≈10 ms a frame at 720p and ≈21 ms at 1080p** for the neural pass alone — one pass of the Original model with the guide pair on, submit p50 on an RX 9070 XT, of which the network itself is 4.6 and 8.5 ms. That is 4.0x and 1.9x a 24 fps frame's budget before a live session's own decode, present and encode. Every job pays a cold start of **6.9–10.0 s**. [Measured speeds](#render-speed-and-the-render-ahead-window) has the numbers, what they cost, and which of them are measured rather than derived. The upscale's and the interpolation's own cost is unmeasured, and so are 900 and 4K |
-| What it needs | The `amd-neural-runtime/` package (≈600 MiB, not in this repository) beside the module directory, or named by `DLSS5_AMD_RUNTIME_DIR`. For the two newer stages, FidelityFX's `amd_fidelityfx_loader_dx12.dll` beside the exe, with `amd_fidelityfx_upscaler_dx12.dll` and `amd_fidelityfx_framegeneration_dx12.dll` — three files, in the packaged build, that [the notices](docs/THIRD-PARTY-NOTICES.md) list |
+| What it needs | The `amd-neural-runtime/` package — 325 MiB as a download, 844 MiB unpacked, from this fork's [`lmxxf-<line>` release](https://github.com/myth2loki/dlss5-video-player-on-amd/releases) — beside the module directory or at the root of the checkout, or named by `DLSS5_AMD_RUNTIME_DIR`. For the two newer stages, FidelityFX's `amd_fidelityfx_loader_dx12.dll` beside the exe, with `amd_fidelityfx_upscaler_dx12.dll` and `amd_fidelityfx_framegeneration_dx12.dll` — three files, in the packaged build, that [the notices](docs/THIRD-PARTY-NOTICES.md) list |
 | Add-on, ReShade, `dxgi.dll` | None. This backend loads no proxy and registers no add-on |
 
 Measured on an RX 9070 XT: the player resolves and logs the pack at startup, the
@@ -354,12 +354,17 @@ the picture worse](docs/media/README.md#comparison-stills).
 
 ## Download
 
-**This fork has no releases, and a source zip of it would not run on its own.**
-The AMD runtime package is 600 MiB and is not in this repository, so there is no
-backend in the source tree — the same reason upstream's "Source code" zip won't
-run. Build it: [Build and test](docs/BUILDING.md). For the AMD backend, put the
-`amd-neural-runtime/` package beside the module directory
-([what is in it](third_party/lmxxf/README.md)).
+**A source zip of this fork would not run on its own, and there is no player
+build to download yet.** The AMD runtime package is 325 MiB as a download and
+844 MiB unpacked, and it is not in this repository, so a checkout carries no
+backend until the pack is fetched — the same reason upstream's "Source code" zip
+won't run. This fork publishes the pack as
+[`lmxxf-0.44`](https://github.com/myth2loki/dlss5-video-player-on-amd/releases/tag/lmxxf-0.44);
+the player still has to be built: [Build and test](docs/BUILDING.md), or one
+command that builds and packages it (`build_and_package_amd.bat`). Put the
+unpacked `amd-neural-runtime/` beside the module directory or at the root of the
+checkout ([what is in it](third_party/lmxxf/README.md),
+[how to integrate it](#integrating-the-backend-binaries-without-a-build)).
 
 Upstream publishes signed builds of the NVIDIA version on
 [its releases page](https://github.com/2600th/dlss5-video-player/releases), with
@@ -375,7 +380,8 @@ reader knows where the other one lives.
    new, empty folder first.) On the AMD backend the `amd-neural-runtime/`
    package has to be reachable as well, and the three FidelityFX DLLs — loader,
    upscaler, frame generation — beside the exe for the upscale and the
-   interpolation: see [On an AMD card](#on-an-amd-card).
+   interpolation: see [On an AMD card](#on-an-amd-card) and [integrating the
+   backend binaries](#integrating-the-backend-binaries-without-a-build).
 2. Run `DLSSVideoPlayer.exe`. The player is not code-signed, so Windows may
    say "Windows protected your PC": choose **More info > Run anyway**. This fork
    has no signed builds to check against, so if you did not build it yourself,
@@ -825,6 +831,54 @@ stages.
 - **Before changing the AMD backend**, read [the pitfalls list](docs/AMD-BACKEND-PITFALLS-zh.md) (Chinese): the shared files that may not be touched, the guide field's units and extents, the runtime config's write order, and the traps that have already cost an afternoon each
 - Hardware test records: the `VERIFICATION-*.md` files in [docs](docs/) — upstream's, on the NVIDIA backend
 - [Contributing](CONTRIBUTING.md): the checks a pull request must pass
+
+### Integrating the backend binaries without a build
+
+The AMD backend is two things that have to match. A **runtime pack** —
+`amd-neural-runtime/`: `LmxxfNrRuntime.dll`, 80 HSACO modules for
+`gfx1200`/`gfx1201`, the tiled network weights, the runtime's own shaders and
+`DLSS5-AMD/custom-config.txt` — which is data and never needs compiling. And the
+**code** that drives it: `DLSSVideoPlayer.exe`, `neural-runtime/NeuralWorker.exe`
+and the three FidelityFX DLLs beside it, which is what CMake builds. Both can come
+from outside this repository.
+
+**The pack alone, into a source checkout.** This fork's releases carry the pack
+and nothing else, so a checkout plus this zip is a runnable backend as soon as
+the player is built (`build_and_package_amd.bat`, see
+[Build and test](docs/BUILDING.md)):
+
+```powershell
+$tag    = 'lmxxf-0.44'
+$sha256 = '8965AC8919106EC59E24B21F44F31E534AC026C0895FE7FF4E51AADAC9131C8F'
+Invoke-WebRequest "https://github.com/myth2loki/dlss5-video-player-on-amd/releases/download/$tag/amd-neural-runtime.zip" -OutFile amd-neural-runtime.zip
+if ((Get-FileHash amd-neural-runtime.zip -Algorithm SHA256).Hash -ne $sha256) { throw 'amd-neural-runtime.zip does not match the release digest.' }
+tar -xf amd-neural-runtime.zip -C .    # Windows' bsdtar reads zip; Git Bash's GNU tar does not
+```
+
+325 MiB to download, 844 MiB unpacked, 743 entries. The build does not read it —
+nothing in the CMake graph mentions the tree — so integrating it is a file copy.
+The player finds it by walking up from its own directory: beside the module, one
+level above, two levels above (`src/AmdLmxxfRuntime.cpp`), which is why the root
+of a checkout serves a `build-ninja/` or `run-fg/` executable with no copy of its
+own, and why a packaged build keeps one inside its own folder.
+`DLSS5_AMD_RUNTIME_DIR` overrides the search when you would rather keep the pack
+elsewhere.
+
+**A player build someone else produced.** Unpack it into its own empty folder and
+keep the pieces together. `DLSSVideoPlayer.exe`, `neural-runtime/NeuralWorker.exe`,
+the three FidelityFX DLLs and `amd-neural-runtime/` are one build, not four files
+that can be mixed: the worker carries the evaluator and the offline renderer, so a
+worker from a different build changes what the player renders without saying so —
+the symptom is two builds that look identical frame for frame. `PACKAGE_MANIFEST.txt`
+in the package lists a size and a SHA256 per file; compare it after unpacking, and
+again after replacing any single file.
+
+**Refreshing the pack.** Replace the whole tree; never merge two packs, and do not
+carry `shaders/shader-cache/` across — it is compiled output that the runtime
+regenerates. The first render afterwards is a cold start (6.9–10.0 s, see
+[speed](#render-speed-and-the-render-ahead-window)), and the tag names the pack,
+not the file name: `lmxxf-0.44` and a later line are different tags with the same
+`amd-neural-runtime.zip` inside.
 
 **Reporting a bug:** open an [issue](https://github.com/myth2loki/dlss5-video-player-on-amd/issues)
 in this fork, and say which backend. On AMD, give the GPU, where the runtime
