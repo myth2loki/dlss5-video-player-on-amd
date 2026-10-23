@@ -361,11 +361,62 @@ attests the published zip after checking it against that `.sha256`. A publish
 that failed can be re-run for the same tag from the Actions tab
 (`workflow_dispatch` with the tag as input).
 
+### The AMD neural runtime pack
+
+The AMD backend loads `amd-neural-runtime/`: `LmxxfNrRuntime.dll`, 80 HSACO
+modules for `gfx1200`/`gfx1201`, the tiled network weights, the runtime's own
+shader sources and `DLSS5-AMD/custom-config.txt`. The tree is not in this
+repository (`.gitignore` keeps `/amd-neural-runtime/` out) and it is **not a
+build input** - nothing in the CMake graph reads it. Only two things do: the
+player at run time, and `package_amd_release.ps1`, which copies it into the
+package.
+
+Fetch it from this fork's `lmxxf-<line>` release and unpack it at the repository
+root:
+
+```powershell
+$tag    = 'lmxxf-0.44'
+$zip    = 'amd-neural-runtime.zip'
+$sha256 = '8965AC8919106EC59E24B21F44F31E534AC026C0895FE7FF4E51AADAC9131C8F'
+Invoke-WebRequest "https://github.com/myth2loki/dlss5-video-player-on-amd/releases/download/$tag/$zip" -OutFile $zip
+if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne $sha256) { throw 'amd-neural-runtime.zip does not match the release digest.' }
+tar -xf $zip -C .    # creates ./amd-neural-runtime/; Windows' bsdtar reads zip, Git Bash's GNU tar does not
+```
+
+The asset is 341,283,097 bytes: 743 entries, 844 MiB unpacked. `lmxxf-0.44` is
+the tag the 0.44 line of the AMD backend is built against. The runtime carries
+its own version, so a pack for another line is a different tag rather than a
+different file name - check the tag, not the file name, when refreshing it.
+
+The player resolves the tree in this order (`src/AmdLmxxfRuntime.cpp`):
+`DLSS5_AMD_RUNTIME_DIR`, then `amd-neural-runtime` beside the module directory,
+one level above it, and two levels above it - which is why a `build-ninja/` or
+`run-fg/` executable finds the copy at the repository root without one of its
+own. The layout it needs:
+
+```
+amd-neural-runtime/
+  LmxxfNrRuntime.dll
+  lmxxf-modules/gfx1200/SHA256SUMS   + 40 HSACOs
+  lmxxf-modules/gfx1201/SHA256SUMS   + 40 HSACOs
+  native-game-tiled-assets/          network weights
+  shaders/                           the runtime's own .hlsl sources
+  DLSS5-AMD/custom-config.txt        key/value overrides, read per process
+```
+
+`package_amd_release.ps1` verifies all 80 modules against those two `SHA256SUMS`
+manifests before copying anything (`Runtime modules verified: 80 HSACOs`), so a
+truncated unpack fails there rather than inside the player. Editing
+`DLSS5-AMD/custom-config.txt` needs no rebuild - it is read at run time - but it
+is not part of the neural render cache key either, so clear the cache after
+changing it.
+
 ### The AMD backend's package
 
 The assembler above is the NVIDIA release: it stages single DLLs, so it knows
 nothing about `amd-neural-runtime/`, the several-hundred-megabyte
-`LmxxfNrRuntime` pack the AMD backend loads. That pack has its own assembler,
+`LmxxfNrRuntime` pack the AMD backend loads (see the section above for where
+that pack comes from and how it is verified). That pack has its own assembler,
 and it is the only one of the two that runs on a local AMD build (no tagged
 tree, no hardware JUnit report, no locked NVIDIA inputs):
 
@@ -398,6 +449,25 @@ they are conveyed under (`THIRD_PARTY_LICENSES/ffmpeg.txt`, `ffmpeg-GPL-3.0.txt`
 and SHA-256 first. It is worth the 330 MB: the player links no libav*, so the
 pair is the decoder, the probe and the encoder - a package without them starts
 but opens nothing.
+
+`build_and_package_amd.bat` runs the build and that assembler in one call,
+against the local `build-ninja` tree:
+
+```powershell
+./build_and_package_amd.bat                    # build, then dist/...-amd-win64/ + .zip
+./build_and_package_amd.bat -IncludeFfmpeg     # forwarded to the assembler
+./build_and_package_amd.bat -SkipBuild -NoZip   # assemble what is already built
+./build_and_package_amd.bat -Test              # non-GPU suites first; a failure ships nothing
+```
+
+It reads the toolset and SDK back from the build directory's own
+`CMakeCache.txt` and sets `PATH`, `INCLUDE` and `LIB` itself, so it runs from an
+ordinary shell instead of a Developer prompt - and an incremental build keeps the
+compiler it was configured with rather than the newest one on the machine. It
+also refuses to package when the build did not stage `NeuralWorker.exe`: the
+assembler would otherwise fall back to `run-fg\neural-runtime\NeuralWorker.exe`,
+a worker from a different build that makes two differently built evaluators
+produce identical frames.
 
 
 The documentation stamps (`_Verified against <version> ...`) have to name the
