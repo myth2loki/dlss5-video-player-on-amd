@@ -8,6 +8,7 @@
 - 记录提交：`88f45295e932f5f5f56711b43499d5faa312231a`
 - 目标开发机器：Windows 11 x64，AMD Radeon RX 9070 XT，RDNA 4，`gfx1200` 或 `gfx1201`
 - 文档语言：中文
+- 文档位置：`docs/REALTIME-SUBTITLE-PLAN-zh.md`
 - 本文件用途：作为后续在 Windows 11 + RX 9070 XT 环境继续开发的总设计记录
 
 本文档只记录方案和决策，不表示已有相关功能实现。
@@ -538,6 +539,10 @@ targetLanguage
 翻译不阻塞原文显示。
 
 ## 10. 统一 GPU 资源协调器
+
+详细实现方案见同目录文档：
+
+- `GPU-SCHEDULER-DESIGN-zh.md`
 
 ### 10.1 定位
 
