@@ -6,6 +6,7 @@
 #include "AudioFadePolicy.h"
 #include "AudioTrackPolicy.h"
 #include "SubtitlePolicy.h"
+#include "SubtitleTranslatePolicy.h"
 #include "SourceDigestMemo.h"
 #include "AudioEndpointPolicy.h"
 #include "AudioPassthroughPolicy.h"
@@ -14317,7 +14318,8 @@ void subtitle_menu_lists_off_the_streams_and_the_file_test()
     CHECK(has_menu_entry(entries, L"Load subtitle file…", app_menu::IDM_SUBTITLE_LOAD));
 
     const std::wstring labels[] = {L"1. English - SRT", L"2. French - Styled & Co - ASS"};
-    app_menu::UpdateSubtitles(menu, L"Off", labels, L"File: Film.srt", app_menu::IDM_SUBTITLE_TRACK_FIRST + 1, true);
+    app_menu::UpdateSubtitles(menu, L"Off", labels, L"File: Film.srt", app_menu::IDM_SUBTITLE_TRACK_FIRST + 1,
+                              true, app_menu::IDM_SUBTITLE_MODE_ORIGINAL, true);
     entries.clear();
     collect_menu_entries(menu, entries);
     CHECK(has_menu_entry(entries, L"Off", app_menu::IDM_SUBTITLE_OFF));
@@ -14330,16 +14332,36 @@ void subtitle_menu_lists_off_the_streams_and_the_file_test()
     CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_LOAD, MF_BYCOMMAND) & MF_GRAYED);
 
     // Rebuilt for a source with no streams: the old rows go, the commands stay.
-    app_menu::UpdateSubtitles(menu, L"Off", {}, L"", app_menu::IDM_SUBTITLE_OFF, true);
+    app_menu::UpdateSubtitles(menu, L"Off", {}, L"", app_menu::IDM_SUBTITLE_OFF, true,
+                              app_menu::IDM_SUBTITLE_MODE_ORIGINAL, false);
     entries.clear();
     collect_menu_entries(menu, entries);
     CHECK(!has_menu_entry(entries, labels[0], app_menu::IDM_SUBTITLE_TRACK_FIRST));
     CHECK(!has_menu_entry(entries, L"File: Film.srt", app_menu::IDM_SUBTITLE_FILE));
     CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_OFF, MF_BYCOMMAND) & MF_CHECKED);
     CHECK(has_menu_entry(entries, L"Next subtitles\tV", app_menu::IDM_SUBTITLE_NEXT));
+    // The translation entries are a group of their own, below a separator, so
+    // the track radio above cannot reach them.
+    CHECK(has_menu_entry(entries, L"Original", app_menu::IDM_SUBTITLE_MODE_ORIGINAL));
+    CHECK(has_menu_entry(entries, L"Chinese", app_menu::IDM_SUBTITLE_MODE_CHINESE));
+    CHECK(has_menu_entry(entries, L"Chinese and original", app_menu::IDM_SUBTITLE_MODE_DUAL));
+    CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_ORIGINAL, MF_BYCOMMAND) & MF_CHECKED);
+    // This call was made without an engine, so they are grey rather than absent.
+    CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_CHINESE, MF_BYCOMMAND) & MF_GRAYED);
     const HMENU popup = app_menu::FindMenuContainingCommand(menu, app_menu::IDM_SUBTITLE_OFF);
     CHECK(popup != nullptr);
-    if (popup) CHECK_EQ(8, GetMenuItemCount(popup));
+    if (popup) CHECK_EQ(12, GetMenuItemCount(popup));
+
+    // With the engine installed the three modes become selectable, and only one
+    // of them is checked: the choice is exclusive.
+    app_menu::UpdateSubtitles(menu, L"Off", labels, L"File: Film.srt", app_menu::IDM_SUBTITLE_TRACK_FIRST,
+                              true, app_menu::IDM_SUBTITLE_MODE_DUAL, true);
+    CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_DUAL, MF_BYCOMMAND) & MF_GRAYED);
+    CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_DUAL, MF_BYCOMMAND) & MF_CHECKED);
+    CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_ORIGINAL, MF_BYCOMMAND) & MF_CHECKED);
+    CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_CHINESE, MF_BYCOMMAND) & MF_CHECKED);
+    // Still one radio group with the track choice above: the track is checked too.
+    CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_TRACK_FIRST, MF_BYCOMMAND) & MF_CHECKED);
     DestroyMenu(menu);
 }
 
@@ -16002,6 +16024,218 @@ void nvenc_direct_hand_off_matroska_is_laid_out_as_ebml_test()
     CHECK(!std::filesystem::exists(path));
 }
 
+// ---- Translation of a subtitle track -----------------------------------------
+
+// The cues the translator works on come out of an SRT file, whatever the source
+// stream was: ffmpeg converts ASS, mov_text and WebVTT to SRT and loses the
+// typesetting, which is right - the translation is made from the words.
+void subtitle_translate_reads_cues_out_of_srt_and_vtt_test()
+{
+    namespace st = subtitle_translate;
+    // BOM, CRLF, numbering, and VTT's settings after the end timestamp.
+    const std::string file =
+        "\xEF\xBB\xBF" "1\r\n"
+        "00:00:01,200 --> 00:00:03,000\r\n"
+        "\xE3\x81\x82\r\n"
+        "\r\n"
+        "2\r\n"
+        "00:00:03.500 --> 00:00:05.000 align:start position:50%\r\n"
+        "b\r\n"
+        "c\r\n"
+        "\r\n"
+        "3\r\n"
+        "00:00:06,000 --> 00:00:07,000\r\n"
+        "\r\n";
+    const auto cues = st::ParseSrt(file);
+    REQUIRE(cues.size() == 2);  // the third block has no text
+    CHECK_EQ(1.2, cues[0].start);
+    CHECK_EQ(3.0, cues[0].end);
+    CHECK_EQ(std::string("\xE3\x81\x82"), cues[0].text);
+    CHECK_EQ(3.5, cues[1].start);  // a dot separator, as WebVTT writes it
+    CHECK_EQ(5.0, cues[1].end);    // the settings are not part of the timestamp
+    CHECK_EQ(std::string("b\nc"), cues[1].text);
+    CHECK(!cues[0].Translated());
+
+    // A block without a timing line is skipped rather than misread, and an
+    // empty file is not an error.
+    CHECK_EQ(size_t{1}, st::ParseSrt("garbage\n\n1\n00:00:01,000 --> 00:00:02,000\nok\n").size());
+    CHECK(st::ParseSrt("").empty());
+    // Fraction digits mean milliseconds, so "5" is 500 ms and not 5 ms.
+    CHECK_EQ(1.5, st::ParseTimestamp("00:00:01,5"));
+    CHECK_EQ(0.0, st::ParseTimestamp("not a time"));
+}
+
+// One ASS file carries both languages: the translation above, the source below,
+// switched by \r between events of the same Dialogue line. That is what lets the
+// player show two languages without a second overlay.
+void subtitle_translate_builds_one_dual_ass_track_test()
+{
+    namespace st = subtitle_translate;
+    std::vector<st::Cue> cues(2);
+    cues[0].start = 1.2;
+    cues[0].end = 3.0;
+    cues[0].text = "a{b";       // a brace must not become an override tag
+    cues[0].translation = "\xE7\x94\xB2";  // 甲
+    cues[1].start = 4.0;
+    cues[1].end = 5.0;
+    cues[1].text = "only-source";  // the model has not answered for this one
+    const st::Layout layout;
+
+    const std::string dual = st::BuildAss(cues, st::Mode::Dual, layout, 1920, 1080);
+    REQUIRE(!dual.empty());
+    CHECK(dual.find("PlayResX: 1920") != std::string::npos);
+    CHECK(dual.find("PlayResY: 1080") != std::string::npos);
+    // Centiseconds, not milliseconds: ASS has no third decimal.
+    CHECK(dual.find("Dialogue: 0,0:00:01.20,0:00:03.00,Dual,,0,0,0,,") != std::string::npos);
+    // Translation, a blank line for spacing, then the source.
+    CHECK(dual.find("{\\rZh}\xE7\x94\xB2\\N{\\fs18}\\h\\N{\\rSrc}a\\{b") != std::string::npos);
+    // A cue with no translation shows its source line rather than nothing, so a
+    // half-finished track never leaves the screen blank.
+    CHECK(dual.find("{\\rSrc}only-source") != std::string::npos);
+    // Both styles are declared, and the file is one Event per cue.
+    CHECK(dual.find("Style: Zh,") != std::string::npos);
+    CHECK(dual.find("Style: Src,") != std::string::npos);
+
+    // Translation-only keeps the same fallback; Source ignores translations.
+    const std::string translated = st::BuildAss(cues, st::Mode::Translation, layout, 1920, 1080);
+    CHECK(translated.find("{\\rZh}\xE7\x94\xB2") != std::string::npos);
+    CHECK(translated.find("only-source") != std::string::npos);
+    const std::string source = st::BuildAss(cues, st::Mode::Source, layout, 1920, 1080);
+    CHECK(source.find("\xE7\x94\xB2") == std::string::npos);
+    CHECK(source.find("only-source") != std::string::npos);
+
+    // Nothing to draw is reported as an empty file, never as a blank one the
+    // caller would swap in over a track that works.
+    CHECK(st::BuildAss(cues, st::Mode::Off, layout, 1920, 1080).empty());
+    CHECK(st::BuildAss({}, st::Mode::Dual, layout, 1920, 1080).empty());
+    CHECK(st::BuildAss(cues, st::Mode::Dual, layout, 0, 0).empty());
+}
+
+// TranslateGemma's own template wants a structured content item carrying the two
+// language codes, which llama.cpp's OpenAI endpoint cannot express. The
+// instruction is therefore reproduced as text - copied from the template's text
+// branch, because that is the wording the model was trained to answer.
+void subtitle_translate_prompt_matches_the_models_template_test()
+{
+    namespace st = subtitle_translate;
+    const std::string prompt = st::OfficialPrompt("\xE3\x83\x86");  // テ
+    CHECK(prompt.starts_with("You are a professional Japanese (ja) to Chinese (zh-Hans) translator."));
+    CHECK(prompt.find("while adhering to Chinese grammar, vocabulary, and cultural sensitivities.") !=
+          std::string::npos);
+    CHECK(prompt.find("Produce only the Chinese translation, without any additional explanations or "
+                      "commentary.") != std::string::npos);
+    // Three newlines between the instruction and the text, as the template has.
+    CHECK(prompt.ends_with(":\n\n\n\xE3\x83\x86"));
+
+    // The target language is a knob, and it reaches the wording.
+    st::Languages french;
+    french.targetName = "French";
+    french.targetCode = "fr";
+    const std::string toFrench = st::OfficialPrompt("x", french);
+    CHECK(toFrench.find("Japanese (ja) to French (fr) translator") != std::string::npos);
+    CHECK(toFrench.find("Produce only the French translation") != std::string::npos);
+}
+
+// What the model answers, as a subtitle line. It obeys "produce only the
+// translation" almost always; these are the shapes it produced in the slice.
+void subtitle_translate_cleans_what_the_model_answers_test()
+{
+    namespace st = subtitle_translate;
+    const std::string text = "\xE4\xBD\xA0\xE5\xA5\xBD\xE3\x80\x82";  // 你好。
+    CHECK_EQ(text, st::CleanTranslation("  " + text + " \r\n"));
+    CHECK_EQ(text, st::CleanTranslation("\"" + text + "\""));
+    CHECK_EQ(text, st::CleanTranslation("\xE2\x80\x9C" + text + "\xE2\x80\x9D"));
+    // A model that numbers the line it was given.
+    CHECK_EQ(text, st::CleanTranslation("1. " + text));
+    CHECK_EQ(text, st::CleanTranslation("12\xE3\x80\x81" + text));  // "12、"
+    // A stray turn marker is not part of the subtitle.
+    CHECK_EQ(text, st::CleanTranslation(text + "<end_of_turn>\nanything"));
+    // A bare number is the translation, not a list index: stripping it would
+    // turn a year into an empty line.
+    CHECK_EQ(std::string("2019"), st::CleanTranslation("2019"));
+    CHECK(st::CleanTranslation("   ").empty());
+}
+
+// An interrupted translation leaves what it finished behind, and the next run
+// picks it up instead of asking the engine again.
+void subtitle_translate_resumes_where_the_last_run_stopped_test()
+{
+    namespace st = subtitle_translate;
+    std::vector<st::Cue> cues(3);
+    cues[0].start = 1.0; cues[0].end = 2.0; cues[0].text = "a";
+    cues[1].start = 5.0; cues[1].end = 6.0; cues[1].text = "b";
+    cues[2].start = 9.0; cues[2].end = 10.0; cues[2].text = "c";
+
+    // What a run that stopped after two cues would have written.
+    std::vector<st::Cue> saved(2);
+    saved[0].start = 1.0; saved[0].text = "甲";
+    saved[1].start = 5.0; saved[1].text = "乙";
+
+    CHECK_EQ(size_t{2}, st::ApplySavedTranslations(cues, saved));
+    CHECK_EQ(std::string("甲"), cues[0].translation);
+    CHECK_EQ(std::string("乙"), cues[1].translation);
+    CHECK(cues[2].translation.empty());  // still to translate
+
+    // Applying again restores nothing: the cues already have their answer.
+    CHECK_EQ(size_t{0}, st::ApplySavedTranslations(cues, saved));
+
+    // A start time 10 ms off is the same cue; a second off is a different edit.
+    // Not `near`/`far`: those are empty macros in the Windows headers, so
+    // `near[0]` would expand to `[0]`.
+    std::vector<st::Cue> close(1);
+    close[0].start = 1.01;
+    const std::vector<st::Cue> exact(1, saved[0]);
+    CHECK_EQ(size_t{1}, st::ApplySavedTranslations(close, exact));
+    std::vector<st::Cue> distant(1);
+    distant[0].start = 2.0;
+    CHECK_EQ(size_t{0}, st::ApplySavedTranslations(distant, exact));
+
+    // Nothing saved is not an error.
+    std::vector<st::Cue> fresh(1);
+    fresh[0].start = 1.0;
+    CHECK_EQ(size_t{0}, st::ApplySavedTranslations(fresh, {}));
+}
+
+// The size a line of Chinese needs on screen. Measured on the staged FFmpeg's
+// libass with DirectWrite: ten full-width characters at Fontsize 100 are 748 px,
+// so a glyph advances 0.748 of the size. A budget that assumes one em per
+// character puts the wrap point a third too far out.
+void subtitle_translate_wrap_budget_matches_the_measurement_test()
+{
+    namespace st = subtitle_translate;
+    CHECK_EQ(0.748, st::kAdvancePerPoint);
+    const st::Layout layout;
+    // 1760 usable / (0.748 * 62) = 37.9, so 37 whole characters fit.
+    CHECK_EQ(size_t{37}, st::CharsPerLine(1920, layout, 62));
+    CHECK_EQ(size_t{56}, st::CharsPerLine(1920, layout, 42));
+    // Half the canvas is not half the budget: the margins do not shrink with it,
+    // so 800 usable / 46.376 leaves 17 whole characters, not 18.
+    CHECK_EQ(size_t{17}, st::CharsPerLine(960, layout, 62));
+    CHECK_EQ(size_t{0}, st::CharsPerLine(0, layout, 62));
+    CHECK_EQ(size_t{0}, st::CharsPerLine(1920, layout, 0));
+}
+
+// A translated track is cached under a key that changes with everything the
+// translation depends on, and with nothing else.
+void subtitle_translate_cache_key_tracks_what_the_translation_depends_on_test()
+{
+    namespace st = subtitle_translate;
+    const std::string key = st::CacheKey("film.mkv|123|456", "s:0", "model.gguf");
+    CHECK_EQ(size_t{16}, key.size());
+    CHECK_EQ(key, st::CacheKey("film.mkv|123|456", "s:0", "model.gguf"));
+    // A different stream, model, target language or prompt wording is a
+    // different translation: none of them may read the other's file.
+    CHECK(key != st::CacheKey("film.mkv|123|456", "s:1", "model.gguf"));
+    CHECK(key != st::CacheKey("film.mkv|123|456", "s:0", "other.gguf"));
+    CHECK(key != st::CacheKey("film.mkv|123|999", "s:0", "model.gguf"));
+    st::Languages french;
+    french.targetCode = "fr";
+    CHECK(key != st::CacheKey("film.mkv|123|456", "s:0", "model.gguf", french));
+    // Field boundaries are part of the key: moving a character across one is
+    // not the same input.
+    CHECK(st::CacheKey("ab", "c", "d") != st::CacheKey("a", "bc", "d"));
+}
+
 constexpr test_support::TestCase kCases[] = {
     TEST_CASE(harness_isolates_a_failing_case_from_the_ones_after_it_test),
     TEST_CASE(runtime_shutdown_releases_player_before_media_foundation_and_com_test),
@@ -16364,6 +16598,13 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(subtitle_command_lines_escape_paths_for_both_filtergraph_parsers_test),
     TEST_CASE(subtitle_timing_follows_the_clock_and_the_delay_test),
     TEST_CASE(subtitle_canvas_bounds_hold_every_drawn_pixel_test),
+    TEST_CASE(subtitle_translate_reads_cues_out_of_srt_and_vtt_test),
+    TEST_CASE(subtitle_translate_builds_one_dual_ass_track_test),
+    TEST_CASE(subtitle_translate_prompt_matches_the_models_template_test),
+    TEST_CASE(subtitle_translate_cleans_what_the_model_answers_test),
+    TEST_CASE(subtitle_translate_resumes_where_the_last_run_stopped_test),
+    TEST_CASE(subtitle_translate_wrap_budget_matches_the_measurement_test),
+    TEST_CASE(subtitle_translate_cache_key_tracks_what_the_translation_depends_on_test),
     TEST_CASE(subtitle_choice_round_trips_through_the_settings_file_test),
     TEST_CASE(youtube_helper_refusals_each_say_which_one_happened_test),
     TEST_CASE(source_digest_is_computed_once_per_file_and_never_survives_a_change_test),

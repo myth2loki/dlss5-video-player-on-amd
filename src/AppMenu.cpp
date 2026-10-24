@@ -103,6 +103,14 @@ HMENU CreateMenuBar(const Localizer& localizer, bool youtubeAvailable)
     addGrayed(IDM_SUBTITLE_EARLIER, L"menu.subtitles_earlier");
     addGrayed(IDM_SUBTITLE_LATER, L"menu.subtitles_later");
     addGrayed(IDM_SUBTITLE_DELAY_RESET, L"menu.subtitles_delay_reset");
+    // What is drawn: the track itself, or a translation of it. A group of its
+    // own below a separator, so the track radio above cannot reach it.
+    AppendMenuW(subtitles, MF_SEPARATOR, 0, nullptr);
+    addGrayed(IDM_SUBTITLE_MODE_ORIGINAL, L"menu.subtitles_mode_original");
+    addGrayed(IDM_SUBTITLE_MODE_CHINESE, L"menu.subtitles_mode_chinese");
+    addGrayed(IDM_SUBTITLE_MODE_DUAL, L"menu.subtitles_mode_dual");
+    CheckMenuRadioItem(subtitles, IDM_SUBTITLE_MODE_ORIGINAL, IDM_SUBTITLE_MODE_DUAL,
+                       IDM_SUBTITLE_MODE_ORIGINAL, MF_BYCOMMAND);
     CheckMenuRadioItem(subtitles, 0, 0, 0, MF_BYPOSITION);
     AppendMenuW(play, MF_POPUP, reinterpret_cast<UINT_PTR>(subtitles),
                 localizer.Get(L"menu.subtitles").c_str());
@@ -492,7 +500,8 @@ void UpdateAudioTracks(HMENU menuBar, std::span<const std::wstring> labels, int 
 }
 
 void UpdateSubtitles(HMENU menuBar, const std::wstring& offLabel, std::span<const std::wstring> trackLabels,
-                     const std::wstring& fileLabel, UINT chosen, bool loaded)
+                     const std::wstring& fileLabel, UINT chosen, bool loaded, UINT modeCommand,
+                     bool translationEnabled)
 {
     HMENU menu=find_menu_containing_command(menuBar,IDM_SUBTITLE_OFF);
     if(!menu)return;
@@ -527,6 +536,13 @@ void UpdateSubtitles(HMENU menuBar, const std::wstring& offLabel, std::span<cons
     CheckRadioCommand(menuBar,IDM_SUBTITLE_OFF,last,chosen);
     for(const UINT command:{IDM_SUBTITLE_NEXT,IDM_SUBTITLE_LOAD,IDM_SUBTITLE_EARLIER,IDM_SUBTITLE_LATER,IDM_SUBTITLE_DELAY_RESET})
         EnableMenuItem(menu,command,MF_BYCOMMAND|enabled);
+    // Translating needs something to translate and something to translate with.
+    const UINT modesEnabled=(loaded&&translationEnabled)?MF_ENABLED:MF_GRAYED;
+    EnableMenuItem(menu,IDM_SUBTITLE_MODE_ORIGINAL,MF_BYCOMMAND|modesEnabled);
+    EnableMenuItem(menu,IDM_SUBTITLE_MODE_CHINESE,MF_BYCOMMAND|modesEnabled);
+    EnableMenuItem(menu,IDM_SUBTITLE_MODE_DUAL,MF_BYCOMMAND|modesEnabled);
+    CheckMenuRadioItem(menu,IDM_SUBTITLE_MODE_ORIGINAL,IDM_SUBTITLE_MODE_DUAL,
+                       modeCommand?modeCommand:IDM_SUBTITLE_MODE_ORIGINAL,MF_BYCOMMAND);
 }
 
 bool RoutesToRehook(PlayerCommandRoute route, UINT value)

@@ -111,3 +111,6 @@ site/dist/
 # The guide dumps an A/B of the AMD estimator writes: one .pfm per frame per arm,
 # in a directory per arm. Same family as the PNGs above, same reason.
 /amd-lmxxf-pan-guides-*/
+
+# Translation engine + GGUF (downloaded on first use, ~2.7 GB)
+/translation/

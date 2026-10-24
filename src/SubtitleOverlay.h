@@ -96,7 +96,14 @@ public:
     std::optional<subtitle::Discovery> TakeDiscovery();
 
     // Draws `source` on `canvas` from subtitle time `at`.
-    void Show(const Source& source, const Canvas& canvas, double at);
+    //
+    // `keepFrames` is for a track that is being rewritten under the same timing -
+    // a translation arriving cue by cue. Replacing the source outright clears
+    // every frame read so far, which is right when the viewer picked something
+    // else and wrong when the new file says the same thing with more words: the
+    // screen would go blank until the new child drew its first frame. Kept
+    // frames stay on screen and the new child's first frame takes over.
+    void Show(const Source& source, const Canvas& canvas, double at, bool keepFrames = false);
     // The clock jumped to `at`. Frames already read answer it when they can
     // (subtitle::QueueAnswers); otherwise the child starts over there.
     void Seek(double at);
@@ -158,6 +165,9 @@ private:
     Phase m_phase = Phase::Idle;
 
     std::deque<std::shared_ptr<const subtitle::Frame>> m_frames;
+    // A hot-reloaded track has been asked for but has not drawn yet; its first
+    // frame is what replaces the frames still on screen.
+    bool m_handOverPending = false;
     bool m_ended = false;
     double m_consumedAt = 0.0;
 

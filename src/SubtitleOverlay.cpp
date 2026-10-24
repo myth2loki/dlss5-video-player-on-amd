@@ -136,7 +136,7 @@ std::optional<subtitle::Discovery> SubtitleOverlay::TakeDiscovery()
     return taken;
 }
 
-void SubtitleOverlay::Show(const Source& source, const Canvas& canvas, double at)
+void SubtitleOverlay::Show(const Source& source, const Canvas& canvas, double at, bool keepFrames)
 {
     {
         std::lock_guard lock(m_mutex);
@@ -150,7 +150,14 @@ void SubtitleOverlay::Show(const Source& source, const Canvas& canvas, double at
         m_startAt = std::max(0.0, at);
         m_consumedAt = at;
         ++m_generation;
-        m_frames.clear();
+        // A keep-frames swap has the same timing, so what is already on screen is
+        // still correct for this moment; it stays until the new child draws.
+        if (keepFrames && m_showing) {
+            m_handOverPending = true;
+        } else {
+            m_frames.clear();
+            m_handOverPending = false;
+        }
         m_ended = false;
         InterruptLocked(!sameSource);
     }
@@ -172,6 +179,7 @@ void SubtitleOverlay::Seek(double at)
         m_startAt = std::max(0.0, at);
         ++m_generation;
         m_frames.clear();
+        m_handOverPending = false;
         m_ended = false;
         InterruptLocked(false);
     }
@@ -186,6 +194,7 @@ void SubtitleOverlay::Hide()
         m_showing = false;
         ++m_generation;
         m_frames.clear();
+        m_handOverPending = false;
         m_ended = false;
         InterruptLocked(true);
     }
@@ -636,6 +645,10 @@ void SubtitleOverlay::RunSession(uint64_t generation)
         last = frame;
         std::lock_guard lock(m_mutex);
         if (generation != m_generation) break;
+        if (m_handOverPending) {
+            m_frames.clear();
+            m_handOverPending = false;
+        }
         m_frames.push_back(std::move(frame));
         // Frames already behind the one on screen are never shown again.
         size_t shown = 0;
@@ -648,6 +661,15 @@ void SubtitleOverlay::RunSession(uint64_t generation)
     m_phase = Phase::Idle;
     if (generation != m_generation || m_stop) return;
     m_ended = true;
+    if (m_handOverPending) {
+        // The reloaded track never drew. It has the SAME timing as the one on
+        // screen - that is what makes a reload a reload - so the frames already
+        // up are still correct for this moment and are far better than a blank
+        // screen nobody will re-request. The flag goes so that a later frame is
+        // not mistaken for the hand-over.
+        m_handOverPending = false;
+        LOG("Subtitles: the replacement track drew nothing; keeping the frames already on screen.");
+    }
     const DWORD code = session.ExitCode();
     if (failed || (code != 0 && code != STILL_ACTIVE)) {
         std::string tail;

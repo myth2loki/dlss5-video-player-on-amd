@@ -59,6 +59,11 @@ inline constexpr UINT IDM_SUBTITLE_NEXT = 249;
 inline constexpr UINT IDM_SUBTITLE_EARLIER = 250;
 inline constexpr UINT IDM_SUBTITLE_LATER = 251;
 inline constexpr UINT IDM_SUBTITLE_DELAY_RESET = 252;
+// What is drawn: the track as it is, or the same track translated. A separate
+// radio group from the track choice, because they answer different questions.
+inline constexpr UINT IDM_SUBTITLE_MODE_ORIGINAL = 253;
+inline constexpr UINT IDM_SUBTITLE_MODE_CHINESE = 254;
+inline constexpr UINT IDM_SUBTITLE_MODE_DUAL = 255;
 inline constexpr UINT IDM_NEURAL_RENDERING = 300;
 inline constexpr UINT IDM_REHOOK = 301;
 inline constexpr UINT IDM_VIEW_FINAL = 302;
@@ -241,8 +246,12 @@ void UpdateAudioTracks(HMENU menuBar, std::span<const std::wstring> labels, int 
 // Playback > Subtitles: rebuilds the radio group at the top of the popup - Off,
 // one row per subtitle stream, and `fileLabel`'s row when a file is loaded -
 // checks `chosen` (one of those commands), and enables the rest for `loaded`.
+// The translation entries below the last separator are a radio group of their
+// own: `modeCommand` is which of the three is checked, and they are enabled only
+// when the engine is installed and there is a track it could translate.
 void UpdateSubtitles(HMENU menuBar, const std::wstring& offLabel, std::span<const std::wstring> trackLabels,
-                     const std::wstring& fileLabel, UINT chosen, bool loaded);
+                     const std::wstring& fileLabel, UINT chosen, bool loaded, UINT modeCommand,
+                     bool translationEnabled);
 HMENU CreateDebugViewMenu(UINT selectedCommand);
 bool RoutesToRehook(PlayerCommandRoute route, UINT value);
 // Shows, relabels or removes the right-justified update item in the menu bar.

@@ -41,6 +41,7 @@
 #include "StrictJson.h"
 #include "AudioPlayer.h"
 #include "SubtitleOverlay.h"
+#include "SubtitleTranslator.h"
 #include "Localization.h"
 #include "AppMenu.h"
 #include "UiLayout.h"
@@ -3672,6 +3673,10 @@ private:
         m_subtitles.Hide();
         if(m_renderer)m_renderer->SetSubtitleOverlay(nullptr,0,0);
         m_subtitleFrame.reset();
+        // A translation belongs to the source it was made from.
+        if(m_translator)m_translator->Cancel();
+        m_translatedTrack.clear();m_translateRequestedKey.clear();
+        m_translateSeenState=subtitle_translate::State::Idle;m_translateSeenDone=-1;
         if(!source.empty()){
             // A stream has no folder to look in and no container this can read
             // cheaply; only a file the viewer loaded for it before comes back.
@@ -3804,13 +3809,246 @@ private:
         UINT chosen=IDM_SUBTITLE_OFF;
         if(m_subtitleChoice.mode==subtitle::Choice::Mode::Track)chosen=IDM_SUBTITLE_TRACK_FIRST+UINT(m_subtitleChoice.track);
         else if(m_subtitleChoice.mode==subtitle::Choice::Mode::File)chosen=IDM_SUBTITLE_FILE;
-        app_menu::UpdateSubtitles(menu,T(L"menu.subtitles_off"),labels,file,chosen,m_loaded);
+        LoadSubtitleMode();
+        UINT modeCommand=IDM_SUBTITLE_MODE_ORIGINAL;
+        if(m_subtitleMode==subtitle_translate::Mode::Translation)modeCommand=IDM_SUBTITLE_MODE_CHINESE;
+        else if(m_subtitleMode==subtitle_translate::Mode::Dual)modeCommand=IDM_SUBTITLE_MODE_DUAL;
+        // Enabled only when there is a text track and an engine to send it to;
+        // otherwise the entries explain themselves by being grey.
+        const bool translatable=SubtitleTranslatable()&&
+            subtitle_translate::Translator::Available(TranslationEngine());
+        app_menu::UpdateSubtitles(menu,T(L"menu.subtitles_off"),labels,file,chosen,m_loaded,modeCommand,translatable);
         std::wstring reset=T(L"menu.subtitles_delay_reset");
         if(m_subtitleDelayMs)reset+=L" ("+SubtitleDelayText()+L")";
         if(const HMENU owner=app_menu::FindMenuContainingCommand(menu,IDM_SUBTITLE_DELAY_RESET))
             app_menu::SetMenuCommandText(owner,IDM_SUBTITLE_DELAY_RESET,reset);
         DrawMenuBar(m_hwnd);
     }
+    // ---- Translation ---------------------------------------------------------
+    // The mode is a property of the viewer, not of the film: it survives a
+    // change of source and is remembered across runs.
+    std::wstring IniString(const wchar_t* section,const wchar_t* key)const{
+        wchar_t buffer[1024]{};
+        GetPrivateProfileStringW(section,key,L"",buffer,static_cast<DWORD>(std::size(buffer)),SettingsPath().c_str());
+        return std::wstring(buffer);
+    }
+    static const wchar_t* SubtitleModeKey(subtitle_translate::Mode mode){
+        switch(mode){
+        case subtitle_translate::Mode::Translation:return L"chinese";
+        case subtitle_translate::Mode::Dual:return L"dual";
+        default:return L"original";
+        }
+    }
+    static subtitle_translate::Mode SubtitleModeFromKey(const std::wstring& key){
+        if(key==L"chinese")return subtitle_translate::Mode::Translation;
+        if(key==L"dual")return subtitle_translate::Mode::Dual;
+        return subtitle_translate::Mode::Source;
+    }
+    void LoadSubtitleMode(){
+        if(m_subtitleModeLoaded)return;
+        m_subtitleModeLoaded=true;
+        m_subtitleMode=SubtitleModeFromKey(IniString(L"Subtitles",L"DisplayMode"));
+    }
+    void RememberSubtitleMode()const{
+        WritePrivateProfileStringW(L"Subtitles",L"DisplayMode",SubtitleModeKey(m_subtitleMode),SettingsPath().c_str());
+    }
+    // <player>/translation/{runtime,models}. A directory left out of the cache
+    // root on purpose: the render cache is evicted and rekeyed by driver
+    // version, and a 2.5 GB model is not something to download twice.
+    std::filesystem::path TranslationRoot()const{
+        const auto directory=ExecutableDirectory();
+        const auto base=directory.empty()?std::filesystem::current_path():directory;
+        std::error_code error;
+        // The build tree keeps the player in run-fg/ beside the repository root,
+        // where the engine and its models live; an installed player has them
+        // beside itself. Both layouts are tried rather than one being assumed.
+        if(!std::filesystem::exists(base/L"translation",error)&&
+           std::filesystem::exists(base.parent_path()/L"translation",error))
+            return base.parent_path()/L"translation";
+        return base/L"translation";
+    }
+    subtitle_translate::Engine TranslationEngine()const{
+        subtitle_translate::Engine engine;
+        const std::wstring runtime=IniString(L"Translation",L"Runtime");
+        engine.runtimeDirectory=runtime.empty()?TranslationRoot()/L"runtime":std::filesystem::path(runtime);
+        const std::wstring model=IniString(L"Translation",L"Model");
+        if(!model.empty()){
+            engine.model=std::filesystem::path(model);
+        }else{
+            std::error_code error;
+            for(std::filesystem::directory_iterator it(TranslationRoot()/L"models",error),end;!error&&it!=end;it.increment(error)){
+                if(it->path().extension()==L".gguf"){engine.model=it->path();break;}
+            }
+        }
+        engine.port=int(GetPrivateProfileIntW(L"Translation",L"Port",8127,SettingsPath().c_str()));
+        engine.gpuLayers=GetPrivateProfileIntW(L"Translation",L"Gpu",1,SettingsPath().c_str())?99:0;
+        return engine;
+    }
+    // Beside the player when it can be written to, otherwise in the profile.
+    // Never the render cache: its eviction would delete a translation that cost
+    // two minutes to produce.
+    const std::filesystem::path& TranslationCacheDirectory(){
+        if(!m_translationCacheDirectory.empty())return m_translationCacheDirectory;
+        std::error_code error;
+        std::filesystem::path candidate=ExecutableDirectory()/L"subtitles";
+        std::filesystem::create_directories(candidate,error);
+        bool writable=false;
+        if(!error){
+            std::ofstream probe(candidate/L".writable",std::ios::trunc);
+            writable=probe.good();
+            probe.close();
+            std::filesystem::remove(candidate/L".writable",error);
+        }
+        if(!writable){
+            wchar_t* raw=nullptr;
+            if(SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData,0,nullptr,&raw))&&raw){
+                candidate=std::filesystem::path(raw)/L"DLSSVideoPlayer"/L"subtitles";
+                CoTaskMemFree(raw);
+            }
+            std::error_code fallbackError;
+            std::filesystem::create_directories(candidate,fallbackError);
+            LOG("Subtitles: the player's folder is not writable; translated tracks go to "<<candidate.string());
+        }
+        m_translationCacheDirectory=candidate;
+        return m_translationCacheDirectory;
+    }
+    // What the translation is keyed on: the source it was made from, which
+    // stream of it, whether that is a file, and the model (inside CacheKey).
+    std::wstring TranslationIdentity()const{
+        if(!m_subtitleWanted)return {};
+        std::wstring identity=SubtitleSourceKey();
+        if(identity.empty())identity=m_subtitleWanted->path;
+        identity+=L"|"+std::to_wstring(m_subtitleWanted->stream);
+        identity+=m_subtitleWanted->external?L"|file":L"|stream";
+        return identity;
+    }
+    std::filesystem::path TranslatedTrackPath(){
+        if(!m_subtitleWanted)return {};
+        const auto engine=TranslationEngine();
+        if(engine.model.empty())return {};
+        return TranslationCacheDirectory()/
+            (subtitle_translate::CacheKey(WideToUtf8(TranslationIdentity()),std::to_string(m_subtitleWanted->stream),
+                                          engine.model.filename().string())+".ass");
+    }
+    // Bitmap subtitles are pictures: there is no text to send anywhere.
+    bool SubtitleTranslatable()const{
+        return m_subtitleWanted&&subtitle::KindForCodec(m_subtitleWanted->codec)==subtitle::Kind::Text;
+    }
+    void SetSubtitleMode(subtitle_translate::Mode mode){
+        LoadSubtitleMode();
+        m_subtitleMode=mode;
+        RememberSubtitleMode();
+        // Back to the original drops the generated track; a translated mode
+        // asks again, which is a file read when it was made before.
+        m_translateRequestedKey.clear();
+        m_translateSeenState=subtitle_translate::State::Idle;
+        m_translateSeenDone=-1;
+        if(mode==subtitle_translate::Mode::Source){
+            if(m_translator)m_translator->Cancel();
+            m_translatedTrack.clear();
+        }else if(!SubtitleTranslatable()){
+            m_sourceNotice=T(L"subtitles.translate_bitmap");
+            UpdateCachedStatus();
+        }
+        UpdateSubtitleMenu();
+    }
+    // Called every tick: makes the player's state match the mode, once. A key
+    // that is already requested is not requested again, so a failure does not
+    // hammer the engine.
+    void EnsureTranslation(){
+        if(m_subtitleMode==subtitle_translate::Mode::Source||!m_loaded||!m_subtitleWanted)return;
+        if(!SubtitleTranslatable())return;
+        const std::wstring key=TranslationIdentity();
+        if(key.empty()||m_translateRequestedKey==key)return;
+        std::error_code error;
+        const auto cached=TranslatedTrackPath();
+        if(!cached.empty()&&std::filesystem::is_regular_file(cached,error)){
+            m_translateRequestedKey=key;
+            m_translatedTrack=cached.wstring();
+            LOG("Subtitles: reusing the translated track at "<<WideToUtf8(cached.wstring()));
+            return;
+        }
+        const auto engine=TranslationEngine();
+        if(!subtitle_translate::Translator::Available(engine)){
+            m_translateRequestedKey=key;  // reported once, not every tick
+            m_sourceNotice=T(L"subtitles.translate_failed")+(engine.model.empty()?L"translation\\models":engine.model.wstring());
+            UpdateCachedStatus();
+            LOG("Subtitles: no translation engine at "<<engine.runtimeDirectory.string());
+            return;
+        }
+        if(!m_translator)
+            m_translator=std::make_unique<subtitle_translate::Translator>(std::filesystem::path{},engine,
+                                                                          TranslationCacheDirectory());
+        subtitle_translate::Job job;
+        job.path=m_subtitleWanted->path;
+        job.stream=m_subtitleWanted->stream;
+        job.external=m_subtitleWanted->external;
+        job.charenc=m_subtitleWanted->charenc;
+        job.identity=key;
+        job.width=m_renderer?m_renderer->BackbufferW():uint32_t(m_decoder.Width());
+        job.height=m_renderer?m_renderer->BackbufferH():uint32_t(m_decoder.Height());
+        if(!job.width||!job.height){job.width=1920;job.height=1080;}
+        m_translateRequestedKey=key;
+        m_translatedTrack.clear();
+        m_translateSeenState=subtitle_translate::State::Extracting;
+        m_translateSeenDone=-1;
+        m_translator->Start(job);
+        LOG("Subtitles: translating stream "<<job.stream<<" for a "<<job.width<<"x"<<job.height<<" picture.");
+    }
+    // Progress and the finished track, both on the status row: the engine is
+    // fast enough (a few seconds for a film) that a bar would be gone before it
+    // was read.
+    void PollTranslation(){
+        if(!m_translator)return;
+        const auto status=m_translator->Poll();
+        if(status.state==m_translateSeenState&&status.done==m_translateSeenDone)return;
+        m_translateSeenState=status.state;
+        m_translateSeenDone=status.done;
+        switch(status.state){
+        case subtitle_translate::State::Extracting:
+        case subtitle_translate::State::Starting:
+            m_sourceNotice=T(L"subtitles.translating")+L"\u2026";UpdateCachedStatus();break;
+        case subtitle_translate::State::Translating:
+            // Each published version is drawn as soon as it exists: the same
+            // cues, more of them in Chinese.
+            if(!status.partial.empty()&&status.partial.wstring()!=m_translatedTrack){
+                m_translatedTrack=status.partial.wstring();
+                m_subtitleReloadPending=true;
+            }
+            m_sourceNotice=T(L"subtitles.translating")+L" "+std::to_wstring(status.done)+L"/"+std::to_wstring(status.total);
+            UpdateCachedStatus();break;
+        case subtitle_translate::State::Done:
+            if(!status.result.empty()&&status.result.wstring()!=m_translatedTrack){
+                m_translatedTrack=status.result.wstring();
+                m_subtitleReloadPending=true;
+                m_sourceNotice=T(L"subtitles.translated");UpdateCachedStatus();UpdateSubtitleMenu();
+                LOG("Subtitles: translated track ready at "<<WideToUtf8(m_translatedTrack));
+            }
+            break;
+        case subtitle_translate::State::Failed:
+            m_sourceNotice=T(L"subtitles.translate_failed")+status.notice;UpdateCachedStatus();
+            LOG("Subtitles: translation failed: "<<WideToUtf8(status.notice));break;
+        default:break;
+        }
+    }
+    // What the overlay should draw: the chosen source, or the translated file
+    // made from it. Null when neither exists, which hides the overlay.
+    const SubtitleOverlay::Source* SubtitleSourceForDisplay(){
+        if(!m_subtitleWanted)return nullptr;
+        if(m_subtitleMode==subtitle_translate::Mode::Source||m_translatedTrack.empty())return &*m_subtitleWanted;
+        m_subtitleTranslated=*m_subtitleWanted;
+        m_subtitleTranslated.path=m_translatedTrack;
+        m_subtitleTranslated.stream=0;
+        m_subtitleTranslated.external=true;
+        m_subtitleTranslated.codec="ass";
+        m_subtitleTranslated.charenc.clear();
+        // The ASS is stamped with the container's own clock, exactly like the
+        // track it was made from, so the overlay maps the watch clock the same
+        // way for both.
+        m_subtitleTranslated.origin=m_subtitleOrigin;
+        return &m_subtitleTranslated;
+    }
+
     // Every tick: keeps the child drawing what is chosen at the size the picture
     // has, tells it when the clock jumped, and hands the renderer a new picture
     // when there is one. Paused, a new picture marks the present stale, and the
@@ -3818,10 +4056,13 @@ private:
     void ServiceSubtitles(){
         SyncSubtitlesToSource();
         TakeSubtitleDiscoveries();
+        PollTranslation();
+        EnsureTranslation();
         if(!m_loaded||!m_renderer)return;
         // A rebuilt renderer holds no picture of its own.
         if(m_subtitleRenderer!=m_renderer.get()){m_subtitleRenderer=m_renderer.get();m_subtitleFrame.reset();}
-        if(!m_subtitleWanted){
+        const SubtitleOverlay::Source* wanted=SubtitleSourceForDisplay();
+        if(!wanted){
             if(m_subtitles.Showing())m_subtitles.Hide();
             if(m_subtitleFrame||m_renderer->SubtitleOverlayShown()){m_renderer->SetSubtitleOverlay(nullptr,0,0);m_subtitleFrame.reset();}
             return;
@@ -3832,7 +4073,7 @@ private:
         canvas.videoWidth=m_decoder.Width();canvas.videoHeight=m_decoder.Height();
         canvas.rate=subtitle::CanvasRate(m_decoder.FrameRate());canvas.duration=m_decoder.DurationSeconds();
         const SubtitleOverlay::Source* shown=m_subtitles.CurrentSource();
-        bool start=!shown||!(*shown==*m_subtitleWanted);
+        bool start=!shown||!(*shown==*wanted);
         if(!start&&!(m_subtitles.CurrentCanvas()==canvas)){
             // A window being dragged to a new size passes through dozens; the
             // picture already up is stretched until one of them holds.
@@ -3841,7 +4082,10 @@ private:
                 m_subtitleResizeW=canvas.width;m_subtitleResizeH=canvas.height;m_subtitleResizeAt=now;
             }else if(now-m_subtitleResizeAt>=250)start=true;
         }
-        if(start&&subtitle::CanvasUsable(canvas.width,canvas.height))m_subtitles.Show(*m_subtitleWanted,canvas,clock);
+        if(start&&subtitle::CanvasUsable(canvas.width,canvas.height)){
+            m_subtitles.Show(*wanted,canvas,clock,m_subtitleReloadPending);
+            m_subtitleReloadPending=false;
+        }
         else if(m_subtitleClock>=0.0&&subtitle::ClockJumped(m_subtitleClock,clock))m_subtitles.Seek(clock);
         m_subtitleClock=clock;
         const auto frame=m_subtitles.FrameAt(clock);
@@ -13486,6 +13730,9 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
         case IDM_SUBTITLE_OFF:SelectSubtitlesOff(true);break;case IDM_SUBTITLE_FILE:SelectSubtitleFile(true);break;
         case IDM_SUBTITLE_LOAD:LoadSubtitleFromDialog();break;case IDM_SUBTITLE_NEXT:NextSubtitles();break;
         case IDM_SUBTITLE_EARLIER:StepSubtitleDelay(-1);break;case IDM_SUBTITLE_LATER:StepSubtitleDelay(+1);break;
+        case IDM_SUBTITLE_MODE_ORIGINAL:SetSubtitleMode(subtitle_translate::Mode::Source);break;
+        case IDM_SUBTITLE_MODE_CHINESE:SetSubtitleMode(subtitle_translate::Mode::Translation);break;
+        case IDM_SUBTITLE_MODE_DUAL:SetSubtitleMode(subtitle_translate::Mode::Dual);break;
         case IDM_SUBTITLE_DELAY_RESET:StepSubtitleDelay(0);break;
         case IDM_COMPARE_TOGGLE:ToggleSideBySide();break;
         case IDM_COMPARE_HDR_AT_SDR:ToggleCompareHdrAtSdr();break;
@@ -13892,6 +14139,21 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     std::optional<SubtitleOverlay::Source> m_subtitleWanted;
     std::shared_ptr<const subtitle::Frame> m_subtitleFrame;
     const D3D12Renderer* m_subtitleRenderer=nullptr;
+    // Translating the chosen track into Chinese. m_subtitleWanted stays the
+    // source the viewer picked; this decides whether the overlay is handed that
+    // source or the ASS made from it.
+    std::unique_ptr<subtitle_translate::Translator> m_translator;
+    subtitle_translate::Mode m_subtitleMode=subtitle_translate::Mode::Source;
+    bool m_subtitleModeLoaded=false;
+    std::wstring m_translatedTrack;
+    std::wstring m_translateRequestedKey;
+    subtitle_translate::State m_translateSeenState=subtitle_translate::State::Idle;
+    int m_translateSeenDone=-1;
+    std::filesystem::path m_translationCacheDirectory;
+    SubtitleOverlay::Source m_subtitleTranslated;
+    // The next Show() replaces a track whose timing did not change, so the
+    // frames already on screen must survive until the new one draws.
+    bool m_subtitleReloadPending=false;
     double m_subtitleClock=-1.0;
     uint32_t m_subtitleResizeW=0,m_subtitleResizeH=0;
     ULONGLONG m_subtitleResizeAt=0;
