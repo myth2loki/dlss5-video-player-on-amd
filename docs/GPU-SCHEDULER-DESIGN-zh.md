@@ -2,7 +2,7 @@
 
 ## 文档状态
 
-- 状态：设计阶段，尚未实现
+- 状态：P0/P1 已实现，待 Windows 11 + RX 9070 XT 构建验证
 - 日期：2026-10-24
 - 目标分支：`main-subtitle`
 - 目标平台：Windows 11 x64
@@ -945,7 +945,7 @@ rejected=3 reason=pressure
 ### 15.1 无适配器预算
 
 - 记录 `budget-unavailable`。
-- 压力视为 Hard。
+- 压力视为 Critical。
 - 只允许 PlaybackCritical。
 
 ### 15.2 设备移除
@@ -1174,3 +1174,17 @@ Windows 11 + RX 9070 XT：
 字幕和翻译按能力降级
 任何资源决策都有记录
 ```
+
+## 22. 当前代码落地
+
+截至 2026-10-24，已落地第一阶段基础：
+
+- `src/GpuSchedulerPolicy.h`：纯策略、压力等级、迟滞和准入规则。
+- `src/GpuScheduler.h/.cpp`：进程内调度器、原子快照、租约和回执。
+- `tests/GpuSchedulerTests.cpp`：不依赖 GPU、D3D12 或 Windows 的单元测试。
+- `CMakeLists.txt`：加入 `player_app` 和 `GpuSchedulerTests`。
+- `D3D12Renderer`：暴露适配器 LUID 和视频内存预算。
+- `PlayerApp`：每约 2 秒采样一次帧时间、显存、live lead、超分和插帧状态。
+- 默认模式仍为 `Observe`，不改变任何现有功能。
+
+本机已使用 C++20 和 AddressSanitizer/UndefinedBehaviorSanitizer 运行 `GpuSchedulerTests`。Windows 11 + MSVC + RX 9070 XT 构建和真机影子数据仍需在目标机器补测。

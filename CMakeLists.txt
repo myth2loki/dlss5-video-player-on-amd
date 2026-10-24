@@ -327,6 +327,7 @@ add_library(player_neural OBJECT
 # What only the player links.
 add_library(player_app OBJECT
     src/AppMenu.cpp src/AppMenu.h
+    src/GpuScheduler.cpp src/GpuScheduler.h src/GpuSchedulerPolicy.h
     src/UiLayout.cpp src/UiLayout.h
     src/UiResources.cpp src/UiResources.h
     src/DLSSGBackend.cpp src/DLSSGBackend.h
@@ -595,6 +596,15 @@ if(BUILD_TESTING)
     target_include_directories(AmdLmxxfApiTests PRIVATE "${CMAKE_SOURCE_DIR}/src")
     add_test(NAME AmdLmxxfApiTests COMMAND AmdLmxxfApiTests)
 
+    # GPU scheduling is pure policy plus an in-process reservation registry.
+    # This target deliberately links no D3D12, Windows or player objects.
+    add_executable(GpuSchedulerTests tests/GpuSchedulerTests.cpp
+        src/GpuScheduler.cpp src/GpuScheduler.h src/GpuSchedulerPolicy.h)
+    target_compile_features(GpuSchedulerTests PRIVATE cxx_std_20)
+    target_compile_options(GpuSchedulerTests PRIVATE /W4 /WX /permissive- /EHsc /Zc:__cplusplus)
+    target_include_directories(GpuSchedulerTests PRIVATE "${CMAKE_SOURCE_DIR}/src")
+    add_test(NAME GpuSchedulerTests COMMAND GpuSchedulerTests)
+
     # The two executables that ship link the runtime statically (see
     # CMAKE_MSVC_RUNTIME_LIBRARY at the top), because no package carries the
     # Visual C++ Redistributable. This reads their import tables with the
@@ -677,7 +687,7 @@ if(BUILD_TESTING)
     # run time on the reference machine; NeuralWorkerTests sleeps a child for
     # 20 s and the hardware smokes render real frames.
     set_tests_properties(RecentMediaTests RenderSettingsTests RuntimeLockTests RangeSelectionTests
-        UpscalingTests ReleaseApiCompileTests UpdateCheckTests PROPERTIES TIMEOUT 60)
+        UpscalingTests ReleaseApiCompileTests UpdateCheckTests GpuSchedulerTests PROPERTIES TIMEOUT 60)
     set_tests_properties(FrameIdentityTests CachedExportTests PlayerUiRegressionTests
         PROPERTIES TIMEOUT 300)
     set_tests_properties(NeuralWorkerTests PolicyTests PolicyTestsSlow NeuralPrerenderTests PROPERTIES TIMEOUT 600)

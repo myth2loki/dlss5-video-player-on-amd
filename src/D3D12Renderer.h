@@ -886,6 +886,11 @@ public:
     // than the running maximum above. An idle helper's question is "what is
     // parked right now", which has no maximum in it.
     uint64_t CurrentLocalVideoMemoryMiB() const;
+    // The same adapter and budget the memory samples above describe. The GPU
+    // scheduler needs both identities to keep reservations attributable when a
+    // hybrid machine places the player on a different adapter.
+    uint64_t AdapterLuid() const;
+    uint64_t LocalVideoMemoryBudgetMiB() const;
     // Drains the queue and hands the NGX feature back, asking the runtime to
     // free its memory with it. Nothing else this renderer holds is touched;
     // the next RenderFrame re-creates the feature through the ordinary

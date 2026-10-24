@@ -10,6 +10,7 @@
 #include <wrl/event.h>
 #include <windows.media.h>
 #include <SystemMediaTransportControlsInterop.h>
+#include <array>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -61,6 +62,7 @@
 #include "PlaybackCadence.h"
 #include "PlaybackTiming.h"
 #include "LiveSessionPolicy.h"
+#include "GpuScheduler.h"
 #include "CachedRenderVerdict.h"
 #include "CrashDump.h"
 #include "Nv12Convert.h"
@@ -3420,6 +3422,7 @@ public:
         // all - was the quietest: one measured session logged a single line
         // covering 132 s and two presented frames.
         ReportPlaybackHealth();
+        ReportGpuSchedulerHealth();
         GuardPlaybackVsr();
         if(playback_tick::ReadsCachedAhead(TickNow())){
             if(!ReadNextCachedFrame())return;
@@ -5055,6 +5058,82 @@ private:
         m_cadenceReanchoredRecently=false;
         m_playbackHealthAt=now;m_playbackHealthDropped=m_droppedFrames;
         m_playbackHealthPresented=m_cachedPresentedFrames;
+    }
+    static constexpr size_t kGpuFrameSampleCapacity=128;
+    static constexpr double kGpuSchedulerHealthSeconds=2.0;
+    void RecordGpuFrameMs(double milliseconds){
+        if(!(milliseconds>=0.0)||!std::isfinite(milliseconds))return;
+        m_gpuFrameMs[m_gpuFrameMsNext]=milliseconds;
+        m_gpuFrameMsNext=(m_gpuFrameMsNext+1u)%uint32_t(kGpuFrameSampleCapacity);
+        if(m_gpuFrameMsCount<kGpuFrameSampleCapacity)++m_gpuFrameMsCount;
+    }
+    std::pair<double,double> TakeGpuFrameMsPercentiles(){
+        const uint32_t count=m_gpuFrameMsCount;
+        if(!count)return {};
+        std::array<double,kGpuFrameSampleCapacity> sorted{};
+        std::copy_n(m_gpuFrameMs.begin(),count,sorted.begin());
+        std::sort(sorted.begin(),sorted.begin()+count);
+        const auto percentile=[&](double q){
+            const size_t rank=std::clamp<size_t>(
+                size_t(std::ceil(q*double(count))),size_t{1},size_t(count));
+            return sorted[rank-1u];
+        };
+        m_gpuFrameMsNext=0;m_gpuFrameMsCount=0;
+        return {percentile(0.50),percentile(0.95)};
+    }
+    // Shadow observation only. This reads cached renderer/worker metrics and
+    // never changes a feature. The scheduler sees a coarse two-second window,
+    // not a callback from the present path.
+    void ReportGpuSchedulerHealth(){
+        if(!m_renderer){m_gpuSchedulerHealthAt={};return;}
+        const auto now=Clock::now();
+        if(m_gpuSchedulerHealthAt==Clock::time_point{}){
+            m_gpuSchedulerHealthAt=now;
+            return;
+        }
+        const double elapsed=std::chrono::duration<double>(now-m_gpuSchedulerHealthAt).count();
+        if(elapsed<kGpuSchedulerHealthSeconds)return;
+        m_gpuSchedulerHealthAt=now;
+
+        const auto [frameP50,frameP95]=TakeGpuFrameMsPercentiles();
+        constexpr uint64_t mib=uint64_t{1}<<20;
+        const uint64_t rendererPeak=std::max(
+            m_renderer->PeakLocalVideoMemoryMiB(),m_gpuWorkerPeakLocalVramMiB);
+        gpu_scheduler::GpuRuntimeSample sample;
+        sample.adapterLuid=m_renderer->AdapterLuid();
+        sample.localBudgetBytes=m_renderer->LocalVideoMemoryBudgetMiB()*mib;
+        sample.localUsageBytes=m_renderer->CurrentLocalVideoMemoryMiB()*mib;
+        sample.peakLocalUsageBytes=rendererPeak*mib;
+        sample.frameBudgetMs=m_decoder.FrameRate()>0.0?1000.0/m_decoder.FrameRate():0.0;
+        sample.frameP50Ms=frameP50;
+        sample.frameP95Ms=frameP95;
+        sample.droppedFrames=m_droppedFrames;
+        sample.neuralRealtimeRatio=LiveRealtimeRatio();
+        sample.neuralLeadSeconds=m_liveAttached?LiveLeadSeconds():0.0;
+        sample.neuralActive=m_liveAttached;
+        sample.upscaleActive=UpscalingActive();
+        sample.frameGenerationActive=PlaybackFrameGenerationActive();
+        sample.rendererUsable=!m_renderer->GpuUnusable();
+        sample.workerLocalUsageBytes=m_gpuWorkerLocalVramMiB*mib;
+        sample.workerPeakLocalUsageBytes=m_gpuWorkerPeakLocalVramMiB*mib;
+        sample.sampleSequence=++m_gpuSchedulerSampleSequence;
+        sample.sampleTimeMs=static_cast<int64_t>(GetTickCount64());
+        m_gpuScheduler.Observe(sample);
+
+        ++m_gpuSchedulerLoggedSamples;
+        const auto snapshot=m_gpuScheduler.Snapshot();
+        if(!m_gpuSchedulerLoggedOnce||snapshot.pressure!=m_gpuSchedulerLastPressure||
+           m_gpuSchedulerLoggedSamples%5u==0){
+            const auto receipt=m_gpuScheduler.Receipt();
+            LOG(gpu_scheduler::FormatGpuSchedulerLine(snapshot,receipt)
+                <<" render_path_p50="<<frameP50<<"ms p95="<<frameP95<<"ms"
+                <<" worker_vram="<<m_gpuWorkerLocalVramMiB<<"MiB"
+                <<" neural="<<(sample.neuralActive?"live":"off")
+                <<" upscale="<<(sample.upscaleActive?"on":"off")
+                <<" framegen="<<(sample.frameGenerationActive?"on":"off"));
+            m_gpuSchedulerLoggedOnce=true;
+            m_gpuSchedulerLastPressure=snapshot.pressure;
+        }
     }
     bool ReadNextCachedFrame(){
         // Before the read, because the stall window below has to be told that
@@ -8012,6 +8091,13 @@ private:
     }
 
     void Unload() {
+        m_gpuScheduler.ResetSession(++m_gpuSchedulerGeneration);
+        m_gpuSchedulerHealthAt={};
+        m_gpuFrameMsNext=0;m_gpuFrameMsCount=0;
+        m_gpuWorkerLocalVramMiB=0;m_gpuWorkerPeakLocalVramMiB=0;
+        m_gpuSchedulerLoggedSamples=0;
+        m_gpuSchedulerLoggedOnce=false;
+        m_gpuSchedulerLastPressure=gpu_scheduler::GpuPressure::Normal;
         // A new file gets a new digest, even if the old one had the same size
         // and timestamp: the memo is scoped to the loaded media precisely so
         // it cannot outlive it.
@@ -8374,7 +8460,8 @@ private:
             std::vector<float> grid=std::move(g.guideGridRGBA32F);grid.clear();
             g=GuideFrame{};g.guideGridRGBA32F=std::move(grid);
         }
-        m_guideMsTotal+=std::chrono::duration<double,std::milli>(Clock::now()-guideStart).count();
+        const double guideMs=std::chrono::duration<double,std::milli>(Clock::now()-guideStart).count();
+        m_guideMsTotal+=guideMs;
         // This path renders without a frame identity, so the renderer never logs
         // its reset reason and a cut decided from the pixels was invisible here.
         // Both outcomes are worth a line: an accepted cut discards the DLSS
@@ -8405,7 +8492,9 @@ private:
         m_renderer->SetNextSourcePq(f.pq);
         m_renderer->SetUpscalingHistory(m_upscalingHistory);
         bool ok=m_renderer->RenderFrame(f.bgra.data(),f.bgra.size(),g.guideGridRGBA32F.data(),g.guideGridRGBA32F.size()*sizeof(float),g.gridW,g.gridH,r,g.motionVectors,ms);
-        m_renderMsTotal+=std::chrono::duration<double,std::milli>(Clock::now()-renderStart).count();
+        const double renderMs=std::chrono::duration<double,std::milli>(Clock::now()-renderStart).count();
+        m_renderMsTotal+=renderMs;
+        RecordGpuFrameMs(guideMs+renderMs);
         ++m_renderMsFrames;
         if(ok){
             RememberPlaybackFrame(f);
@@ -12372,6 +12461,9 @@ private:
     }
     void HandleNeuralCompletion(const std::unique_ptr<NeuralJobCompletion>& completion){
         if(m_neuralWorker.joinable()){m_neuralWorker.join();m_neuralWorker=std::jthread{};}m_neuralProgressMessages.Clear();m_pendingNeuralTitle.clear();m_neuralCancelBounds={};
+        m_gpuWorkerLocalVramMiB=completion->result.timing.postJobLocalVramMiB;
+        m_gpuWorkerPeakLocalVramMiB=std::max(
+            m_gpuWorkerPeakLocalVramMiB,completion->result.timing.peakLocalVramMiB);
         // An active session already plays what the job produced: keep the media
         // loaded and only record how the job ended.
         if(m_previewJob)return CompletePausedPreview(*completion);
@@ -13852,6 +13944,18 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     bool m_neuralToggleDeferred=false;
     // Manual-reset event shared with the render helper: signalled means pause.
     HANDLE m_neuralPauseEvent=nullptr;
+    gpu_scheduler::GpuScheduler m_gpuScheduler;
+    uint64_t m_gpuSchedulerGeneration=0;
+    uint64_t m_gpuSchedulerSampleSequence=0;
+    uint64_t m_gpuSchedulerLoggedSamples=0;
+    bool m_gpuSchedulerLoggedOnce=false;
+    gpu_scheduler::GpuPressure m_gpuSchedulerLastPressure=gpu_scheduler::GpuPressure::Normal;
+    Clock::time_point m_gpuSchedulerHealthAt{};
+    std::array<double,kGpuFrameSampleCapacity> m_gpuFrameMs{};
+    uint32_t m_gpuFrameMsNext=0;
+    uint32_t m_gpuFrameMsCount=0;
+    uint64_t m_gpuWorkerLocalVramMiB=0;
+    uint64_t m_gpuWorkerPeakLocalVramMiB=0;
     // Active neural rendering: the render job runs while playback continues and
     // the player consumes finalized segments as they land. m_liveDirectory holds
     // those segments until their run is published: from then on the run plays

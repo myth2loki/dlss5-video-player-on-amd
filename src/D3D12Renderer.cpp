@@ -5713,6 +5713,20 @@ uint64_t D3D12Renderer::CurrentLocalVideoMemoryMiB()const{
     return info.CurrentUsage>>20;
 }
 
+uint64_t D3D12Renderer::AdapterLuid()const{
+    if(!m_adapter)return 0;
+    DXGI_ADAPTER_DESC1 description{};
+    if(FAILED(m_adapter->GetDesc1(&description)))return 0;
+    return PackAdapterLuid(description.AdapterLuid.HighPart,description.AdapterLuid.LowPart);
+}
+
+uint64_t D3D12Renderer::LocalVideoMemoryBudgetMiB()const{
+    if(!m_adapter3)return 0;
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    if(FAILED(m_adapter3->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&info)))return 0;
+    return info.Budget>>20;
+}
+
 bool D3D12Renderer::ReleaseDLSSFeatureForIdle(){
     if(!m_dlss.FeatureCreated())return false;
     if(!WaitGPUForContinuedUse())return false;
