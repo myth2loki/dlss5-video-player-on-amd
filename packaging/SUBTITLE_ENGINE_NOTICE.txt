@@ -1,0 +1,51 @@
+SUBTITLE ENGINE (LLAMA-SERVER) - RUNTIME ONLY, NO MODEL
+========================================================
+
+This package carries the translation engine's runtime in
+
+    translation\runtime\          llama-server (llama.cpp, MIT licensed)
+
+It does NOT carry a model. The player treats an engine as usable only when a
+server binary AND a model file are both present, so until you add one the
+subtitle toggle stays greyed out and the menu entries for the translated and
+dual-language views stay disabled. Nothing breaks: no child process is
+started, and nothing is downloaded for you.
+
+Adding a model
+--------------
+
+1. Create translation\models\ next to this file, if it is not there yet.
+2. Put a .gguf translation model in it, for example
+   translategemma-4b-it-Q4_K_M.gguf.
+3. Start the player. It picks the first .gguf it finds in that directory.
+
+The player looks for translation\ beside DLSSVideoPlayer.exe, so keep this
+folder where it is relative to the executable.
+
+Speaking of which: a model is not the only thing that is missing. Speech
+recognition (whisper-server, for films with no subtitle track) is a separate
+runtime under asr\ and is not in this package at all.
+
+Why no model is shipped
+-----------------------
+
+A translation model is a multi-gigabyte download whose licence is the model
+author's, not llama.cpp's, and redistributing it is usually not permitted.
+The runtime is MIT and can be shipped; the model cannot, so it is left to you.
+
+Settings
+--------
+
+The engine is configured from the player's ini file:
+
+    [Translation]
+    Runtime=<path to the directory holding llama-server.exe>
+    Model=<path to the .gguf>
+    Port=8127
+    Gpu=1
+
+Gpu=1 (the default) puts all layers on the GPU and needs ggml-vulkan.dll,
+which is in translation\runtime. Set Gpu=0 to run on the CPU instead.
+
+Translated tracks are written to subtitles\ beside the executable, or to your
+profile when that directory is not writable.

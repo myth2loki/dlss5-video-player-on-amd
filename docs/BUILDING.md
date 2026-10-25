@@ -421,8 +421,9 @@ and it is the only one of the two that runs on a local AMD build (no tagged
 tree, no hardware JUnit report, no locked NVIDIA inputs):
 
 ```powershell
-./tools/package_amd_release.ps1                 # dist/DLSSVideoPlayer-v<version>-amd-win64/ + .zip
-./package_amd_release.bat -IncludeFfmpeg        # same, plus ffmpeg.exe and ffprobe.exe
+./tools/package_amd_release.ps1                    # dist/DLSSVideoPlayer-v<version>-amd-win64/ + .zip
+./package_amd_release.bat -IncludeFfmpeg           # same, plus ffmpeg.exe and ffprobe.exe
+./package_amd_release.bat -IncludeSubtitleEngine   # same, plus translation/runtime (llama-server)
 ```
 
 It refuses a runtime pack whose `lmxxf-modules/gfx1200|gfx1201` do not match
@@ -449,6 +450,18 @@ they are conveyed under (`THIRD_PARTY_LICENSES/ffmpeg.txt`, `ffmpeg-GPL-3.0.txt`
 and SHA-256 first. It is worth the 330 MB: the player links no libav*, so the
 pair is the decoder, the probe and the encoder - a package without them starts
 but opens nothing.
+
+`-IncludeSubtitleEngine` stages llama-server and the 25 files it loads as
+`translation/runtime` (~96 MB), plus `translation/models/` and a README that
+says what goes in it. It ships no model, and an engine without one is inert by
+design: `Translator::Available()` wants the server binary *and* a model file,
+so the subtitle toggle stays greyed until a `.gguf` is dropped into
+`translation/models`. Models are not redistributable - Gemma's terms for the
+one this was measured with - which is why only the MIT runtime travels with
+the package. The assembler asserts the DLL set llama-server imports
+(`ggml-vulkan.dll` included, because `[Translation] Gpu=1` puts every layer on
+the GPU) rather than trusting the player's two-file check, which would pass
+and then fail inside the child process.
 
 `build_and_package_amd.bat` runs the build and that assembler in one call,
 against the local `build-ninja` tree:

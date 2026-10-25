@@ -16,6 +16,12 @@ param(
     # player actually loads, and the one that gets verified at startup.
     [string]$RuntimeDirectory,
     [switch]$IncludeFfmpeg,
+    # The subtitle translation engine: llama-server and the DLLs it loads,
+    # staged as translation\runtime. ~96 MB, and useless without a model the
+    # package is not allowed to carry, so it is opt-in like ffmpeg.
+    [switch]$IncludeSubtitleEngine,
+    # Not committed (see .gitignore): the tree is downloaded on first use.
+    [string]$SubtitleRuntimeDirectory,
     # The NVIDIA backend's SDK DLLs are ~66 MB and dead weight on an AMD-only
     # machine, so they can be dropped.
     [switch]$WithoutNvidiaBackend,
@@ -112,6 +118,35 @@ function Assert-RuntimeModules {
     Write-Host "Runtime modules verified: $total HSACOs against their SHA256SUMS."
 }
 
+# The player's own check is Translator::Available(), which only asks whether
+# llama-server.exe and the model are regular files. A runtime missing a DLL
+# that llama-server imports still passes that check and then fails when the
+# child starts, where the error lands in stderr nobody reads - so the set is
+# asserted here instead, while a package build can still fail cleanly.
+function Assert-SubtitleEngine {
+    param([string]$Root)
+    foreach ($required in @(
+        'llama-server.exe',       # the process the player starts
+        'llama-server-impl.dll',  # everything else is what it imports
+        'llama-common.dll',
+        'llama.dll',
+        'ggml.dll',
+        'ggml-base.dll',
+        'ggml-vulkan.dll'         # [Translation] Gpu=1, the default, loads all layers here
+    )) {
+        $path = Join-Path $Root $required
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Translation runtime is missing $required`: $path" }
+    }
+    # ggml picks one CPU variant per machine at load time, so the file needed
+    # depends on the CPU it runs on: any one is enough, none at all is not.
+    $variants = @(Get-ChildItem -LiteralPath $Root -File -Filter 'ggml-cpu-*.dll')
+    if ($variants.Count -eq 0) { throw "Translation runtime carries no ggml-cpu-*.dll: $Root" }
+    if (-not (Test-Path -LiteralPath (Join-Path $Root 'LICENSE-LLVM-OpenMP') -PathType Leaf)) {
+        Write-Warning "Translation runtime has no LICENSE-LLVM-OpenMP; libomp.dll is shipped without its licence."
+    }
+    Write-Host ("Translation runtime: {0} ({1} ggml-cpu variants)" -f $Root, $variants.Count)
+}
+
 function Assert-RuntimeLayout {
     param([string]$Root)
     foreach ($required in @('LmxxfNrRuntime.dll', 'lmxxf-modules', 'native-game-tiled-assets', 'shaders')) {
@@ -195,6 +230,12 @@ if ($IncludeFfmpeg) {
         @{ Destination = 'THIRD_PARTY_LICENSES/ffmpeg-bundled-notices.txt'; Required = $true; Candidates = @((Join-Path $repositoryRoot 'THIRD_PARTY_LICENSES\ffmpeg-bundled-notices.txt')) }
     )
 }
+if ($IncludeSubtitleEngine) {
+    # MIT, and llama-server links libomp: both notices travel with the copy.
+    $sources += @(
+        @{ Destination = 'THIRD_PARTY_LICENSES/llama-cpp-MIT.txt'; Required = $false; Candidates = @((Join-Path $repositoryRoot 'THIRD_PARTY_LICENSES\llama-cpp-MIT.txt')) }
+    )
+}
 
 $resolved = New-Object Collections.Generic.List[object]
 foreach ($source in $sources) {
@@ -248,10 +289,51 @@ foreach ($file in Get-ChildItem -LiteralPath $runtimeSource -Recurse -File) {
 }
 Write-Host "Staged amd-neural-runtime: $copied files ($excluded skipped)."
 
+if ($IncludeSubtitleEngine) {
+    if (-not $SubtitleRuntimeDirectory) { $SubtitleRuntimeDirectory = Join-Path $repositoryRoot 'translation/runtime' }
+    if (-not (Test-Path -LiteralPath $SubtitleRuntimeDirectory -PathType Container)) {
+        throw "Translation runtime directory not found: $SubtitleRuntimeDirectory (pass -SubtitleRuntimeDirectory)."
+    }
+    $subtitleSource = (Resolve-Path -LiteralPath $SubtitleRuntimeDirectory).Path
+    Assert-SubtitleEngine -Root $subtitleSource
+    # The DLLs, the server and libomp's licence: everything else in the upstream
+    # archive is a CLI the player never starts (bench, quantize, the llava and
+    # qwen2vl front ends), and the downloads/ scratch log is not a runtime file.
+    $subtitleDestination = Join-Path (Join-Path $stageFull 'translation') 'runtime'
+    New-Item -ItemType Directory -Path $subtitleDestination -Force | Out-Null
+    $subtitleFiles = @(Get-ChildItem -LiteralPath $subtitleSource -File | Where-Object {
+        # -impl.dll belongs to a CLI front end the package does not carry
+        # (llama-cli, llama-bench, llama-quantize); llama-server's own is the
+        # one exception, it is the server.
+        ($_.Extension -eq '.dll' -and ($_.Name -eq 'llama-server-impl.dll' -or $_.Name -notlike '*-impl.dll')) -or
+        $_.Name -eq 'llama-server.exe' -or
+        $_.Name -eq 'LICENSE-LLVM-OpenMP'
+    })
+    foreach ($file in $subtitleFiles) {
+        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $subtitleDestination $file.Name)
+    }
+    Write-Host ("Staged translation/runtime: {0} files ({1:N0} bytes)." -f $subtitleFiles.Count, ($subtitleFiles | Measure-Object -Property Length -Sum).Sum)
+    # Where the model goes, and why it is not already there. The player needs
+    # the directory to exist before it will look inside it, so it is created
+    # here rather than left to whoever unpacks the archive.
+    New-Item -ItemType Directory -Path (Join-Path (Join-Path $stageFull 'translation') 'models') -Force | Out-Null
+    $notice = Join-Path (Join-Path $repositoryRoot 'packaging') 'SUBTITLE_ENGINE_NOTICE.txt'
+    if (Test-Path -LiteralPath $notice -PathType Leaf) {
+        Copy-Item -LiteralPath $notice -Destination (Join-Path (Join-Path $stageFull 'translation') 'README.txt')
+    }
+    else { Write-Warning "No packaging/SUBTITLE_ENGINE_NOTICE.txt to stage beside the translation runtime." }
+}
+
 $files = @(Get-OrdinalPackageFiles -Root $stageFull)
 $manifest = New-Object Collections.Generic.List[string]
 $manifest.Add("ProductVersion=$Version")
 $manifest.Add("RuntimePack=amd-neural-runtime (LmxxfNrRuntime.dll $(Get-Sha256 -Path (Join-Path $runtimeSource 'LmxxfNrRuntime.dll')))")
+# The engine ships without a model, and the manifest is what tells a user which
+# build they have: without this line a package with the engine and one without
+# differ only in a hundred file rows nobody reads.
+if ($IncludeSubtitleEngine) {
+    $manifest.Add("SubtitleEngine=translation/runtime (llama-server.exe $(Get-Sha256 -Path (Join-Path $subtitleSource 'llama-server.exe')))")
+}
 $manifest.Add('Path|Size|SHA256')
 foreach ($file in $files) {
     $relative = Get-RelativePackagePath -Root $stageFull -Path $file.FullName

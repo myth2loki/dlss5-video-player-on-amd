@@ -175,6 +175,22 @@ The embedded font and application icon derive from Tabler Icons 3.46.0,
 copyright (c) 2020-2026 Pawel Kuna, under MIT. The package includes
 `THIRD_PARTY_LICENSES/tabler-MIT.txt`.
 
+## llama.cpp (optional subtitle engine)
+
+Source and license: https://github.com/ggml-org/llama.cpp — MIT.
+
+An AMD package built with `-IncludeSubtitleEngine` carries
+`translation/runtime`: llama-server b10679 and the DLLs it loads. It is
+conveyed with `THIRD_PARTY_LICENSES/llama-cpp-MIT.txt`, and with
+`LICENSE-LLVM-OpenMP` for the OpenMP runtime `libomp.dll` links.
+
+No model is shipped. A translation model is a multi-gigabyte download whose
+terms are the model author's — Gemma's terms for the one this was measured
+with — and redistributing it is not permitted, so the engine only becomes
+usable once the person who installed it puts a `.gguf` in
+`translation/models`. The runtime alone is inert: the player treats an engine
+as available only when both the server binary and a model file are present.
+
 ## Redistribution warning
 
 The package's combined ReShade/RenoDX/NVIDIA/Streamline/patched-neural binary
