@@ -7,6 +7,7 @@
 #include "AudioTrackPolicy.h"
 #include "SubtitlePolicy.h"
 #include "SubtitleTranslatePolicy.h"
+#include "SubtitleSpeechPolicy.h"
 #include "SourceDigestMemo.h"
 #include "AudioEndpointPolicy.h"
 #include "AudioPassthroughPolicy.h"
@@ -16236,6 +16237,140 @@ void subtitle_translate_cache_key_tracks_what_the_translation_depends_on_test()
     CHECK(st::CacheKey("ab", "c", "d") != st::CacheKey("a", "bc", "d"));
 }
 
+
+// ---- Speech to subtitles -----------------------------------------------------
+
+// The film is cut into windows the engine can hear in one go: a short first one
+// so the first line arrives sooner, then longer ones that overlap slightly.
+void speech_windows_cover_the_film_once_test()
+{
+    namespace sp = subtitle_speech;
+    const sp::ChunkPlan plan;
+    CHECK_EQ(22.0, plan.Step());  // 24 s window, 2 s overlap
+
+    const auto first = sp::ChunkAt(plan, 0, 100.0);
+    REQUIRE(first.has_value());
+    CHECK_EQ(0.0, first->start);
+    CHECK_EQ(10.0, first->end);
+    CHECK_EQ(0.0, first->coveredUntil);
+
+    const auto second = sp::ChunkAt(plan, 1, 100.0);
+    REQUIRE(second.has_value());
+    CHECK_EQ(8.0, second->start);         // reaches back over the overlap
+    CHECK_EQ(32.0, second->end);          // and stays a whole window long
+    CHECK_EQ(10.0, second->coveredUntil); // new material starts here
+
+    // 10 s then five 22 s steps reaches 120 s, so 100 s needs six windows and
+    // the sixth is the one clamped to the end.
+    const auto fifth = sp::ChunkAt(plan, 4, 100.0);
+    REQUIRE(fifth.has_value());
+    CHECK_EQ(98.0, fifth->end);
+    const auto sixth = sp::ChunkAt(plan, 5, 100.0);
+    REQUIRE(sixth.has_value());
+    CHECK_EQ(100.0, sixth->end);
+    CHECK(!sp::ChunkAt(plan, 6, 100.0).has_value());
+    CHECK_EQ(size_t{6}, sp::ChunkCount(plan, 100.0));
+    CHECK_EQ(size_t{0}, sp::ChunkCount(plan, 0.0));
+    CHECK_EQ(size_t{1}, sp::ChunkCount(plan, 6.0));  // shorter than the first window
+}
+
+// Each window's answers are put on the film's clock, and the two seconds every
+// window re-hears are not shown twice.
+void speech_windows_are_merged_onto_the_film_clock_test()
+{
+    namespace sp = subtitle_speech;
+    using Cue = subtitle_translate::Cue;
+    const sp::Chunk chunk{8.0, 32.0, 10.0};  // 8..10 was heard by the window before
+
+    std::vector<Cue> heard(3);
+    heard[0].start = 0.5; heard[0].end = 1.5; heard[0].text = " in the overlap";  // 8.5..9.5
+    heard[1].start = 3.0; heard[1].end = 6.0; heard[1].text = " hello there ";
+    heard[2].start = 20.0; heard[2].end = 40.0; heard[2].text = " runs past the window";
+    std::vector<Cue> cues;
+    CHECK_EQ(size_t{2}, sp::AppendChunk(cues, heard, chunk));
+    REQUIRE(cues.size() == 2);
+    CHECK_EQ(11.0, cues[0].start);  // chunk start + 3 s
+    CHECK_EQ(14.0, cues[0].end);
+    CHECK_EQ(std::string("hello there"), cues[0].text);  // trimmed
+    CHECK_EQ(32.0, cues[1].end);    // never drawn past the audio that was sent
+
+    // A cue that begins in the overlap but runs past it is trimmed, not dropped:
+    // dropping it lost every line that happened to start in those two seconds.
+    std::vector<Cue> straddling(1);
+    straddling[0].start = 0.0; straddling[0].end = 6.0; straddling[0].text = "straddles";
+    std::vector<Cue> trimmed;
+    CHECK_EQ(size_t{1}, sp::AppendChunk(trimmed, straddling, chunk));
+    CHECK_EQ(10.0, trimmed[0].start);
+    CHECK_EQ(14.0, trimmed[0].end);
+
+    // Noise is not speech.
+    std::vector<Cue> noise(2);
+    noise[0].start = 1.0; noise[0].end = 2.0; noise[0].text = " ... ";
+    noise[1].start = 2.0; noise[1].end = 3.0; noise[1].text = "";
+    std::vector<Cue> kept;
+    CHECK_EQ(size_t{0}, sp::AppendChunk(kept, noise, sp::Chunk{0.0, 10.0, 0.0}));
+
+    // The engine stuck on one line is not a character repeating themselves.
+    std::vector<Cue> stuck(5);
+    for (size_t i = 0; i < stuck.size(); ++i) {
+        stuck[i].start = double(i); stuck[i].end = double(i) + 0.9; stuck[i].text = "loop";
+    }
+    std::vector<Cue> looped;
+    CHECK_EQ(size_t{3}, sp::AppendChunk(looped, stuck, sp::Chunk{0.0, 10.0, 0.0}));
+
+    CHECK_EQ(8.0, sp::LagSeconds(40.0, 32.0));
+    CHECK_EQ(0.0, sp::LagSeconds(20.0, 32.0));
+}
+
+// A twenty-second cue is unreadable: it is cut at sentence marks, and the time
+// is shared out by how much of the text each piece carries.
+void speech_long_cues_are_split_at_sentence_marks_test()
+{
+    namespace sp = subtitle_speech;
+    using Cue = subtitle_translate::Cue;
+    std::vector<Cue> cues(1);
+    cues[0].start = 10.0; cues[0].end = 32.0;
+    cues[0].text = "First sentence here. Second one follows. And a third.";
+    const auto pieces = sp::SplitLongCues(cues);
+    CHECK_EQ(size_t{3}, pieces.size());
+    CHECK_EQ(10.0, pieces[0].start);
+    CHECK_EQ(pieces[0].end, pieces[1].start);  // contiguous
+    CHECK_EQ(32.0, pieces[2].end);
+    CHECK_EQ(std::string("First sentence here."), pieces[0].text);
+
+    // A cue that is already short enough is untouched.
+    std::vector<Cue> brief(1);
+    brief[0].start = 1.0; brief[0].end = 3.0; brief[0].text = "Short.";
+    CHECK_EQ(size_t{1}, sp::SplitLongCues(brief).size());
+
+    // One sentence with no marks is still cut rather than shown as a wall.
+    std::vector<Cue> wall(1);
+    wall[0].start = 0.0; wall[0].end = 8.0; wall[0].text = std::string(60, 'x');
+    CHECK(sp::SplitLongCues(wall).size() >= 2);
+}
+
+// The engine takes one multipart form, and the audio in it is bytes: every value
+// from 0 to 255 occurs in a window of PCM.
+void speech_request_body_carries_the_audio_as_bytes_test()
+{
+    namespace sp = subtitle_speech;
+    std::string audio;
+    for (int value = 0; value < 256; ++value) audio.push_back(char(value));
+    const std::string body = sp::MultipartBody("BOUND", "chunk.wav", audio, "ja");
+    CHECK(body.find("--BOUND\r\n") == 0);
+    CHECK(body.find("name=\"response_format\"") != std::string::npos);
+    CHECK(body.find("\r\n\r\nsrt\r\n") != std::string::npos);
+    CHECK(body.find("\r\n\r\nja\r\n") != std::string::npos);
+    CHECK(body.find("name=\"file\"; filename=\"chunk.wav\"") != std::string::npos);
+    // The audio survives byte for byte, including its NULs.
+    const size_t at = body.find("\r\nContent-Type: audio/wav\r\n\r\n");
+    REQUIRE(at != std::string::npos);
+    const size_t from = at + std::string("\r\nContent-Type: audio/wav\r\n\r\n").size();
+    CHECK_EQ(audio.size(), body.size() - from - std::string("\r\n--BOUND--\r\n").size());
+    CHECK(body.compare(from, audio.size(), audio) == 0);
+    CHECK(body.ends_with("\r\n--BOUND--\r\n"));
+}
+
 constexpr test_support::TestCase kCases[] = {
     TEST_CASE(harness_isolates_a_failing_case_from_the_ones_after_it_test),
     TEST_CASE(runtime_shutdown_releases_player_before_media_foundation_and_com_test),
@@ -16603,6 +16738,10 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(subtitle_translate_prompt_matches_the_models_template_test),
     TEST_CASE(subtitle_translate_cleans_what_the_model_answers_test),
     TEST_CASE(subtitle_translate_resumes_where_the_last_run_stopped_test),
+    TEST_CASE(speech_windows_cover_the_film_once_test),
+    TEST_CASE(speech_windows_are_merged_onto_the_film_clock_test),
+    TEST_CASE(speech_long_cues_are_split_at_sentence_marks_test),
+    TEST_CASE(speech_request_body_carries_the_audio_as_bytes_test),
     TEST_CASE(subtitle_translate_wrap_budget_matches_the_measurement_test),
     TEST_CASE(subtitle_translate_cache_key_tracks_what_the_translation_depends_on_test),
     TEST_CASE(subtitle_choice_round_trips_through_the_settings_file_test),

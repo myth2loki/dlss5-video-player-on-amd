@@ -1,6 +1,7 @@
 #include "SubtitleTranslator.h"
 
-#include "InheritedHandles.h"
+#include "EngineChild.h"
+
 #include "KillOnCloseJob.h"
 #include "Log.h"
 #include "MediaTools.h"
@@ -28,232 +29,14 @@ inline constexpr size_t kFirstPartial = 8;
 // so they are batched rather than written per cue.
 inline constexpr size_t kPartialEvery = 24;
 
-// A Win32 handle that closes itself, so every early return in this file is also
-// a correct one. Deliberately not shared_ptr: nothing here outlives its scope.
-class Handle {
-public:
-    Handle() = default;
-    explicit Handle(HANDLE value) : m_value(value) {}
-    ~Handle() { Reset(); }
-    Handle(const Handle&) = delete;
-    Handle& operator=(const Handle&) = delete;
-    Handle(Handle&& other) noexcept : m_value(other.Release()) {}
-    Handle& operator=(Handle&& other) noexcept
-    {
-        if (this != &other) {
-            Reset();
-            m_value = other.Release();
-        }
-        return *this;
-    }
-
-    HANDLE Get() const { return m_value; }
-    explicit operator bool() const { return m_value != nullptr && m_value != INVALID_HANDLE_VALUE; }
-    HANDLE Release()
-    {
-        HANDLE value = m_value;
-        m_value = nullptr;
-        return value;
-    }
-    void Reset(HANDLE value = nullptr)
-    {
-        if (m_value && m_value != INVALID_HANDLE_VALUE) CloseHandle(m_value);
-        m_value = value;
-    }
-
-private:
-    HANDLE m_value = nullptr;
-};
-
-class InternetHandle {
-public:
-    InternetHandle() = default;
-    explicit InternetHandle(HINTERNET value) : m_value(value) {}
-    ~InternetHandle() { Reset(); }
-    InternetHandle(const InternetHandle&) = delete;
-    InternetHandle& operator=(const InternetHandle&) = delete;
-    InternetHandle(InternetHandle&& other) noexcept : m_value(other.Release()) {}
-    InternetHandle& operator=(InternetHandle&& other) noexcept
-    {
-        if (this != &other) {
-            Reset();
-            m_value = other.Release();
-        }
-        return *this;
-    }
-
-    HINTERNET Get() const { return m_value; }
-    explicit operator bool() const { return m_value != nullptr; }
-    HINTERNET Release()
-    {
-        HINTERNET value = m_value;
-        m_value = nullptr;
-        return value;
-    }
-    void Reset(HINTERNET value = nullptr)
-    {
-        if (m_value) WinHttpCloseHandle(m_value);
-        m_value = value;
-    }
-
-private:
-    HINTERNET m_value = nullptr;
-};
-
-// A child in a kill-on-close job. With `capture`, its stdout and stderr are one
-// pipe the player drains; without, they go to NUL - an engine that logs
-// progress for minutes would otherwise fill a pipe nobody reads and block.
-struct Child {
-    Handle process;
-    Handle output;
-};
-
-bool Spawn(const fs::path& executable, const std::wstring& arguments, HANDLE job, bool capture,
-           Child& child, const char* what)
-{
-    SECURITY_ATTRIBUTES inheritPipe{};
-    inheritPipe.nLength = sizeof(inheritPipe);
-    inheritPipe.bInheritHandle = TRUE;
-
-    Handle pipeRead, pipeWrite;
-    if (capture) {
-        HANDLE readRaw = nullptr, writeRaw = nullptr;
-        if (!CreatePipe(&readRaw, &writeRaw, &inheritPipe, 0)) {
-            LOG("Translate: CreatePipe failed winerr=" << GetLastError());
-            return false;
-        }
-        pipeRead.Reset(readRaw);
-        pipeWrite.Reset(writeRaw);
-        // Only the writing end is the child's; the player's read end must not be
-        // inherited, or the pipe never reports end-of-file.
-        SetHandleInformation(pipeRead.Get(), HANDLE_FLAG_INHERIT, 0);
-    }
-
-    Handle nulIn(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritPipe,
-                             OPEN_EXISTING, 0, nullptr));
-    Handle nulOut;
-    if (!nulIn) {
-        LOG("Translate: opening NUL failed winerr=" << GetLastError());
-        return false;
-    }
-    if (!capture) {
-        nulOut.Reset(CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritPipe,
-                                 OPEN_EXISTING, 0, nullptr));
-        if (!nulOut) {
-            LOG("Translate: opening NUL for writing failed winerr=" << GetLastError());
-            return false;
-        }
-    }
-
-    STARTUPINFOW startupInfo{};
-    startupInfo.cb = sizeof(startupInfo);
-    startupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startupInfo.hStdInput = nulIn.Get();
-    startupInfo.hStdOutput = capture ? pipeWrite.Get() : nulOut.Get();
-    startupInfo.hStdError = startupInfo.hStdOutput;
-
-    // The handle list, not bInheritHandles alone: this is what stops a child of
-    // the overlay from inheriting this pipe and holding its end open.
-    InheritedHandles inherited{startupInfo.hStdInput, startupInfo.hStdOutput, startupInfo.hStdError};
-    if (!inherited.Ready()) {
-        LOG("Translate: the inherited-handle list could not be built");
-        return false;
-    }
-    STARTUPINFOEXW startup{};
-    startup.StartupInfo = startupInfo;
-    startup.StartupInfo.cb = sizeof(startup);
-    startup.lpAttributeList = inherited.AttributeList();
-
-    std::wstring command = L"\"" + executable.wstring() + L"\" " + arguments;
-    PROCESS_INFORMATION info{};
-    const BOOL started =
-        CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, inherited.InheritHandles(),
-                       CREATE_NO_WINDOW | CREATE_SUSPENDED | inherited.CreationFlags(), nullptr, nullptr,
-                       &startup.StartupInfo, &info);
-    const DWORD startError = GetLastError();
-    // The child owns its copies now; the player's writing end must close or the
-    // read never ends.
-    pipeWrite.Reset();
-    nulIn.Reset();
-    nulOut.Reset();
-    if (!started) {
-        LOG("Translate: CreateProcess(" << what << ") failed winerr=" << startError);
-        return false;
-    }
-    Handle thread(info.hThread);
-    // Assigned before it runs, so there is no window in which it is unowned.
-    if (!job || !AssignProcessToJobObject(job, info.hProcess) ||
-        ResumeThread(thread.Get()) == DWORD(-1)) {
-        LOG("Translate: " << what << " could not be put in its job winerr=" << GetLastError());
-        TerminateProcess(info.hProcess, 1);
-        CloseHandle(info.hProcess);
-        return false;
-    }
-    child.process.Reset(info.hProcess);
-    child.output = std::move(pipeRead);
-    return true;
-}
-
-// Everything the child wrote, up to `cap`, or as much as arrived before `cancel`
-// said stop or the deadline passed. Reading in this loop rather than with one
-// blocking ReadFile is what makes a cancel take effect while a child is quiet.
-std::string Drain(HANDLE pipe, size_t cap, const std::function<bool()>& cancel, DWORD timeoutMillis)
-{
-    std::string text;
-    const ULONGLONG deadline = GetTickCount64() + timeoutMillis;
-    char buffer[8192];
-    for (;;) {
-        DWORD available = 0;
-        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) break;  // closed
-        if (available) {
-            DWORD got = 0;
-            if (!ReadFile(pipe, buffer, std::min<DWORD>(available, DWORD(sizeof(buffer))), &got, nullptr) ||
-                !got)
-                break;
-            if (text.size() + got > cap) {
-                text.append(buffer, cap - text.size());
-                break;
-            }
-            text.append(buffer, got);
-            continue;
-        }
-        if ((cancel && cancel()) || GetTickCount64() >= deadline) break;
-        Sleep(2);
-    }
-    return text;
-}
-
-// Runs a lambda when it goes out of scope. Every early return in RunOnce has to
-// stop the server and release the job, and a guard is the only form of that
-// which cannot be forgotten on one path.
-template <class Function>
-class ScopeExit {
-public:
-    explicit ScopeExit(Function function) : m_function(std::move(function)) {}
-    ~ScopeExit() { m_function(); }
-    ScopeExit(const ScopeExit&) = delete;
-    ScopeExit& operator=(const ScopeExit&) = delete;
-
-private:
-    Function m_function;
-};
-
-template <class Function>
-ScopeExit<Function> OnExit(Function function)
-{
-    return ScopeExit<Function>(std::move(function));
-}
-
-bool WriteWholeFile(const fs::path& path, std::string_view text)
-{
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) return false;
-    out.write(text.data(), std::streamsize(text.size()));
-    // Close before reporting: a partial that another process is about to open
-    // must be complete on disk, not merely written.
-    out.close();
-    return out.good();
-}
+using engine_child::Child;
+using engine_child::Drain;
+using engine_child::Handle;
+using engine_child::HttpStatus;
+using engine_child::InternetHandle;
+using engine_child::OnExit;
+using engine_child::Spawn;
+using engine_child::WriteWholeFile;
 
 // The versions written while translating sit beside the finished file and share
 // its stem: "<key>.8.ass", "<key>.32.ass". Removing them is best effort - a
@@ -275,15 +58,6 @@ void RemovePartials(const fs::path& finalPath)
         std::error_code ignored;
         fs::remove(it->path(), ignored);
     }
-}
-
-int HttpStatus(HINTERNET request)
-{
-    DWORD status = 0, size = sizeof(status);
-    if (!WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX))
-        return 0;
-    return int(status);
 }
 
 } // namespace
@@ -662,40 +436,10 @@ void Translator::StopServer()
 std::optional<std::string> Translator::Post(const std::string& path, const std::string& body,
                                             const std::string& contentType, int timeoutMillis)
 {
-    if (!m_httpConnection) return std::nullopt;
-    const std::wstring widePath = utf8_text::ToWide(path);
-    InternetHandle request(WinHttpOpenRequest(m_httpConnection, body.empty() ? L"GET" : L"POST",
-                                              widePath.c_str(), nullptr, WINHTTP_NO_REFERER,
-                                              WINHTTP_DEFAULT_ACCEPT_TYPES, 0));
-    if (!request) return std::nullopt;
-    WinHttpSetTimeouts(request.Get(), 2000, 2000, 30000, timeoutMillis);
-    std::wstring headers;
-    if (!contentType.empty()) headers = L"Content-Type: " + utf8_text::ToWide(contentType) + L"\r\n";
-    const DWORD length = DWORD(body.size());
-    // WinHttpSendRequest takes a mutable buffer it only reads; const_cast keeps
-    // the caller's string const rather than copying a prompt for every cue.
-    void* payload = body.empty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char*>(body.data());
-    if (!WinHttpSendRequest(request.Get(),
-                            headers.empty() ? WINHTTP_NO_ADDITIONAL_HEADERS : headers.c_str(),
-                            headers.empty() ? 0 : DWORD(headers.size()), payload, length, length, 0))
-        return std::nullopt;
-    if (!WinHttpReceiveResponse(request.Get(), nullptr)) return std::nullopt;
-    const int status = HttpStatus(request.Get());
-    if (status != 200) return std::nullopt;
-    std::string text;
-    for (;;) {
-        DWORD available = 0;
-        if (!WinHttpQueryDataAvailable(request.Get(), &available) || available == 0) break;
-        const size_t offset = text.size();
-        const size_t chunk = std::min<size_t>(available, 64u << 10);
-        text.resize(offset + chunk);
-        DWORD read = 0;
-        const BOOL ok = WinHttpReadData(request.Get(), text.data() + offset, DWORD(chunk), &read);
-        text.resize(offset + read);
-        // A reply is a few hundred bytes; anything past this is not a reply.
-        if (!ok || read == 0 || text.size() > (4u << 20)) break;
-    }
-    return text;
+    const auto answer = engine_child::HttpRequest(m_httpConnection, body.empty() ? L"GET" : L"POST",
+                                                  path, body, contentType, timeoutMillis);
+    if (!answer || answer->status != 200) return std::nullopt;
+    return answer->body;
 }
 
 std::optional<std::string> Translator::TranslateOne(const std::string& text, const Languages& languages)

@@ -114,3 +114,6 @@ site/dist/
 
 # Translation engine + GGUF (downloaded on first use, ~2.7 GB)
 /translation/
+
+# Speech recognition runtime + GGML model (downloaded on first use)
+/asr/

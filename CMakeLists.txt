@@ -340,6 +340,7 @@ add_library(player_app OBJECT
     src/AudioPlayer.cpp src/AudioPlayer.h src/WasapiRenderer.cpp
     src/SubtitleOverlay.cpp src/SubtitleOverlay.h src/SubtitlePolicy.h
     src/SubtitleTranslator.cpp src/SubtitleTranslator.h src/SubtitleTranslatePolicy.h
+    src/SpeechToText.cpp src/SpeechToText.h src/SubtitleSpeechPolicy.h src/EngineChild.h
     src/RecentMedia.cpp src/RecentMedia.h
     src/SynchronizedPlayback.cpp src/SynchronizedPlayback.h
     src/NeuralReceipt.cpp src/NeuralReceipt.h
