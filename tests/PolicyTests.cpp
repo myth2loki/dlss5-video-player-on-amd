@@ -16291,6 +16291,31 @@ void speech_windows_cover_the_film_once_test()
     CHECK_EQ(size_t{6}, sp::ChunkCount(plan, 100.0));
     CHECK_EQ(size_t{0}, sp::ChunkCount(plan, 0.0));
     CHECK_EQ(size_t{1}, sp::ChunkCount(plan, 6.0));  // shorter than the first window
+
+    // Listening can begin where the viewer is. Asked for twelve minutes into a
+    // film, starting at zero would leave the subtitles minutes behind the
+    // picture, drawing nothing until they caught up.
+    sp::ChunkPlan late;
+    late.startSeconds = 300.0;
+    const auto l0 = sp::ChunkAt(late, 0, 400.0);
+    REQUIRE(l0.has_value());
+    CHECK_EQ(300.0, l0->start);
+    CHECK_EQ(310.0, l0->end);
+    CHECK_EQ(300.0, l0->coveredUntil);
+    const auto l1 = sp::ChunkAt(late, 1, 400.0);
+    REQUIRE(l1.has_value());
+    CHECK_EQ(308.0, l1->start);
+    CHECK_EQ(332.0, l1->end);
+    CHECK_EQ(size_t{6}, sp::ChunkCount(late, 400.0));
+    CHECK_EQ(size_t{0}, sp::ChunkCount(late, 300.0));  // starting past the end
+
+    // The overlap never reaches back past where listening began.
+    sp::ChunkPlan tight;
+    tight.startSeconds = 5.0;
+    tight.firstSeconds = 1.0;
+    const auto t1 = sp::ChunkAt(tight, 1, 100.0);
+    REQUIRE(t1.has_value());
+    CHECK_EQ(5.0, t1->start);
 }
 
 // Each window's answers are put on the film's clock, and the two seconds every

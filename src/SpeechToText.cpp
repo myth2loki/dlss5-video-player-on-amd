@@ -132,6 +132,25 @@ void SpeechToText::Start(const Job& job)
     m_wake.notify_all();
 }
 
+void SpeechToText::SetPlayhead(double seconds)
+{
+    m_playhead.store(seconds);
+}
+
+bool SpeechToText::WaitForLead(double frontier, double lead, uint64_t generation)
+{
+    // Four checks a second: the transcript runs at twice real time, so a window
+    // of audio is twenty seconds of work against a fifth of a second of lag.
+    constexpr DWORD kSlice = 250;
+    for (;;) {
+        const double playhead = m_playhead.load();
+        if (playhead < 0.0) return true;                 // nothing to keep up with
+        if (frontier <= playhead + lead) return true;     // near enough
+        if (Cancelled(generation)) return false;
+        Sleep(kSlice);
+    }
+}
+
 void SpeechToText::Cancel()
 {
     HANDLE jobObject = nullptr;
@@ -215,6 +234,12 @@ void SpeechToText::RunOnce(const Job& job, uint64_t generation)
         const auto chunk = ChunkAt(job.plan, index, job.duration);
         if (!chunk) break;
         if (Cancelled(generation)) {
+            SetState(State::Cancelled);
+            return;
+        }
+        // Ahead of the viewer, the engine waits: the rest of the film is not
+        // going anywhere, and sixteen cores are worth more to the picture.
+        if (!WaitForLead(frontier, job.plan.leadSeconds, generation)) {
             SetState(State::Cancelled);
             return;
         }

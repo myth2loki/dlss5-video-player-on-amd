@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <winhttp.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -90,6 +91,10 @@ public:
     void Start(const Job& job);
     void Cancel();
     Status Poll() const;
+    // Where the viewer is, so the engine can keep a lead rather than transcribe
+    // the second half of a film nobody has reached. Negative means nothing is
+    // playing and the lead does not apply.
+    void SetPlayhead(double seconds);
 
 private:
     void Run();
@@ -103,6 +108,9 @@ private:
     // window's own time.
     std::optional<std::vector<subtitle_translate::Cue>> Listen(const Job& job, const Chunk& chunk,
                                                                uint64_t generation);
+    // Waits until the transcript is within `lead` seconds of the playhead. False
+    // when the run was cancelled while waiting.
+    bool WaitForLead(double frontier, double lead, uint64_t generation);
 
     const std::filesystem::path m_helperDirectory;
     const Engine m_engine;
@@ -113,6 +121,7 @@ private:
     bool m_stop = false;
     uint64_t m_generation = 0;
     bool m_requested = false;
+    std::atomic<double> m_playhead{-1.0};
     Job m_job;
     Status m_status;
 

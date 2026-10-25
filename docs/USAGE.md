@@ -949,7 +949,17 @@ plain `asr\` folder beside the player, or one level up in the build tree), or
 `[Speech] Runtime=` and `Model=` in the ini. `Threads=` (8) is how many cores the
 engine may have - every one it takes is one the player does not have - and
 `Language=` (empty lets the engine decide) and `AudioStream=` (0) pick what to
-listen to.
+listen to. `Lead=` (180) is how far ahead of the picture the transcript may run
+before the engine waits; the rest of a two-hour film is not going anywhere, and
+writing it an hour early would cost the picture its cores for an hour.
+
+Listening begins **where the viewer is**, not at the beginning. A film picked up
+twelve minutes in has twelve minutes of audio nobody needs written down, and at
+a little over twice real time the transcript would take minutes to reach the
+picture - minutes of nothing on screen. The status line says how far behind the
+picture the transcript still is (`Subtitles 3/44 · 2 min behind`) so that a wait
+is never unexplained. Seeking past what has been heard starts listening again
+from where the seek landed, for the same reason.
 
 The audio is transcribed in windows: the first ten seconds, then twenty-four at
 a time, each starting two seconds before the last one ended so a word cut in

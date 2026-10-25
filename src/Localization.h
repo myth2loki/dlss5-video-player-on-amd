@@ -59,6 +59,8 @@ private:
             {L"subtitles.speech_done", L"Subtitles written from speech"},
             {L"subtitles.speech_stopped", L"Stopped listening"},
             {L"subtitles.speech_failed", L"Subtitles could not be made: "},
+            {L"subtitles.speech_seconds_behind", L" s behind"},
+            {L"subtitles.speech_minutes_behind", L" min behind"},
             {L"subtitles.dialog", L"Load a subtitle file"}, {L"subtitles.filter", L"Subtitles"},
             {L"subtitles.failed", L"The subtitle file could not be read"}, {L"subtitles.delay", L"Subtitle delay "},
             {L"menu.mark_in", L"Mark In\tI"}, {L"menu.mark_out", L"Mark Out\tO"}, {L"menu.clear_marks", L"Clear Marks\tShift+I / Shift+O"},

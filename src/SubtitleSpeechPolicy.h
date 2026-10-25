@@ -33,6 +33,15 @@ struct ChunkPlan {
     double firstSeconds = 10.0;
     double windowSeconds = 24.0;
     double overlapSeconds = 2.0;
+    // Where listening begins on the film's clock. A viewer who asks for
+    // subtitles twelve minutes in must not sit through the opening titles being
+    // heard again first: at a little over twice real time, the transcript would
+    // take minutes to reach the picture, and nothing would be drawn until it did.
+    double startSeconds = 0.0;
+    // How far ahead of the viewer the transcript may run before the engine is
+    // left idle. A two-hour film is an hour of cores; none of that is worth
+    // spending on audio nobody will reach for another twenty minutes.
+    double leadSeconds = 180.0;
 
     // A window is asked to hear `overlapSeconds` of audio it has already been
     // given, so the step between window starts is what is left.
@@ -57,20 +66,24 @@ struct Chunk {
 inline std::optional<Chunk> ChunkAt(const ChunkPlan& plan, size_t index, double duration)
 {
     if (!(duration > 0.0) || !std::isfinite(duration)) return std::nullopt;
+    const double from = std::max(0.0, plan.startSeconds);
+    if (duration <= from) return std::nullopt;  // asked to start past the end
     if (index == 0) {
         Chunk chunk;
-        chunk.start = 0.0;
-        chunk.end = std::min(duration, plan.firstSeconds);
-        chunk.coveredUntil = 0.0;
+        chunk.start = from;
+        chunk.end = std::min(duration, from + plan.firstSeconds);
+        chunk.coveredUntil = from;
         return chunk.end > 0.0 ? std::optional<Chunk>(chunk) : std::nullopt;
     }
     // Roll the windows forward: each covers the step, and reaches back over the
     // overlap it shares with the one before.
-    double covered = std::min(duration, plan.firstSeconds);
+    double covered = std::min(duration, from + plan.firstSeconds);
     for (size_t at = 1; at <= index; ++at) {
         if (covered >= duration) return std::nullopt;
         const double step = plan.Step();
-        const double start = std::max(0.0, covered - plan.overlapSeconds);
+        // Never reach back past where listening began: those seconds were not
+        // asked for, and the two before them are outside this transcript.
+        const double start = std::max(from, covered - plan.overlapSeconds);
         // start = covered - overlap and the window is windowSeconds long, so it
         // ends at start + windowSeconds == covered + step. Adding the overlap a
         // second time would make every window 26 s for a 24 s plan.

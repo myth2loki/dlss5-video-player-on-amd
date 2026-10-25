@@ -4168,7 +4168,10 @@ private:
     // Starts listening to the film's audio. The transcript is the player's own
     // source track: it is drawn by the same overlay, translated by the same
     // engine, and hot-reloaded as it grows, all without a file the viewer made.
-    void StartSpeech(){
+    void StartSpeech(){StartSpeechFrom(Position());}
+    // `position` is where the transcript should begin: the playhead when the
+    // viewer asks, and where they landed when they jump past what has been heard.
+    void StartSpeechFrom(double position){
         if(!m_loaded||m_path.empty())return;
         const bool local=_wcsnicmp(m_path.c_str(),L"http://",7)!=0&&_wcsnicmp(m_path.c_str(),L"https://",8)!=0;
         const auto engine=SpeechEngine();
@@ -4186,7 +4189,17 @@ private:
         job.audioStream=int(GetPrivateProfileIntW(L"Speech",L"AudioStream",0,SettingsPath().c_str()));
         job.duration=duration;
         job.language=WideToUtf8(IniString(L"Speech",L"Language"));
-        job.identity=L"speech|"+m_path;
+        // Begin where the viewer is, not at the beginning. Asked for twelve
+        // minutes into a film, listening from zero would leave the subtitles
+        // minutes behind the picture and draw nothing at all until they caught
+        // up - which for a two-hour film is most of the time anyone would give
+        // it. The start is rounded down to ten seconds so that asking again
+        // nearby reuses the same transcript instead of making a new one.
+        double from=std::floor((position-2.0)/10.0)*10.0;
+        if(!(from>0.0))from=0.0;
+        job.plan.startSeconds=from;
+        job.plan.leadSeconds=double(GetPrivateProfileIntW(L"Speech",L"Lead",180,SettingsPath().c_str()));
+        job.identity=L"speech|"+m_path+L"|"+std::to_wstring(static_cast<long long>(from));
         if(!m_speech)
             m_speech=std::make_unique<subtitle_speech::SpeechToText>(ExecutableDirectory(),engine,
                                                                      TranslationCacheDirectory());
@@ -4198,8 +4211,8 @@ private:
         m_speechOwnsDisplay=true;
         m_speech->Start(job);
         m_sourceNotice=T(L"subtitles.speech_starting");UpdateCachedStatus();UpdateSubtitleMenu();
-        LOG("Subtitles: listening to "<<WideToUtf8(m_path)<<" ("<<duration<<" s, "
-            <<engine.threads<<" threads).");
+        LOG("Subtitles: listening to "<<WideToUtf8(m_path)<<" from "<<from<<" s of "<<duration
+            <<" s ("<<engine.threads<<" threads, "<<job.plan.leadSeconds<<" s ahead).");
     }
     // Stops listening but keeps what was already heard on screen: the viewer
     // asked for the subtitles to stop growing, not to disappear.
@@ -4215,6 +4228,8 @@ private:
     }
     void PollSpeech(){
         if(!m_speech)return;
+        // The engine keeps its lead over this number, not over the film's end.
+        m_speech->SetPlayhead(m_loaded?Position():-1.0);
         const auto status=m_speech->Poll();
         const bool changed=status.state!=m_speechStatus.state||status.chunksDone!=m_speechStatus.chunksDone;
         m_speechStatus=status;
@@ -4240,9 +4255,20 @@ private:
         switch(status.state){
         case subtitle_speech::State::Starting:
             m_sourceNotice=T(L"subtitles.speech_starting");break;
-        case subtitle_speech::State::Listening:
-            m_sourceNotice=T(L"subtitles.speech_generating")+L" "+std::to_wstring(status.chunksDone)+
-                L"/"+std::to_wstring(status.chunksTotal);break;
+        case subtitle_speech::State::Listening:{
+            std::wstring notice=T(L"subtitles.speech_generating")+L" "+std::to_wstring(status.chunksDone)+
+                L"/"+std::to_wstring(status.chunksTotal);
+            // How far behind the picture the transcript is. Without this, a
+            // viewer who asked for subtitles at the start of a film that is
+            // already at minute twelve sees nothing and has no way to know why.
+            const double lag=subtitle_speech::LagSeconds(Position(),status.frontier);
+            if(lag>=5.0){
+                notice+=L" \u00b7 ";
+                notice+=lag<120.0?std::to_wstring(int(lag+0.5))+T(L"subtitles.speech_seconds_behind")
+                                 :std::to_wstring(int(lag/60.0+0.5))+T(L"subtitles.speech_minutes_behind");
+            }
+            m_sourceNotice=notice;
+            break;}
         case subtitle_speech::State::Done:
             m_sourceNotice=T(L"subtitles.speech_done");
             LOG("Subtitles: transcript ready, "<<status.chunksDone<<" window(s).");break;
@@ -9110,7 +9136,16 @@ private:
     }
 
     bool PerformSeek(double sec,bool resumeAfter) {
-        if(!m_loaded||m_seeking)return false;SetSeeking(true);LeaveSettingsPreviewFrame();CancelPausedSettingsPreview();sec=ClampSeek(sec);LOG("Seek begin target="<<sec<<" resume="<<resumeAfter);
+        if(!m_loaded||m_seeking)return false;
+        // A transcript is made of the audio that was heard. Jumping past what it
+        // covers leaves nothing to draw, and waiting for it to catch up at twice
+        // real time is the very wait this feature exists to avoid: start again
+        // where the viewer landed instead.
+        if(m_speech&&m_speechStatus.Running()&&sec>m_speechStatus.frontier+30.0){
+            LOG("Subtitles: seeking past the transcript ("<<sec<<" s against "<<m_speechStatus.frontier
+                <<" s); listening again from there.");
+            StartSpeechFrom(sec);
+        }SetSeeking(true);LeaveSettingsPreviewFrame();CancelPausedSettingsPreview();sec=ClampSeek(sec);LOG("Seek begin target="<<sec<<" resume="<<resumeAfter);
         // Seek is deliberately transactional and performed from Tick(), never from a mouse message.
         // Shut down the audio producer first, wait for GPU work, then restart the video decoder.
         Audio().Stop();
