@@ -13748,6 +13748,10 @@ private:
         case ToolbarAction::Stop:StopPlayback();break;
         case ToolbarAction::Forward10:RequestSeek(Position()+10);break;
         case ToolbarAction::Mute:ToggleMute();break;
+        // The one-press subtitle switch. Mouse/touch hits the toolbar button,
+        // which lands here; the WM_COMMAND path (IDM_SUBTITLE_TOGGLE) already
+        // calls ToggleSubtitles() directly, so this case keeps the two in sync.
+        case ToolbarAction::ToggleSubtitles:ToggleSubtitles();break;
         case ToolbarAction::ToggleNeuralRendering:ToggleNeuralRendering();break;
         case ToolbarAction::ToggleUpscaling:ToggleUpscaling();break;
         // While a conversion runs this pill reads "Cancel", so it has to cancel.
