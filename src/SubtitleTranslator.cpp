@@ -55,6 +55,15 @@ void RemovePartials(const fs::path& finalPath)
         // about to open, and the swap failed with "No such file or directory".
         if (name == finalPath.filename().string()) continue;
         if (name.rfind(stem, 0) != 0) continue;  // a different source's track
+        // The versions written on the way here are "<key>.<count>.ass". A file
+        // that merely shares the prefix is not one of them: the one-language
+        // track derived from the finished file is "<key>.zh.ass", and taking it
+        // with the versions left the single-language view holding a path to
+        // nothing - the child then failed with "No such file or directory".
+        const std::string version =
+            name.substr(stem.size(), name.size() - stem.size() - 4);  // ".ass" is four
+        if (version.empty() || version.find_first_not_of("0123456789") != std::string::npos)
+            continue;
         std::error_code ignored;
         fs::remove(it->path(), ignored);
     }

@@ -378,6 +378,83 @@ inline std::string BuildAss(const std::vector<Cue>& cues, Mode mode, const Layou
     return out;
 }
 
+// ---- One language out of a bilingual track -----------------------------------
+//
+// A bilingual track keeps both languages in one dialogue line: the translation
+// first, the source under it. The two halves are marked rather than guessed -
+// the translation opens with the \rZh switch and the source with \rSrc - and
+// neither can appear inside a subtitle line, because the escape above turns a
+// brace into \{ . So the single-language track is this same file with the
+// source half taken out.
+//
+// A cue that never got a translation is left out altogether: a viewer who asked
+// for Chinese alone does not read the English underneath it, and a lone
+// English line under a file of Chinese is worse than a gap. This is the one
+// place the result differs from BuildAss(cues, Mode::Translation), which falls
+// back to the source for such a cue - here the cue is dropped, which is what
+// "Chinese only" means. Every cue that does have a translation comes out the
+// same as that builder would have made it.
+inline std::string SingleLanguageAss(const std::string& dualAss)
+{
+    const std::string kZhSwitch="{\\rZh}";
+    const std::string kSrcSwitch="{\\rSrc}";
+    std::string out;
+    out.reserve(dualAss.size());
+    size_t pos=0;
+    bool inEvents=false;
+    while(true){
+        const size_t eol=dualAss.find('\n',pos);
+        const bool last=(eol==std::string::npos);
+        std::string line=dualAss.substr(pos,last?std::string::npos:eol-pos);
+        bool keep=true;
+        if(!line.empty()&&line[0]=='['){
+            inEvents=(line.rfind("[Events]",0)==0);
+        }else if(inEvents&&line.rfind("Dialogue:",0)==0){
+            // Nine commas put us at the text: the first nine fields are the
+            // layer, the timing, the style, the name, the three margins and the
+            // effect, and the text is whatever is left - commas included.
+            size_t textStart=std::string::npos;
+            int commas=0;
+            for(size_t i=0;i<line.size();++i){
+                if(line[i]==','){
+                    if(++commas==9){textStart=i+1;break;}
+                }
+            }
+            if(textStart!=std::string::npos){
+                std::string text=line.substr(textStart);
+                if(text.rfind(kZhSwitch,0)==0){
+                    const size_t src=text.find(kSrcSwitch);
+                    if(src!=std::string::npos){
+                        std::string head=text.substr(0,src);
+                        // The blank line between the two languages goes with
+                        // the source half: left behind, it would hold the
+                        // translation up by one line of the source's size.
+                        if(head.size()>=2&&head.compare(head.size()-2,2,"\\N")==0){
+                            const size_t gap=head.rfind("\\N{");
+                            if(gap!=std::string::npos&&
+                               head.size()>=4&&head.compare(head.size()-4,4,"\\h\\N")==0)
+                                head.erase(gap);
+                            else
+                                head.erase(head.size()-2);
+                        }
+                        text=head;
+                    }
+                    line=line.substr(0,textStart)+text;
+                }else if(text.rfind(kSrcSwitch,0)==0){
+                    keep=false;
+                }
+            }
+        }
+        if(keep){
+            out+=line;
+            if(!last)out+='\n';
+        }
+        if(last)break;
+        pos=eol+1;
+    }
+    return out;
+}
+
 // ---- The prompt the model was trained on -------------------------------------
 
 // A pair of language names and the codes the model's own template uses. The

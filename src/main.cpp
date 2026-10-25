@@ -4182,6 +4182,9 @@ private:
             // a picture that changes again before it is on screen.
             if(m_subtitleWanted&&!status.partial.empty()&&status.partial.wstring()!=m_translatedTrack){
                 m_translatedTrack=status.partial.wstring();
+                // A new version of the bilingual track means a new one-language
+                // track: the one is derived from the other.
+                m_translatedTrackSingle.clear();m_translatedTrackSingleFor.clear();
                 m_subtitleReloadPending=true;
             }
             m_sourceNotice=T(L"subtitles.translating")+L" "+std::to_wstring(status.done)+L"/"+std::to_wstring(status.total);
@@ -4194,7 +4197,10 @@ private:
                 m_translateBehind=false;
                 // A resumed run writes to the same name as the one before it, so
                 // the path is not a signal that anything changed - the overlay is
-                // told to reload regardless.
+                // told to reload regardless, and the one-language track derived
+                // from it has to be made again, because the lines in it are not
+                // the ones it was made from.
+                m_translatedTrackSingle.clear();m_translatedTrackSingleFor.clear();
                 m_subtitleReloadPending=true;
                 // A transcript that finished while this batch was running has just
                 // been covered: without this the next tick would see "not running"
@@ -4338,6 +4344,52 @@ private:
         UpdateCachedStatus();UpdateSubtitleMenu();
     }
 
+    // One language out of the bilingual track, made the first time it is asked
+    // for. The overlay draws a file, not a mode, so a single-language view
+    // needs a file of its own; deriving it here means every bilingual track -
+    // one just translated, one left behind by an earlier run, one that came
+    // with the film - can be shown in one language, and the translator never
+    // has to write the same lines twice.
+    std::wstring SingleLanguageTrack(){
+        if(m_translatedTrack.empty())return {};
+        if(m_translatedTrackSingleFor==m_translatedTrack&&!m_translatedTrackSingle.empty()){
+            // The derived file is a file on disk, so it can be gone: the
+            // translator tidies its folder, and something else may tidy it too.
+            // A path to a file that is not there is worse than deriving it
+            // again, so the answer is checked before it is believed.
+            std::error_code error;
+            if(std::filesystem::is_regular_file(m_translatedTrackSingle,error))
+                return m_translatedTrackSingle;
+            m_translatedTrackSingle.clear();
+            m_translatedTrackSingleFor.clear();
+        }
+        std::ifstream in(m_translatedTrack,std::ios::binary);
+        if(!in){
+            LOG("Subtitles: the bilingual track at "<<WideToUtf8(m_translatedTrack)<<" could not be read.");
+            return {};
+        }
+        const std::string dual((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
+        const std::string single=subtitle_translate::SingleLanguageAss(dual);
+        if(single.empty()){
+            LOG("Subtitles: the bilingual track at "<<WideToUtf8(m_translatedTrack)
+                <<" has no Chinese to show on its own.");
+            return {};
+        }
+        const std::filesystem::path target=
+            std::filesystem::path(m_translatedTrack).replace_extension(L".zh.ass");
+        std::ofstream out(target,std::ios::binary|std::ios::trunc);
+        if(out){
+            out.write(single.data(),(std::streamsize)single.size());
+            out.close();
+        }
+        if(!out){
+            LOG("Subtitles: the one-language track could not be written at "<<WideToUtf8(target.wstring()));
+            return {};
+        }
+        m_translatedTrackSingle=target.wstring();
+        m_translatedTrackSingleFor=m_translatedTrack;
+        return m_translatedTrackSingle;
+    }
     // What the overlay should draw: the chosen source, or the translated file
     // made from it. Null when neither exists, which hides the overlay.
     const SubtitleOverlay::Source* SubtitleSourceForDisplay(){
@@ -4359,6 +4411,9 @@ private:
         // the transcript as well, both files have nothing to say at this moment,
         // and swapping one empty screen for another costs a child restart and
         // changes nothing on it.
+        // One language asked for, one language drawn: the bilingual file holds
+        // both, so the single-language view is the file derived from it.
+        const bool oneLanguage=m_subtitleMode==subtitle_translate::Mode::Translation;
         const bool transcriptHasIt=!m_speechTrack.empty()&&m_speechStatus.frontier>Position()+1.0;
         const double lead=m_translateCoverage-Position();
         if(m_translateCoverage>0.0&&transcriptHasIt&&(m_translateBehind?lead<15.0:lead<0.5)){
@@ -4367,11 +4422,17 @@ private:
                 LOG("Subtitles: the translated track ends at "<<m_translateCoverage
                     <<" s, before the picture; showing the transcript until the next batch.");
             }
-            return source;
+            // The bilingual view falls back to the original, which is a language
+            // the viewer can read. The one-language view has no such fallback:
+            // the original there is the language that was not asked for, so
+            // nothing is drawn until the next batch reaches here.
+            return oneLanguage?nullptr:source;
         }
         m_translateBehind=false;
         m_subtitleTranslated=*source;
-        m_subtitleTranslated.path=m_translatedTrack;
+        const std::wstring track=oneLanguage?SingleLanguageTrack():m_translatedTrack;
+        if(track.empty())return oneLanguage?nullptr:source;
+        m_subtitleTranslated.path=track;
         m_subtitleTranslated.stream=0;
         m_subtitleTranslated.external=true;
         m_subtitleTranslated.codec="ass";
@@ -14649,6 +14710,11 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     bool m_subtitleModeLoaded=false;
     std::wstring m_translatedTrack;
     std::wstring m_translateRequestedKey;
+    // The one-language track derived from the bilingual one, and the bilingual
+    // one it was derived from - so the derivation happens once per track rather
+    // than once per frame.
+    std::wstring m_translatedTrackSingle;
+    std::wstring m_translatedTrackSingleFor;
     subtitle_translate::State m_translateSeenState=subtitle_translate::State::Idle;
     int m_translateSeenDone=-1;
     int m_translateSeenTotal=-1;

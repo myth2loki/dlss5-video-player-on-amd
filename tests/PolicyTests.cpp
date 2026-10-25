@@ -16157,6 +16157,56 @@ void subtitle_translate_builds_one_dual_ass_track_test()
     CHECK(st::BuildAss(cues, st::Mode::Dual, layout, 0, 0).empty());
 }
 
+// The viewer who asks for Chinese alone must not read the English underneath.
+// The overlay draws a file, so the one-language track is derived from the
+// bilingual one: the Chinese half stays, the source half goes, and a cue that
+// never got a translation goes with it rather than showing the language that
+// was not asked for.
+void subtitle_translate_derives_one_language_from_the_bilingual_track_test()
+{
+    namespace st = subtitle_translate;
+    std::vector<st::Cue> cues(3);
+    cues[0].start = 1.2;
+    cues[0].end = 3.0;
+    cues[0].text = "a{b";       // a brace must not become an override tag
+    cues[0].translation = "\xE7\x94\xB2";  // 甲
+    cues[1].start = 4.0;
+    cues[1].end = 5.0;
+    cues[1].text = "only-source";  // the model has not answered for this one
+    cues[2].start = 6.0;
+    cues[2].end = 7.0;
+    cues[2].text = "second";
+    cues[2].translation = "\xE4\xB9\x99";  // 乙
+    const st::Layout layout;
+
+    const std::string dual = st::BuildAss(cues, st::Mode::Dual, layout, 1920, 1080);
+    REQUIRE(!dual.empty());
+    const std::string single = st::SingleLanguageAss(dual);
+    REQUIRE(!single.empty());
+    // The Chinese is there, and the source under it is not.
+    CHECK(single.find("{\\rZh}\xE7\x94\xB2\n") != std::string::npos);
+    CHECK(single.find("{\\rZh}\xE4\xB9\x99\n") != std::string::npos);
+    CHECK(single.find("\\rSrc") == std::string::npos);
+    CHECK(single.find("a\\{b") == std::string::npos);
+    // The blank line that separated the two languages went with the source:
+    // left behind it would hold the translation up by one line.
+    CHECK(single.find("\\fs18") == std::string::npos);
+    // A cue that never got a translation is dropped, not shown in English.
+    CHECK(single.find("only-source") == std::string::npos);
+    // It is still a track: the styles, the events header and the timing are
+    // all the overlay needs to draw it.
+    CHECK(single.find("Style: Zh,") != std::string::npos);
+    CHECK(single.find("[Events]") != std::string::npos);
+    CHECK(single.find("Dialogue: 0,0:00:01.20,0:00:03.00,Dual,,0,0,0,,") != std::string::npos);
+    // One event fewer: the cue without a translation is gone.
+    CHECK(std::count(single.begin(), single.end(), '\n') ==
+          std::count(dual.begin(), dual.end(), '\n') - 1);
+    // A file that is not a bilingual track at all is left alone rather than
+    // mangled: nothing to take out, so nothing is taken out.
+    CHECK(st::SingleLanguageAss(dual).size() > 0);
+    CHECK(st::SingleLanguageAss("").empty());
+}
+
 // TranslateGemma's own template wants a structured content item carrying the two
 // language codes, which llama.cpp's OpenAI endpoint cannot express. The
 // instruction is therefore reproduced as text - copied from the template's text
@@ -16897,6 +16947,7 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(subtitle_canvas_bounds_hold_every_drawn_pixel_test),
     TEST_CASE(subtitle_translate_reads_cues_out_of_srt_and_vtt_test),
     TEST_CASE(subtitle_translate_builds_one_dual_ass_track_test),
+    TEST_CASE(subtitle_translate_derives_one_language_from_the_bilingual_track_test),
     TEST_CASE(subtitle_translate_prompt_matches_the_models_template_test),
     TEST_CASE(subtitle_translate_language_pair_follows_the_track_test),
     TEST_CASE(subtitle_translate_cleans_what_the_model_answers_test),
