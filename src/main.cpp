@@ -3936,8 +3936,12 @@ private:
             const size_t index=size_t(m_subtitleWanted->stream);
             if(index<m_subtitleTracks.size())sourceTag=m_subtitleTracks[index].language;
         }
-        // A transcript is in whatever language the engine was told to hear.
-        if(sourceTag.empty()&&!m_subtitleWanted)sourceTag=WideToUtf8(IniString(L"Speech",L"Language"));
+        // A transcript is in whatever language the engine was told to hear - or,
+        // when it was not told, in whatever it heard.
+        if(sourceTag.empty()&&!m_subtitleWanted){
+            sourceTag=WideToUtf8(IniString(L"Speech",L"Language"));
+            if(sourceTag.empty())sourceTag=m_speechStatus.language;
+        }
         return subtitle_translate::LanguagesFor(sourceTag,WideToUtf8(IniString(L"Translation",L"Target")));
     }
     // Beside the player when it can be written to, otherwise in the profile.

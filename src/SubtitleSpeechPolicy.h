@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cwchar>
 #include <iterator>
 #include <optional>
@@ -336,7 +337,10 @@ inline std::string MultipartBody(std::string_view boundary, std::string_view fil
         body += value;
         body += "\r\n";
     };
-    field("response_format", "srt");
+    // verbose_json rather than srt: the answer carries the language the engine
+    // decided the audio was in, which is what tells the translation what it is
+    // translating from. An SRT answer says nothing about it.
+    field("response_format", "verbose_json");
     field("language", language.empty() ? std::string_view("auto") : language);
     body += "--";
     body += boundary;
@@ -348,6 +352,108 @@ inline std::string MultipartBody(std::string_view boundary, std::string_view fil
     body += boundary;
     body += "--\r\n";
     return body;
+}
+
+// ---- The engine's answer -----------------------------------------------------
+
+namespace detail {
+
+// One object of an array, from its "{" to its matching "}". Strings are skipped,
+// so a brace inside a line of dialogue cannot end it early.
+inline std::string_view JsonObjectAt(std::string_view text, size_t from)
+{
+    const size_t open = text.find('{', from);
+    if (open == std::string_view::npos) return {};
+    size_t depth = 0;
+    bool inString = false, escaped = false;
+    for (size_t at = open; at < text.size(); ++at) {
+        const char c = text[at];
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (c == '\\') escaped = true;
+            else if (c == '"') inString = false;
+            continue;
+        }
+        if (c == '"') { inString = true; continue; }
+        if (c == '{') {
+            ++depth;
+        } else if (c == '}') {
+            if (--depth == 0) return text.substr(open, at - open + 1);
+        } else if (c == ']' && depth == 0) {
+            return {};
+        }
+    }
+    return {};
+}
+
+// A numeric field of one object. Zero when it is absent, which is also what a
+// missing start or end means to the merge.
+inline double JsonNumberField(std::string_view object, std::string_view key)
+{
+    std::string quoted;
+    quoted.reserve(key.size() + 3);
+    quoted += '"';
+    quoted += key;
+    quoted += "\":";
+    size_t at = object.find(quoted);
+    if (at == std::string_view::npos) return 0.0;
+    at += quoted.size();
+    while (at < object.size() && (object[at] == ' ' || object[at] == '\t')) ++at;
+    // Cheap and exact: copy the numeric token and let strtod do the conversion,
+    // rather than reimplementing its edge cases.
+    char token[40]{};
+    size_t length = 0;
+    if (at < object.size() && (object[at] == '-' || object[at] == '+')) token[length++] = object[at++];
+    while (at < object.size() && length + 1 < sizeof(token)) {
+        const char c = object[at];
+        if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' || c == '-' || c == '+') {
+            token[length++] = c;
+            ++at;
+        } else {
+            break;
+        }
+    }
+    token[length] = 0;
+    return length ? std::strtod(token, nullptr) : 0.0;
+}
+
+} // namespace detail
+
+// The lines the engine heard, and the language it heard them in.
+struct Heard {
+    std::vector<subtitle_translate::Cue> cues;
+    std::string language;  // "english", "japanese": a name, as the engine writes it
+};
+
+// One verbose_json answer. The segment objects carry their own "text", "start"
+// and "end" before the per-word array, so the first occurrence of each key is
+// the one wanted; `detail::JsonObjectAt` keeps a "}" inside a line of dialogue
+// from ending a segment early.
+inline Heard ParseHeard(std::string_view json)
+{
+    Heard heard;
+    if (const auto language = subtitle_translate::JsonStringField(json, "language"))
+        heard.language = *language;
+    const size_t key = json.find("\"segments\"");
+    if (key == std::string_view::npos) return heard;
+    const size_t array = json.find('[', key);
+    if (array == std::string_view::npos) return heard;
+    size_t at = array;
+    for (;;) {
+        const std::string_view object = detail::JsonObjectAt(json, at);
+        if (object.empty()) break;
+        subtitle_translate::Cue cue;
+        cue.start = detail::JsonNumberField(object, "start");
+        cue.end = detail::JsonNumberField(object, "end");
+        if (const auto text = subtitle_translate::JsonStringField(object, "text")) cue.text = *text;
+        if (cue.end > cue.start && !cue.text.empty()) heard.cues.push_back(std::move(cue));
+        const size_t after = size_t(object.data() - json.data()) + object.size();
+        const size_t next = json.find('{', after);
+        const size_t close = json.find(']', after);
+        if (next == std::string_view::npos || (close != std::string_view::npos && close < next)) break;
+        at = next;
+    }
+    return heard;
 }
 
 // ---- The engine's command lines ----------------------------------------------
@@ -368,9 +474,15 @@ inline std::wstring ServerArguments(const std::wstring& modelPath, int port, int
         args += L" -t ";
         args += std::to_wstring(threads);
     }
-    // No translating inside the engine: the player has a model for that, and
+    // Transcribing is what the engine does unless it is told to translate, so
+    // nothing here asks for it: the player has a model for translation and
     // whisper's own -tr would be a second, worse one.
-    args += L" -nt";
+    //
+    // NOT -nt. That is --no-timestamps, not --no-translate, and it does what it
+    // says: with it, a verbose_json answer carries segment text with no start or
+    // end at all, every window's lines then land on the film's clock at zero and
+    // all but the first are dropped as already covered. SRT output hid this,
+    // because that writer needs the times and forces them back.
     return args;
 }
 

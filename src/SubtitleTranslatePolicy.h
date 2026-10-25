@@ -444,6 +444,14 @@ inline Languages LanguagesFor(std::string_view sourceTag, std::string_view targe
         for (const char c : tag) lowered.push_back(char(std::tolower(static_cast<unsigned char>(c))));
         for (const Entry& entry : kEntries)
             if (entry.tag == lowered) return &entry;
+        // The speech engine names the language rather than tagging it: "english",
+        // not "eng". The name is as good an answer as the tag.
+        for (const Entry& entry : kEntries) {
+            std::string name;
+            name.reserve(entry.name.size());
+            for (const char c : entry.name) name.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+            if (name == lowered) return &entry;
+        }
         return nullptr;
     };
     Languages languages;

@@ -16187,6 +16187,16 @@ void subtitle_translate_language_pair_follows_the_track_test()
     CHECK_EQ(std::string("Traditional Chinese"), traditional.targetName);
     CHECK_EQ(std::string("zh-Hant"), traditional.targetCode);
 
+    // The speech engine names the language instead of tagging it, and the name
+    // has to resolve the same way: "english" is English, not Japanese.
+    for (const char* name : {"english", "English", "japanese", "CHINESE"}) {
+        const st::Languages pair = st::LanguagesFor(name);
+        CHECK(pair.sourceCode != "ja" || std::string(name).find("apan") != std::string::npos);
+    }
+    CHECK_EQ(std::string("en"), st::LanguagesFor("english").sourceCode);
+    CHECK_EQ(std::string("ja"), st::LanguagesFor("Japanese").sourceCode);
+    CHECK_EQ(std::string("zh-Hans"), st::LanguagesFor("chinese").sourceCode);
+
     // An unknown tag is passed through rather than replaced by a guess, and a
     // track that says "und" has said nothing.
     const st::Languages unknown = st::LanguagesFor("tlh");
@@ -16303,6 +16313,38 @@ void subtitle_translate_cache_key_tracks_what_the_translation_depends_on_test()
 
 
 // ---- Speech to subtitles -----------------------------------------------------
+
+// The engine's own answer when it is asked for verbose_json: the lines with their
+// times, and - the reason for that format - the language it decided the audio
+// was in. That language is what the translation is told to translate FROM.
+void speech_engine_answer_carries_the_language_and_the_lines_test()
+{
+    namespace sp = subtitle_speech;
+    const std::string json =
+        "{\"task\":\"transcribe\",\"language\":\"english\",\"duration\":24.0,"
+        "\"segments\":[{\"id\":0,\"text\":\" Hello there.\",\"start\":0.5,\"end\":2.25,"
+        "\"tokens\":[1,2],\"words\":[{\"word\":\" Hello\",\"start\":0.5,\"end\":1.0}]},"
+        "{\"id\":1,\"text\":\" And a \\\"quote\\\" then a } brace.\",\"start\":3.0,\"end\":5.5}]}";
+    const sp::Heard heard = sp::ParseHeard(json);
+    CHECK_EQ(std::string("english"), heard.language);
+    REQUIRE(heard.cues.size() == 2);
+    CHECK_EQ(0.5, heard.cues[0].start);
+    CHECK_EQ(2.25, heard.cues[0].end);
+    CHECK_EQ(std::string(" Hello there."), heard.cues[0].text);
+    // The per-word objects are inside the segment, not segments of their own, and
+    // a brace inside a line of dialogue does not end it early.
+    CHECK_EQ(3.0, heard.cues[1].start);
+    CHECK_EQ(5.5, heard.cues[1].end);
+    CHECK_EQ(std::string(" And a \"quote\" then a } brace."), heard.cues[1].text);
+
+    // Silence is an empty array rather than an error.
+    const sp::Heard silent = sp::ParseHeard("{\"language\":\"english\",\"segments\":[]}");
+    CHECK(silent.cues.empty());
+    CHECK_EQ(std::string("english"), silent.language);
+    // Not that shape at all: no lines, and no crash.
+    CHECK(sp::ParseHeard("<html>502 Bad Gateway</html>").cues.empty());
+    CHECK(sp::ParseHeard("").cues.empty());
+}
 
 // The film is cut into windows the engine can hear in one go: a short first one
 // so the first line arrives sooner, then longer ones that overlap slightly.
@@ -16448,7 +16490,9 @@ void speech_request_body_carries_the_audio_as_bytes_test()
     const std::string body = sp::MultipartBody("BOUND", "chunk.wav", audio, "ja");
     CHECK(body.find("--BOUND\r\n") == 0);
     CHECK(body.find("name=\"response_format\"") != std::string::npos);
-    CHECK(body.find("\r\n\r\nsrt\r\n") != std::string::npos);
+    // verbose_json, because only that answer carries the language the engine
+    // heard, which is what the translation's prompt needs.
+    CHECK(body.find("\r\n\r\nverbose_json\r\n") != std::string::npos);
     CHECK(body.find("\r\n\r\nja\r\n") != std::string::npos);
     CHECK(body.find("name=\"file\"; filename=\"chunk.wav\"") != std::string::npos);
     // The audio survives byte for byte, including its NULs.
@@ -16828,6 +16872,7 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(subtitle_translate_language_pair_follows_the_track_test),
     TEST_CASE(subtitle_translate_cleans_what_the_model_answers_test),
     TEST_CASE(subtitle_translate_resumes_where_the_last_run_stopped_test),
+    TEST_CASE(speech_engine_answer_carries_the_language_and_the_lines_test),
     TEST_CASE(speech_windows_cover_the_film_once_test),
     TEST_CASE(speech_windows_are_merged_onto_the_film_clock_test),
     TEST_CASE(speech_long_cues_are_split_at_sentence_marks_test),

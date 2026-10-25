@@ -252,7 +252,8 @@ void SpeechToText::RunOnce(const Job& job, uint64_t generation)
             SetState(State::Cancelled);
             return;
         }
-        auto heard = Listen(job, *chunk, generation);
+        std::string language;
+        auto heard = Listen(job, *chunk, generation, language);
         if (!heard) {
             if (Cancelled(generation)) {
                 SetState(State::Cancelled);
@@ -277,6 +278,9 @@ void SpeechToText::RunOnce(const Job& job, uint64_t generation)
             m_status.chunksDone = index + 1;
             m_status.frontier = frontier;
             m_status.track = version;
+            // The first window's answer stands: a later one over music should not
+            // change what the transcript is being translated from.
+            if (m_status.language.empty()) m_status.language = language;
         }
     }
 
@@ -387,7 +391,8 @@ void SpeechToText::StopServer()
 
 std::optional<std::vector<subtitle_translate::Cue>> SpeechToText::Listen(const Job& job,
                                                                         const Chunk& chunk,
-                                                                        uint64_t generation)
+                                                                        uint64_t generation,
+                                                                        std::string& language)
 {
     const fs::path ffmpeg =
         media_tools::FindTool(m_helperDirectory, L"ffmpeg.exe", media_tools::Fallback::SearchPath);
@@ -430,9 +435,20 @@ std::optional<std::vector<subtitle_translate::Cue>> SpeechToText::Listen(const J
         LOG("Speech: the engine answered " << answer->status << " for window " << chunk.start << " s");
         return std::nullopt;
     }
-    // The engine's SRT is in the window's own time; the merge puts it on the
-    // film's clock.
-    return subtitle_translate::ParseSrt(answer->body);
+    // The engine's times are in the window's own time; the merge puts them on
+    // the film's clock.
+    Heard heard = ParseHeard(answer->body);
+    if (!heard.language.empty()) language = heard.language;
+    if (!heard.cues.empty()) return heard.cues;
+    // An engine that answered SRT instead of verbose_json still has its lines
+    // where they were expected; only the language is lost.
+    auto fallback = subtitle_translate::ParseSrt(answer->body);
+    if (!fallback.empty()) return fallback;
+    // Neither shape: say what came back, because "no subtitles appeared" is
+    // otherwise indistinguishable from silence in the film.
+    LOG("Speech: the engine's answer for " << chunk.start << " s could not be read ("
+        << answer->body.size() << " bytes): " << answer->body.substr(0, 160));
+    return std::vector<subtitle_translate::Cue>{};
 }
 
 } // namespace subtitle_speech

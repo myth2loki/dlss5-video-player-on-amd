@@ -72,6 +72,10 @@ struct Status {
     // player can key a translation of it on a name that does not change while
     // the transcript is still growing.
     std::filesystem::path finalTrack;
+    // What the engine decided the audio was in, as it names it ("english"). The
+    // translation is told to translate FROM this, so an English film is not
+    // handed a prompt that says Japanese.
+    std::string language;
     std::wstring notice;
 
     bool Running() const { return state == State::Starting || state == State::Listening; }
@@ -107,7 +111,8 @@ private:
     // One window: extract the audio, ask the engine, hand back its cues in the
     // window's own time.
     std::optional<std::vector<subtitle_translate::Cue>> Listen(const Job& job, const Chunk& chunk,
-                                                               uint64_t generation);
+                                                               uint64_t generation,
+                                                               std::string& language);
     // Waits until the transcript is within `lead` seconds of the playhead. False
     // when the run was cancelled while waiting.
     bool WaitForLead(double frontier, double lead, uint64_t generation);

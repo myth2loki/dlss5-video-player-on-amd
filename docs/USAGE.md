@@ -981,6 +981,12 @@ blanking the screen, a line that would sit there for twenty seconds is cut at
 the sentence breaks, and what whisper invents in silence is dropped rather than
 drawn.
 
+The engine also names the language it heard, and the translation is told to
+translate from that rather than from a guess: an English film gets an "English to
+Chinese" prompt without anything being configured, and `[Speech] Language=`
+overrides it for a film whose audio the engine misreads. `[Translation] Source=`
+is the same override for a subtitle track the player was given.
+
 The entry turns into **Stop listening** while it runs; stopping keeps what was
 already heard. Choosing a subtitle track of your own stops it, because a track
 somebody wrote is better than one guessed from the audio. A transcript belongs
