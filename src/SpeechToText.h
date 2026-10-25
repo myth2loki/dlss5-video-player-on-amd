@@ -63,8 +63,14 @@ struct Status {
     // Media seconds transcribed so far. Compared against the playhead it is how
     // far behind the subtitles are, which is a number worth showing.
     double frontier = 0.0;
-    // The growing track, for the player to draw like any other subtitle file.
+    // The newest whole transcript, for the player to draw like any other
+    // subtitle file. Every window publishes a new one under a new name, so the
+    // overlay sees a different file and hot-reloads it.
     std::filesystem::path track;
+    // Where the finished transcript goes. Fixed before the first window, so a
+    // player can key a translation of it on a name that does not change while
+    // the transcript is still growing.
+    std::filesystem::path finalTrack;
     std::wstring notice;
 
     bool Running() const { return state == State::Starting || state == State::Listening; }

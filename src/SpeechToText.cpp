@@ -33,6 +33,26 @@ std::string ReadWholeFile(const fs::path& path)
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
+// The per-window transcripts of an earlier run: "<base>.<seconds>.asr.srt". The
+// finished one is "<base>.asr.srt" and is never touched here - a prefix test
+// alone would match it, which once deleted the file the player was about to
+// open. Removing them is best effort; a version still open in the overlay's
+// child cannot be deleted, and that is not worth reporting.
+void RemoveVersions(const fs::path& directory, const std::string& base, const fs::path& finalTrack)
+{
+    std::error_code error;
+    const std::string prefix = base + ".";
+    const std::string finished = finalTrack.filename().string();
+    for (fs::directory_iterator it(directory, error), end; !error && it != end; it.increment(error)) {
+        const std::string name = it->path().filename().string();
+        if (name == finished) continue;
+        if (it->path().extension() != ".srt") continue;
+        if (name.rfind(prefix, 0) != 0) continue;
+        std::error_code ignored;
+        fs::remove(it->path(), ignored);
+    }
+}
+
 } // namespace
 
 SpeechToText::SpeechToText(fs::path helperDirectory, Engine engine, fs::path cacheDirectory)
@@ -167,15 +187,19 @@ void SpeechToText::RunOnce(const Job& job, uint64_t generation)
     }
     std::error_code error;
     fs::create_directories(m_cacheDirectory, error);
-    const fs::path track =
-        m_cacheDirectory /
-        (subtitle_translate::CacheKey(utf8_text::FromWide(job.identity), "asr:" + job.language,
-                                      m_engine.model.filename().string()) +
-         ".asr.srt");
+    const std::string base =
+        subtitle_translate::CacheKey(utf8_text::FromWide(job.identity), "asr:" + job.language,
+                                     m_engine.model.filename().string());
+    const fs::path finalTrack = m_cacheDirectory / (base + ".asr.srt");
+    // Versions from an earlier run of this same film are not this run's. They are
+    // removed here, before anything is written, rather than at the end: a version
+    // removed at the end may be the one the overlay's child has just been told to
+    // open, and that failure looks like the transcript itself being broken.
+    RemoveVersions(m_cacheDirectory, base, finalTrack);
     {
         std::lock_guard lock(m_mutex);
         m_status.chunksTotal = total;
-        m_status.track = track;
+        m_status.finalTrack = finalTrack;
     }
 
     if (!StartServer(generation)) {
@@ -207,14 +231,18 @@ void SpeechToText::RunOnce(const Job& job, uint64_t generation)
         // segment, and the pieces belong to different moments.
         AppendChunk(cues, SplitLongCues(*heard), *chunk);
         frontier = std::max(frontier, chunk->end);
-        // The track is rewritten whole: the player swaps files rather than
-        // patching one, so a half-written file is never opened.
-        WriteWholeFile(track, subtitle_translate::FormatSrt(cues, false));
+        // Each window is a new file rather than a rewrite of the last one: the
+        // overlay is told to draw a path, and a path whose contents changed under
+        // it is a path it will not reopen. A whole file per window also means a
+        // half-written transcript is never opened.
+        const fs::path version =
+            m_cacheDirectory / (base + "." + std::to_string(size_t(frontier)) + ".asr.srt");
+        WriteWholeFile(version, subtitle_translate::FormatSrt(cues, false));
         {
             std::lock_guard lock(m_mutex);
             m_status.chunksDone = index + 1;
             m_status.frontier = frontier;
-            m_status.track = track;
+            m_status.track = version;
         }
     }
 
@@ -222,11 +250,15 @@ void SpeechToText::RunOnce(const Job& job, uint64_t generation)
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     LOG("Speech: " << cues.size() << " cue(s) from " << total << " window(s) in " << seconds
                    << " s (RTF " << (job.duration > 0.0 ? seconds / job.duration : 0.0) << ")"
-                   << " -> " << track.string());
-    std::lock_guard lock(m_mutex);
-    m_status.state = State::Done;
-    m_status.track = track;
-    m_status.frontier = std::max(m_status.frontier, job.duration);
+                   << " -> " << finalTrack.string());
+    // The finished transcript gets the fixed name the translation is keyed on.
+    WriteWholeFile(finalTrack, subtitle_translate::FormatSrt(cues, false));
+    {
+        std::lock_guard lock(m_mutex);
+        m_status.state = State::Done;
+        m_status.track = finalTrack;
+        m_status.frontier = std::max(m_status.frontier, job.duration);
+    }
 }
 
 bool SpeechToText::StartServer(uint64_t generation)

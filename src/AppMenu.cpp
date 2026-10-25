@@ -111,6 +111,10 @@ HMENU CreateMenuBar(const Localizer& localizer, bool youtubeAvailable)
     addGrayed(IDM_SUBTITLE_MODE_DUAL, L"menu.subtitles_mode_dual");
     CheckMenuRadioItem(subtitles, IDM_SUBTITLE_MODE_ORIGINAL, IDM_SUBTITLE_MODE_DUAL,
                        IDM_SUBTITLE_MODE_ORIGINAL, MF_BYCOMMAND);
+    // Not part of either radio group: it makes a track rather than choosing one,
+    // and it is the only entry here that is a verb.
+    AppendMenuW(subtitles, MF_SEPARATOR, 0, nullptr);
+    addGrayed(IDM_SUBTITLE_SPEECH, L"menu.subtitles_speech");
     CheckMenuRadioItem(subtitles, 0, 0, 0, MF_BYPOSITION);
     AppendMenuW(play, MF_POPUP, reinterpret_cast<UINT_PTR>(subtitles),
                 localizer.Get(L"menu.subtitles").c_str());
@@ -501,7 +505,7 @@ void UpdateAudioTracks(HMENU menuBar, std::span<const std::wstring> labels, int 
 
 void UpdateSubtitles(HMENU menuBar, const std::wstring& offLabel, std::span<const std::wstring> trackLabels,
                      const std::wstring& fileLabel, UINT chosen, bool loaded, UINT modeCommand,
-                     bool translationEnabled)
+                     bool translationEnabled, bool speechEnabled, const std::wstring& speechLabel)
 {
     HMENU menu=find_menu_containing_command(menuBar,IDM_SUBTITLE_OFF);
     if(!menu)return;
@@ -543,6 +547,12 @@ void UpdateSubtitles(HMENU menuBar, const std::wstring& offLabel, std::span<cons
     EnableMenuItem(menu,IDM_SUBTITLE_MODE_DUAL,MF_BYCOMMAND|modesEnabled);
     CheckMenuRadioItem(menu,IDM_SUBTITLE_MODE_ORIGINAL,IDM_SUBTITLE_MODE_DUAL,
                        modeCommand?modeCommand:IDM_SUBTITLE_MODE_ORIGINAL,MF_BYCOMMAND);
+    // Running turns the entry into its own off switch, so the same key that
+    // started the transcription is the one that stops it.
+    const UINT speechEnabledFlags=loaded&&speechEnabled?MF_ENABLED:MF_GRAYED;
+    if(const HMENU owner=find_menu_containing_command(menuBar,IDM_SUBTITLE_SPEECH))
+        ModifyMenuW(owner,IDM_SUBTITLE_SPEECH,MF_BYCOMMAND|MF_STRING|speechEnabledFlags,
+                    IDM_SUBTITLE_SPEECH,speechLabel.c_str());
 }
 
 bool RoutesToRehook(PlayerCommandRoute route, UINT value)

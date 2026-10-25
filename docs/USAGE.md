@@ -905,6 +905,67 @@ second. A stream inside a large file is read out of it once, in the background,
 the first time it is shown. Subtitles are not shown in the Motion vectors and
 Depth views.
 
+### Translate subtitles into Chinese
+
+**Playback > Subtitles** carries three more entries: **Original**, **Chinese**
+and **Chinese and original**. They are grey unless the translation engine is
+installed; the mode is a property of you rather than of the film, so it is
+remembered across sources.
+
+The translation is written as a single ASS file - the Chinese line above, the
+source line below, both styled by a `Style:` block inside it - and drawn by the
+same overlay as any other subtitle, so nothing in the render path is involved
+and the file can be opened in anything that reads ASS. It is kept in
+`subtitles\` beside the player, or in
+`%LOCALAPPDATA%\DLSSVideoPlayer\subtitles\` when the player's folder is not
+writable, keyed by the source, the stream and the model. It is deliberately not
+in the render cache: that cache is rekeyed when the graphics driver changes and
+evicted under pressure, and a translation is minutes of work. The second time a
+film is opened in a translated mode it is read off the disk instead of remade.
+
+Measured with TranslateGemma 4B on a 9070 XT: 0.10 s per line, 182 characters a
+second, so a thousand-line film takes about a minute and a half. It does not
+wait for the end: the translated track is republished while the engine works,
+and the overlay swaps to the new version without blanking the screen. A run that
+is interrupted picks up where it stopped. Lines that are not translated yet
+still show the source, so a translated mode from the first second is a track
+that is complete and increasingly Chinese.
+
+`[Translation]` in the ini file sets it up: `Runtime=` (the folder holding
+`llama-server.exe`), `Model=` (the `.gguf`; the first one in `models\` is used
+when this is empty), `Port=` (8127) and `Gpu=` (1 uses the graphics card, 0 the
+processor).
+
+### Subtitles from speech
+
+**Playback > Subtitles > Subtitles from speech** is for a film that has no
+subtitle track at all. It listens to the audio and writes one. The transcript is
+an ordinary subtitle file in `subtitles\`, so it is drawn, delayed, translated
+and exported like any other; **Chinese and original** on top of it gives a
+translated dual track from a film nothing was ever written for.
+
+It needs `asr\runtime\whisper-server.exe` and one model in `asr\models\` (the
+plain `asr\` folder beside the player, or one level up in the build tree), or
+`[Speech] Runtime=` and `Model=` in the ini. `Threads=` (8) is how many cores the
+engine may have - every one it takes is one the player does not have - and
+`Language=` (empty lets the engine decide) and `AudioStream=` (0) pick what to
+listen to.
+
+The audio is transcribed in windows: the first ten seconds, then twenty-four at
+a time, each starting two seconds before the last one ended so a word cut in
+half is heard whole at least once. That is faster than playback - measured at
+0.26 of real time on 16 threads, and 0.55 while the film is also being played
+and upscaled - so the transcript runs ahead of the picture rather than behind
+it. Each window is published as soon as it is heard and swapped in without
+blanking the screen, a line that would sit there for twenty seconds is cut at
+the sentence breaks, and what whisper invents in silence is dropped rather than
+drawn.
+
+The entry turns into **Stop listening** while it runs; stopping keeps what was
+already heard. Choosing a subtitle track of your own stops it, because a track
+somebody wrote is better than one guessed from the audio. A transcript belongs
+to the film it was heard in and is discarded when another is opened.
+
 ## Generate frames for a higher frame rate
 
 **DLSS > Generate frames (higher frame rate)** converts what you are watching to

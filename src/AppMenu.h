@@ -64,6 +64,9 @@ inline constexpr UINT IDM_SUBTITLE_DELAY_RESET = 252;
 inline constexpr UINT IDM_SUBTITLE_MODE_ORIGINAL = 253;
 inline constexpr UINT IDM_SUBTITLE_MODE_CHINESE = 254;
 inline constexpr UINT IDM_SUBTITLE_MODE_DUAL = 255;
+// The player's own producer of a source track, for a film that has none: it
+// listens to the audio and writes subtitles. One command that starts and stops.
+inline constexpr UINT IDM_SUBTITLE_SPEECH = 256;
 inline constexpr UINT IDM_NEURAL_RENDERING = 300;
 inline constexpr UINT IDM_REHOOK = 301;
 inline constexpr UINT IDM_VIEW_FINAL = 302;
@@ -251,7 +254,7 @@ void UpdateAudioTracks(HMENU menuBar, std::span<const std::wstring> labels, int 
 // when the engine is installed and there is a track it could translate.
 void UpdateSubtitles(HMENU menuBar, const std::wstring& offLabel, std::span<const std::wstring> trackLabels,
                      const std::wstring& fileLabel, UINT chosen, bool loaded, UINT modeCommand,
-                     bool translationEnabled);
+                     bool translationEnabled, bool speechEnabled, const std::wstring& speechLabel);
 HMENU CreateDebugViewMenu(UINT selectedCommand);
 bool RoutesToRehook(PlayerCommandRoute route, UINT value);
 // Shows, relabels or removes the right-justified update item in the menu bar.

@@ -14320,7 +14320,7 @@ void subtitle_menu_lists_off_the_streams_and_the_file_test()
 
     const std::wstring labels[] = {L"1. English - SRT", L"2. French - Styled & Co - ASS"};
     app_menu::UpdateSubtitles(menu, L"Off", labels, L"File: Film.srt", app_menu::IDM_SUBTITLE_TRACK_FIRST + 1,
-                              true, app_menu::IDM_SUBTITLE_MODE_ORIGINAL, true);
+                              true, app_menu::IDM_SUBTITLE_MODE_ORIGINAL, true, false, L"Subtitles from speech");
     entries.clear();
     collect_menu_entries(menu, entries);
     CHECK(has_menu_entry(entries, L"Off", app_menu::IDM_SUBTITLE_OFF));
@@ -14334,7 +14334,8 @@ void subtitle_menu_lists_off_the_streams_and_the_file_test()
 
     // Rebuilt for a source with no streams: the old rows go, the commands stay.
     app_menu::UpdateSubtitles(menu, L"Off", {}, L"", app_menu::IDM_SUBTITLE_OFF, true,
-                              app_menu::IDM_SUBTITLE_MODE_ORIGINAL, false);
+                              app_menu::IDM_SUBTITLE_MODE_ORIGINAL, false, false,
+                              L"Subtitles from speech");
     entries.clear();
     collect_menu_entries(menu, entries);
     CHECK(!has_menu_entry(entries, labels[0], app_menu::IDM_SUBTITLE_TRACK_FIRST));
@@ -14349,20 +14350,38 @@ void subtitle_menu_lists_off_the_streams_and_the_file_test()
     CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_ORIGINAL, MF_BYCOMMAND) & MF_CHECKED);
     // This call was made without an engine, so they are grey rather than absent.
     CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_CHINESE, MF_BYCOMMAND) & MF_GRAYED);
+    // The verb at the bottom: it makes a track instead of choosing one, and with
+    // no speech engine on this machine it is grey.
+    CHECK(has_menu_entry(entries, L"Subtitles from speech", app_menu::IDM_SUBTITLE_SPEECH));
+    CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_SPEECH, MF_BYCOMMAND) & MF_GRAYED);
     const HMENU popup = app_menu::FindMenuContainingCommand(menu, app_menu::IDM_SUBTITLE_OFF);
     CHECK(popup != nullptr);
-    if (popup) CHECK_EQ(12, GetMenuItemCount(popup));
+    if (popup) CHECK_EQ(14, GetMenuItemCount(popup));
 
     // With the engine installed the three modes become selectable, and only one
     // of them is checked: the choice is exclusive.
     app_menu::UpdateSubtitles(menu, L"Off", labels, L"File: Film.srt", app_menu::IDM_SUBTITLE_TRACK_FIRST,
-                              true, app_menu::IDM_SUBTITLE_MODE_DUAL, true);
+                              true, app_menu::IDM_SUBTITLE_MODE_DUAL, true, false, L"Subtitles from speech");
     CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_DUAL, MF_BYCOMMAND) & MF_GRAYED);
     CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_DUAL, MF_BYCOMMAND) & MF_CHECKED);
     CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_ORIGINAL, MF_BYCOMMAND) & MF_CHECKED);
     CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_CHINESE, MF_BYCOMMAND) & MF_CHECKED);
     // Still one radio group with the track choice above: the track is checked too.
     CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_TRACK_FIRST, MF_BYCOMMAND) & MF_CHECKED);
+
+    // With an engine installed and nothing chosen, the verb is live and says what
+    // it will do; running, the same row is its own off switch.
+    app_menu::UpdateSubtitles(menu, L"Off", {}, L"", app_menu::IDM_SUBTITLE_OFF, true,
+                              app_menu::IDM_SUBTITLE_MODE_ORIGINAL, false, true, L"Subtitles from speech");
+    CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_SPEECH, MF_BYCOMMAND) & MF_GRAYED);
+    entries.clear();
+    collect_menu_entries(menu, entries);
+    CHECK(has_menu_entry(entries, L"Subtitles from speech", app_menu::IDM_SUBTITLE_SPEECH));
+    app_menu::UpdateSubtitles(menu, L"Off", {}, L"", app_menu::IDM_SUBTITLE_OFF, true,
+                              app_menu::IDM_SUBTITLE_MODE_ORIGINAL, false, true, L"Stop listening");
+    entries.clear();
+    collect_menu_entries(menu, entries);
+    CHECK(has_menu_entry(entries, L"Stop listening", app_menu::IDM_SUBTITLE_SPEECH));
     DestroyMenu(menu);
 }
 
