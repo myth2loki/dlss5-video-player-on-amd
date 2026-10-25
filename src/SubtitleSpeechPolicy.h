@@ -324,7 +324,8 @@ inline double LagSeconds(double positionSeconds, double frontierSeconds)
 // Built as bytes, not as a string of text: a window of 16 kHz PCM contains every
 // byte value, including the NULs and CRLFs a text-oriented builder would mangle.
 inline std::string MultipartBody(std::string_view boundary, std::string_view fileName,
-                                 std::string_view audio, std::string_view language)
+                                 std::string_view audio, std::string_view language,
+                                 std::string_view format)
 {
     std::string body;
     body.reserve(audio.size() + 512);
@@ -337,10 +338,11 @@ inline std::string MultipartBody(std::string_view boundary, std::string_view fil
         body += value;
         body += "\r\n";
     };
-    // verbose_json rather than srt: the answer carries the language the engine
-    // decided the audio was in, which is what tells the translation what it is
-    // translating from. An SRT answer says nothing about it.
-    field("response_format", "verbose_json");
+    // The format is the caller's, because it is not free: a verbose_json answer
+    // makes the engine do the work twice over - 9.5 s against 5.0 s for the same
+    // 24 s window, measured - and it is asked for only to learn the language,
+    // which is decided once for the whole film.
+    field("response_format", format);
     field("language", language.empty() ? std::string_view("auto") : language);
     body += "--";
     body += boundary;

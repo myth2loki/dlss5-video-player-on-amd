@@ -238,6 +238,8 @@ void SpeechToText::RunOnce(const Job& job, uint64_t generation)
 
     std::vector<subtitle_translate::Cue> cues;
     double frontier = 0.0;
+    // Carried across windows: the first one is asked for it, the rest are not.
+    std::string heardLanguage;
     const auto started = std::chrono::steady_clock::now();
     for (size_t index = 0;; ++index) {
         const auto chunk = ChunkAt(job.plan, index, job.duration);
@@ -252,8 +254,7 @@ void SpeechToText::RunOnce(const Job& job, uint64_t generation)
             SetState(State::Cancelled);
             return;
         }
-        std::string language;
-        auto heard = Listen(job, *chunk, generation, language);
+        auto heard = Listen(job, *chunk, generation, heardLanguage);
         if (!heard) {
             if (Cancelled(generation)) {
                 SetState(State::Cancelled);
@@ -280,7 +281,7 @@ void SpeechToText::RunOnce(const Job& job, uint64_t generation)
             m_status.track = version;
             // The first window's answer stands: a later one over music should not
             // change what the transcript is being translated from.
-            if (m_status.language.empty()) m_status.language = language;
+            if (m_status.language.empty()) m_status.language = heardLanguage;
         }
     }
 
@@ -427,7 +428,12 @@ std::optional<std::vector<subtitle_translate::Cue>> SpeechToText::Listen(const J
     // The file has served its purpose; the next window overwrites it anyway.
     fs::remove(m_chunkFile, error);
 
-    const std::string body = MultipartBody(kBoundary, "chunk.wav", audio, job.language);
+    // The language is worth one expensive window: without it the translation is
+    // told the wrong source language for the whole film. Every window after the
+    // first asks for SRT, which is half the work and carries the same lines.
+    const bool probe = language.empty();
+    const std::string body =
+        MultipartBody(kBoundary, "chunk.wav", audio, job.language, probe ? "verbose_json" : "srt");
     const std::string contentType = "multipart/form-data; boundary=" + std::string(kBoundary);
     const auto answer = HttpRequest(m_httpConnection, L"POST", "/inference", body, contentType, 600000);
     if (!answer) return std::nullopt;
@@ -437,9 +443,14 @@ std::optional<std::vector<subtitle_translate::Cue>> SpeechToText::Listen(const J
     }
     // The engine's times are in the window's own time; the merge puts them on
     // the film's clock.
-    Heard heard = ParseHeard(answer->body);
-    if (!heard.language.empty()) language = heard.language;
-    if (!heard.cues.empty()) return heard.cues;
+    if (probe) {
+        Heard heard = ParseHeard(answer->body);
+        if (!heard.language.empty()) language = heard.language;
+        if (!heard.cues.empty()) return heard.cues;
+        // An engine that ignored the format will ignore it again: stop asking,
+        // and let the translation fall back to its default source.
+        if (language.empty()) language = "und";
+    }
     // An engine that answered SRT instead of verbose_json still has its lines
     // where they were expected; only the language is lost.
     auto fallback = subtitle_translate::ParseSrt(answer->body);

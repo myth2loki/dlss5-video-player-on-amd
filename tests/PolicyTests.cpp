@@ -16487,12 +16487,15 @@ void speech_request_body_carries_the_audio_as_bytes_test()
     namespace sp = subtitle_speech;
     std::string audio;
     for (int value = 0; value < 256; ++value) audio.push_back(char(value));
-    const std::string body = sp::MultipartBody("BOUND", "chunk.wav", audio, "ja");
+    const std::string body = sp::MultipartBody("BOUND", "chunk.wav", audio, "ja", "verbose_json");
     CHECK(body.find("--BOUND\r\n") == 0);
     CHECK(body.find("name=\"response_format\"") != std::string::npos);
-    // verbose_json, because only that answer carries the language the engine
-    // heard, which is what the translation's prompt needs.
+    // The format is the caller's: verbose_json carries the language the engine
+    // heard, SRT is what every window after the first asks for because it is
+    // half the work.
     CHECK(body.find("\r\n\r\nverbose_json\r\n") != std::string::npos);
+    const std::string plain = sp::MultipartBody("BOUND", "chunk.wav", audio, "ja", "srt");
+    CHECK(plain.find("\r\n\r\nsrt\r\n") != std::string::npos);
     CHECK(body.find("\r\n\r\nja\r\n") != std::string::npos);
     CHECK(body.find("name=\"file\"; filename=\"chunk.wav\"") != std::string::npos);
     // The audio survives byte for byte, including its NULs.

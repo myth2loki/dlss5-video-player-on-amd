@@ -3678,6 +3678,7 @@ private:
         if(m_translator)m_translator->Cancel();
         m_translatedTrack.clear();m_translateRequestedKey.clear();
         m_translateSeenState=subtitle_translate::State::Idle;m_translateSeenDone=-1;
+        m_translateCoverage=0.0;m_translateBehind=false;
         // A transcript belongs to the film whose audio it came from.
         if(m_speech)m_speech->Cancel();
         m_speechTrack.clear();m_speechFinal.clear();m_speechStatus={};
@@ -4031,6 +4032,7 @@ private:
         if(mode==subtitle_translate::Mode::Source){
             if(m_translator)m_translator->Cancel();
             m_translatedTrack.clear();
+            m_translateCoverage=0.0;m_translateBehind=false;
         }else if(!SubtitleTranslatable()){
             m_sourceNotice=T(L"subtitles.translate_bitmap");
             UpdateCachedStatus();
@@ -4060,17 +4062,28 @@ private:
         // been heard since the last one".
         bool due=true;
         if(speech){
-            // Thirty seconds of film is about eight lines: a second of translation
-            // and the two and a half a run spends loading the model, so the engine
-            // is busy about a tenth of the time. Longer batches would leave the
-            // translated track further behind the transcript than the viewer is
-            // ahead of it.
-            constexpr double kSpeechBatchSeconds=30.0;
+            // How much translated track to keep ahead of the picture. Not a fixed
+            // cadence: each batch costs a llama-server start of about five
+            // seconds, and those five seconds are taken from whisper, which is
+            // supposed to stay ahead of the picture - so a batch every thirty
+            // seconds made the transcript fall behind, which left the translated
+            // track behind the picture, which made the display fall back to the
+            // original, which looked exactly like subtitles that keep vanishing.
+            //
+            // One batch covers the whole transcript, so this settles into a batch
+            // every couple of minutes, not every few: the lead is spent at the
+            // rate of playback and restored to whatever the transcript has.
+            constexpr double kSpeechLeadSeconds=25.0;
+            // Below this the transcript has nothing worth translating yet, and a
+            // batch would only take the cores whisper needs to get there.
+            constexpr double kSpeechUsefulSeconds=5.0;
             if(m_translateSpeechFinal)return;  // the finished transcript has been done
-            // The last batch is the one that catches the tail, so it does not wait
-            // for a frontier that will not move again.
-            if(m_speechStatus.Running()&&m_translateSpeechFrontier>=0.0&&
-               m_speechStatus.frontier-m_translateSpeechFrontier<kSpeechBatchSeconds)due=false;
+            if(m_speechStatus.Running()){
+                const bool more=m_speechStatus.frontier>m_translateSpeechFrontier+1.0;
+                const bool useful=m_speechStatus.frontier>Position()+kSpeechUsefulSeconds;
+                const bool short_lead=m_translateCoverage-Position()<kSpeechLeadSeconds;
+                if(!(more&&useful&&short_lead))due=false;
+            }
         }else if(m_translateRequestedKey==key){
             return;
         }
@@ -4094,6 +4107,7 @@ private:
         if(haveCached&&!speech){
             m_translateRequestedKey=key;
             m_translatedTrack=cached.wstring();
+            m_translateCoverage=0.0;  // a finished track: nothing to run out of
             m_subtitleReloadPending=true;
             LOG("Subtitles: reusing the translated track at "<<WideToUtf8(cached.wstring()));
             return;
@@ -4111,6 +4125,12 @@ private:
                                                                           TranslationCacheDirectory());
         subtitle_translate::Job job;
         if(speech){
+            // A window of music publishes a transcript with no lines in it, and
+            // handing that to the engine is a run that fails on nothing: the file
+            // is not wrong, it is empty. Wait for the next one.
+            std::error_code sizeError;
+            const auto size=std::filesystem::file_size(m_speechTrack,sizeError);
+            if(sizeError||size==0)return;
             // The newest transcript: the finished one does not exist yet.
             job.path=m_speechTrack;
             job.stream=0;
@@ -4154,9 +4174,12 @@ private:
         case subtitle_translate::State::Starting:
             m_sourceNotice=T(L"subtitles.translating")+L"\u2026";UpdateCachedStatus();break;
         case subtitle_translate::State::Translating:
-            // Each published version is drawn as soon as it exists: the same
-            // cues, more of them in Chinese.
-            if(!status.partial.empty()&&status.partial.wstring()!=m_translatedTrack){
+            // A version published mid-run is a snapshot of a partly translated
+            // track: worth drawing for a film the viewer chose, whose run lasts
+            // seconds. Not for a transcript, whose batches come every half
+            // minute: each of those snapshots would be another child restart for
+            // a picture that changes again before it is on screen.
+            if(m_subtitleWanted&&!status.partial.empty()&&status.partial.wstring()!=m_translatedTrack){
                 m_translatedTrack=status.partial.wstring();
                 m_subtitleReloadPending=true;
             }
@@ -4166,6 +4189,8 @@ private:
             if(!status.result.empty()){
                 const bool changed=status.result.wstring()!=m_translatedTrack;
                 m_translatedTrack=status.result.wstring();
+                m_translateCoverage=status.coverage;
+                m_translateBehind=false;
                 // A resumed run writes to the same name as the one before it, so
                 // the path is not a signal that anything changed - the overlay is
                 // told to reload regardless.
@@ -4266,11 +4291,19 @@ private:
                 m_subtitleChoice={};
                 m_subtitleChoice.mode=subtitle::Choice::Mode::Off;
                 m_translatedTrack.clear();
+                m_translateCoverage=0.0;m_translateBehind=false;
                 m_translateRequestedKey.clear();
                 m_translateSeenState=subtitle_translate::State::Idle;
                 m_translateSeenDone=-1;
             }
-            m_subtitleReloadPending=true;
+            // A new transcript version changes the picture only when the
+            // transcript is what is drawn - in a translated mode the display is
+            // the ASS, and this file is not in it. Reloading anyway restarted the
+            // child once per window for nothing, and a child that is still
+            // starting when the next reload is asked for never draws at all: that
+            // is the flicker, and the stretches with no subtitles at all.
+            if(m_subtitleMode==subtitle_translate::Mode::Source||m_translatedTrack.empty())
+                m_subtitleReloadPending=true;
             UpdateSubtitleMenu();
         }
         if(!changed)return;
@@ -4310,6 +4343,32 @@ private:
         const SubtitleOverlay::Source* source=TextSource();
         if(!source)return nullptr;
         if(m_subtitleMode==subtitle_translate::Mode::Source||m_translatedTrack.empty())return source;
+        // The translated track is a snapshot of a shorter transcript. Past its
+        // end it has nothing to draw for this moment, and a blank screen where
+        // the transcript already knows the words is the worst of both: the
+        // original comes back until the next batch reaches here.
+        //
+        // Sticky in one direction: once the picture has passed the end of the
+        // track, the original stays until a batch has put fifteen seconds of
+        // translated track back under the playhead. Flipping back the moment the
+        // two overlap again is what made one gap look like subtitles that keep
+        // changing language.
+        //
+        // Only when the transcript has reached here. If the picture is ahead of
+        // the transcript as well, both files have nothing to say at this moment,
+        // and swapping one empty screen for another costs a child restart and
+        // changes nothing on it.
+        const bool transcriptHasIt=!m_speechTrack.empty()&&m_speechStatus.frontier>Position()+1.0;
+        const double lead=m_translateCoverage-Position();
+        if(m_translateCoverage>0.0&&transcriptHasIt&&(m_translateBehind?lead<15.0:lead<0.5)){
+            if(!m_translateBehind){
+                m_translateBehind=true;
+                LOG("Subtitles: the translated track ends at "<<m_translateCoverage
+                    <<" s, before the picture; showing the transcript until the next batch.");
+            }
+            return source;
+        }
+        m_translateBehind=false;
         m_subtitleTranslated=*source;
         m_subtitleTranslated.path=m_translatedTrack;
         m_subtitleTranslated.stream=0;
@@ -14440,6 +14499,11 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // The next Show() replaces a track whose timing did not change, so the
     // frames already on screen must survive until the new one draws.
     bool m_subtitleReloadPending=false;
+    // How far the translated track in hand reaches. Past that it says nothing,
+    // and the transcript is what the viewer should be looking at while the next
+    // batch is made - not an empty screen.
+    double m_translateCoverage=0.0;
+    bool m_translateBehind=false;
     // Speech to subtitles: the player's own producer of a source track, for films
     // that have none. It does not replace m_subtitleWanted - it answers the same
     // question, and the viewer's own choice wins when there is one.

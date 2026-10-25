@@ -558,6 +558,11 @@ void SubtitleOverlay::RunSession(uint64_t generation)
 
     Session session;
     const auto started = std::chrono::steady_clock::now();
+    // A session that never reaches its first frame used to leave no trace at all,
+    // which is the one case where the picture and the log disagree with no way to
+    // tell why.
+    LOG("Subtitles: session for " << fs::path(input).filename().string() << " from " << start
+                                  << " s at " << canvas.width << "x" << canvas.height << ".");
     const bool spawned = Spawn(FFmpeg(),
         // A picture track is read as an input and gets the local whitelist; a
         // text track is read by the subtitles filter inside a lavfi graph,
@@ -567,6 +572,9 @@ void SubtitleOverlay::RunSession(uint64_t generation)
     {
         std::lock_guard lock(m_mutex);
         if (!spawned) {
+            // Silent until now, which made a track that never drew
+            // indistinguishable from a film with nothing to say in it.
+            LOG("Subtitles: the child for " << start << " s could not be started.");
             if (generation == m_generation) m_ended = true;
             return;
         }

@@ -102,10 +102,27 @@ void Translator::SetState(State state, std::wstring notice)
     m_status.notice = std::move(notice);
 }
 
-Status Translator::Poll() const
+Status Translator::Poll()
 {
-    std::lock_guard lock(m_mutex);
-    return m_status;
+    Status status;
+    bool reap = false;
+    {
+        std::lock_guard lock(m_mutex);
+        status = m_status;
+        reap = m_serverIdle && m_server != nullptr &&
+               std::chrono::steady_clock::now() - m_serverIdleSince > std::chrono::seconds(120);
+    }
+    if (reap) {
+        LOG("Translate: the engine has been idle; stopping it.");
+        StopServer();
+        std::lock_guard lock(m_mutex);
+        m_serverIdle = false;
+        if (m_jobObject) {
+            CloseHandle(m_jobObject);
+            m_jobObject = nullptr;
+        }
+    }
+    return status;
 }
 
 bool Translator::Cancelled(uint64_t generation) const
@@ -116,7 +133,6 @@ bool Translator::Cancelled(uint64_t generation) const
 
 void Translator::Start(const Job& job)
 {
-    HANDLE jobObject = nullptr;
     {
         std::lock_guard lock(m_mutex);
         ++m_generation;  // a run in progress is now stale
@@ -124,11 +140,16 @@ void Translator::Start(const Job& job)
         m_job = job;
         m_status = {};
         m_status.state = State::Extracting;
-        jobObject = m_jobObject;
     }
-    // A running child is ended so its blocked read returns; the worker then
-    // picks up the new job.
-    if (jobObject) TerminateJobObject(jobObject, 1);
+    // Deliberately no TerminateJobObject here. It used to be what ended a run in
+    // flight, and it worked while a job existed for exactly one run. Now the job
+    // lives as long as the translator, so terminating it kills the engine and
+    // every child in it - including the ffmpeg that the run this call is asking
+    // for is about to start, which then cannot even be put in the job
+    // (AssignProcessToJobObject, winerr 5, reported as "the subtitle stream could
+    // not be read"). A run in flight stops at its own next checkpoint instead:
+    // this bumps the generation and every checkpoint checks it. Cancel still
+    // terminates, because that is a viewer walking away, not the next batch.
     m_wake.notify_all();
 }
 
@@ -165,23 +186,40 @@ void Translator::Run()
 
 void Translator::RunOnce(const Job& job, uint64_t generation)
 {
-    // One job object per run: closing it is what guarantees nothing survives,
-    // even a child that was still spawning when the run ended.
-    Handle runJob(CreateKillOnCloseJob());
-    if (!runJob) {
-        SetState(State::Failed, L"the translation could not be started");
-        return;
-    }
+    // The job object outlives a single run, so the engine it holds survives from
+    // one batch to the next: it costs about five seconds to start, and those five
+    // seconds come out of the speech engine's cores.
     {
         std::lock_guard lock(m_mutex);
-        m_jobObject = runJob.Get();
+        if (!m_jobObject) {
+            Handle created(CreateKillOnCloseJob());
+            if (!created) {
+                SetState(State::Failed, L"the translation could not be started");
+                return;
+            }
+            m_jobObject = created.Release();
+        }
     }
-    // Runs on every return path below; the handle above outlives it, so the job
-    // is closed after its children have been stopped.
-    auto endOfRun = OnExit([this, job = runJob.Get()] {
+    // Runs on every return path below. A finished or failed run leaves the engine
+    // up for the next batch; an abandoned one takes it down, because nothing is
+    // waiting for it any more.
+    auto endOfRun = OnExit([this] {
+        bool keep = false;
+        {
+            std::lock_guard lock(m_mutex);
+            keep = m_status.state == State::Done || m_status.state == State::Failed;
+            if (keep) {
+                m_serverIdle = true;
+                m_serverIdleSince = std::chrono::steady_clock::now();
+            }
+        }
+        if (keep) return;
         StopServer();
         std::lock_guard lock(m_mutex);
-        if (m_jobObject == job) m_jobObject = nullptr;
+        if (m_jobObject) {
+            CloseHandle(m_jobObject);
+            m_jobObject = nullptr;
+        }
     });
 
     SetState(State::Extracting);
@@ -296,11 +334,15 @@ void Translator::RunOnce(const Job& job, uint64_t generation)
     fs::remove(progressPath, ignored);
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-    LOG("Translate: " << translated << " cue(s) in " << seconds << " s -> " << path.string());
+    double coverage = 0.0;
+    for (const Cue& cue : *cues) coverage = std::max(coverage, cue.end);
+    LOG("Translate: " << translated << " cue(s) in " << seconds << " s -> " << path.string()
+                      << " (covers up to " << coverage << " s)");
     {
         std::lock_guard lock(m_mutex);
         m_status.state = State::Done;
         m_status.result = path;
+        m_status.coverage = coverage;
     }
 }
 
@@ -345,6 +387,17 @@ HANDLE Translator::CurrentJob() const
 
 bool Translator::StartServer(uint64_t generation)
 {
+    {
+        // Still running from the last batch, and still answering: nothing to do.
+        std::lock_guard lock(m_mutex);
+        if (m_server && m_httpConnection && WaitForSingleObject(m_server, 0) == WAIT_TIMEOUT) {
+            m_serverIdle = false;
+            return true;
+        }
+    }
+    // A server that died between batches is not reusable, and its handles are
+    // stale: drop them before another is started.
+    StopServer();
     const fs::path server = m_engine.runtimeDirectory / L"llama-server.exe";
     Child child;
     // No capture: the engine logs for the whole run, and nothing reads it.

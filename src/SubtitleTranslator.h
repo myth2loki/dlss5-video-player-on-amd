@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <winhttp.h>
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
@@ -75,6 +76,10 @@ struct Status {
     int done = 0;   // cues answered
     std::wstring notice;
     std::filesystem::path result;  // the finished ASS, once Done
+    // Where that track ends, in film seconds. A translated track is a snapshot
+    // of the transcript at the moment its batch ran, and past this the player is
+    // looking at a file with nothing in it for that moment.
+    double coverage = 0.0;
     // A usable track written while the engine is still working, for the player
     // to swap in without waiting for the end. Each one is a whole ASS of its
     // own, named by how many cues it covers, so the overlay can hot-reload it.
@@ -105,7 +110,9 @@ public:
     void Start(const Job& job);
     // Ends the running translation. The status becomes Cancelled.
     void Cancel();
-    Status Poll() const;
+    // Also the moment the engine is put away: it is kept between batches, and
+    // this is what stops it once nothing has needed it for a while.
+    Status Poll();
 
 private:
     void Run();
@@ -142,8 +149,17 @@ private:
 
     // Worker-only: the server and the handles it needs. Kept out of the mutex'
     // users' reach so no lock is held across a blocking call.
+    // One job object for the life of the translator, not one per run: the engine
+    // it holds takes about five seconds to start and a transcript is translated
+    // in batches a minute apart, so paying that every batch starved the speech
+    // engine of the very cores it needs to stay ahead of the picture. Still
+    // kill-on-close, so nothing outlives the player.
     HANDLE m_jobObject = nullptr;
     HANDLE m_server = nullptr;
+    // Set when a run ends with the engine still up, cleared when it is used or
+    // stopped. Poll() stops it once it has been idle this long.
+    bool m_serverIdle = false;
+    std::chrono::steady_clock::time_point m_serverIdleSince{};
     HINTERNET m_httpSession = nullptr;
     HINTERNET m_httpConnection = nullptr;
     std::thread m_worker;

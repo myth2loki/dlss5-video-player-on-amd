@@ -926,7 +926,18 @@ film is opened in a translated mode it is read off the disk instead of remade.
 Measured with TranslateGemma 4B on a 9070 XT: 0.10 s per line, 182 characters a
 second, so a thousand-line film takes about a minute and a half. It does not
 wait for the end: the translated track is republished while the engine works,
-and the overlay swaps to the new version without blanking the screen. A run that
+and the overlay swaps to the new version without blanking the screen.
+
+The engine stays loaded between batches and is stopped after two minutes with
+nothing to do, because loading it costs about five seconds and a transcript is
+translated in batches a minute apart. On a transcript, a batch is made whenever
+the translated track has less than about twenty-five seconds of film left ahead
+of the picture rather than on a fixed timer: each batch costs cores that the
+speech engine needs to stay ahead, and a cadence that ignores that ends up
+translating lines it already has while the transcript falls behind. While the
+translated track has not reached the picture yet, the original is shown - the
+cover of a batch that is still being made - and it goes back to the translated
+track when there is fifteen seconds of it under the playhead. A run that
 is interrupted picks up where it stopped. Lines that are not translated yet
 still show the source, so a translated mode from the first second is a track
 that is complete and increasingly Chinese.
