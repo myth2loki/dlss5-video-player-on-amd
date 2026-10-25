@@ -2,6 +2,8 @@
 
 #include <windows.h>
 
+#include <string>
+
 enum class UiIcon {
     Open,
     Rewind,
@@ -22,6 +24,13 @@ enum class UiIcon {
     YouTube,
     Warning,
     Compare,
+    // The AI subtitle switch: a caption frame carrying a spark, and the same
+    // frame crossed out. A pair in the shape of Volume/VolumeOff, because the
+    // button is a toggle and an off state that looks like the on state is worse
+    // than no icon at all. Both verified present in the committed
+    // tabler-icons.ttf cmap (U+101A4 / U+101A2).
+    SubtitlesAi,
+    SubtitlesOff,
 };
 
 namespace ui_palette {
@@ -75,7 +84,10 @@ enum class ButtonPresentation {
     LabelOnly,
 };
 
-wchar_t GlyphForIcon(UiIcon icon);
+// UTF-16 rather than a single wchar_t: the caption glyphs live past the BMP
+// (U+101A4), where one 16-bit wchar_t cannot hold them, and a font glyph is a
+// string like any other.
+std::wstring GlyphForIcon(UiIcon icon);
 ButtonVisual ResolveButtonVisual(ButtonState state);
 ButtonPresentation ResolveButtonPresentation(bool iconFontAvailable);
 

@@ -17,7 +17,11 @@ enum class ToolbarAction {
     Open, OpenYouTube, Back10, PlayPause, Stop, Forward10, Mute,
     ToggleNeuralRendering, ToggleUpscaling, ToggleFrameGeneration,
     TogglePlaybackFrameGeneration,
-    Aspect, Adjustments, DebugView, Fullscreen, None
+    Aspect, Adjustments, DebugView, Fullscreen,
+    // The one press that gets subtitles out of a film: it listens to the audio
+    // when there is no track, translates whatever it finds, and shows the two
+    // together. Beside Mute, because Mute is the sound and this is the words.
+    ToggleSubtitles, None
 };
 
 struct ToolbarItem {
@@ -48,6 +52,13 @@ struct ToolbarAvailability {
     // conversion the ToggleFrameGeneration pill starts). Enabled whenever there
     // is a loaded source and a renderer to hand the setting to.
     bool playbackFrameGenerationAvailable{false};
+    // The AI subtitle switch. "Active" is the moment the TRANSLATED track is on
+    // screen, not the moment the first line of the original is: the button was
+    // pressed for Chinese, and going active on the English would make a second
+    // press cancel the translation that is still loading.
+    bool subtitlesAvailable{false};
+    bool subtitlesActive{false};
+    bool subtitlesWorking{false};
 };
 
 class YouTubeResolutionLifecycle {

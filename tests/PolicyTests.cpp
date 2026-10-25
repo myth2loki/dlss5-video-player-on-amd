@@ -546,6 +546,7 @@ void toolbar_layout_selects_stable_action_sets_for_width_modes_test()
         ToolbarAction::Stop,
         ToolbarAction::Forward10,
         ToolbarAction::Mute,
+        ToolbarAction::ToggleSubtitles,
         ToolbarAction::ToggleNeuralRendering,
         ToolbarAction::ToggleUpscaling,
         ToolbarAction::ToggleFrameGeneration,
@@ -605,14 +606,19 @@ void toolbar_layout_preserves_group_separation_test()
     const ToolbarItem* neural = find_toolbar_item(items, ToolbarAction::ToggleNeuralRendering);
     const ToolbarItem* upscaling = find_toolbar_item(items, ToolbarAction::ToggleUpscaling);
     const ToolbarItem* frameGeneration = find_toolbar_item(items, ToolbarAction::ToggleFrameGeneration);
+    const ToolbarItem* subtitles = find_toolbar_item(items, ToolbarAction::ToggleSubtitles);
     const ToolbarItem* adjustments = find_toolbar_item(items, ToolbarAction::Adjustments);
     const ToolbarItem* debug = find_toolbar_item(items, ToolbarAction::DebugView);
     const ToolbarItem* fullscreen = find_toolbar_item(items, ToolbarAction::Fullscreen);
-    CHECK(back && play && mute && neural && upscaling && frameGeneration && adjustments && debug && fullscreen);
-    if (!(back && play && mute && neural && upscaling && frameGeneration && adjustments && debug && fullscreen)) return;
+    CHECK(back && play && mute && subtitles && neural && upscaling && frameGeneration && adjustments && debug && fullscreen);
+    if (!(back && play && mute && subtitles && neural && upscaling && frameGeneration && adjustments && debug && fullscreen)) return;
 
     CHECK_EQ(4L, play->bounds.left - back->bounds.right);
-    CHECK_EQ(12L, neural->bounds.left - mute->bounds.right);
+    // The subtitle switch sits in Mute's group, not the pills': a control in
+    // group 1 would take a feature pill's place the moment one becomes
+    // available, which is the crowding those pills were measured against.
+    CHECK_EQ(4L, subtitles->bounds.left - mute->bounds.right);
+    CHECK_EQ(12L, neural->bounds.left - subtitles->bounds.right);
     CHECK_EQ(4L, upscaling->bounds.left - neural->bounds.right);
     CHECK_EQ(4L, frameGeneration->bounds.left - upscaling->bounds.right);
     CHECK_EQ(12L, debug->bounds.left - adjustments->bounds.right);
@@ -2455,22 +2461,29 @@ void paint_buffer_layout_uses_only_the_clipped_nonzero_paint_rectangle_test()
 
 void tabler_glyph_mapping_uses_the_pinned_css_codepoints_test()
 {
-    CHECK_EQ(L'\xfaf7', GlyphForIcon(UiIcon::Open));
-    CHECK_EQ(L'\xfaba', GlyphForIcon(UiIcon::Rewind));
-    CHECK_EQ(L'\xed46', GlyphForIcon(UiIcon::Play));
-    CHECK_EQ(L'\xed45', GlyphForIcon(UiIcon::Pause));
-    CHECK_EQ(L'\xed4a', GlyphForIcon(UiIcon::Stop));
-    CHECK_EQ(L'\xfac2', GlyphForIcon(UiIcon::FastForward));
-    CHECK_EQ(L'\xeb51', GlyphForIcon(UiIcon::Volume));
-    CHECK_EQ(L'\xf1c3', GlyphForIcon(UiIcon::VolumeOff));
-    CHECK_EQ(L'\xf6d7', GlyphForIcon(UiIcon::Sparkles));
-    CHECK_EQ(L'\xea85', GlyphForIcon(UiIcon::Crop));
-    CHECK_EQ(L'\xea03', GlyphForIcon(UiIcon::Adjustments));
-    CHECK_EQ(L'\xea48', GlyphForIcon(UiIcon::Debug));
-    CHECK_EQ(L'\xeaea', GlyphForIcon(UiIcon::Maximize));
-    CHECK_EQ(L'\xec90', GlyphForIcon(UiIcon::YouTube));
-    CHECK_EQ(L'\xea06', GlyphForIcon(UiIcon::Warning));
-    CHECK_EQ(L'\xead4', GlyphForIcon(UiIcon::Compare));
+    CHECK_EQ(L"\xfaf7", GlyphForIcon(UiIcon::Open));
+    CHECK_EQ(L"\xfaba", GlyphForIcon(UiIcon::Rewind));
+    CHECK_EQ(L"\xed46", GlyphForIcon(UiIcon::Play));
+    CHECK_EQ(L"\xed45", GlyphForIcon(UiIcon::Pause));
+    CHECK_EQ(L"\xed4a", GlyphForIcon(UiIcon::Stop));
+    CHECK_EQ(L"\xfac2", GlyphForIcon(UiIcon::FastForward));
+    CHECK_EQ(L"\xeb51", GlyphForIcon(UiIcon::Volume));
+    CHECK_EQ(L"\xf1c3", GlyphForIcon(UiIcon::VolumeOff));
+    CHECK_EQ(L"\xf6d7", GlyphForIcon(UiIcon::Sparkles));
+    CHECK_EQ(L"\xea28", GlyphForIcon(UiIcon::Upscaling));
+    CHECK_EQ(L"\xfdae", GlyphForIcon(UiIcon::FrameGeneration));
+    CHECK_EQ(L"\xeafa", GlyphForIcon(UiIcon::FrameInterpolation));
+    CHECK_EQ(L"\xea85", GlyphForIcon(UiIcon::Crop));
+    CHECK_EQ(L"\xea03", GlyphForIcon(UiIcon::Adjustments));
+    CHECK_EQ(L"\xea48", GlyphForIcon(UiIcon::Debug));
+    CHECK_EQ(L"\xeaea", GlyphForIcon(UiIcon::Maximize));
+    CHECK_EQ(L"\xec90", GlyphForIcon(UiIcon::YouTube));
+    CHECK_EQ(L"\xea06", GlyphForIcon(UiIcon::Warning));
+    CHECK_EQ(L"\xead4", GlyphForIcon(UiIcon::Compare));
+    // Past the BMP, which is why a glyph is a string: these two are the
+    // caption pair the AI subtitle switch is drawn with.
+    CHECK_EQ(L"\U000101a4", GlyphForIcon(UiIcon::SubtitlesAi));
+    CHECK_EQ(L"\U000101a2", GlyphForIcon(UiIcon::SubtitlesOff));
 }
 
 void native_button_palette_has_distinct_interaction_states_test()
@@ -5683,9 +5696,10 @@ void render_range_residual_below_one_frame_is_coverage_not_work_test()
 // noticing it twice.
 void feature_pills_are_visually_distinguishable_test()
 {
-    const wchar_t neural = GlyphForIcon(UiIcon::Sparkles);
-    const wchar_t upscaling = GlyphForIcon(UiIcon::Upscaling);
-    const wchar_t framegen = GlyphForIcon(UiIcon::FrameGeneration);
+    // A glyph is a string, not a wchar_t: the caption icons live past the BMP.
+    const std::wstring neural = GlyphForIcon(UiIcon::Sparkles);
+    const std::wstring upscaling = GlyphForIcon(UiIcon::Upscaling);
+    const std::wstring framegen = GlyphForIcon(UiIcon::FrameGeneration);
     CHECK(neural != upscaling);
     CHECK(neural != framegen);
     CHECK(upscaling != framegen);
@@ -5697,6 +5711,18 @@ void feature_pills_are_visually_distinguishable_test()
         CHECK(GlyphForIcon(other) != upscaling);
         CHECK(GlyphForIcon(other) != framegen);
     }
+    // The subtitle switch is a pair, and the pair must not be the same glyph:
+    // an off state that looks like the on state is worse than no icon.
+    const std::wstring subOn = GlyphForIcon(UiIcon::SubtitlesAi);
+    const std::wstring subOff = GlyphForIcon(UiIcon::SubtitlesOff);
+    CHECK(!subOn.empty());
+    CHECK(!subOff.empty());
+    CHECK(subOn != subOff);
+    CHECK(subOn != neural);
+    CHECK(subOff != neural);
+    // Past the BMP, so the string carries a surrogate pair rather than one unit.
+    CHECK_EQ(size_t{2}, subOn.size());
+    CHECK_EQ(size_t{2}, subOff.size());
 
     // Four states, four fills. With only enabled/active, "running a conversion"
     // and "switched on" painted the same - and at icon-only widths the label

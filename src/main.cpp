@@ -2088,9 +2088,9 @@ private:
 // take nothing but HICONs. GDI draws no alpha, so the glyph is drawn white on
 // black and its coverage becomes the alpha of a premultiplied white icon -
 // the same glyph, antialiased, as the toolbar button beside it.
-static HICON RenderGlyphIcon(wchar_t glyph, int size)
+static HICON RenderGlyphIcon(const std::wstring& glyph, int size)
 {
-    if(size<=0||glyph==L'\0')return nullptr;
+    if(size<=0||glyph.empty())return nullptr;
     BITMAPINFO info{};info.bmiHeader.biSize=sizeof(info.bmiHeader);info.bmiHeader.biWidth=size;info.bmiHeader.biHeight=-size;
     info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
     void* bits=nullptr;
@@ -2104,7 +2104,7 @@ static HICON RenderGlyphIcon(wchar_t glyph, int size)
         const HGDIOBJ oldBitmap=SelectObject(dc,color),oldFont=SelectObject(dc,font);
         RECT box{0,0,size,size};FillRect(dc,&box,static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
         SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(255,255,255));
-        DrawTextW(dc,&glyph,1,&box,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
+        DrawTextW(dc,glyph.c_str(),int(glyph.size()),&box,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
         GdiFlush();
         auto* pixel=static_cast<uint32_t*>(bits);
         for(int index=0;index<size*size;++index){
@@ -3561,7 +3561,7 @@ private:
     // minutes of work with a panel on screen, and this predicate is what arms
     // the repaint timer that animates it. Without it the spinner never moved
     // and the elapsed clock read zero.
-    bool ActivityBusy()const{return NeuralJobActive()||m_youtubeLifecycle.IsResolving()||m_stageExport.running;}
+    bool ActivityBusy()const{return NeuralJobActive()||m_youtubeLifecycle.IsResolving()||m_stageExport.running||SubtitlesWorking();}
     // A job that renders behind the loaded media: the player keeps the window,
     // and only its own panel and lanes report progress.
     bool JobBehindPlayback()const{return m_liveSession||m_previewJob;}
@@ -4169,6 +4169,7 @@ private:
         if(status.state==m_translateSeenState&&status.done==m_translateSeenDone)return;
         m_translateSeenState=status.state;
         m_translateSeenDone=status.done;
+        m_translateSeenTotal=status.total;
         switch(status.state){
         case subtitle_translate::State::Extracting:
         case subtitle_translate::State::Starting:
@@ -4386,6 +4387,16 @@ private:
     // when there is one. Paused, a new picture marks the present stale, and the
     // tick's paused present shows it.
     void ServiceSubtitles(){
+        // Repaint the AI-subtitle button the instant its indication changes
+        // (Off <-> Working <-> On). The activity timer only paints it while
+        // SubtitlesWorking() holds and is killed once only SubtitlesActive()
+        // remains, so without this the button freezes on its last "Working"
+        // frame and never turns "On" when the bilingual actually reaches the
+        // screen - the exact moment the toggle is meant to reflect.
+        {
+            const int ind=SubtitlesActive()?2:(SubtitlesWorking()?1:0);
+            if(ind!=m_subtitleIndication){m_subtitleIndication=ind;InvalidateControls();}
+        }
         SyncSubtitlesToSource();
         TakeSubtitleDiscoveries();
         PollSpeech();
@@ -5537,7 +5548,10 @@ private:
         // and the status line animate, never the full-window pre-render surface.
         if(JobBehindPlayback()){RefreshBufferOverlay();const RECT dirty=StatusRect();InvalidateRect(m_hwnd,&dirty,FALSE);
             if(m_liveSession&&m_activityMotionEnabled){RECT timeline=TimelineRect();InflateRect(&timeline,0,Dip(2));InvalidateRect(m_hwnd,&timeline,FALSE);}return;}
-        if(m_loaded&&!NeuralJobActive()){const RECT dirty=StatusRect();InvalidateRect(m_hwnd,&dirty,FALSE);return;}
+        if(m_loaded&&!NeuralJobActive()){
+            const RECT dirty=StatusRect();InvalidateRect(m_hwnd,&dirty,FALSE);
+            if(SubtitlesWorking()&&m_subtitleButtonValid)InvalidateRect(m_hwnd,&m_subtitleButton,FALSE);
+            return;}
         RECT c{};GetClientRect(m_hwnd,&c);
         const auto surface=LayoutPreRenderSurface(c.right-c.left,c.bottom-c.top,ActiveWindowDpi(m_hwnd));
         for(const RECT& dirty:{surface.spinner,surface.progressTrack,surface.elapsedEta})InvalidateRect(m_hwnd,&dirty,FALSE);
@@ -7093,8 +7107,14 @@ private:
         // The one place every state change already funnels through, which makes
         // it the one place the tip rectangles cannot fall behind the layout.
         if(!m_hwnd)return;SyncFeatureMenuState();RefreshToolbarTips();RECT c{};GetClientRect(m_hwnd,&c);
-        if(!m_loaded){InvalidateRect(m_hwnd,nullptr,FALSE);return;}
+        if(!m_loaded){InvalidateRect(m_hwnd,nullptr,FALSE);UpdateWindow(m_hwnd);return;}
         RECT bar{0,std::max<LONG>(0,c.bottom-ControlHeight()),c.right,c.bottom};InvalidateRect(m_hwnd,&bar,FALSE);
+        // InvalidateRect marks the region and POSTS WM_PAINT. A window that is
+        // also presenting video frame by frame never gets to that post: measured,
+        // a toolbar button kept the colour of the state it had just left for as
+        // long as the film played on. UpdateWindow sends the paint now instead of
+        // leaving it in the queue.
+        UpdateWindow(m_hwnd);
     }
 
     void SetTrack(HWND h,int id,int lo,int hi,int pos){
@@ -9723,9 +9743,9 @@ private:
             }
             StretchDIBits(dc,x,y,w,h,0,0,pictureSize.cx,pictureSize.cy,pixels,&info,DIB_RGB_COLORS,SRCCOPY);
         }else if(m_iconFont){
-            const wchar_t glyph=GlyphForIcon(content.trailer?UiIcon::YouTube:UiIcon::Open);
+            const std::wstring glyph=GlyphForIcon(content.trailer?UiIcon::YouTube:UiIcon::Open);
             const HGDIOBJ old=SelectObject(dc,m_iconFont);SetTextColor(dc,ui_palette::SecondaryText);RECT box=thumb;
-            DrawTextW(dc,&glyph,1,&box,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);SelectObject(dc,old);
+            DrawTextW(dc,glyph.c_str(),int(glyph.size()),&box,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);SelectObject(dc,old);
         }
         if(!content.badge.empty()){
             SIZE size{};GetTextExtentPoint32W(dc,content.badge.c_str(),int(content.badge.size()),&size);
@@ -10124,7 +10144,7 @@ private:
     IdleSurfaceLayout IdleLayout()const{return StartLayout().core;}
     std::vector<ToolbarItem> ToolbarItems()const{if(!ControlsVisible())return {};RECT c{};GetClientRect(m_hwnd,&c);return LayoutToolbar(static_cast<int>(c.right-c.left),static_cast<int>(c.bottom-c.top),ActiveWindowDpi(m_hwnd));}
     std::vector<ToolbarItem> FocusableItems()const{if(m_loaded)return ToolbarItems();const auto idle=IdleLayout();return{idle.actions.begin(),idle.actions.end()};}
-    ToolbarAvailability ToolbarState()const{return{m_loaded,m_seeking||m_seekPending,m_renderer!=nullptr,YouTubePlaybackAvailable(),m_youtubeLifecycle.IsResolving()||(NeuralJobActive()&&!JobBehindPlayback()),m_cachedPlayback&&m_havePresentedPair&&m_renderer!=nullptr,m_liveSession||LiveSessionAvailable()||StillImageRenderAvailable(),UpscalingAvailable(),FrameGenerationAvailable(),m_frameGenWorker.joinable()&&!m_frameGenCancelling,PlaybackFrameGenerationSupported()};}
+    ToolbarAvailability ToolbarState()const{return{m_loaded,m_seeking||m_seekPending,m_renderer!=nullptr,YouTubePlaybackAvailable(),m_youtubeLifecycle.IsResolving()||(NeuralJobActive()&&!JobBehindPlayback()),m_cachedPlayback&&m_havePresentedPair&&m_renderer!=nullptr,m_liveSession||LiveSessionAvailable()||StillImageRenderAvailable(),UpscalingAvailable(),FrameGenerationAvailable(),m_frameGenWorker.joinable()&&!m_frameGenCancelling,PlaybackFrameGenerationSupported(),SubtitlesAvailable(),SubtitlesActive(),SubtitlesWorking()};}
     std::optional<RECT> VolumeRect()const{if(!ControlsVisible())return std::nullopt;RECT c{};GetClientRect(m_hwnd,&c);const auto items=ToolbarItems();return LayoutVolumeSlider(static_cast<int>(c.right-c.left),static_cast<int>(c.bottom-c.top),ActiveWindowDpi(m_hwnd),items);}
     bool PtIn(const RECT&r,int x,int y)const{return x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom;}
 
@@ -10436,7 +10456,11 @@ private:
     // `working` is the fourth state: a conversion or a render is running. It
     // defaults false, so every control that is simply on or off says so by
     // saying nothing.
-    struct ToolbarButtonContent{UiIcon icon;std::wstring label;bool enabled;bool active;bool working{false};};
+    // progress: -1 when the amount left is not knowable (an engine loading its
+    // model, which reports nothing until it answers), 0..1 when it is. The bar
+    // at the bottom of the button draws a pulse for the first and a fill for the
+    // second; a bar that lied would be worse than none.
+    struct ToolbarButtonContent{UiIcon icon;std::wstring label;bool enabled;bool active;bool working{false};float progress{-1.0f};};
 
     ToolbarButtonContent ButtonContent(ToolbarAction action,bool idleSurface=false)const{
         const bool rendererReady=m_renderer!=nullptr;
@@ -10455,6 +10479,19 @@ private:
         case ToolbarAction::Stop:return{UiIcon::Stop,L"Stop",enabled,false};
         case ToolbarAction::Forward10:return{UiIcon::FastForward,L"10s",enabled,false};
         case ToolbarAction::Mute:return{m_muted?UiIcon::VolumeOff:UiIcon::Volume,m_muted?L"Sound":L"Mute",enabled,m_muted};
+        case ToolbarAction::ToggleSubtitles:{
+            // The switch says "working" for the whole wait and only turns "on"
+            // when the TRANSLATED track is on screen. Going on at the first line
+            // of the original would make a second press look like "I am done"
+            // when it would actually cancel the translation still loading.
+            const bool working=SubtitlesWorking();
+            const bool active=SubtitlesActive();
+            float progress=-1.0f;
+            if(working)progress=SubtitleProgress();
+            return{working||active?UiIcon::SubtitlesAi:UiIcon::SubtitlesOff,
+                   working?L"Subtitles \u00b7 Working":active?L"Subtitles \u00b7 On":L"Subtitles \u00b7 Off",
+                   enabled,active,working,progress};
+        }
         // The unavailable arm carries the reason, not the verdict: a pill that
         // says only "Unavailable" sends a viewer looking for a broken toggle
         // when the answer is usually that their source already fills the panel.
@@ -10520,7 +10557,7 @@ private:
 
     bool ToolbarActionEnabled(ToolbarAction action)const{return IsToolbarActionEnabled(action,ToolbarState());}
 
-    void DrawButton(HDC dc,ToolbarAction action,UiIcon icon,const std::wstring&label,const RECT&r,bool enabled,bool active,bool hover,bool pressed,bool focus,bool compact,bool working=false){
+    void DrawButton(HDC dc,ToolbarAction action,UiIcon icon,const std::wstring&label,const RECT&r,bool enabled,bool active,bool hover,bool pressed,bool focus,bool compact,bool working=false,float progress=-1.0f){
         // The resting and hovered looks mixed by how far the hover fade has got,
         // so the tint eases rather than snapping; at 0 or 1 it is either look.
         const ButtonVisual rest=ResolveButtonVisual(ButtonState{enabled,active,working,false,pressed,focus});
@@ -10536,9 +10573,9 @@ private:
         RoundRect(dc,r.left,r.top,r.right,r.bottom,radius*2,radius*2);
         SelectObject(dc,oldBrush);SelectObject(dc,oldPen);DeleteObject(brush);DeleteObject(pen);
         SetBkMode(dc,TRANSPARENT);SetTextColor(dc,visual.text);
-        const wchar_t glyph=GlyphForIcon(icon);const bool showIcon=ResolveButtonPresentation(m_iconFont!=nullptr)==ButtonPresentation::IconAndLabel&&glyph!=L'\0';
+        const std::wstring glyph=GlyphForIcon(icon);const bool showIcon=ResolveButtonPresentation(m_iconFont!=nullptr)==ButtonPresentation::IconAndLabel&&!glyph.empty();
         const bool stacked=compact&&showIcon;SIZE iconSize{},textSize{};
-        if(showIcon){const HGDIOBJ measured=SelectObject(dc,m_iconFont);GetTextExtentPoint32W(dc,&glyph,1,&iconSize);SelectObject(dc,measured);}
+        if(showIcon){const HGDIOBJ measured=SelectObject(dc,m_iconFont);GetTextExtentPoint32W(dc,glyph.c_str(),int(glyph.size()),&iconSize);SelectObject(dc,measured);}
         const HFONT textFont=m_fontSmall?m_fontSmall:m_font;const HGDIOBJ measuredText=SelectObject(dc,textFont);
         GetTextExtentPoint32W(dc,label.c_str(),static_cast<int>(label.size()),&textSize);
         const bool featureLabel=action==ToolbarAction::ToggleNeuralRendering||action==ToolbarAction::ToggleUpscaling||action==ToolbarAction::ToggleFrameGeneration||action==ToolbarAction::TogglePlaybackFrameGeneration;
@@ -10559,11 +10596,44 @@ private:
         // the inset a physical key gives under a finger. No timer: a press is
         // as long as the button is held.
         if(pressed&&enabled){const int sink=std::max(1,Dip(1));OffsetRect(&content.icon,0,sink);OffsetRect(&content.text,0,sink);}
-        if(showIcon){const HGDIOBJ oldFont=SelectObject(dc,m_iconFont);RECT iconRect=content.icon;DrawTextW(dc,&glyph,1,&iconRect,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);SelectObject(dc,oldFont);}
+        if(showIcon){const HGDIOBJ oldFont=SelectObject(dc,m_iconFont);RECT iconRect=content.icon;DrawTextW(dc,glyph.c_str(),int(glyph.size()),&iconRect,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);SelectObject(dc,oldFont);}
         if(showText){const HGDIOBJ oldFont=SelectObject(dc,textFont);RECT textRect=content.text;
             DrawTextW(dc,shown.c_str(),-1,&textRect,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
             SelectObject(dc,oldFont);}
         if(visual.drawFocus&&action!=ToolbarAction::None)DrawRoundedFocusRing(dc,r,radius,visual.text,ActiveWindowDpi(m_hwnd));
+        // The wait for the first line is the one thing this button owes an answer
+        // for, and it owes it where the eye already is: a lane along the bottom of
+        // the button. A pulse while an engine is loading its model - nothing knows
+        // how long that takes and a bar claiming a number would be lying - and a
+        // fill once there is a total to be a fraction of. Teal, the colour the
+        // timeline already uses for "being made right now", so the two places that
+        // say it say it the same way.
+        if(working&&enabled&&r.right>r.left){
+            const int laneHeight=std::max(2,Dip(2));
+            const int inset=std::max(2,Dip(3));
+            RECT lane{r.left+inset,r.bottom-laneHeight-Dip(1),r.right-inset,r.bottom-Dip(1)};
+            if(lane.right>lane.left){
+                HBRUSH track=CreateSolidBrush(chrome_motion::Mix(visual.fill,ui_palette::Window,0.4));
+                if(track){FillRect(dc,&lane,track);DeleteObject(track);}
+                RECT fill=lane;
+                if(progress>=0.0f){
+                    const int span=fill.right-fill.left;
+                    fill.right=fill.left+int(span*std::clamp(double(progress),0.0,1.0));
+                }else{
+                    // Unknown amount: a lit segment sweeping the lane, which says
+                    // "working" without pretending to know how much is left.
+                    const int segment=std::max(6,Dip(10));
+                    const int travel=fill.right-fill.left+segment;
+                    const int head=int(std::fmod(double(GetTickCount64())/26.0,double(travel)));
+                    fill.left=std::min(fill.right-segment,fill.left+std::max(0,head-segment/2));
+                    fill.right=fill.left+segment;
+                }
+                if(fill.right>fill.left){
+                    HBRUSH ink=CreateSolidBrush(ui_palette::NeuralCoverage);
+                    if(ink){FillRect(dc,&fill,ink);DeleteObject(ink);}
+                }
+            }
+        }
     }
 
     bool FocusCueFor(ToolbarAction action)const{return m_keyboardCues&&GetFocus()==m_hwnd&&m_focusedToolbarAction==action;}
@@ -10995,7 +11065,11 @@ private:
         const auto reaches=[&](RECT r){InflateRect(&r,Dip(2),Dip(2));return RectVisible(dc,&r)!=FALSE;};
         if(CompareBarVisible()&&reaches(RECT{0,c.bottom-ControlHeight(),c.right,c.bottom-ControlHeight()+Dip(compare_bar::kBarHeightDip)}))DrawCompareBar(dc);
         const auto toolbarItems=ToolbarItems();
-        for(const auto& item:toolbarItems){if(!reaches(item.bounds))continue;const auto content=ButtonContent(item.action);const bool hover=content.enabled&&m_hoverAction==item.action;DrawButton(dc,item.action,content.icon,content.label,item.bounds,content.enabled,content.active,hover,m_pressedToolbarAction==item.action,FocusCueFor(item.action),item.compact,content.working);}
+        for(const auto& item:toolbarItems){if(!reaches(item.bounds))continue;const auto content=ButtonContent(item.action);const bool hover=content.enabled&&m_hoverAction==item.action;
+            // Remembered so the repaint that keeps the bar pulsing knows where to
+            // invalidate; a pulse that is never repainted is a still picture of one.
+            if(item.action==ToolbarAction::ToggleSubtitles){m_subtitleButton=item.bounds;m_subtitleButtonValid=true;}
+            DrawButton(dc,item.action,content.icon,content.label,item.bounds,content.enabled,content.active,hover,m_pressedToolbarAction==item.action,FocusCueFor(item.action),item.compact,content.working,content.progress);}
         const auto volumeRect=LayoutVolumeSlider(static_cast<int>(c.right-c.left),static_cast<int>(c.bottom-c.top),ActiveWindowDpi(m_hwnd),toolbarItems);
         if(volumeRect&&reaches(RECT{volumeRect->left-Dip(24),volumeRect->top-Dip(16),c.right,volumeRect->bottom})){
             const auto now=Clock::now();
@@ -13746,6 +13820,85 @@ private:
     void ToggleMute(){m_muted=!m_muted;Audio().SetVolume(m_muted?0.0f:m_volume);InvalidateToolbarAction(ToolbarAction::Mute);InvalidateVolumeControls();}
     // With a rendered pair loaded the toggle switches which member is presented.
     // Without one it is how an active session is started, and how it is stopped.
+    // ---- The one press that gets subtitles -----------------------------------
+    // A film on this machine, and an engine to listen or translate with. Either
+    // one is enough: a film that already has a track needs only the translator,
+    // and one without needs the listener to make the track first.
+    bool SubtitlesAvailable()const{
+        if(!m_loaded||m_path.empty())return false;
+        const bool local=_wcsnicmp(m_path.c_str(),L"http://",7)!=0&&_wcsnicmp(m_path.c_str(),L"https://",8)!=0;
+        if(!local)return false;
+        return subtitle_speech::SpeechToText::Available(SpeechEngine())||
+               subtitle_translate::Translator::Available(TranslationEngine());
+    }
+    // On means the TRANSLATED track is what the overlay is drawing. Not "the
+    // transcript reached the screen": the button was pressed for Chinese.
+    bool SubtitlesActive()const{
+        return m_subtitleMode!=subtitle_translate::Mode::Source&&!m_translatedTrack.empty()&&!m_translateBehind;
+    }
+    bool SubtitlesWorking()const{
+        if(m_speech&&m_speechStatus.Running())return true;
+        const auto state=m_translateSeenState;
+        return state==subtitle_translate::State::Extracting||state==subtitle_translate::State::Starting||
+               state==subtitle_translate::State::Translating;
+    }
+    // -1 while an engine is loading its model - it reports nothing until it
+    // answers, and a made-up number would be a lie - and done/total after that.
+    float SubtitleProgress()const{
+        if(m_speech&&m_speechStatus.Running()){
+            if(m_speechStatus.chunksTotal>0&&m_speechStatus.chunksDone>=0)
+                return float(m_speechStatus.chunksDone)/float(std::max<size_t>(1,m_speechStatus.chunksTotal));
+            return -1.0f;
+        }
+        if(m_translator&&m_translateSeenState==subtitle_translate::State::Translating&&
+           m_translateSeenDone>=0&&m_translateSeenTotal>0)
+            return float(m_translateSeenDone)/float(m_translateSeenTotal);
+        return -1.0f;
+    }
+    // The switch repaints itself the moment it is pressed, and a repaint reads
+    // the status the previous tick left behind - which is one tick stale at
+    // exactly the moment it matters. Pull the engines' own answer before asking
+    // for the paint, or the button keeps the colour of the state it just left.
+    void SyncSubtitleStatus(){
+        if(m_speech)m_speechStatus=m_speech->Poll();
+        if(m_translator){
+            const auto status=m_translator->Poll();
+            m_translateSeenState=status.state;
+            m_translateSeenDone=status.done;
+            m_translateSeenTotal=status.total;
+        }
+    }
+    void ToggleSubtitles(){
+        if(!m_loaded)return;
+        if(SubtitlesActive()||SubtitlesWorking()){StopSubtitles();return;}
+        StartSubtitles();
+    }
+    // The mode is what makes the translation run at all, so it is set first and
+    // it is remembered: a viewer who wants Chinese wants it on the next film
+    // too. A film with no text of its own then gets a transcript made for it,
+    // and the same machinery translates that.
+    void StartSubtitles(){
+        if(m_subtitleMode==subtitle_translate::Mode::Source)SetSubtitleMode(subtitle_translate::Mode::Dual);
+        const bool listening=m_speech&&m_speechStatus.Running();
+        if(!m_subtitleWanted&&m_speechTrack.empty()&&!listening)StartSpeech();
+        m_sourceNotice=T(L"subtitles.starting");
+        SyncSubtitleStatus();
+        UpdateCachedStatus();UpdateSubtitleMenu();
+        LOG("Subtitles: the switch was pressed for a "<<(m_subtitleWanted?"subtitle track":"transcript")
+            <<" of "<<WideToUtf8(m_path)<<".");
+    }
+    // Stops what is running AND drops the translated track, so the second press
+    // is an honest stop rather than a pause that leaves Chinese on screen.
+    void StopSubtitles(){
+        if(m_speech)m_speech->Cancel();
+        if(m_translator)m_translator->Cancel();
+        if(m_subtitleMode!=subtitle_translate::Mode::Source)SetSubtitleMode(subtitle_translate::Mode::Source);
+        m_sourceNotice=T(L"subtitles.stopped");
+        SyncSubtitleStatus();
+        UpdateCachedStatus();UpdateSubtitleMenu();
+        LOG("Subtitles: stopped at the switch.");
+    }
+
     void ToggleNeuralRendering(){
         if(!ToolbarActionEnabled(ToolbarAction::ToggleNeuralRendering)){
             // A seek in flight is the one refusal that is purely about timing:
@@ -14026,7 +14179,7 @@ private:
         if(id>=IDM_SUBTITLE_TRACK_FIRST&&id<IDM_SUBTITLE_TRACK_FIRST+IDM_SUBTITLE_TRACK_COUNT){
             SelectSubtitleTrack(int(id-IDM_SUBTITLE_TRACK_FIRST),true);return;}
         switch(id){
-        case IDM_OPEN:OpenFromDialog();break;case IDM_EXIT:DestroyWindow(m_hwnd);break;case IDM_PLAY:TogglePause();break;case IDM_STOP:StopPlayback();break;case IDM_BACK10:RequestSeek(Position()-10);break;case IDM_FWD10:RequestSeek(Position()+10);break;case IDM_MUTE:ToggleMute();break;case IDM_NEURAL_RENDERING:ToggleNeuralRendering();break;
+        case IDM_OPEN:OpenFromDialog();break;case IDM_EXIT:DestroyWindow(m_hwnd);break;case IDM_PLAY:TogglePause();break;case IDM_STOP:StopPlayback();break;case IDM_BACK10:RequestSeek(Position()-10);break;case IDM_FWD10:RequestSeek(Position()+10);break;case IDM_MUTE:ToggleMute();break;case IDM_SUBTITLE_TOGGLE:ToggleSubtitles();break;case IDM_NEURAL_RENDERING:ToggleNeuralRendering();break;
         case IDM_DLSS_UPSCALING:ToggleUpscaling();break;
         case IDM_PLAYBACK_FRAME_GENERATION:TogglePlaybackFrameGeneration();break;
         case IDM_RTX_VSR_UPSCALING:TogglePlaybackVsr();break;
@@ -14494,6 +14647,7 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     std::wstring m_translateRequestedKey;
     subtitle_translate::State m_translateSeenState=subtitle_translate::State::Idle;
     int m_translateSeenDone=-1;
+    int m_translateSeenTotal=-1;
     std::filesystem::path m_translationCacheDirectory;
     SubtitleOverlay::Source m_subtitleTranslated;
     // The next Show() replaces a track whose timing did not change, so the
@@ -14504,6 +14658,10 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // batch is made - not an empty screen.
     double m_translateCoverage=0.0;
     bool m_translateBehind=false;
+    // Where the subtitle switch was drawn, so its pulsing bar can be repainted.
+    RECT m_subtitleButton{};
+    bool m_subtitleButtonValid=false;
+    int m_subtitleIndication=-1;   // last rendered subtitle-button state: Off(0)/Working(1)/On(2)
     // Speech to subtitles: the player's own producer of a source track, for films
     // that have none. It does not replace m_subtitleWanted - it answers the same
     // question, and the viewer's own choice wins when there is one.

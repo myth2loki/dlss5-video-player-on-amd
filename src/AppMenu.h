@@ -67,6 +67,10 @@ inline constexpr UINT IDM_SUBTITLE_MODE_DUAL = 255;
 // The player's own producer of a source track, for a film that has none: it
 // listens to the audio and writes subtitles. One command that starts and stops.
 inline constexpr UINT IDM_SUBTITLE_SPEECH = 256;
+// The toolbar switch beside Mute: one press gets subtitles out of the film, the
+// next stops them. The menu row and this are the same command, so whatever
+// reaches one reaches the other.
+inline constexpr UINT IDM_SUBTITLE_TOGGLE = 257;
 inline constexpr UINT IDM_NEURAL_RENDERING = 300;
 inline constexpr UINT IDM_REHOOK = 301;
 inline constexpr UINT IDM_VIEW_FINAL = 302;

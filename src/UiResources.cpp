@@ -4,20 +4,20 @@
 
 #include <algorithm>
 
-wchar_t GlyphForIcon(UiIcon icon)
+std::wstring GlyphForIcon(UiIcon icon)
 {
     // @tabler/icons-webfont 3.46.0. Keep these values aligned with the
     // committed assets/tabler/tabler-icons.css source of truth.
     switch (icon) {
-    case UiIcon::Open: return L'\xfaf7';             // folder-open
-    case UiIcon::Rewind: return L'\xfaba';           // rewind-backward-10
-    case UiIcon::Play: return L'\xed46';             // player-play
-    case UiIcon::Pause: return L'\xed45';            // player-pause
-    case UiIcon::Stop: return L'\xed4a';             // player-stop
-    case UiIcon::FastForward: return L'\xfac2';      // rewind-forward-10
-    case UiIcon::Volume: return L'\xeb51';           // volume
-    case UiIcon::VolumeOff: return L'\xf1c3';        // volume-off
-    case UiIcon::Sparkles: return L'\xf6d7';         // sparkles
+    case UiIcon::Open: return L"\xfaf7";             // folder-open
+    case UiIcon::Rewind: return L"\xfaba";           // rewind-backward-10
+    case UiIcon::Play: return L"\xed46";             // player-play
+    case UiIcon::Pause: return L"\xed45";            // player-pause
+    case UiIcon::Stop: return L"\xed4a";             // player-stop
+    case UiIcon::FastForward: return L"\xfac2";      // rewind-forward-10
+    case UiIcon::Volume: return L"\xeb51";           // volume
+    case UiIcon::VolumeOff: return L"\xf1c3";        // volume-off
+    case UiIcon::Sparkles: return L"\xf6d7";         // sparkles
     // arrows-maximize: four arrows pushing outward from a centre, which is what
     // Super Resolution does to a picture. Verified present in the committed
     // tabler-icons.ttf cmap (U+EA28, glyph 341).
@@ -28,7 +28,7 @@ wchar_t GlyphForIcon(UiIcon icon)
     // two of the three were still indistinguishable at exactly the width the
     // note was written about. Sparkles stays with the neural model, which is
     // the one that earns it.
-    case UiIcon::Upscaling: return L'\xea28';        // arrows-maximize
+    case UiIcon::Upscaling: return L"\xea28";        // arrows-maximize
     // copy-plus: a duplicated frame with a plus, the one glyph in the embedded
     // 3.46.0 set that reads as "more frames out of one frame". Verified present
     // in the committed tabler-icons.ttf cmap (U+FDAE, 15 contours), so it needs
@@ -38,26 +38,29 @@ wchar_t GlyphForIcon(UiIcon icon)
     // It must not be sparkles: the three feature pills collapse to icon-only
     // at 44/36 dip, where three identical sparkles hid which one starts a
     // minutes-long conversion.
-    case UiIcon::FrameGeneration: return L'\xfdae'; // copy-plus
+    case UiIcon::FrameGeneration: return L"\xfdae"; // copy-plus
     // movie: a film frame, the one glyph that reads as "video being played"
     // rather than "a file being written". Verified present in the committed
     // tabler-icons.ttf cmap (U+EAFA). Distinct from copy-plus (the offline
     // conversion pill) and from arrows-maximize / sparkles, the other two
     // feature pills, so the four never collapse to the same icon at narrow
     // widths.
-    case UiIcon::FrameInterpolation: return L'\xeafa'; // movie
-    case UiIcon::Crop: return L'\xea85';             // crop
-    case UiIcon::Adjustments: return L'\xea03';      // adjustments
-    case UiIcon::Debug: return L'\xea48';            // bug
-    case UiIcon::Maximize: return L'\xeaea';         // maximize
-    case UiIcon::YouTube: return L'\xec90';          // brand-youtube
-    case UiIcon::Warning: return L'\xea06';          // alert-triangle
+    case UiIcon::FrameInterpolation: return L"\xeafa"; // movie
+    case UiIcon::Crop: return L"\xea85";             // crop
+    case UiIcon::Adjustments: return L"\xea03";      // adjustments
+    case UiIcon::Debug: return L"\xea48";            // bug
+    case UiIcon::Maximize: return L"\xeaea";         // maximize
+    case UiIcon::YouTube: return L"\xec90";          // brand-youtube
+    case UiIcon::Warning: return L"\xea06";          // alert-triangle
     // layout-columns: two panes side by side, which is what the compare
     // button on the taskbar thumbnail turns on. Verified present in the
     // committed tabler-icons.ttf cmap (U+EAD4, 9 contours).
-    case UiIcon::Compare: return L'\xead4';          // layout-columns
+    case UiIcon::Compare: return L"\xead4";          // layout-columns
+    // Past the BMP, so these two are why the return type is a string.
+    case UiIcon::SubtitlesAi: return L"\U000101a4";   // subtitles-ai
+    case UiIcon::SubtitlesOff: return L"\U000101a2";  // subtitles-off
     }
-    return L'\0';
+    return L"";
 }
 
 ButtonVisual ResolveButtonVisual(ButtonState state)

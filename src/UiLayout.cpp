@@ -29,6 +29,12 @@ constexpr std::array kToolbarDefinitions{
     ToolbarDefinition{ToolbarAction::Stop, 48, 0, false},
     ToolbarDefinition{ToolbarAction::Forward10, 44, 0, false},
     ToolbarDefinition{ToolbarAction::Mute, 54, 0, true},
+    // 54 dip, the width of an icon button, and group 0 beside Mute: a control in
+    // group 1 would take a feature pill's place the moment one of them becomes
+    // available, which is exactly the crowding those pills were measured
+    // against. Not required at narrow widths - the menu row still reaches it -
+    // so a small window drops this before it drops play/pause.
+    ToolbarDefinition{ToolbarAction::ToggleSubtitles, 54, 0, false},
     ToolbarDefinition{ToolbarAction::ToggleNeuralRendering, 270, 1, true, kFeaturePillNarrowWidthDip},
     // 270 dip, the same as the neural pill beside it and for the same kind of
     // measurement: the widest arm is now a reason rather than "Unavailable".
@@ -477,6 +483,10 @@ bool IsToolbarActionEnabled(ToolbarAction action, ToolbarAvailability availabili
     case ToolbarAction::Mute:
     case ToolbarAction::Aspect:
         return availability.mediaLoaded && !availability.seeking;
+    case ToolbarAction::ToggleSubtitles:
+        // A film on this machine, and an engine to listen with: grey rather than
+        // dead-looking when the engine is missing.
+        return availability.mediaLoaded && !availability.seeking && availability.subtitlesAvailable;
     case ToolbarAction::ToggleNeuralRendering:
         // Either a rendered pair is loaded, or a render can be started from the
         // playhead and the toggle becomes the way to start it.
