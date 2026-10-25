@@ -154,8 +154,11 @@ void SubtitleOverlay::Show(const Source& source, const Canvas& canvas, double at
         // still correct for this moment; it stays until the new child draws.
         if (keepFrames && m_showing) {
             m_handOverPending = true;
+            m_handOverFrames = std::move(m_frames);
+            m_frames.clear();
         } else {
             m_frames.clear();
+            m_handOverFrames.clear();
             m_handOverPending = false;
         }
         m_ended = false;
@@ -179,6 +182,7 @@ void SubtitleOverlay::Seek(double at)
         m_startAt = std::max(0.0, at);
         ++m_generation;
         m_frames.clear();
+        m_handOverFrames.clear();
         m_handOverPending = false;
         m_ended = false;
         InterruptLocked(false);
@@ -194,6 +198,7 @@ void SubtitleOverlay::Hide()
         m_showing = false;
         ++m_generation;
         m_frames.clear();
+        m_handOverFrames.clear();
         m_handOverPending = false;
         m_ended = false;
         InterruptLocked(true);
@@ -214,14 +219,25 @@ std::shared_ptr<const subtitle::Frame> SubtitleOverlay::FrameAt(double at)
     m_consumedAt = at;
     size_t shown = subtitle::kNoTrack;
     for (size_t index = 0; index < m_frames.size() && m_frames[index]->pts <= at; ++index) shown = index;
-    if (shown == subtitle::kNoTrack) return nullptr;
-    if (shown > 0) {
-        // The frames before the one on screen are done with; dropping them is
-        // what lets the worker read the next change.
-        m_frames.erase(m_frames.begin(), m_frames.begin() + std::ptrdiff_t(shown));
-        m_progress.notify_all();
+    if (shown != subtitle::kNoTrack) {
+        if (shown > 0) {
+            // The frames before the one on screen are done with; dropping them is
+            // what lets the worker read the next change.
+            m_frames.erase(m_frames.begin(), m_frames.begin() + std::ptrdiff_t(shown));
+            m_progress.notify_all();
+        }
+        return m_frames.front();
     }
-    return m_frames.front();
+    // The track being swapped in has not drawn this moment yet, and the frames
+    // parked by the reload are the last correct answer for it. They are read,
+    // not erased: the new track may still need them for a moment it has not
+    // reached, and it discards them itself once it draws.
+    if (m_handOverPending) {
+        for (size_t index = 0; index < m_handOverFrames.size() && m_handOverFrames[index]->pts <= at; ++index)
+            shown = index;
+        if (shown != subtitle::kNoTrack) return m_handOverFrames[size_t(shown)];
+    }
+    return nullptr;
 }
 
 bool SubtitleOverlay::Settled(double at) const
@@ -230,6 +246,7 @@ bool SubtitleOverlay::Settled(double at) const
     if (!m_showing) return true;
     std::vector<double> pts;
     for (const auto& frame : m_frames) pts.push_back(frame->pts);
+    if (m_handOverPending) for (const auto& frame : m_handOverFrames) pts.push_back(frame->pts);
     return m_sessionGeneration == m_generation && (subtitle::QueueAnswers(pts, m_ended, at) || (m_ended && pts.empty()));
 }
 
@@ -654,7 +671,10 @@ void SubtitleOverlay::RunSession(uint64_t generation)
         std::lock_guard lock(m_mutex);
         if (generation != m_generation) break;
         if (m_handOverPending) {
-            m_frames.clear();
+            // The replacement has drawn: the frames it was covering for are done
+            // with, and holding them would keep the old picture's memory for the
+            // rest of the film.
+            m_handOverFrames.clear();
             m_handOverPending = false;
         }
         m_frames.push_back(std::move(frame));
@@ -675,6 +695,10 @@ void SubtitleOverlay::RunSession(uint64_t generation)
         // up are still correct for this moment and are far better than a blank
         // screen nobody will re-request. The flag goes so that a later frame is
         // not mistaken for the hand-over.
+        // They go back where the UI thread reads them, and the flag goes so a
+        // later frame is not mistaken for the hand-over.
+        m_frames = std::move(m_handOverFrames);
+        m_handOverFrames.clear();
         m_handOverPending = false;
         LOG("Subtitles: the replacement track drew nothing; keeping the frames already on screen.");
     }

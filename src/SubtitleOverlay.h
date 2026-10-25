@@ -167,7 +167,17 @@ private:
     std::deque<std::shared_ptr<const subtitle::Frame>> m_frames;
     // A hot-reloaded track has been asked for but has not drawn yet; its first
     // frame is what replaces the frames still on screen.
+    //
+    // Those frames are parked OUT of m_frames, not left in it. m_frames is also
+    // what the worker's back-pressure counts (nothing may sit more than
+    // kFramesAhead ahead of the playhead), so a reloaded track that inherits six
+    // frames of its predecessor starts at six and reads nothing at all: the old
+    // picture stays up for as long as the new track would have taken to draw,
+    // which is exactly the "only the English is there" report. Parked frames are
+    // still answered to the UI thread - the reload must not blink - but they are
+    // not in the way of the track replacing them.
     bool m_handOverPending = false;
+    std::deque<std::shared_ptr<const subtitle::Frame>> m_handOverFrames;
     bool m_ended = false;
     double m_consumedAt = 0.0;
 
