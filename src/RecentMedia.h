@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -41,6 +43,14 @@ public:
     // Invalid entries are ignored. Newest first; returns evicted records and
     // records whose nonempty cache keys were replaced. Empty keys mean absent.
     std::vector<RecentMediaEntry> Remember(RecentMediaEntry entry);
+
+    // Behind the Recent row's corner switch: take one entry out of the list and
+    // leave every other one exactly where it was. Nothing on disk is touched
+    // but the list itself - a render is minutes of GPU time the owner of it may
+    // still want, and "Clear neural cache" is the one thing that deletes those,
+    // never a menu rolling over and never this. Nullopt when `index` names no
+    // entry, which includes the index of a tile whose row the layout shortened.
+    std::optional<RecentMediaEntry> Forget(size_t index);
 
 private:
     std::filesystem::path file_;

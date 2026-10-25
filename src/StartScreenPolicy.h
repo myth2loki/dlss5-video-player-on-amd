@@ -233,6 +233,14 @@ inline std::wstring CoverageBadge(int64_t rangeStart100ns, int64_t rangeEnd100ns
 
 inline constexpr int kTileWidthDip = 192;
 inline constexpr int kTileThumbHeightDip = 108;   // 16:9 of the width
+// The corner switch that drops a recent tile from the list: over the top-right
+// of its thumbnail, inset from two edges rather than laid across the picture, so
+// it covers the corner of the frame and not the face in the middle of it. 20 dip
+// square - the toolbar's own switches are 54 dip wide but nothing here has a
+// label to hold, and at 128 dip, the smallest tile the layout hands out, this
+// still leaves nine tenths of the picture clear.
+inline constexpr int kTileCloseDip = 20;
+inline constexpr int kTileCloseInsetDip = 6;
 // Smaller tiles, tried before a row is dropped: at 175% the default window is
 // 503 dip tall, and with 192 dip tiles a fresh profile's one row of trailers
 // never fitted beside the capability panel, so the start screen showed none.
@@ -382,6 +390,30 @@ inline RECT TileThumbnail(RECT tile, UINT dpi)
 {
     const int height = std::max(0, static_cast<int>(tile.bottom - tile.top) - ScaleDip(kTileTextDip, dpi));
     return RECT{tile.left, tile.top, tile.right, tile.top + height};
+}
+
+// Where that tile's corner switch sits, and how a pointer reaches it. Recent
+// tiles get one and trailers do not - a trailer is something the player offers,
+// not something the user put there, so there is nothing of theirs to remove.
+// The square never leaves the picture it belongs to: at the smallest tile the
+// layout takes, the inset still keeps it inside the thumbnail's edges.
+inline RECT TileCloseButton(RECT tile, UINT dpi)
+{
+    const RECT picture = TileThumbnail(tile, dpi);
+    const int inset = ScaleDip(kTileCloseInsetDip, dpi);
+    const int room = std::min(static_cast<int>(picture.right - picture.left) - 2 * inset,
+                              static_cast<int>(picture.bottom - picture.top) - 2 * inset);
+    // Kept inside the picture even where the row shrank past the switch's own
+    // size; a tile too small to hold it would otherwise find it hanging off the
+    // bottom, where the tile's title lines are.
+    const int side = std::max(1, std::min(ScaleDip(kTileCloseDip, dpi), room));
+    return RECT{picture.right - inset - side, picture.top + inset, picture.right - inset, picture.top + inset + side};
+}
+
+inline bool HitTileCloseButton(RECT tile, UINT dpi, int x, int y)
+{
+    const RECT box = TileCloseButton(tile, dpi);
+    return x >= box.left && x < box.right && y >= box.top && y < box.bottom;
 }
 
 } // namespace start_screen

@@ -169,6 +169,14 @@ bool RecentMediaHistory::Save() const
     return static_cast<bool>(atomic_file::Replace(file_, bytes));
 }
 
+std::optional<RecentMediaEntry> RecentMediaHistory::Forget(size_t index)
+{
+    if (index >= entries_.size()) return {};
+    RecentMediaEntry removed = std::move(entries_[index]);
+    entries_.erase(entries_.begin() + static_cast<std::ptrdiff_t>(index));
+    return removed;
+}
+
 std::vector<RecentMediaEntry> RecentMediaHistory::Remember(RecentMediaEntry entry)
 {
     if (!Normalize(entry)) return {};

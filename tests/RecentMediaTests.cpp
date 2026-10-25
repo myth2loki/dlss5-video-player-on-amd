@@ -236,6 +236,40 @@ void failed_atomic_replace_preserves_previous_file()
     CHECK_EQ(history.Entries(), loaded.Entries());
 }
 
+// Behind the tile's corner switch: one entry leaves the list, every other
+// one stays exactly where it was, and the file on disk says the same thing
+// the list does.
+void forget_takes_one_entry_out_and_leaves_the_rest_where_they_were()
+{
+    TempDirectory temp;
+    const auto file = temp.path / L"recent.dat";
+    RecentMediaHistory history(file);
+    for (char id = 'A'; id <= 'C'; ++id) CHECK(history.Remember(Video(id)).empty());
+    CHECK_EQ(size_t{3}, history.Entries().size());
+    // Newest first: C, B, A.
+    const auto removed = history.Forget(1);
+    CHECK(removed.has_value());
+    if (removed) CHECK_EQ(std::string(11, 'B'), removed->id);
+    CHECK_EQ(size_t{2}, history.Entries().size());
+    if (history.Entries().size() == 2) {
+        CHECK_EQ(std::string(11, 'C'), history.Entries()[0].id);
+        CHECK_EQ(std::string(11, 'A'), history.Entries()[1].id);
+    }
+    // An index that names no entry changes nothing.
+    CHECK(!history.Forget(5).has_value());
+    CHECK_EQ(size_t{2}, history.Entries().size());
+    // And the list survives a save, so the next start does not bring it back.
+    CHECK(history.Save());
+    RecentMediaHistory loaded(file);
+    CHECK(loaded.Load());
+    CHECK_EQ(history.Entries(), loaded.Entries());
+    CHECK_EQ(size_t{2}, loaded.Entries().size());
+    if (loaded.Entries().size() == 2) {
+        CHECK_EQ(std::string(11, 'C'), loaded.Entries()[0].id);
+        CHECK_EQ(std::string(11, 'A'), loaded.Entries()[1].id);
+    }
+}
+
 } // namespace
 
 int main()
@@ -248,6 +282,7 @@ int main()
     invalid_records_are_dropped_and_the_rest_kept();
     network_paths_are_remembered_for_the_session_but_never_loaded();
     failed_atomic_replace_preserves_previous_file();
+    forget_takes_one_entry_out_and_leaves_the_rest_where_they_were();
     if (test_support::failure_count != 0) return 1;
     std::cout << "Recent media tests passed\n";
     return 0;

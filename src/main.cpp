@@ -49,6 +49,7 @@
 #include "UiResources.h"
 #include "HexText.h"
 #include "Utf8Text.h"
+#include "NarrowText.h"
 #include "Log.h"
 #include "HardErrorSuppression.h"
 #include "InheritedHandles.h"
@@ -9716,11 +9717,17 @@ private:
         LOG("Trailer thumbnails: "<<ids.size()<<" trailers, network fetch "<<(fetch?"on":"off ([Start] ThumbnailFetch=0)")<<".");
         m_trailerThumbnails->Start(std::move(ids),{m_cacheRoot,fetch,Dip(start_screen::kTileWidthDip),{}},m_hwnd,WM_START_SCREEN);
     }
+    // The render keys the start screen is built from: one per recent entry, in
+    // list order. The screen is gathered again when these change.
+    std::vector<std::string> StartScreenKeys()const{
+        std::vector<std::string> keys;
+        if(m_recent)for(const auto& entry:m_recent->Entries())keys.push_back(entry.renderKey);
+        return keys;
+    }
     void SyncStartScreen(){
         if(m_loaded||!m_hwnd)return;
         StartTrailerThumbnails();
-        std::vector<std::string> keys;
-        if(m_recent)for(const auto& entry:m_recent->Entries())keys.push_back(entry.renderKey);
+        const std::vector<std::string> keys=StartScreenKeys();
         if(m_startRequested&&keys==m_startRequestedKeys)return;
         m_startRequested=true;m_startRequestedKeys=keys;
         if(m_startWorker.joinable()){m_startWorker.request_stop();m_startWorker.join();}
@@ -9763,8 +9770,8 @@ private:
         };
         headings(layout.recentHeading,L"start.recent");headings(layout.trailersHeading,L"start.trailers");
         const auto recent=StartTiles(false),trailers=StartTiles(true);
-        for(size_t index=0;index<layout.recentTiles.size()&&index<recent.size();++index)DrawStartTile(dc,layout.recentTiles[index],recent[index],StartTileLevel(StartHover::Recent,index));
-        for(size_t index=0;index<layout.trailerTiles.size()&&index<trailers.size();++index)DrawStartTile(dc,layout.trailerTiles[index],trailers[index],StartTileLevel(StartHover::Trailer,index));
+        for(size_t index=0;index<layout.recentTiles.size()&&index<recent.size();++index)DrawStartTile(dc,layout.recentTiles[index],recent[index],StartTileLevel(StartHover::Recent,index),m_startHover==StartHover::RecentClose&&m_startHoverIndex==index);
+        for(size_t index=0;index<layout.trailerTiles.size()&&index<trailers.size();++index)DrawStartTile(dc,layout.trailerTiles[index],trailers[index],StartTileLevel(StartHover::Trailer,index),false);
         SetTextColor(dc,ui_palette::SecondaryText);RECT hint=layout.hint;const std::wstring hintText=T(L"start.hint");
         DrawTextW(dc,hintText.c_str(),-1,&hint,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
         SelectObject(dc,oldFont);
@@ -9773,8 +9780,33 @@ private:
     // brightens by 6% and a blue edge fades in, over the toolbar's hover fade.
     // `hover` is that fade's level, so without animations it is 0 or 1.
     static constexpr double kTileBrighten=0.06;
-    void DrawStartTile(HDC dc,RECT tile,const StartTile& content,double hover){
+    // The switch that takes an entry out of the recent list: a plate over the
+    // thumbnail's top-right corner with a cross in it. It is drawn rather than
+    // typed so it stays sharp at the size the tile allows, and the plate turns
+    // amber - the palette's one warning colour - while the pointer is on it,
+    // so the button that removes something says so before it is pressed.
+    void DrawTileCloseSwitch(HDC dc,const RECT& box,bool hovered){
+        if(box.right<=box.left||box.bottom<=box.top)return;
+        const int cx=(box.left+box.right)/2,cy=(box.top+box.bottom)/2;
+        const int reach=static_cast<int>(std::max<LONG>(2,(box.right-box.left)/4));
+        HBRUSH plate=CreateSolidBrush(hovered?ui_palette::Attention:ui_palette::Window);
+        HGDIOBJ oldBrush=SelectObject(dc,plate);
+        HGDIOBJ oldPen=SelectObject(dc,GetStockObject(NULL_PEN));
+        Ellipse(dc,box.left,box.top,box.right,box.bottom);
+        SelectObject(dc,oldPen);
+        HPEN cross=CreatePen(PS_SOLID,std::max(1,Dip(1)),hovered?ui_palette::Window:ui_palette::PrimaryText);
+        oldPen=SelectObject(dc,cross);
+        MoveToEx(dc,cx-reach,cy-reach,nullptr);LineTo(dc,cx+reach,cy+reach);
+        MoveToEx(dc,cx+reach,cy-reach,nullptr);LineTo(dc,cx-reach,cy+reach);
+        SelectObject(dc,oldPen);DeleteObject(cross);
+        SelectObject(dc,oldBrush);DeleteObject(plate);
+    }
+    void DrawStartTile(HDC dc,RECT tile,const StartTile& content,double hover,bool closeHovered){
         const UINT dpi=ActiveWindowDpi(m_hwnd);
+        // The switch is anchored to the tile's slot and not to the picture that
+        // lifts under the pointer: the place the pointer has to hit must not
+        // move while the pointer is on its way there.
+        const RECT closeBox=content.trailer?RECT{}:start_screen::TileCloseButton(tile,dpi);
         OffsetRect(&tile,0,-LONG(std::lround(hover*Dip(2))));
         const RECT thumb=start_screen::TileThumbnail(tile,dpi);
         HBRUSH surface=CreateSolidBrush(ui_palette::Inactive);FillRect(dc,&thumb,surface);DeleteObject(surface);
@@ -9815,13 +9847,17 @@ private:
             SetTextColor(dc,ui_palette::Window);DrawTextW(dc,content.badge.c_str(),-1,&badge,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
         }
         if(hover>0.0){HBRUSH edge=CreateSolidBrush(chrome_motion::Mix(ui_palette::Window,ui_palette::PrimaryBlue,hover));FrameRect(dc,&thumb,edge);DeleteObject(edge);}
+        if(closeBox.right>closeBox.left)DrawTileCloseSwitch(dc,closeBox,closeHovered);
         const int line=Dip(start_screen::kTileTextDip)/2;
         RECT title{tile.left,thumb.bottom+Dip(3),tile.right,thumb.bottom+Dip(3)+line};
         SetTextColor(dc,ui_palette::PrimaryText);DrawTextW(dc,content.title.c_str(),-1,&title,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
         RECT detail{tile.left,title.bottom,tile.right,title.bottom+line};
         SetTextColor(dc,ui_palette::SecondaryText);DrawTextW(dc,content.detail.c_str(),-1,&detail,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
     }
-    enum class StartHover{None,SafeMode,Recent,Trailer};
+    // RecentClose is the switch in a recent tile's top-right corner: it takes
+    // that entry out of the list instead of opening it. It is a kind of its
+    // own so a click on it can never fall through to the tile underneath.
+    enum class StartHover{None,SafeMode,Recent,RecentClose,Trailer};
     // The start screen is what the idle window paints unless a job or a
     // resolve has put the progress panel over it; a click on a tile that is
     // not on screen must not open anything.
@@ -9832,6 +9868,10 @@ private:
         if(!StartScreenShown())return {StartHover::None,0};
         const auto layout=StartLayout();if(!layout.full)return {StartHover::None,0};
         if(PtIn(layout.safeMode,x,y))return {StartHover::SafeMode,0};
+        // The switch is tested before the tile it sits on: a click on it takes
+        // the entry out of the list, and must not open the video as well.
+        const UINT dpi=ActiveWindowDpi(m_hwnd);
+        for(size_t index=0;index<layout.recentTiles.size();++index)if(start_screen::HitTileCloseButton(layout.recentTiles[index],dpi,x,y))return {StartHover::RecentClose,index};
         for(size_t index=0;index<layout.recentTiles.size();++index)if(PtIn(layout.recentTiles[index],x,y))return {StartHover::Recent,index};
         for(size_t index=0;index<layout.trailerTiles.size();++index)if(PtIn(layout.trailerTiles[index],x,y))return {StartHover::Trailer,index};
         return {StartHover::None,0};
@@ -9840,8 +9880,13 @@ private:
         const auto [hover,index]=StartScreenHit(x,y);
         if(hover==m_startHover&&index==m_startHoverIndex)return;
         const auto now=Clock::now();
-        if(m_startHover==StartHover::Recent||m_startHover==StartHover::Trailer)m_tileFades[StartTileKey(m_startHover,m_startHoverIndex)].Set(false,now,m_activityMotionEnabled);
-        if(hover==StartHover::Recent||hover==StartHover::Trailer)m_tileFades[StartTileKey(hover,index)].Set(true,now,m_activityMotionEnabled);
+        // The switch belongs to the tile it is drawn on, so the lift follows
+        // the tile the pointer is on and not the part of it the pointer is
+        // over: moving from a tile onto its own switch must not drop it.
+        const auto tileKind=[](StartHover kind){return kind==StartHover::RecentClose?StartHover::Recent:kind;};
+        const StartHover leaving=tileKind(m_startHover),entering=tileKind(hover);
+        if(leaving==StartHover::Recent||leaving==StartHover::Trailer)m_tileFades[StartTileKey(leaving,m_startHoverIndex)].Set(false,now,m_activityMotionEnabled);
+        if(entering==StartHover::Recent||entering==StartHover::Trailer)m_tileFades[StartTileKey(entering,index)].Set(true,now,m_activityMotionEnabled);
         m_startHover=hover;m_startHoverIndex=index;if(!m_loaded&&m_hwnd)InvalidateRect(m_hwnd,nullptr,FALSE);
         if(m_activityMotionEnabled)EnsureHoverTimer();
     }
@@ -9862,11 +9907,33 @@ private:
         const auto [hit,index]=StartScreenHit(x,y);
         switch(hit){
         case StartHover::SafeMode:RestartInSafeMode();return true;
+        case StartHover::RecentClose:{ForgetRecentTile(index);return true;}
         case StartHover::Recent:{const auto tiles=StartTiles(false);if(index<tiles.size())OpenRecent(tiles[index].index);return true;}
         case StartHover::Trailer:{const auto tiles=StartTiles(true);if(index<tiles.size()&&IsToolbarActionEnabled(ToolbarAction::OpenYouTube,ToolbarState()))ActivateExampleVideo(kExampleVideos[tiles[index].index]);return true;}
         case StartHover::None:break;
         }
         return false;
+    }
+    // Take one entry out of the recent list, and nothing else with it: the
+    // render in the cache is the user's, and only "Clear neural cache" throws
+    // those away. The tiles after it move one place left, so the layout is
+    // read again on the next paint.
+    void ForgetRecentTile(size_t index){
+        if(!m_recent)return;
+        const auto removed=m_recent->Forget(index);
+        if(!removed)return;
+        if(!m_recent->Save())LOG("Recent video history could not be saved.");
+        UpdateRecentMenu();
+        // The pointer's tile is gone and the ones after it moved left, so the
+        // hover and the lifts it began belong to tiles that are not there.
+        m_startHover=StartHover::None;m_startHoverIndex=0;
+        m_tileFades.clear();
+        // The renders already gathered are still the ones the remaining tiles
+        // show, so the screen is not gathered again: the entry that left did
+        // not change any of the others.
+        m_startRequestedKeys=StartScreenKeys();
+        if(m_hwnd)InvalidateRect(m_hwnd,nullptr,FALSE);
+        LOG("A recent video was taken out of the list: "<<narrow_text::LossyAscii(removed->source));
     }
 
     // ---- The keyboard cheat sheet (? / F1) -------------------------------

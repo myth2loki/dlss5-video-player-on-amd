@@ -1796,6 +1796,53 @@ void start_screen_stacks_the_panel_and_tiles_and_gives_way_to_small_windows_test
     CHECK_EQ(measured.lines.front().left + 150, measured.safeMode.left);
 }
 
+// The switch that takes a recent entry out of the list lives in the tile's
+// own top-right corner: inside the picture, off the face in the middle of it,
+// and where the pointer is sent when it is clicked.
+void start_screen_close_switch_sits_in_the_tile_corner_test()
+{
+    using namespace start_screen;
+    const Layout layout = LayoutStartScreen(1440, 880, 96, 4, true, 5, 6);
+    REQUIRE(layout.full);
+    REQUIRE(!layout.recentTiles.empty());
+    for (const RECT& tile : layout.recentTiles) {
+        const RECT picture = TileThumbnail(tile, 96);
+        const RECT box = TileCloseButton(tile, 96);
+        // Inside the picture, in its corner, and never over the title lines.
+        CHECK(box.left >= picture.left);
+        CHECK(box.right <= picture.right);
+        CHECK(box.top >= picture.top);
+        CHECK(box.bottom <= picture.bottom);
+        CHECK(box.bottom <= picture.bottom);
+        CHECK_EQ(LONG(ScaleDip(kTileCloseDip, 96)), box.right - box.left);
+        CHECK_EQ(LONG(ScaleDip(kTileCloseDip, 96)), box.bottom - box.top);
+        CHECK_EQ(picture.right - ScaleDip(kTileCloseInsetDip, 96), box.right);
+        CHECK_EQ(picture.top + ScaleDip(kTileCloseInsetDip, 96), box.top);
+        // It covers the corner of the frame and not the middle of it.
+        CHECK(box.left > (picture.left + picture.right) / 2);
+        // The pointer finds it there, and only there.
+        const int cx = (box.left + box.right) / 2, cy = (box.top + box.bottom) / 2;
+        CHECK(HitTileCloseButton(tile, 96, cx, cy));
+        CHECK(!HitTileCloseButton(tile, 96, box.left - 1, cy));
+        CHECK(!HitTileCloseButton(tile, 96, cx, box.bottom));
+        CHECK(!HitTileCloseButton(tile, 96, (picture.left + picture.right) / 2, (picture.top + picture.bottom) / 2));
+    }
+    // The smallest tile the layout hands out still holds the switch whole.
+    const int small = ScaleDip(kSmallTileWidthDip, 96);
+    const RECT smallTile{100, 100, 100 + small, 100 + small};
+    const RECT smallPicture = TileThumbnail(smallTile, 96);
+    const RECT smallBox = TileCloseButton(smallTile, 96);
+    CHECK(smallBox.left >= smallPicture.left);
+    CHECK(smallBox.right <= smallPicture.right);
+    CHECK(smallBox.top >= smallPicture.top);
+    CHECK(smallBox.bottom <= smallPicture.bottom);
+    CHECK(HitTileCloseButton(smallTile, 96, (smallBox.left + smallBox.right) / 2, (smallBox.top + smallBox.bottom) / 2));
+    // And it is scaled with the display, like everything else on the screen.
+    const RECT scaledTile{0, 0, MulDiv(kTileWidthDip, 168, 96), MulDiv(kTileWidthDip, 168, 96)};
+    const RECT scaledBox = TileCloseButton(scaledTile, 168);
+    CHECK_EQ(LONG(MulDiv(kTileCloseDip, 168, 96)), scaledBox.right - scaledBox.left);
+}
+
 void status_chips_carry_the_rate_the_drops_and_the_render_test()
 {
     using namespace status_chips;
@@ -16632,6 +16679,7 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(framegen_addon_download_is_offered_only_on_rtx20_and_rtx30_without_it_test),
     TEST_CASE(framegen_addon_install_verifies_every_pin_before_writing_test),
     TEST_CASE(start_screen_stacks_the_panel_and_tiles_and_gives_way_to_small_windows_test),
+    TEST_CASE(start_screen_close_switch_sits_in_the_tile_corner_test),
     TEST_CASE(playback_timeline_follows_the_presented_frame_test),
     TEST_CASE(playback_lateness_is_bounded_to_one_and_a_half_frames_test),
     TEST_CASE(long_media_title_is_bounded_with_a_real_ellipsis_test),
