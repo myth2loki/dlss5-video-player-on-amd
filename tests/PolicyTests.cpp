@@ -16156,6 +16156,51 @@ void subtitle_translate_prompt_matches_the_models_template_test()
     CHECK(toFrench.find("Produce only the French translation") != std::string::npos);
 }
 
+// The pair the prompt names comes from the track's own tag, because the model
+// was trained to be told it - and telling it "Japanese" about English lines is
+// worse than telling it nothing.
+void subtitle_translate_language_pair_follows_the_track_test()
+{
+    namespace st = subtitle_translate;
+    // Nothing said anywhere: the pair this was measured on.
+    const st::Languages fallback = st::LanguagesFor("", "");
+    CHECK_EQ(std::string("Japanese"), fallback.sourceName);
+    CHECK_EQ(std::string("ja"), fallback.sourceCode);
+    CHECK_EQ(std::string("Chinese"), fallback.targetName);
+    CHECK_EQ(std::string("zh-Hans"), fallback.targetCode);
+
+    // Japanese, as a container or a file name writes it, in any case.
+    for (const char* tag : {"jpn", "ja", "JPN"}) {
+        const st::Languages pair = st::LanguagesFor(tag);
+        CHECK_EQ(std::string("Japanese"), pair.sourceName);
+        CHECK_EQ(std::string("ja"), pair.sourceCode);
+    }
+
+    // English is named as English rather than assumed to be Japanese.
+    const st::Languages english = st::LanguagesFor("eng");
+    CHECK_EQ(std::string("English"), english.sourceName);
+    CHECK_EQ(std::string("en"), english.sourceCode);
+    CHECK_EQ(std::string("Chinese"), english.targetName);
+
+    // The target is a knob, and traditional Chinese has its own code.
+    const st::Languages traditional = st::LanguagesFor("jpn", "zh-Hant");
+    CHECK_EQ(std::string("Traditional Chinese"), traditional.targetName);
+    CHECK_EQ(std::string("zh-Hant"), traditional.targetCode);
+
+    // An unknown tag is passed through rather than replaced by a guess, and a
+    // track that says "und" has said nothing.
+    const st::Languages unknown = st::LanguagesFor("tlh");
+    CHECK_EQ(std::string("tlh"), unknown.sourceName);
+    CHECK_EQ(std::string("tlh"), unknown.sourceCode);
+    CHECK_EQ(std::string("Japanese"), st::LanguagesFor("und").sourceName);
+
+    // The pair is part of the cache key: another language is another
+    // translation, not a hit on this one.
+    const std::string key = st::CacheKey("film|1|2", "s:0", "model.gguf");
+    CHECK(key != st::CacheKey("film|1|2", "s:0", "model.gguf", traditional));
+    CHECK(key != st::CacheKey("film|1|2", "s:0", "model.gguf", english));
+}
+
 // What the model answers, as a subtitle line. It obeys "produce only the
 // translation" almost always; these are the shapes it produced in the slice.
 void subtitle_translate_cleans_what_the_model_answers_test()
@@ -16780,6 +16825,7 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(subtitle_translate_reads_cues_out_of_srt_and_vtt_test),
     TEST_CASE(subtitle_translate_builds_one_dual_ass_track_test),
     TEST_CASE(subtitle_translate_prompt_matches_the_models_template_test),
+    TEST_CASE(subtitle_translate_language_pair_follows_the_track_test),
     TEST_CASE(subtitle_translate_cleans_what_the_model_answers_test),
     TEST_CASE(subtitle_translate_resumes_where_the_last_run_stopped_test),
     TEST_CASE(speech_windows_cover_the_film_once_test),

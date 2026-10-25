@@ -936,6 +936,16 @@ that is complete and increasingly Chinese.
 when this is empty), `Port=` (8127) and `Gpu=` (1 uses the graphics card, 0 the
 processor).
 
+`Source=` and `Target=` are the language pair the model is told to translate
+between. Left empty, the source is read from the subtitle track's own language
+tag - which every MKV and MP4 carries, and which is the difference between
+telling the model "Japanese" about a Japanese line and telling it "Japanese"
+about a French one - and the target is Simplified Chinese, the pair this was
+measured on. `Source=jpn` forces Japanese for a file whose tag says nothing;
+`Target=zh-Hant` gives Traditional Chinese, `Target=en` English. The pair is
+part of the cache key, so the same film in two targets is two translations
+rather than one reading the other's file.
+
 ### Subtitles from speech
 
 **Playback > Subtitles > Subtitles from speech** is for a film that has no

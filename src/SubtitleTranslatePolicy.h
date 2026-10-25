@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -385,12 +386,83 @@ inline std::string BuildAss(const std::vector<Cue>& cues, Mode mode, const Layou
 // reproduced as text (the same thing Transub-Player does with
 // --no-jinja --chat-template gemma). Wording copied from the template's text
 // branch, because it is what the model was trained to answer.
+// The pair the prompt names, because the model was trained to be told it. Owned
+// rather than viewed: the tags come from a container, an ini file and a table,
+// and a view into any of those outlives nothing.
 struct Languages {
-    std::string_view sourceName = "Japanese";
-    std::string_view sourceCode = "ja";
-    std::string_view targetName = "Chinese";
-    std::string_view targetCode = "zh-Hans";
+    std::string sourceName = "Japanese";
+    std::string sourceCode = "ja";
+    std::string targetName = "Chinese";
+    std::string targetCode = "zh-Hans";
 };
+
+// A pair built from tags. `sourceTag` is what the subtitle track says ("jpn",
+// "eng", "zh-Hans"), empty when it says nothing; `targetTag` is the ini file's
+// word, empty for Simplified Chinese.
+//
+// An unrecognised source is passed through as its own tag instead of being
+// guessed at: telling the model "Japanese (ja) to Chinese" about English lines
+// is worse than telling it "eng (eng)". Empty means the pair this feature was
+// measured on.
+inline Languages LanguagesFor(std::string_view sourceTag, std::string_view targetTag = {})
+{
+    struct Entry {
+        std::string_view tag;   // as a container or a file name writes it
+        std::string_view code;  // as the model's own template writes it
+        std::string_view name;
+    };
+    static constexpr Entry kEntries[] = {
+        {"ja", "ja", "Japanese"},       {"jpn", "ja", "Japanese"},
+        {"en", "en", "English"},        {"eng", "en", "English"},
+        {"ko", "ko", "Korean"},         {"kor", "ko", "Korean"},
+        {"zh", "zh-Hans", "Chinese"},   {"zho", "zh-Hans", "Chinese"},
+        {"chi", "zh-Hans", "Chinese"},  {"cmn", "zh-Hans", "Chinese"},
+        {"zh-hans", "zh-Hans", "Chinese"}, {"zh-cn", "zh-Hans", "Chinese"},
+        {"zh-hant", "zh-Hant", "Traditional Chinese"},
+        {"zh-tw", "zh-Hant", "Traditional Chinese"},
+        {"zh-hk", "zh-Hant", "Traditional Chinese"},
+        {"yue", "yue", "Cantonese"},
+        {"fr", "fr", "French"},         {"fra", "fr", "French"},
+        {"fre", "fr", "French"},
+        {"de", "de", "German"},         {"deu", "de", "German"},
+        {"ger", "de", "German"},
+        {"es", "es", "Spanish"},        {"spa", "es", "Spanish"},
+        {"it", "it", "Italian"},        {"ita", "it", "Italian"},
+        {"pt", "pt", "Portuguese"},     {"por", "pt", "Portuguese"},
+        {"ru", "ru", "Russian"},        {"rus", "ru", "Russian"},
+        {"th", "th", "Thai"},           {"tha", "th", "Thai"},
+        {"vi", "vi", "Vietnamese"},     {"vie", "vi", "Vietnamese"},
+        {"id", "id", "Indonesian"},     {"ind", "id", "Indonesian"},
+        {"ar", "ar", "Arabic"},         {"ara", "ar", "Arabic"},
+        {"hi", "hi", "Hindi"},          {"hin", "hi", "Hindi"},
+    };
+    const auto lookup = [](std::string_view tag) -> const Entry* {
+        if (tag.empty()) return nullptr;
+        // Containers write lowercase three-letter tags; a file name may not.
+        std::string lowered;
+        lowered.reserve(tag.size());
+        for (const char c : tag) lowered.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+        for (const Entry& entry : kEntries)
+            if (entry.tag == lowered) return &entry;
+        return nullptr;
+    };
+    Languages languages;
+    if (const Entry* target = lookup(targetTag)) {
+        languages.targetCode = target->code;
+        languages.targetName = target->name;
+    } else if (!targetTag.empty()) {
+        languages.targetCode = targetTag;
+        languages.targetName = targetTag;
+    }
+    if (const Entry* source = lookup(sourceTag)) {
+        languages.sourceCode = source->code;
+        languages.sourceName = source->name;
+    } else if (!sourceTag.empty() && sourceTag != "und") {
+        languages.sourceCode = sourceTag;
+        languages.sourceName = sourceTag;
+    }
+    return languages;
+}
 
 // Bumped when the wording below changes: it is part of the cache key, so a
 // prompt change must not read translations produced by the old one.
@@ -672,6 +744,8 @@ inline std::string CacheKey(std::string_view mediaIdentity, std::string_view tra
     joined += modelFile;
     joined += '\x1f';
     joined += languages.targetCode;
+    joined += '\x1f';
+    joined += languages.sourceCode;
     joined += '\x1f';
     joined += kPromptVersion;
     char buffer[24];

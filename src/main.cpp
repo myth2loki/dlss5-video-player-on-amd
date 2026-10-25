@@ -3925,6 +3925,21 @@ private:
         engine.gpuLayers=GetPrivateProfileIntW(L"Translation",L"Gpu",1,SettingsPath().c_str())?99:0;
         return engine;
     }
+    // The pair the prompt asks for. The subtitle track's own tag when it has one
+    // - an MKV or MP4 carries it, and telling the model the wrong source is worse
+    // than telling it nothing - then the ini file's word, then Japanese, which is
+    // the pair this was measured on. The target is Simplified Chinese unless the
+    // ini file says otherwise.
+    subtitle_translate::Languages TranslationLanguages(){
+        std::string sourceTag=WideToUtf8(IniString(L"Translation",L"Source"));
+        if(sourceTag.empty()&&m_subtitleWanted&&!m_subtitleWanted->external){
+            const size_t index=size_t(m_subtitleWanted->stream);
+            if(index<m_subtitleTracks.size())sourceTag=m_subtitleTracks[index].language;
+        }
+        // A transcript is in whatever language the engine was told to hear.
+        if(sourceTag.empty()&&!m_subtitleWanted)sourceTag=WideToUtf8(IniString(L"Speech",L"Language"));
+        return subtitle_translate::LanguagesFor(sourceTag,WideToUtf8(IniString(L"Translation",L"Target")));
+    }
     // Beside the player when it can be written to, otherwise in the profile.
     // Never the render cache: its eviction would delete a translation that cost
     // two minutes to produce.
@@ -4103,6 +4118,7 @@ private:
             job.charenc=source->charenc;
         }
         job.identity=key;
+        job.languages=TranslationLanguages();
         job.width=m_renderer?m_renderer->BackbufferW():uint32_t(m_decoder.Width());
         job.height=m_renderer?m_renderer->BackbufferH():uint32_t(m_decoder.Height());
         if(!job.width||!job.height){job.width=1920;job.height=1080;}
@@ -4116,7 +4132,9 @@ private:
         m_translateSeenDone=-1;
         m_translator->Start(job);
         LOG("Subtitles: translating "<<(speech?"the transcript":"stream "+std::to_string(job.stream))
-            <<" for a "<<job.width<<"x"<<job.height<<" picture.");
+            <<" from "<<job.languages.sourceName<<" ("<<job.languages.sourceCode<<") to "
+            <<job.languages.targetName<<" ("<<job.languages.targetCode<<") for a "<<job.width<<"x"
+            <<job.height<<" picture.");
     }
     // Progress and the finished track, both on the status row: the engine is
     // fast enough (a few seconds for a film) that a bar would be gone before it
