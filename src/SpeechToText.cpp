@@ -33,21 +33,30 @@ std::string ReadWholeFile(const fs::path& path)
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
-// The per-window transcripts of an earlier run: "<base>.<seconds>.asr.srt". The
-// finished one is "<base>.asr.srt" and is never touched here - a prefix test
-// alone would match it, which once deleted the file the player was about to
-// open. Removing them is best effort; a version still open in the overlay's
-// child cannot be deleted, and that is not worth reporting.
-void RemoveVersions(const fs::path& directory, const std::string& base, const fs::path& finalTrack)
+// Every window publishes "<base>.<seconds>.asr.srt" and the finished transcript
+// is "<base>.asr.srt". A per-window one is only ever useful to the run that wrote
+// it, so they are swept for every film rather than only this one: a run that was
+// stopped, or restarted somewhere else (which changes the base, because the
+// start is part of the identity), leaves a family of them that nothing will ever
+// ask for again.
+//
+// The numeric tail is what tells them apart. The finished name has no dot in its
+// stem at all, and a prefix test alone once matched it and deleted the very file
+// the player was about to open. Removing them is best effort: a version still
+// open in the overlay's child cannot be deleted, and that is not worth reporting.
+void RemoveVersions(const fs::path& directory)
 {
     std::error_code error;
-    const std::string prefix = base + ".";
-    const std::string finished = finalTrack.filename().string();
+    constexpr std::string_view suffix = ".asr.srt";
     for (fs::directory_iterator it(directory, error), end; !error && it != end; it.increment(error)) {
         const std::string name = it->path().filename().string();
-        if (name == finished) continue;
-        if (it->path().extension() != ".srt") continue;
-        if (name.rfind(prefix, 0) != 0) continue;
+        if (name.size() <= suffix.size()) continue;
+        if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        const std::string stem = name.substr(0, name.size() - suffix.size());
+        const size_t dot = stem.rfind('.');
+        if (dot == std::string::npos || dot + 1 >= stem.size()) continue;  // a finished one
+        const std::string_view tail(stem.data() + dot + 1, stem.size() - dot - 1);
+        if (tail.find_first_not_of("0123456789") != std::string_view::npos) continue;
         std::error_code ignored;
         fs::remove(it->path(), ignored);
     }
@@ -210,11 +219,11 @@ void SpeechToText::RunOnce(const Job& job, uint64_t generation)
         subtitle_translate::CacheKey(utf8_text::FromWide(job.identity), "asr:" + job.language,
                                      m_engine.model.filename().string());
     const fs::path finalTrack = m_cacheDirectory / (base + ".asr.srt");
-    // Versions from an earlier run of this same film are not this run's. They are
-    // removed here, before anything is written, rather than at the end: a version
-    // removed at the end may be the one the overlay's child has just been told to
-    // open, and that failure looks like the transcript itself being broken.
-    RemoveVersions(m_cacheDirectory, base, finalTrack);
+    // Versions from earlier runs are not this run's. They are removed here, before
+    // anything is written, rather than at the end: a version removed at the end may
+    // be the one the overlay's child has just been told to open, and that failure
+    // looks like the transcript itself being broken.
+    RemoveVersions(m_cacheDirectory);
     {
         std::lock_guard lock(m_mutex);
         m_status.chunksTotal = total;
