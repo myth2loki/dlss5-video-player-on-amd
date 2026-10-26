@@ -8682,7 +8682,15 @@ private:
             // drawn, movable and inert - the exact failure the neural settings
             // dialog shipped with when stacking was added.
             if(((id==IDC_EX_UPSCALE||id==IDC_EX_NEURAL||id==IDC_EX_FRAMEGEN)&&code==BN_CLICKED)||
-               ((id==IDC_EX_RESOLUTION||id==IDC_EX_MULTIPLIER||id==IDC_EX_HISTORY||id==IDC_EX_ENGINE)&&code==CBN_SELCHANGE)){ReadExportStageControls(h);return 0;}
+               ((id==IDC_EX_RESOLUTION||id==IDC_EX_MULTIPLIER||id==IDC_EX_HISTORY||id==IDC_EX_ENGINE)&&code==CBN_SELCHANGE)){
+                // The owner-drawn check boxes do not turn their own state over:
+                // the click is only a click until this flips it, and the read
+                // below is what carries it into the selection. Without this line
+                // every box in this dialog was inert - Run stayed greyed on
+                // "Choose at least one stage" whatever was clicked.
+                if(HWND box=GetDlgItem(h,id);box&&code==BN_CLICKED)SetCheckBoxState(box,!CheckBoxState(box));
+                ReadExportStageControls(h);return 0;
+            }
             break;
         }
         case WM_CLOSE:DestroyWindow(h);return 0;
