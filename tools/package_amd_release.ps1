@@ -22,6 +22,13 @@ param(
     [switch]$IncludeSubtitleEngine,
     # Not committed (see .gitignore): the tree is downloaded on first use.
     [string]$SubtitleRuntimeDirectory,
+    # The speech recognition engine: whisper-server in both builds, staged as
+    # asr\runtime (processor) and asr\runtime-gpu (graphics card). ~191 MB, and
+    # useless without a model the package is not allowed to carry, so it is
+    # opt-in like ffmpeg and the translator.
+    [switch]$IncludeSpeechEngine,
+    # Not committed (see .gitignore): holds runtime\ and runtime-gpu\.
+    [string]$SpeechRuntimeDirectory,
     # The NVIDIA backend's SDK DLLs are ~66 MB and dead weight on an AMD-only
     # machine, so they can be dropped.
     [switch]$WithoutNvidiaBackend,
@@ -147,6 +154,41 @@ function Assert-SubtitleEngine {
     Write-Host ("Translation runtime: {0} ({1} ggml-cpu variants)" -f $Root, $variants.Count)
 }
 
+# Same reasoning for speech: SpeechToText::Available() only asks whether
+# whisper-server.exe exists, so a runtime missing ggml.dll would be packaged,
+# shipped and then silently rejected by whisper's own backend loader.
+#
+# $RequireGpu distinguishes the two directories. The processor build is the
+# floor: with only that, the package still recognises speech, just slowly. The
+# graphics card build is the reason for paying the bytes, but a tree that has
+# been freshly downloaded has not run tools/install_speech_gpu_runtime.ps1 yet,
+# and refusing to package at all would be the worse answer.
+function Assert-SpeechRuntime {
+    param([string]$Root, [string]$Variant, [bool]$RequireGpu)
+    foreach ($required in @(
+        'whisper-server.exe',  # the process the player starts
+        'whisper.dll',
+        'ggml.dll',
+        'ggml-base.dll'
+    )) {
+        $path = Join-Path $Root $required
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Speech runtime '$Variant' is missing $required`: $path" }
+    }
+    $variants = @(Get-ChildItem -LiteralPath $Root -File -Filter 'ggml-cpu-*.dll')
+    if ($variants.Count -eq 0) { throw "Speech runtime '$Variant' carries no ggml-cpu-*.dll: $Root" }
+    # Without either of these the build still runs, but only on the processor,
+    # which is the expensive path this whole feature exists to avoid.
+    if (-not (Test-Path -LiteralPath (Join-Path $Root 'ggml-blas.dll') -PathType Leaf)) {
+        Write-Warning "Speech runtime '$Variant' has no ggml-blas.dll; the processor path falls back to plain ggml-cpu."
+    }
+    $vulkan = Test-Path -LiteralPath (Join-Path $Root 'ggml-vulkan.dll') -PathType Leaf
+    if ($RequireGpu -and -not $vulkan) {
+        throw "Speech runtime '$Variant' carries no ggml-vulkan.dll: $Root (run tools/install_speech_gpu_runtime.ps1)."
+    }
+    Write-Host ("Speech runtime {0}: {1} ({2} ggml-cpu variants, vulkan: {3})" -f $Variant, $Root, $variants.Count, $vulkan)
+    return $vulkan
+}
+
 function Assert-RuntimeLayout {
     param([string]$Root)
     foreach ($required in @('LmxxfNrRuntime.dll', 'lmxxf-modules', 'native-game-tiled-assets', 'shaders')) {
@@ -234,6 +276,13 @@ if ($IncludeSubtitleEngine) {
     # MIT, and llama-server links libomp: both notices travel with the copy.
     $sources += @(
         @{ Destination = 'THIRD_PARTY_LICENSES/llama-cpp-MIT.txt'; Required = $false; Candidates = @((Join-Path $repositoryRoot 'THIRD_PARTY_LICENSES\llama-cpp-MIT.txt')) }
+    )
+}
+if ($IncludeSpeechEngine) {
+    # whisper.cpp is MIT, but two DLLs beside the server are not, and the notice
+    # names them: OpenBLAS (BSD-3) and SDL2 (zlib).
+    $sources += @(
+        @{ Destination = 'THIRD_PARTY_LICENSES/whisper-cpp-MIT.txt'; Required = $false; Candidates = @((Join-Path $repositoryRoot 'THIRD_PARTY_LICENSES\whisper-cpp-MIT.txt')) }
     )
 }
 
@@ -324,6 +373,49 @@ if ($IncludeSubtitleEngine) {
     else { Write-Warning "No packaging/SUBTITLE_ENGINE_NOTICE.txt to stage beside the translation runtime." }
 }
 
+if ($IncludeSpeechEngine) {
+    if (-not $SpeechRuntimeDirectory) { $SpeechRuntimeDirectory = Join-Path $repositoryRoot 'asr' }
+    if (-not (Test-Path -LiteralPath $SpeechRuntimeDirectory -PathType Container)) {
+        throw "Speech runtime directory not found: $SpeechRuntimeDirectory (pass -SpeechRuntimeDirectory)."
+    }
+    $speechRoot = (Resolve-Path -LiteralPath $SpeechRuntimeDirectory).Path
+    # Two builds, not one. The menu offers both, and the directories are how it
+    # tells them apart: whisper enumerates the ggml-*.dll beside its own
+    # executable and prefers Vulkan when it finds it, so there is no command
+    # line that would pick a backend for binaries sharing one directory.
+    $null = Assert-SpeechRuntime -Root (Join-Path $speechRoot 'runtime') -Variant 'runtime' -RequireGpu $false
+    $gpuAvailable = Test-Path -LiteralPath (Join-Path $speechRoot 'runtime-gpu') -PathType Container
+    $speechVariants = @('runtime')
+    if ($gpuAvailable) {
+        $null = Assert-SpeechRuntime -Root (Join-Path $speechRoot 'runtime-gpu') -Variant 'runtime-gpu' -RequireGpu $true
+        $speechVariants += 'runtime-gpu'
+    }
+    else {
+        # Deliberately not fatal: without the GPU build the menu offers only the
+        # processor, which is exactly what the pre-GPU package did.
+        Write-Warning "No asr/runtime-gpu beside $speechRoot; the package will recognise speech on the processor only. Run tools/install_speech_gpu_runtime.ps1 first."
+    }
+    # The server and every DLL beside it. Everything else in the upstream
+    # archive is a CLI: bench, stream, the chess demo, the parakeet quantiser.
+    # libopenblas.dll is 49 MB and only serves the BLAS path, but it is what
+    # the processor build uses, so it travels with it.
+    foreach ($variant in $speechVariants) {
+        $variantSource = Join-Path $speechRoot $variant
+        $variantDestination = Join-Path (Join-Path $stageFull 'asr') $variant
+        New-Item -ItemType Directory -Path $variantDestination -Force | Out-Null
+        $speechFiles = @(Get-ChildItem -LiteralPath $variantSource -File | Where-Object {
+            $_.Extension -eq '.dll' -or $_.Name -eq 'whisper-server.exe'
+        })
+        foreach ($file in $speechFiles) {
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $variantDestination $file.Name)
+        }
+        Write-Host ("Staged asr/{0}: {1} files ({2:N0} bytes)." -f $variant, $speechFiles.Count, ($speechFiles | Measure-Object -Property Length -Sum).Sum)
+    }
+    # Where the model goes. Same reason as translation/models above: the player
+    # looks inside the directory, so it has to exist first.
+    New-Item -ItemType Directory -Path (Join-Path (Join-Path $stageFull 'asr') 'models') -Force | Out-Null
+}
+
 $files = @(Get-OrdinalPackageFiles -Root $stageFull)
 $manifest = New-Object Collections.Generic.List[string]
 $manifest.Add("ProductVersion=$Version")
@@ -333,6 +425,11 @@ $manifest.Add("RuntimePack=amd-neural-runtime (LmxxfNrRuntime.dll $(Get-Sha256 -
 # differ only in a hundred file rows nobody reads.
 if ($IncludeSubtitleEngine) {
     $manifest.Add("SubtitleEngine=translation/runtime (llama-server.exe $(Get-Sha256 -Path (Join-Path $subtitleSource 'llama-server.exe')))")
+}
+# Which of the two builds the package carries is not visible any other way:
+# both directories hold a whisper-server.exe with the same name.
+if ($IncludeSpeechEngine) {
+    $manifest.Add("SpeechEngine=asr/$(($speechVariants -join '+')) (whisper-server.exe $(Get-Sha256 -Path (Join-Path (Join-Path $speechRoot 'runtime') 'whisper-server.exe')))")
 }
 $manifest.Add('Path|Size|SHA256')
 foreach ($file in $files) {

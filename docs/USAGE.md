@@ -989,6 +989,9 @@ translation engine ships one in `translation\runtime\`). `[Speech] Gpu=` (1) is
 the same choice in the ini, and asking for a build that is not installed falls
 back to the one that is rather than to no subtitles at all. `Threads=` only bites
 on the processor build; on the graphics card the threads mostly wait.
+Neither directory travels in a release: like ffmpeg and the translation engine
+the recogniser is opt-in at packaging time, `-IncludeSpeechEngine`, which
+stages both (~65 MB and ~120 MB) and leaves `asr\models\` empty for the model.
 
 Listening begins **where the viewer is**, not at the beginning. A film picked up
 twelve minutes in has twelve minutes of audio nobody needs written down, and at

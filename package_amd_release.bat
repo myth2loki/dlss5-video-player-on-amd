@@ -5,6 +5,7 @@ rem
 rem Extra arguments are forwarded, e.g.:
 rem   package_amd_release.bat -IncludeFfmpeg -WithoutNvidiaBackend
 rem   package_amd_release.bat -IncludeSubtitleEngine
+rem   package_amd_release.bat -IncludeSpeechEngine
 rem   package_amd_release.bat -NoZip -Force
 setlocal EnableExtensions
 cd /d "%~dp0"

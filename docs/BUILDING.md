@@ -424,6 +424,7 @@ tree, no hardware JUnit report, no locked NVIDIA inputs):
 ./tools/package_amd_release.ps1                    # dist/DLSSVideoPlayer-v<version>-amd-win64/ + .zip
 ./package_amd_release.bat -IncludeFfmpeg           # same, plus ffmpeg.exe and ffprobe.exe
 ./package_amd_release.bat -IncludeSubtitleEngine   # same, plus translation/runtime (llama-server)
+./package_amd_release.bat -IncludeSpeechEngine     # same, plus asr/runtime + asr/runtime-gpu (whisper-server)
 ```
 
 It refuses a runtime pack whose `lmxxf-modules/gfx1200|gfx1201` do not match
@@ -462,6 +463,22 @@ the package. The assembler asserts the DLL set llama-server imports
 (`ggml-vulkan.dll` included, because `[Translation] Gpu=1` puts every layer on
 the GPU) rather than trusting the player's two-file check, which would pass
 and then fail inside the child process.
+
+`-IncludeSpeechEngine` stages the recogniser the same way, for the same reason,
+except that there are **two** directories: `asr/runtime` (~65 MB, the upstream
+build) and `asr/runtime-gpu` (~120 MB, the same files plus `ggml-vulkan.dll`).
+Whichever the Subtitles menu picks is the directory the server starts from,
+because whisper enumerates the `ggml-*.dll` beside its own executable and
+prefers Vulkan when it finds one - there is no backend flag to pass, so the
+builds cannot share a directory. Both start from `asr/` beside the tree
+(`-SpeechRuntimeDirectory` overrides it). A tree with only `asr/runtime` is
+staged anyway, with a warning: the package then recognises speech on the
+processor, which is slow but whole. Run `tools/install_speech_gpu_runtime.ps1`
+first to get the second directory. No model travels in either case, so the
+menu stays greyed until a `.bin` lands in `asr/models/`, which the assembler
+creates empty. `THIRD_PARTY_LICENSES/whisper-cpp-MIT.txt` names the two DLLs
+in those directories that are not whisper.cpp itself (OpenBLAS, BSD-3; SDL2,
+zlib).
 
 `build_and_package_amd.bat` runs the build and that assembler in one call,
 against the local `build-ninja` tree:
