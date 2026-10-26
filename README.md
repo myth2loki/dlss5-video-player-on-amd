@@ -431,6 +431,10 @@ reader knows where the other one lives.
 
 ## First run
 
+The full walkthrough — where the AMD runtime pack goes, what the optional
+subtitle engines need, and what each failure looks like — is in
+[docs/INSTALL.md](docs/INSTALL.md). The short version:
+
 1. Keep `neural-runtime/` next to the exe. (Upstream's zips say to unpack into a
    new, empty folder first.) On the AMD backend the `amd-neural-runtime/`
    package has to be reachable as well, and the three FidelityFX DLLs — loader,
