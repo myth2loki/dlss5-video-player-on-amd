@@ -44,7 +44,7 @@ what each is doing — `DLSS Upscaling on: 2560x1440 (auto) · FSR4`, `Source
 > [integration plan and status, in Chinese](docs/AMD-LMXXF-INTEGRATION-PLAN-REV2-zh.md) ·
 > [the runtime package](third_party/lmxxf/README.md)
 
-[Upstream project](https://github.com/2600th/dlss5-video-player) · [On an AMD card](#on-an-amd-card) · [Build it](#building-and-contributing) · [First run](#first-run) · [Usage guide](docs/USAGE.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
+[Upstream project](https://github.com/2600th/dlss5-video-player) · [On an AMD card](#on-an-amd-card) · [Subtitles](#subtitles-listen-to-the-film-then-translate-it) · [Build it](#building-and-contributing) · [First run](#first-run) · [Usage guide](docs/USAGE.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
 
 > [!IMPORTANT]
 > Community project, not an NVIDIA or an AMD product. The neural runtime on
@@ -313,6 +313,53 @@ render.
 A face, source left and render right, cropped from the film: pores, lashes and
 the catchlight in the iris come back on the right.
 
+### Subtitles: listen to the film, then translate it
+
+![The player on an AMD card: Tears of Steel in Split, neural rendering and FSR 4 upscaling on, the film's English speech transcribed and translated into Chinese, both lines drawn under the picture, and the status line reading "Subtitles 12/35"](docs/media/neural_subtitle.png)
+
+The player can hear the film, write down what it says, and put the translation
+on screen. Press the button next to the speaker in the toolbar and the whole
+chain runs:
+
+1. **Listen.** A film with no subtitle track of its own is transcribed from
+   its own audio by [whisper.cpp](https://github.com/ggml-org/whisper.cpp),
+   window by window, starting at the playhead rather than at the beginning:
+   nobody wants the first twelve minutes of a film written down before they
+   get there.
+2. **Translate.** The transcript goes to a local
+   [llama.cpp](https://github.com/ggml-org/llama.cpp) server running a Gemma
+   model, which returns the translation in the language you picked.
+3. **Draw.** The result is one ASS file with both lines in it — the
+   translation above, the original below — and the overlay draws it over the
+   render, so the model never warps the text.
+
+Above: *Tears of Steel* in **Split**, neural rendering and FSR 4 on, the
+film's English speech transcribed and translated into Chinese, and both lines
+drawn under the picture. The status line says how far the transcript has got
+(`Subtitles 12/35`).
+
+**Which hardware does the transcribing** is in the **Subtitles** menu, under
+*Transcribe on the graphics card* or *on the processor*, ticked to show which is
+in force; *Subtitles from speech* there starts the transcription on its own,
+without the toolbar button. It is worth the switch: on the same film and the
+same model, 60 s of audio burns 298 s of CPU time on 12 cores against 2.63 s
+on a 9070 XT — RTF 0.521 against 0.034 — and the transcript comes out word for
+word identical either way.
+
+**The engines are not in the package.** whisper and llama.cpp are MIT and may
+travel with it, but the models are not redistributable, so both are opt-in at
+packaging time (`-IncludeSpeechEngine`, `-IncludeSubtitleEngine`) and the
+model files are yours to place:
+
+| | engine | model | where |
+| --- | --- | --- | --- |
+| transcription | `asr\runtime\whisper-server.exe` (or `asr\runtime-gpu`) | `ggml-*.bin` | `asr\models\` |
+| translation | `translation\runtime\llama-server.exe` | `*.gguf` | `translation\models\` |
+
+With no engine installed the switch is grey and nothing is started: the button
+is in the player, the engine is not. The [usage guide](docs/USAGE.md) has the
+ini keys.
+
 The NVIDIA path is untouched by any of this, and upstream still develops it. It
 is **not** supported in this fork: it needs an RTX card with driver 610.47 or
 newer, which this fork neither ships nor verifies, and the 10-bit ladder, HDR and
@@ -462,6 +509,9 @@ that does.
   places ([details](#upscaling-and-frame-generation)).
 - **Plays like a player.** AC-3, E-AC-3 and DTS passthrough to a receiver, and
   Windows media controls with taskbar thumbnail buttons.
+- **Speaks the film's language.** A film that carries no subtitle track is
+  transcribed from its own audio and translated, and both lines are drawn over
+  the render. See [Subtitles](#subtitles-listen-to-the-film-then-translate-it).
 - **Comes with test material.** Seven official game trailers, chosen for faces,
   skin and light, under **File > Game trailers** and on the start screen.
 
