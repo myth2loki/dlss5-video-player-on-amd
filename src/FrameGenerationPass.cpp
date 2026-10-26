@@ -605,7 +605,11 @@ FrameGenerationResult FrameGenerationPass::Run(const FrameGenerationRequest& req
             }
         }
     }
-    auto backend = CreateFrameGenBackend(preferNvidia);
+    // An explicit request bypasses the vendor preference: the caller named the
+    // generator, and a machine that cannot run it says so with its own reason.
+    auto backend = CreateFrameGenBackend(preferNvidia, request.interpolate
+                                                        ? FrameGenBackendKind::Interpolate
+                                                        : FrameGenBackendKind::Vendor);
 
     // The interpolated output is the only resource the runtime writes, so it is
     // the only one that needs a UAV, and a format that cannot carry one cannot

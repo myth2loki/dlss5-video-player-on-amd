@@ -5,6 +5,22 @@
 #include <memory>
 #include <string>
 
+// Which generator a caller wants.
+//
+// `Vendor` is what every caller asked for before the Convert video dialog
+// existed: NGX DLSS-G on an NVIDIA adapter, the self-contained matcher on
+// anything else, chosen by the adapter and free to go past 2x where the runtime
+// admits it.
+//
+// `Interpolate` names the job - one generated frame per source pair, landing on
+// the content - and asks for the generator that does it on this adapter: AMD's
+// FidelityFX interpolator, literally the backend the playback island runs
+// (D3D12Renderer::m_fgFfx), or DLSS-G on an NVIDIA card, which has no FidelityFX
+// runtime to offer. It is what "interpolate" means everywhere else in this
+// player, so a caller that says interpolate gets the same thing the pill does
+// rather than something else wearing the same word.
+enum class FrameGenBackendKind { Vendor, Interpolate };
+
 // A backend for the offline Frame Generation pass (FrameGenerationPass). The
 // pass hands over two decoded backbuffer frames and asks for the frames between
 // them; what the backend does with them is its own business.
@@ -81,6 +97,9 @@ public:
 
 // Selects the backend for the adapter the conversion runs on, mirroring
 // SelectAdapter's preference: NVIDIA adapters keep the NGX path (measured on an
-// RTX 5090); anything else gets the vendor-neutral optical-flow backend that
-// needs no NGX.
-std::unique_ptr<IFrameGenBackend> CreateFrameGenBackend(bool preferNvidia);
+// RTX 5090); anything else gets the self-contained matcher, which needs no NGX
+// and no runtime on disk. `kind` overrides that choice with a backend asked for
+// by name - see FrameGenBackendKind - and a caller that names one gets it even
+// where it cannot run here, so the failure is the runtime's own reason.
+std::unique_ptr<IFrameGenBackend> CreateFrameGenBackend(bool preferNvidia,
+                                                       FrameGenBackendKind kind = FrameGenBackendKind::Vendor);

@@ -440,6 +440,27 @@ static constexpr int IDC_EX_CLOSE = 7508;
 static constexpr int IDC_EX_HISTORY = 7509;
 static constexpr int IDC_EX_ENGINE = 7510;
 
+// Video > Convert video. Its own block rather than the export dialog's numbers:
+// the two windows are never open at once from the same command, but a control
+// id that means two things is a trap for whoever adds the third dialog.
+static constexpr int IDC_CV_UPSCALE = 7601;
+static constexpr int IDC_CV_RESOLUTION = 7602;
+static constexpr int IDC_CV_NEURAL = 7603;
+static constexpr int IDC_CV_FRAMEGEN = 7604;
+static constexpr int IDC_CV_SUBTITLES = 7606;
+// One list, not a switch beside it: its first row is "Do not translate", so the
+// languages the translator can be asked for are visible without first turning
+// something on, and there is no second control to disagree with the choice.
+static constexpr int IDC_CV_LANGUAGE = 7607;
+static constexpr int IDC_CV_CONTAINER = 7608;
+static constexpr int IDC_CV_RANGE = 7609;
+static constexpr int IDC_CV_RANGE_START = 7610;
+static constexpr int IDC_CV_RANGE_END = 7611;
+static constexpr int IDC_CV_RANGE_TO = 7612;
+static constexpr int IDC_CV_SUMMARY = 7613;
+static constexpr int IDC_CV_RUN = 7614;
+static constexpr int IDC_CV_CLOSE = 7615;
+
 static constexpr int IDC_TIMECODE_EDIT = 7501;
 static constexpr int IDC_TIMECODE_SET_IN = 7502;
 static constexpr int IDC_TIMECODE_SET_OUT = 7503;
@@ -1645,6 +1666,56 @@ static std::filesystem::path PickStageExportFile(HWND owner, std::wstring_view t
         if(MessageBoxW(owner,question.c_str(),L"Export with DLSS stages",MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)!=IDYES)return {};
     }
     return chosen;
+}
+
+// Where "Convert video" writes: a folder, not a name. Two consequences the
+// export dialog's save dialog does not have to answer.
+//
+// The name is derived from the source the way dlss5-convert derives it - stem,
+// then -dlss - so the two front ends produce the same file name for the same
+// film. And because nobody was asked about the name, nobody was asked about
+// replacing it either: an existing file is never overwritten, the name gets -1,
+// -2 and so on instead. Losing a render that took an hour to a second click is
+// not a trade worth making for a shorter path.
+static std::filesystem::path PickConvertVideoFolder(HWND owner, const Localizer& loc, const std::filesystem::path& beside) {
+    ComPtr<IFileOpenDialog> dialog;
+    if(FAILED(CoCreateInstance(CLSID_FileOpenDialog,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&dialog)))||!dialog)return {};
+    FILEOPENDIALOGOPTIONS options{};
+    if(SUCCEEDED(dialog->GetOptions(&options)))
+        dialog->SetOptions(options|FOS_PICKFOLDERS|FOS_FORCEFILESYSTEM|FOS_PATHMUSTEXIST);
+    const std::wstring title=loc.Get(L"convert.title");
+    dialog->SetTitle(title.c_str());
+    // Beside the source is where a viewer looks for the result, so that is where
+    // the picker opens when there is a source folder to open in.
+    if(!beside.empty()){
+        ComPtr<IShellItem> folder;
+        if(SUCCEEDED(SHCreateItemFromParsingName(beside.wstring().c_str(),nullptr,IID_PPV_ARGS(&folder)))&&folder)
+            dialog->SetFolder(folder.Get());
+    }
+    const HRESULT shown=dialog->Show(owner);
+    if(FAILED(shown)||shown==HRESULT_FROM_WIN32(ERROR_CANCELLED))return {};
+    ComPtr<IShellItem> result;
+    if(FAILED(dialog->GetResult(&result))||!result)return {};
+    PWSTR path=nullptr;
+    if(FAILED(result->GetDisplayName(SIGDN_FILESYSPATH,&path))||!path)return {};
+    const std::filesystem::path folder(path);
+    CoTaskMemFree(path);
+    return folder;
+}
+
+static std::filesystem::path ConvertVideoDestination(const std::filesystem::path& source, const std::filesystem::path& folder,
+                                                     const std::wstring& extension) {
+    std::wstring stem=source.stem().wstring();
+    if(stem.empty())stem=L"video";
+    for(wchar_t& c:stem)if(c==L'<'||c==L'>'||c==L':'||c==L'"'||c==L'/'||c==L'\\'||c==L'|'||c==L'?'||c==L'*')c=L'_';
+    const std::wstring base=stem+L"-dlss";
+    std::error_code error;
+    for(int attempt=1;attempt<1000;++attempt){
+        const std::wstring name=base+(attempt>1?L"-"+std::to_wstring(attempt-1):L"")+extension;
+        const std::filesystem::path candidate=folder/name;
+        if(!std::filesystem::exists(candidate,error))return candidate;
+    }
+    return folder/(base+L"-new"+extension);
 }
 
 static std::wstring PickVideoFile(HWND owner, const Localizer& loc) {
@@ -7198,6 +7269,11 @@ private:
                 EnableMenuItem(convert,IDM_EXPORT_STAGES,
                     MF_BYCOMMAND|((m_exportWorker.joinable()||(m_loaded&&!ActivityBusy()&&!m_frameGenWorker.joinable()))?MF_ENABLED:MF_GRAYED));
             }
+            // Video > Convert video: the same conditions as the row above, since
+            // it needs the same source and the same GPU. Enabled through the bar
+            // because it lives in another popup.
+            EnableMenuItem(menu,IDM_CONVERT_VIDEO,
+                MF_BYCOMMAND|((m_loaded&&!ActivityBusy()&&!m_exportWorker.joinable()&&!m_frameGenWorker.joinable())?MF_ENABLED:MF_GRAYED));
             app_menu::CheckRadioCommand(menu,IDM_ASPECT_FIT,IDM_ASPECT_ONE_TO_ONE,m_onePixel?IDM_ASPECT_ONE_TO_ONE:(m_fill?IDM_ASPECT_FILL:IDM_ASPECT_FIT));
             app_menu::UpdateRenderActionAvailability(menu,m_loaded,RangeRenderAvailable(),NeuralJobActive(),NeuralJobPaused(),!m_cachedReceiptPath.empty());
             app_menu::UpdateComparisonMenu(menu,ComparisonModesAvailable(),m_loaded&&m_renderer!=nullptr,CommandForComparisonMode(SelectedComparisonMode()),m_zoomStep>0,m_comparison.swap,m_loupe,m_comparison.differenceLuma,
@@ -8619,6 +8695,402 @@ private:
         if(m==WM_NCCREATE){SetWindowLongPtrW(h,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams));return DefWindowProcW(h,m,w,l);}
         auto* self=reinterpret_cast<PlayerApp*>(GetWindowLongPtrW(h,GWLP_USERDATA));
         return self?self->ExportStagesWndProc(h,m,w,l):DefWindowProcW(h,m,w,l);
+    }
+
+    // ---- Convert video ----------------------------------------------------
+    //
+    // The second dialog that writes a file, and a second window rather than two
+    // more rows on the export dialog, because it answers two questions that one
+    // does not: whether the speech becomes Chinese, and whether that Chinese is
+    // a subtitle track or part of the picture. It also names a folder instead
+    // of a file, so the name is derived rather than typed.
+    //
+    // What it must not do is compute its own plan. The three picture rows feed
+    // the same PlanExport as the export dialog's and the run goes through the
+    // same RunStageExport, so two dialogs with the same three boxes ticked write
+    // the same file. Everything this dialog adds sits before that run (the
+    // transcript and its translation) or after it (how the text reaches the
+    // container), never inside it.
+    static constexpr int kConvertDesignW=470,kConvertDesignH=522;
+
+    // Read once per session, like every other preference here: the file is the
+    // only thing that remembers, and a dialog reopened from the menu keeps what
+    // the last one left.
+    void LoadConvertVideoSelection(){
+        if(m_convert.loaded)return;
+        m_convert.loaded=true;
+        const auto flag=[&](const wchar_t* key){return GetPrivateProfileIntW(L"ConvertVideo",key,0,SettingsPath().c_str())!=0;};
+        m_convert.upscale=flag(L"Upscale");
+        m_convert.neural=flag(L"Neural");
+        m_convert.frameGeneration=flag(L"FrameGeneration");
+        m_convert.translate=flag(L"Translate");
+        const int height=GetPrivateProfileIntW(L"ConvertVideo",L"TargetHeight",1440,SettingsPath().c_str());
+        m_convert.targetHeight=height==1080?1080u:height==2160?2160u:1440u;
+        m_convert.subtitles=std::clamp(int(GetPrivateProfileIntW(L"ConvertVideo",L"Subtitles",0,SettingsPath().c_str())),0,2);
+        m_convert.container=std::clamp(int(GetPrivateProfileIntW(L"ConvertVideo",L"Container",0,SettingsPath().c_str())),0,1);
+        // A tag this build does not offer falls back to the measured pair rather
+        // than reaching the prompt as a language name nobody chose.
+        const std::wstring target=IniString(L"ConvertVideo",L"Target");
+        const std::string tag=WideToUtf8(target);
+        m_convert.language=subtitle_translate::TargetLanguageName(tag).empty()?L"zh":target;
+        // A translation with nowhere to go was never a choice: it costs minutes
+        // to make and a file is the only thing it can be put in.
+        if(m_convert.translate&&m_convert.subtitles==0)m_convert.subtitles=1;
+    }
+
+    void SaveConvertVideoSelection()const{
+        const auto word=[](bool on){return on?L"1":L"0";};
+        const auto number=[](uint32_t value){return std::to_wstring(value);};
+        WritePrivateProfileStringW(L"ConvertVideo",L"Upscale",word(m_convert.upscale),SettingsPath().c_str());
+        WritePrivateProfileStringW(L"ConvertVideo",L"Neural",word(m_convert.neural),SettingsPath().c_str());
+        WritePrivateProfileStringW(L"ConvertVideo",L"FrameGeneration",word(m_convert.frameGeneration),SettingsPath().c_str());
+        WritePrivateProfileStringW(L"ConvertVideo",L"Translate",word(m_convert.translate),SettingsPath().c_str());
+        WritePrivateProfileStringW(L"ConvertVideo",L"TargetHeight",number(m_convert.targetHeight).c_str(),SettingsPath().c_str());
+        WritePrivateProfileStringW(L"ConvertVideo",L"Subtitles",number(static_cast<uint32_t>(m_convert.subtitles)).c_str(),SettingsPath().c_str());
+        WritePrivateProfileStringW(L"ConvertVideo",L"Container",number(static_cast<uint32_t>(m_convert.container)).c_str(),SettingsPath().c_str());
+        WritePrivateProfileStringW(L"ConvertVideo",L"Target",m_convert.language.c_str(),SettingsPath().c_str());
+    }
+
+    // The upscaler is the export dialog's, not a second one: there is one answer
+    // to "which engine upscales" on this machine and the ini carries it, so a
+    // row here would be a second place to disagree with the export.
+    //
+    // The one exception is the engine this machine cannot run. This dialog has
+    // no Upscaler row, so the refusal the plan gives - "Choose DLSS Super
+    // Resolution as the upscaler" - would be an instruction it cannot follow,
+    // and ticking Super Resolution alone would be a dead end on a card without
+    // RTX VSR. The export dialog offers that row; here the answer that works is
+    // taken, and only for this plan: the stored choice is left as it is.
+    ExportSelection ConvertVideoExportSelection()const{
+        ExportSelection selection{};
+        selection.upscale=m_convert.upscale;
+        selection.neural=m_convert.neural;
+        selection.frameGeneration=m_convert.frameGeneration;
+        // Frame generation here IS interpolate: the FidelityFX interpolator the
+        // playback pill runs, not the DLSS-G offline conversion. The rate follows
+        // from that - one generated frame per source pair - so the multiplier is
+        // 2 and there is no row to ask otherwise.
+        selection.frameGenInterpolate=true;
+        selection.multiplier=2;
+        selection.targetHeight=m_convert.targetHeight;
+        selection.engine=m_exportSelection.engine;
+        if(selection.engine==SuperResolutionEngine::RtxVsr&&
+           !VsrExportReady(ExecutableDirectory(),m_opt.detectedGpu.generation))
+            selection.engine=SuperResolutionEngine::Dlss;
+        return selection;
+    }
+
+    bool ConvertVideoHasPictureStage()const{return m_convert.upscale||m_convert.neural||m_convert.frameGeneration;}
+
+    // The interpolator is whichever generator the adapter has: AMD's FidelityFX
+    // runtime, discovered beside the executable rather than shipped inside it, or
+    // - on an NVIDIA card - the DLSS-G session the rest of the player already
+    // uses. So the row is usable when either is there, which on NVIDIA needs no
+    // file check at all. A machine with neither is greyed with the reason on its
+    // tip rather than failing at the end of a run.
+    bool ConvertVideoInterpolateAvailable()const{
+        return m_opt.detectedGpu.vendorId==0x10DE||FsrFrameGenBackend::RuntimePresent();
+    }
+
+    ExportPlan CurrentConvertVideoPlan()const{
+        // The interpolator's ceiling is 2x whatever this GPU's DLSS-G capability
+        // query would say, and that query is not run for this dialog at all.
+        return PlanExport(ConvertVideoExportSelection(),m_decoder.Width(),m_decoder.Height(),
+                          m_decoder.FrameRate(),2u,m_decoder.IsStillImage(),
+                          VsrExportReady(ExecutableDirectory(),m_opt.detectedGpu.generation));
+    }
+
+    // Both engines ship separately from the player - translation and the
+    // transcriber are downloads, not part of the installer - so on a stock
+    // install this is false and the row is greyed with the reason on its tip.
+    // A source that already carries a text track needs only the translator; one
+    // without needs the transcriber as well.
+    bool ConvertVoiceTranslatable(){
+        if(!m_loaded||m_path.empty())return false;
+        if(!subtitle_translate::Translator::Available(TranslationEngine()))return false;
+        return SubtitleTranslatable()||subtitle_speech::SpeechToText::Available(SpeechEngine());
+    }
+
+    bool ConvertVideoRangeValid()const{
+        if(!m_convert.ranged)return true;
+        const double fps=m_decoder.FrameRate();
+        const auto start=ParseTimecode(m_convert.rangeStart,fps),end=ParseTimecode(m_convert.rangeEnd,fps);
+        return start&&end&&*end>*start;
+    }
+
+    // Subtitles on their own are a real job - the file that already exists, plus
+    // a Chinese track - so they count as something to do. Nothing at all does
+    // not: a conversion that only renames a file is a mistake, not a request.
+    bool ConvertVideoUsable()const{return ConvertVideoHasPictureStage()||m_convert.subtitles!=0;}
+
+    // The language as a viewer reads it, from the one table the prompt is built
+    // from - so the line under the controls cannot name a language the engine was
+    // not told about.
+    std::wstring ConvertVideoLanguageName()const{
+        const std::string_view name=subtitle_translate::TargetLanguageName(WideToUtf8(m_convert.language));
+        return Utf8ToWide(std::string(name.empty()?"Chinese":name));
+    }
+
+    // Row 0 is "Do not translate", so a language's row is its index in the table
+    // plus one.
+    int ConvertVideoLanguageRow()const{
+        if(!m_convert.translate)return 0;
+        const auto& languages=subtitle_translate::TargetLanguages();
+        const std::string tag=WideToUtf8(m_convert.language);
+        for(size_t index=0;index<languages.size();++index)
+            if(std::string(languages[index].tag)==tag)return int(index)+1;
+        return 1;
+    }
+
+    std::wstring ConvertVideoSummary(){
+        if(!ConvertVideoUsable())return T(L"convert.refusal.nothing");
+        if(!ConvertVideoRangeValid())return T(L"convert.refusal.range");
+        std::wstring text;
+        if(ConvertVideoHasPictureStage()){
+            const ExportPlan plan=CurrentConvertVideoPlan();
+            text=plan.valid?StageExportResultSummary(plan):T(ExportRefusalKey(plan.refusal));
+        }else text=T(L"convert.summary.subtitles_only");
+        if(m_convert.subtitles!=0){
+            if(m_convert.translate){
+                // "Japanese subtitle track", "Japanese subtitles burned in": the
+                // language IS the choice, so it leads the line.
+                text+=L" \u00b7 "+ConvertVideoLanguageName()+
+                      T(m_convert.subtitles==2?L"convert.summary.burn_suffix":L"convert.summary.track_suffix");
+            }else{
+                text+=L" \u00b7 "+T(m_convert.subtitles==2?L"convert.summary.burn_source":L"convert.summary.soft_source");
+            }
+        }
+        // What it would write, once a folder has been picked: the one thing the
+        // user cannot read off the controls, because the name is derived.
+        if(!m_convert.planned.empty())text+=L"\n\u2192 "+m_convert.planned.wstring();
+        return text;
+    }
+
+    void ShowConvertVideo(){
+        if(m_convertWnd&&IsWindow(m_convertWnd)){ShowWindow(m_convertWnd,SW_SHOWNORMAL);SetForegroundWindow(m_convertWnd);return;}
+        static constexpr const wchar_t* kClassName=L"DLSSVideoConvertVideoClassV1";
+        WNDCLASSW n{};n.lpfnWndProc=ConvertVideoWndProcStatic;n.hInstance=GetModuleHandleW(nullptr);n.lpszClassName=kClassName;n.hCursor=LoadCursor(nullptr,IDC_ARROW);n.hbrBackground=DarkDialogBrush();
+        if(!RegisterClassW(&n)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return;
+        constexpr DWORD style=(WS_OVERLAPPEDWINDOW&~WS_MAXIMIZEBOX)|WS_VISIBLE;
+        const RECT wr=SettingsWindowRect(kConvertDesignW,kConvertDesignH,style,WS_EX_TOOLWINDOW,ActiveWindowDpi(m_hwnd));
+        const int w=int(wr.right-wr.left),h=int(wr.bottom-wr.top);
+        RECT pr{};GetWindowRect(m_hwnd,&pr);const int pw=int(pr.right-pr.left),ph=int(pr.bottom-pr.top);
+        m_convertWnd=CreateWindowExW(WS_EX_TOOLWINDOW,kClassName,T(L"convert.title").c_str(),
+            style,int(pr.left)+std::max(0,(pw-w)/2),int(pr.top)+std::max(0,(ph-h)/2),w,h,
+            m_hwnd,nullptr,GetModuleHandleW(nullptr),this);
+    }
+
+    void BuildConvertVideoControls(HWND h){
+        LoadConvertVideoSelection();
+        constexpr int kColumnW=320;
+        CreateSettingsGroupHeading(h,L"convert.group_picture",8);
+        CreateNeuralCheck(h,IDC_CV_UPSCALE,L"export.stages.upscale",16,30,kColumnW,L"export.tip.upscale");
+        CreateNeuralCombo(h,IDC_CV_RESOLUTION,L"export.stages.resolution",62,{L"1080p",L"1440p",L"2160p"},nullptr,0,kColumnW);
+        CreateNeuralCheck(h,IDC_CV_NEURAL,L"export.stages.neural",16,96,kColumnW,L"export.tip.neural");
+        // Interpolate, not "frame generation" at large: the FidelityFX generator
+        // the playback pill runs, which makes exactly one frame per source pair.
+        // A rate row would be a row with one value in it.
+        CreateNeuralCheck(h,IDC_CV_FRAMEGEN,L"convert.interpolate",16,134,kColumnW,L"convert.tip.interpolate");
+        CreateSettingsGroupHeading(h,L"convert.group_sound",170);
+        {
+            const std::wstring none=T(L"convert.subtitles.none"),soft=T(L"convert.subtitles.soft"),burn=T(L"convert.subtitles.burn");
+            CreateNeuralCombo(h,IDC_CV_SUBTITLES,L"convert.subtitles",194,{none.c_str(),soft.c_str(),burn.c_str()},
+                              L"convert.tip.subtitles",0,kColumnW);
+        }
+        // One list rather than a switch plus a list: its first row is "Do not
+        // translate", so every language the translator can be asked for is
+        // visible at once - which is the whole point of the row - and there is no
+        // second control whose state could disagree with the choice.
+        {
+            HWND label=DialogControl(h,L"STATIC",T(L"convert.translate").c_str(),SS_LEFT,16,228,116,20);
+            HWND languages=DialogControl(h,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST,132,225,kColumnW,260,IDC_CV_LANGUAGE);
+            const std::wstring off=T(L"convert.translate.none");
+            SendMessageW(languages,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(off.c_str()));
+            for(const subtitle_translate::TargetLanguage& language:subtitle_translate::TargetLanguages()){
+                const std::wstring name=Utf8ToWide(std::string(language.name));
+                SendMessageW(languages,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(name.c_str()));
+            }
+            AddTip(h,label,L"convert.tip.translate");
+            AddTip(h,languages,L"convert.tip.translate");
+        }
+        CreateSettingsGroupHeading(h,L"convert.group_output",262);
+        {
+            const std::wstring matroska=T(L"convert.format.mkv"),mp4=T(L"convert.format.mp4");
+            CreateNeuralCombo(h,IDC_CV_CONTAINER,L"convert.format",286,{matroska.c_str(),mp4.c_str()},L"convert.tip.format",0,kColumnW);
+        }
+        CreateNeuralCheck(h,IDC_CV_RANGE,L"convert.range",16,320,150,L"convert.tip.range");
+        const auto timecodeEdit=[&](int id,int x,const std::wstring& text){
+            HWND control=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",text.c_str(),WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,
+                                         Sd(h,x),Sd(h,319),Sd(h,110),Sd(h,26),h,
+                                         reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),nullptr,nullptr);
+            if(control){ApplyDarkControlTheme(control);SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(DialogFont(h)),TRUE);SendMessageW(control,EM_SETLIMITTEXT,32,0);}
+            return control;
+        };
+        timecodeEdit(IDC_CV_RANGE_START,176,m_convert.rangeStart);
+        DialogControl(h,L"STATIC",T(L"convert.range.to").c_str(),SS_CENTER,292,323,18,20);
+        timecodeEdit(IDC_CV_RANGE_END,314,m_convert.rangeEnd);
+        CreateSettingsGroupHeading(h,L"export.stages.group_result",354);
+        DialogControl(h,L"STATIC",L"",SS_LEFT,16,378,436,36,IDC_CV_SUMMARY);
+        DialogControl(h,L"STATIC",T(L"convert.note").c_str(),SS_LEFT,16,418,436,52);
+        DialogButton(h,L"convert.run",IDC_CV_RUN,232,478,120,30,true);
+        DialogButton(h,L"convert.close",IDC_CV_CLOSE,362,478,90,30);
+        SyncConvertVideoControls(h);
+        CaptureSettingsDesignLayout(h);
+    }
+
+    void SyncConvertVideoControls(HWND h){
+        const auto check=[&](int id,bool on){SetCheckBoxState(GetDlgItem(h,id),on);};
+        const auto select=[&](int id,int index){if(HWND c=GetDlgItem(h,id))SendMessageW(c,CB_SETCURSEL,static_cast<WPARAM>(index),0);};
+        const auto enable=[&](int id,bool on){if(HWND c=GetDlgItem(h,id))EnableWindow(c,on);};
+        check(IDC_CV_UPSCALE,m_convert.upscale);
+        check(IDC_CV_NEURAL,m_convert.neural);
+        check(IDC_CV_FRAMEGEN,m_convert.frameGeneration);
+        check(IDC_CV_RANGE,m_convert.ranged);
+        select(IDC_CV_LANGUAGE,ConvertVideoLanguageRow());
+        int rung=1;for(size_t i=0;i<std::size(kUpscaleRungHeights);++i)if(kUpscaleRungHeights[i]==m_convert.targetHeight)rung=int(i);
+        select(IDC_CV_RESOLUTION,rung);
+        select(IDC_CV_SUBTITLES,std::clamp(m_convert.subtitles,0,2));
+        select(IDC_CV_CONTAINER,std::clamp(m_convert.container,0,1));
+        // Greyed rather than hidden, as in the export dialog: a control that
+        // stays visible is what tells the user the choice exists and why it is
+        // not available here.
+        enable(IDC_CV_RESOLUTION,m_convert.upscale);
+        // Interpolate is AMD's runtime, discovered beside the executable rather
+        // than shipped in it, so the row is greyed with the reason on its tip on
+        // an install without it.
+        const bool interpolate=ConvertVideoInterpolateAvailable();
+        enable(IDC_CV_FRAMEGEN,interpolate);
+        if(!interpolate&&m_convert.frameGeneration){
+            m_convert.frameGeneration=false;
+            check(IDC_CV_FRAMEGEN,false);
+        }
+        // The engines are a download, not part of the player. Greyed with the
+        // reason on the tip rather than failing at the end of the run.
+        const bool translatable=ConvertVoiceTranslatable();
+        enable(IDC_CV_LANGUAGE,translatable);
+        if(!translatable&&m_convert.translate){
+            m_convert.translate=false;
+            select(IDC_CV_LANGUAGE,0);
+        }
+        enable(IDC_CV_SUBTITLES,true);
+        enable(IDC_CV_RANGE_START,m_convert.ranged);
+        enable(IDC_CV_RANGE_END,m_convert.ranged);
+        const std::wstring summary=ConvertVideoSummary();
+        SetDlgItemTextW(h,IDC_CV_SUMMARY,summary.c_str());
+        if(HWND run=GetDlgItem(h,IDC_CV_RUN))EnableWindow(run,ConvertVideoUsable()&&ConvertVideoRangeValid()&&!ExportStagesBusy());
+    }
+
+    void ReadConvertVideoControls(HWND h){
+        const auto checked=[&](int id){return CheckBoxState(GetDlgItem(h,id));};
+        const auto sel=[&](int id,int fallback){HWND c=GetDlgItem(h,id);const int i=c?int(SendMessageW(c,CB_GETCURSEL,0,0)):CB_ERR;return i==CB_ERR?fallback:i;};
+        m_convert.upscale=checked(IDC_CV_UPSCALE);
+        m_convert.neural=checked(IDC_CV_NEURAL);
+        m_convert.frameGeneration=checked(IDC_CV_FRAMEGEN);
+        m_convert.ranged=checked(IDC_CV_RANGE);
+        // Row 0 is "Do not translate"; every row past it is a language, taken
+        // from the same table the prompt is built from.
+        {
+            const auto& languages=subtitle_translate::TargetLanguages();
+            const int row=std::clamp(sel(IDC_CV_LANGUAGE,0),0,int(languages.size()));
+            m_convert.translate=row>0&&ConvertVoiceTranslatable();
+            if(row>0)m_convert.language=Utf8ToWide(std::string(languages[size_t(row-1)].tag));
+        }
+        m_convert.targetHeight=kUpscaleRungHeights[std::clamp(sel(IDC_CV_RESOLUTION,1),0,int(std::size(kUpscaleRungHeights))-1)];
+        m_convert.subtitles=std::clamp(sel(IDC_CV_SUBTITLES,0),0,2);
+        m_convert.container=std::clamp(sel(IDC_CV_CONTAINER,0),0,1);
+        wchar_t buffer[64]{};
+        GetDlgItemTextW(h,IDC_CV_RANGE_START,buffer,int(std::size(buffer)));m_convert.rangeStart=buffer;
+        GetDlgItemTextW(h,IDC_CV_RANGE_END,buffer,int(std::size(buffer)));m_convert.rangeEnd=buffer;
+        // A translation is only worth the minutes it costs if the file can carry
+        // it, so asking for one asks for the smallest place to put it first. The
+        // other direction is the user's: choosing None drops the translation
+        // with it, because a translation with nowhere to go has still cost the
+        // time it took to make.
+        if(m_convert.translate&&m_convert.subtitles==0)m_convert.subtitles=1;
+        if(m_convert.subtitles==0)m_convert.translate=false;
+        // Anything that changes what would be written invalidates a name shown
+        // for the old answer.
+        m_convert.planned.clear();
+        SyncConvertVideoControls(h);
+    }
+
+    LRESULT ConvertVideoWndProc(HWND h,UINT m,WPARAM w,LPARAM l){
+        if(LRESULT result=0;SettingsDialogChrome(h,m,w,l,result))return result;
+        switch(m){
+        case WM_CREATE:ApplyDarkTitleBar(h);BuildConvertVideoControls(h);return 0;
+        case WM_GETMINMAXINFO:{
+            const RECT wr=SettingsWindowRect(kConvertDesignW,kConvertDesignH,DWORD(GetWindowLongPtrW(h,GWL_STYLE)),DWORD(GetWindowLongPtrW(h,GWL_EXSTYLE)),ActiveWindowDpi(h));
+            auto* mmi=reinterpret_cast<MINMAXINFO*>(l);mmi->ptMinTrackSize={wr.right-wr.left,wr.bottom-wr.top};return 0;
+        }
+        case WM_SIZE:ResizeSettingsChildren(h,kConvertDesignW,kConvertDesignH);return 0;
+        case WM_COMMAND:{
+            const int id=LOWORD(w);const int code=HIWORD(w);
+            if(id==IDC_CV_CLOSE){DestroyWindow(h);return 0;}
+            if(id==IDC_CV_RUN){StartConvertVideo();if(IsWindow(h))SyncConvertVideoControls(h);return 0;}
+            // Every control this dialog builds is named here or it is drawn,
+            // movable and inert. The owner-drawn check boxes do not turn their
+            // own state over: the click is only a click until this flips it, and
+            // the read below is what carries it into the selection.
+            if((id==IDC_CV_UPSCALE||id==IDC_CV_NEURAL||id==IDC_CV_FRAMEGEN||id==IDC_CV_RANGE)&&code==BN_CLICKED){
+                if(HWND box=GetDlgItem(h,id))SetCheckBoxState(box,!CheckBoxState(box));
+                ReadConvertVideoControls(h);return 0;
+            }
+            if((id==IDC_CV_RESOLUTION||id==IDC_CV_SUBTITLES||id==IDC_CV_CONTAINER||id==IDC_CV_LANGUAGE)&&code==CBN_SELCHANGE){ReadConvertVideoControls(h);return 0;}
+            if((id==IDC_CV_RANGE_START||id==IDC_CV_RANGE_END)&&code==EN_CHANGE){
+                wchar_t buffer[64]{};
+                GetDlgItemTextW(h,id,buffer,int(std::size(buffer)));
+                if(id==IDC_CV_RANGE_START)m_convert.rangeStart=buffer;else m_convert.rangeEnd=buffer;
+                m_convert.planned.clear();
+                SetDlgItemTextW(h,IDC_CV_SUMMARY,ConvertVideoSummary().c_str());
+                if(HWND run=GetDlgItem(h,IDC_CV_RUN))EnableWindow(run,ConvertVideoUsable()&&ConvertVideoRangeValid()&&!ExportStagesBusy());
+                return 0;
+            }
+            break;
+        }
+        case WM_CLOSE:DestroyWindow(h);return 0;
+        case WM_DESTROY:SaveConvertVideoSelection();m_settingsDesignLayout.erase(h);ReleaseDialogTips(h);if(h==m_convertWnd)m_convertWnd=nullptr;return 0;
+        }
+        return DefWindowProcW(h,m,w,l);
+    }
+
+    static LRESULT CALLBACK ConvertVideoWndProcStatic(HWND h,UINT m,WPARAM w,LPARAM l){
+        if(m==WM_NCCREATE){SetWindowLongPtrW(h,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams));return DefWindowProcW(h,m,w,l);}
+        auto* self=reinterpret_cast<PlayerApp*>(GetWindowLongPtrW(h,GWLP_USERDATA));
+        return self?self->ConvertVideoWndProc(h,m,w,l):DefWindowProcW(h,m,w,l);
+    }
+
+    // Where the file would go, and nothing else yet: the transcript, the
+    // translation, the picture stages and the mux are the next step. What this
+    // does today is refuse what cannot be run, ask for the folder, name the
+    // file the way dlss5-convert names it, and say where it would be written -
+    // so the naming and the refusals can be judged before any of the minutes
+    // are spent.
+    void StartConvertVideo(){
+        LoadConvertVideoSelection();
+        const std::wstring title=T(L"convert.title");
+        if(ExportStagesBusy()){MessageBoxW(m_hwnd,T(L"convert.busy").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        if(!ConvertVideoUsable()){MessageBoxW(m_hwnd,T(L"convert.refusal.nothing").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        if(!ConvertVideoRangeValid()){MessageBoxW(m_hwnd,T(L"convert.refusal.range").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        if(m_convert.translate&&!ConvertVoiceTranslatable()){MessageBoxW(m_hwnd,T(L"convert.refusal.engine").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        const std::filesystem::path source=ExportSourceFile();
+        if(source.empty()){MessageBoxW(m_hwnd,T(L"convert.no_source").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        if(ConvertVideoHasPictureStage()){
+            const ExportPlan plan=CurrentConvertVideoPlan();
+            if(!plan.valid){MessageBoxW(m_hwnd,T(ExportRefusalKey(plan.refusal)).c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        }
+        const std::filesystem::path folder=PickConvertVideoFolder(m_hwnd,m_loc,source.parent_path());
+        if(folder.empty())return;
+        const std::wstring extension=m_convert.container==1?L".mp4":L".mkv";
+        m_convert.planned=ConvertVideoDestination(source,folder,extension);
+        SaveConvertVideoSelection();
+        LOG("Convert video planned: output="<<WideToUtf8(m_convert.planned.wstring())
+            <<" upscale="<<m_convert.upscale<<" neural="<<m_convert.neural<<" framegen="<<m_convert.frameGeneration
+            <<" subtitles="<<m_convert.subtitles<<" translate="<<m_convert.translate
+            <<" container="<<(m_convert.container==1?"mp4":"mkv")
+            <<" ranged="<<m_convert.ranged<<" source="<<WideToUtf8(source.wstring()));
+        m_sourceNotice=T(L"convert.destination")+m_convert.planned.filename().wstring();
+        UpdateCachedStatus();
+        if(m_convertWnd&&IsWindow(m_convertWnd))UpdateWindow(m_convertWnd);
     }
 
     // Runs the plan on the export thread, one stage at a time, and hands the
@@ -14442,7 +14914,12 @@ private:
         // Handled before the switch would reach an unknown id, because the
         // presets are a contiguous range rather than named commands.
         case IDM_NEURAL_PRESET_CUSTOM:break;// reports state; not selectable
-case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExportStages();break;case IDM_ENCODER_SETTINGS:ShowEncoderSettings();break;case IDM_OPEN_RENDER_RECEIPT:OpenRenderReceipt();break;case IDM_RENDER_REPORT:ShowRenderReport();break;
+case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExportStages();break;
+        // A window, not a mode: it opens, asks, and closes without touching what
+        // is playing. Unlike the export row above there is nothing to cancel
+        // through it, because the run it starts has not been wired yet.
+        case IDM_CONVERT_VIDEO:ShowConvertVideo();break;
+        case IDM_ENCODER_SETTINGS:ShowEncoderSettings();break;case IDM_OPEN_RENDER_RECEIPT:OpenRenderReceipt();break;case IDM_RENDER_REPORT:ShowRenderReport();break;
         case IDM_CHECK_FOR_UPDATES:MaybeStartUpdateCheck(true);break;
         case IDM_KEYBOARD_SHORTCUTS:ToggleShortcutSheet();break;
         case IDM_SUBTITLE_OFF:SelectSubtitlesOff(true);break;case IDM_SUBTITLE_FILE:SelectSubtitleFile(true);break;
@@ -14488,6 +14965,33 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     StageExportProgress m_stageExport{};
     HWND m_exportStagesWnd{};
     ExportSelection m_exportSelection{};
+    // Video > Convert video. Its own state and its own window: the two dialogs
+    // can both be open with different answers, and neither is a mode of the
+    // other. The upscaler is deliberately absent - it is the export dialog's
+    // row, and there is one answer per machine.
+    struct ConvertVideoSelection{
+        bool upscale{};
+        bool neural{};
+        // Interpolate: the FidelityFX interpolator the playback pill runs, always
+        // 2x, which is why there is no multiplier beside it.
+        bool frameGeneration{};
+        uint32_t targetHeight{1440};
+        // 0 none, 1 a subtitle track, 2 burned into the picture.
+        int subtitles{};
+        bool translate{};
+        // The tag [Translation] uses, as TargetLanguages lists it: "zh" for
+        // Chinese. Empty would mean the pair the prompt defaults to, so it is
+        // never empty here.
+        std::wstring language{L"zh"};
+        int container{};  // 0 Matroska, 1 MP4
+        bool ranged{};
+        std::wstring rangeStart,rangeEnd;
+        // The name the last run would have written, shown under the summary.
+        std::filesystem::path planned;
+        bool loaded{};
+    };
+    ConvertVideoSelection m_convert{};
+    HWND m_convertWnd{};
     CompletionRegistry<ExportCompletion> m_exportCompletions;
     std::jthread m_exportWorker;
     CompletionRegistry<FrameGenerationCompletion> m_frameGenCompletions;

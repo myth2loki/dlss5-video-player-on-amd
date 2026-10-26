@@ -28,6 +28,12 @@ inline constexpr UINT IDM_EXPORT_CACHED_VIDEO = 140;
 inline constexpr UINT IDM_EXPORT_STAGES = 142;
 // The composed comparison as shown, with a provenance footer, as a PNG.
 inline constexpr UINT IDM_SAVE_COMPARISON_IMAGE = 143;
+// Video > Convert video: one dialog for what to do to the picture AND to the
+// sound, and one folder to write the result into. Separate from
+// IDM_EXPORT_STAGES, which asks only about the three picture stages and names
+// the file: this one also asks whether the speech is translated and whether the
+// subtitles travel as a track or are burned in.
+inline constexpr UINT IDM_CONVERT_VIDEO = 144;
 inline constexpr UINT IDM_PLAY = 200;
 inline constexpr UINT IDM_STOP = 201;
 inline constexpr UINT IDM_BACK10 = 202;

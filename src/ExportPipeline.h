@@ -47,6 +47,13 @@ struct ExportSelection {
     // Output frames per source frame. Read only when `frameGeneration`. 2 is
     // the only value an Ada card admits; Blackwell goes further.
     uint32_t multiplier{2};
+    // Which generator makes the in-between frames. True asks for the FidelityFX
+    // interpolator - AMD's own, and the same backend the playback island runs -
+    // whose rate is fixed at the 2x it is measured at. False keeps whatever the
+    // adapter's vendor path is (NGX DLSS-G on an NVIDIA card, the self-contained
+    // matcher elsewhere), which is what every caller before the Convert video
+    // dialog asked for and may go past 2x.
+    bool frameGenInterpolate{};
     // Super Resolution's engine when the model does not run (UpscalingPolicy.h).
     SuperResolutionEngine engine{kRecommendedSuperResolutionEngine};
     // Which backend the worker stage runs on. Carried through the plan into the
@@ -93,6 +100,10 @@ struct ExportPlan {
     bool requireNeural{};
     // Stage two.
     bool frameGenStage{};
+    // True when that stage is the FidelityFX interpolator rather than the
+    // adapter's vendor generator. Carried through the job into the request so
+    // the pass does not have to guess from the selection it was not given.
+    bool frameGenInterpolate{};
     uint32_t multiplier{};
     // Frames per second of the finished file, for the dialog's summary line.
     double outputFps{};
@@ -144,14 +155,19 @@ inline ExportPlan PlanExport(const ExportSelection& selection, uint32_t sourceWi
     plan.requireNeural = selection.neural;
 
     if (selection.frameGeneration) {
+        // The interpolator dispatches exactly one frame per source pair, so with
+        // it the rate is not a choice: 2x whoever asks and whatever the
+        // multiplier field says. The vendor path keeps the measured ceiling.
+        const uint32_t multiplier = selection.frameGenInterpolate ? 2u : selection.multiplier;
         // 2 is the floor: one generated frame per source pair. A runtime that
         // admits none, or fewer than asked, refuses rather than silently
         // delivering a different frame rate than the dialog promised.
-        if (selection.multiplier < 2 || maxMultiplier < 2 || selection.multiplier > maxMultiplier)
+        if (multiplier < 2 || maxMultiplier < 2 || multiplier > maxMultiplier)
             return refuse(ExportRefusal::MultiplierUnsupported);
         plan.frameGenStage = true;
-        plan.multiplier = selection.multiplier;
-        plan.outputFps = sourceFps * selection.multiplier;
+        plan.frameGenInterpolate = selection.frameGenInterpolate;
+        plan.multiplier = multiplier;
+        plan.outputFps = sourceFps * multiplier;
     }
 
     plan.valid = true;

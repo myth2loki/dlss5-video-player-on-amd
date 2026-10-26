@@ -473,6 +473,55 @@ struct Languages {
     std::string targetCode = "zh-Hans";
 };
 
+// The targets a dialog can offer, in one fixed order: exactly the languages the
+// table below can name, so anything the UI shows is something the prompt can ask
+// for by name AND code rather than by a tag the model has never seen. `tag` is
+// what the ini file keeps; LanguagesFor resolves it straight back.
+//
+// Chinese leads because it is the pair this feature was measured on. Adding a
+// language is one row in both lists - and a check on real material, because the
+// prompt is only as good as the model's coverage of that pair.
+struct TargetLanguage {
+    std::string_view tag;
+    std::string_view name;
+};
+
+inline const std::vector<TargetLanguage>& TargetLanguages()
+{
+    static const std::vector<TargetLanguage> languages = {
+        {"zh", "Chinese"},
+        {"zh-hant", "Traditional Chinese"},
+        {"en", "English"},
+        {"ja", "Japanese"},
+        {"ko", "Korean"},
+        {"yue", "Cantonese"},
+        {"fr", "French"},
+        {"de", "German"},
+        {"es", "Spanish"},
+        {"it", "Italian"},
+        {"pt", "Portuguese"},
+        {"ru", "Russian"},
+        {"th", "Thai"},
+        {"vi", "Vietnamese"},
+        {"id", "Indonesian"},
+        {"ar", "Arabic"},
+        {"hi", "Hindi"},
+    };
+    return languages;
+}
+
+// What a stored tag means to a viewer, or empty when it is not one this build
+// offers. Used for the dialog's own words about the choice.
+inline std::string_view TargetLanguageName(std::string_view tag)
+{
+    std::string lowered;
+    lowered.reserve(tag.size());
+    for (const char c : tag) lowered.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+    for (const TargetLanguage& language : TargetLanguages())
+        if (language.tag == lowered) return language.name;
+    return {};
+}
+
 // A pair built from tags. `sourceTag` is what the subtitle track says ("jpn",
 // "eng", "zh-Hans"), empty when it says nothing; `targetTag` is the ini file's
 // word, empty for Simplified Chinese.

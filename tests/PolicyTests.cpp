@@ -46,6 +46,7 @@
 #include "NeuralCoverage.h"
 #include "RangeSelection.h"
 #include "ExportPipeline.h"
+#include "FrameGenBackend.h"
 #include "RenderCommandLine.h"
 #include "StageExport.h"
 #include "FrameResample.h"
@@ -5789,6 +5790,97 @@ void feature_pills_are_visually_distinguishable_test()
     // Unavailable outranks everything, because a control you cannot press must
     // never look like one that is doing something.
     CHECK_EQ(unavailable.fill, ResolveButtonVisual(ButtonState{false, true, true, false, false, false}).fill);
+}
+
+// Every language a dialog can offer has to be one the prompt can name. An entry
+// whose tag the table does not know is passed through as its own tag, so the
+// model would be told "en (en)" instead of "English (en)" - a request it can
+// answer worse than the one the pair was measured on. The dialog reads this same
+// list, so a bad row here would be a bad row in front of the user.
+void convert_video_offers_only_languages_the_prompt_can_name_test()
+{
+    const auto& languages = subtitle_translate::TargetLanguages();
+    CHECK(languages.size() >= 2);
+    for (const auto& language : languages) {
+        CHECK(!language.tag.empty());
+        CHECK(!language.name.empty());
+        const auto pair = subtitle_translate::LanguagesFor({}, language.tag);
+        // Passed through unchanged means the table does not know the tag.
+        CHECK(pair.targetName != std::string(language.tag));
+        CHECK_EQ(std::string(language.name), pair.targetName);
+        // And the name is what the dialog would print for it.
+        CHECK_EQ(std::string(language.name), std::string(subtitle_translate::TargetLanguageName(language.tag)));
+    }
+    // The pair this feature was measured on leads, because it is the default.
+    CHECK_EQ(std::string("zh"), std::string(languages.front().tag));
+    CHECK_EQ(std::string("Chinese"), std::string(subtitle_translate::TargetLanguageName("zh")));
+    // A tag nobody offered reads as nothing rather than as a language.
+    CHECK(subtitle_translate::TargetLanguageName("").empty());
+    CHECK(subtitle_translate::TargetLanguageName("tlh").empty());
+}
+
+// The Convert video dialog's frame generation is interpolation, and the request
+// has to carry that BY NAME. Left to the adapter, a non-NVIDIA card gets the
+// self-contained matcher - a different generator wearing the same word, and the one
+// measured not to land the in-between frame on the content. What naming it buys is
+// the generator each vendor has for the job: FidelityFX on AMD, DLSS-G on NVIDIA,
+// never the matcher on either.
+void convert_video_frame_generation_asks_for_the_interpolator_by_name_test()
+{
+    const auto amd = CreateFrameGenBackend(false, FrameGenBackendKind::Interpolate);
+    CHECK(amd != nullptr);
+    if (amd) CHECK_EQ(std::string("amd-fidelityfx"), std::string(amd->Kind()));
+    // An NVIDIA card has no FidelityFX runtime to offer: naming the job gets the
+    // interpolator that machine has, not a refusal.
+    const auto nvidia = CreateFrameGenBackend(true, FrameGenBackendKind::Interpolate);
+    CHECK(nvidia != nullptr);
+    if (nvidia) CHECK_EQ(std::string("nvidia-ngx"), std::string(nvidia->Kind()));
+    // The vendor path is unchanged, so the export dialog and --render keep the
+    // generator they were measured with - the matcher included.
+    const auto matcher = CreateFrameGenBackend(false, FrameGenBackendKind::Vendor);
+    CHECK(matcher != nullptr);
+    if (matcher) CHECK_EQ(std::string("amd-optical-flow"), std::string(matcher->Kind()));
+    const auto ngx = CreateFrameGenBackend(true, FrameGenBackendKind::Vendor);
+    CHECK(ngx != nullptr);
+    if (ngx) CHECK_EQ(std::string("nvidia-ngx"), std::string(ngx->Kind()));
+}
+
+// Interpolate is 2x by construction - one generated frame per source pair - so the
+// plan takes the rate from the generator rather than from whatever the selection
+// says. A 5x left over from a copied selection must not become a promise the
+// interpolator cannot keep, or the file would be written at half the stated rate.
+void interpolate_frame_generation_is_two_times_and_says_so_in_the_plan_test()
+{
+    ExportSelection selection;
+    selection.frameGeneration = true;
+    selection.frameGenInterpolate = true;
+    selection.multiplier = 5;
+    const ExportPlan plan = PlanExport(selection, 1920, 1080, 24.0, 2, false);
+    CHECK(plan.valid);
+    CHECK(plan.frameGenStage);
+    CHECK(plan.frameGenInterpolate);
+    CHECK_EQ(2u, plan.multiplier);
+    CHECK(plan.outputFps == 48.0);
+
+    // The vendor path keeps the ceiling it was given, and its own rate.
+    ExportSelection vendor = selection;
+    vendor.frameGenInterpolate = false;
+    const ExportPlan vendorPlan = PlanExport(vendor, 1920, 1080, 24.0, 5, false);
+    CHECK(vendorPlan.valid);
+    CHECK(!vendorPlan.frameGenInterpolate);
+    CHECK_EQ(5u, vendorPlan.multiplier);
+    CHECK(vendorPlan.outputFps == 120.0);
+
+    // Nothing else about the stage moved: interpolate on its own is still a valid
+    // one-stage conversion, and a still image is still refused.
+    ExportSelection interpolateOnly;
+    interpolateOnly.frameGeneration = true;
+    interpolateOnly.frameGenInterpolate = true;
+    const ExportPlan only = PlanExport(interpolateOnly, 1920, 1080, 30.0, 2, false);
+    CHECK(only.valid);
+    CHECK(!only.workerStage);
+    CHECK(!only.vsrStage);
+    CHECK(PlanExport(interpolateOnly, 1920, 1080, 30.0, 2, true).refusal == ExportRefusal::StillImage);
 }
 
 void menus_group_two_to_seven_related_items_per_block_test()
@@ -16904,6 +16996,9 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(render_range_residual_below_one_frame_is_coverage_not_work_test),
     TEST_CASE(feature_pills_are_visually_distinguishable_test),
     TEST_CASE(menus_group_two_to_seven_related_items_per_block_test),
+    TEST_CASE(convert_video_offers_only_languages_the_prompt_can_name_test),
+    TEST_CASE(convert_video_frame_generation_asks_for_the_interpolator_by_name_test),
+    TEST_CASE(interpolate_frame_generation_is_two_times_and_says_so_in_the_plan_test),
     TEST_CASE(export_plan_runs_super_resolution_and_neural_as_one_pass_test),
     TEST_CASE(export_container_follows_the_chosen_extension_test),
     TEST_CASE(live_forecast_scales_by_the_processing_rung_test),

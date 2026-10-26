@@ -268,6 +268,10 @@ StageExportOutcome RunStageExport(const StageExportJob& job,std::stop_token stop
         request.multiplier=plan.multiplier;
         request.nvencPreset=job.nvencPreset;
         request.holdDuplicates=job.holdDuplicates;
+        // Which generator, decided by the plan rather than here: the Convert video
+        // dialog asks for the FidelityFX interpolator (the one the playback island
+        // runs, 2x), the export dialog keeps the adapter's vendor path.
+        request.interpolate=plan.frameGenInterpolate;
         const uint32_t generatePass=plan.workerStage?2u:1u;
         report({generatePass,passes,L"export.progress.pass_framegen",0,0});
         const FrameGenerationResult result=FrameGenerationPass(job.helpers).Run(request,stop,

@@ -78,6 +78,13 @@ struct FrameGenerationRequest {
     // detector's error on real motion is a held pair where one was wanted
     // (tools/benchmark/duplab.py). FrameGenerationSmoke's seventh argument runs it.
     bool holdDuplicates{false};
+    // Run the FidelityFX interpolator rather than the adapter's vendor generator
+    // (FrameGenBackendKind). This is what "interpolate" means in the rest of the
+    // player - the same backend the playback island runs - and with it the rate
+    // is 2x, because that backend dispatches one frame per source pair. A machine
+    // without its runtime fails with that runtime's own reason instead of being
+    // handed a different generator.
+    bool interpolate{false};
 };
 
 struct FrameGenerationProgress {

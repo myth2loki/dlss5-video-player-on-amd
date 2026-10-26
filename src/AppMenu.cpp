@@ -182,6 +182,15 @@ HMENU CreateMenuBar(const Localizer& localizer, bool youtubeAvailable)
     add(video, IDM_VIEW_FINAL, L"menu.final"); add(video, IDM_VIEW_INPUT, L"menu.input");
     add(video, IDM_VIEW_MV, L"menu.mv"); add(video, IDM_VIEW_DEPTH, L"menu.depth");
     add(video, IDM_VIEW_FRAME_GENERATED, L"menu.generated");
+    // The one row in this menu that produces a file rather than changing what is
+    // on screen, so it sits last - but with no separator above it. A separator
+    // would make it a group of one, and the grouping rule this menu is held to
+    // (PolicyTests' menus_group_two_to_seven_related_items_per_block) allows a
+    // lone row only for Exit. Greyed until a local source is loaded: the dialog
+    // reads the loaded source's geometry and audio, so there is nothing to ask
+    // about before that.
+    AppendMenuW(video, MF_STRING | MF_GRAYED, IDM_CONVERT_VIDEO,
+                localizer.Get(L"menu.convert_video").c_str());
     // The DLSS menu, grouped one feature per block.
     //
     // Microsoft's own menu guidance is the measure here: separators between

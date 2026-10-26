@@ -305,6 +305,54 @@ private:
             {L"export.stages.refusal.vsr", L"RTX VSR is not available here (it needs an RTX GPU and the complete download). Choose DLSS Super Resolution as the upscaler."},
             {L"export.stages.refusal.still", L"A still image has no successor frame to generate toward."},
             {L"export.stages.busy", L"Another conversion is running."},
+            // ---- Video > Convert video. The dialog that asks about the picture
+            // and the sound in one place, and writes into a folder rather than
+            // onto a name. Its stage rows say the same things as the export
+            // dialog's, so they reuse those keys; everything new is here.
+            {L"menu.convert_video", L"Convert video\u2026"},
+            {L"convert.title", L"Convert video"},
+            {L"convert.group_picture", L"Picture"},
+            {L"convert.group_sound", L"Sound and text"},
+            // Interpolate, not "frame generation": this dialog runs the same
+            // FidelityFX generator as the playback pill, which makes one frame per
+            // source pair. The export dialog's row keeps the DLSS-G conversion and
+            // with it the 2x-5x choice.
+            {L"convert.interpolate", L"Interpolate frames (2\u00d7)"},
+            {L"convert.group_output", L"The file"},
+            {L"convert.subtitles", L"Subtitles"},
+            {L"convert.subtitles.none", L"None"},
+            {L"convert.subtitles.soft", L"A subtitle track (soft)"},
+            {L"convert.subtitles.burn", L"Burned into the picture"},
+            {L"convert.translate", L"Translate the speech"},
+            {L"convert.translate.none", L"Do not translate"},
+            {L"convert.format", L"Container"},
+            {L"convert.format.mkv", L"Matroska (mkv)"},
+            {L"convert.format.mp4", L"MP4"},
+            {L"convert.range", L"Only part of it"},
+            {L"convert.range.to", L"to"},
+            {L"convert.run", L"Convert\u2026"},
+            {L"convert.close", L"Cancel"},
+            {L"convert.note", L"Runs in one order: the speech is transcribed and translated first, then the picture stages, then the file is written with the subtitles. Image adjustments and Mix are not included: they change only what the screen shows."},
+            {L"convert.summary.subtitles_only", L"Nothing done to the picture - only the subtitles"},
+            // A language name goes in front of these, so each begins with the
+            // space that separates it from it.
+            {L"convert.summary.track_suffix", L" subtitle track"},
+            {L"convert.summary.burn_suffix", L" subtitles burned in"},
+            {L"convert.summary.soft_source", L"The source's own subtitle track"},
+            {L"convert.summary.burn_source", L"The source's subtitles burned in"},
+            {L"convert.refusal.nothing", L"Choose at least one thing to do."},
+            {L"convert.refusal.range", L"Both ends of the range have to be times this source has, and the end has to be after the start."},
+            {L"convert.refusal.engine", L"The subtitle engines are not installed, so the speech cannot be translated."},
+            {L"convert.busy", L"Another conversion is running."},
+            {L"convert.no_source", L"Open a local video first. A stream has to finish copying before it can be converted."},
+            {L"convert.destination", L"Convert video: "},
+            {L"convert.planned", L" is ready to write. The conversion itself is not wired yet."},
+            {L"convert.tip.picture", L"The picture stages are the export dialog's, in the same order: Super Resolution, then neural rendering on the upscaled frame, then interpolation."},
+            {L"convert.tip.interpolate", L"Generates one frame between each pair, writing a file at twice the frame rate: AMD's FidelityFX interpolator - the same generator the Interpolate pill runs during playback - or DLSS-G on an NVIDIA card. 2x is the rate because one frame per pair is what both make, so there is no multiplier to choose. Greyed only when this machine has neither runtime."},
+            {L"convert.tip.subtitles", L"None leaves the file's subtitle streams as they are. A track adds the translated text as its own stream and keeps the original beside it; Matroska keeps the styling, MP4 keeps only the words. Burned into the picture re-encodes the video so the text is part of every frame: any player, any phone, but a second encode."},
+            {L"convert.tip.translate", L"Listens to the audio track, writes the speech down and translates it into the language chosen. Greyed when the translation engine or a transcriber is missing from this install: both ship separately from the player. Choosing a language also sets Subtitles, because a translation that is thrown away has still cost the time it took to make."},
+            {L"convert.tip.format", L"Matroska carries the subtitle styling and any number of tracks, and copies the video stream without re-encoding. MP4 is what a phone or a chat app expects, but its subtitles are plain text."},
+            {L"convert.tip.range", L"Converts only the part between the two times, typed as 1:23.5 or f0-f300. Empty means the whole file. The sound is trimmed to the same part before it is transcribed."},
             {L"export.stages.no_source", L"Open a local video first. A stream has to finish copying before it can be exported."},
             {L"export.tip.upscale", L"Upscales the file to the resolution below, with the Upscaler under it - RTX VSR unless DLSS Super Resolution is chosen. Off, the render stays at the source resolution. Without Neural rendering the neural model does not run at all."},
             {L"export.stages.history", L"History"},
