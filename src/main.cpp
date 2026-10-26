@@ -10735,10 +10735,18 @@ private:
     bool ToolbarActionEnabled(ToolbarAction action)const{return IsToolbarActionEnabled(action,ToolbarState());}
 
     void DrawButton(HDC dc,ToolbarAction action,UiIcon icon,const std::wstring&label,const RECT&r,bool enabled,bool active,bool hover,bool pressed,bool focus,bool compact,bool working=false,float progress=-1.0f){
+        // The subtitle switch is lit while it is still working - the viewer
+        // asked for subtitles, and the answer is that they are coming - and it
+        // says so in the same blue as every other lit control. The teal
+        // belongs to the timeline's "being made right now", and a third
+        // colour on a lit button reads as a state of its own: a viewer who
+        // pressed the switch found it a different colour from the button
+        // next to it and read that as something wrong.
+        const bool accent=active||(working&&action==ToolbarAction::ToggleSubtitles);
         // The resting and hovered looks mixed by how far the hover fade has got,
         // so the tint eases rather than snapping; at 0 or 1 it is either look.
-        const ButtonVisual rest=ResolveButtonVisual(ButtonState{enabled,active,working,false,pressed,focus});
-        const ButtonVisual hot=ResolveButtonVisual(ButtonState{enabled,active,working,true,pressed,focus});
+        const ButtonVisual rest=ResolveButtonVisual(ButtonState{enabled,accent,working&&!accent,false,pressed,focus});
+        const ButtonVisual hot=ResolveButtonVisual(ButtonState{enabled,accent,working&&!accent,true,pressed,focus});
         const double hoverLevel=HoverLevel(action,hover);
         ButtonVisual visual=hot;
         visual.fill=chrome_motion::Mix(rest.fill,hot.fill,hoverLevel);
@@ -10806,7 +10814,10 @@ private:
                     fill.right=fill.left+segment;
                 }
                 if(fill.right>fill.left){
-                    HBRUSH ink=CreateSolidBrush(ui_palette::NeuralCoverage);
+                    // The lane is ink on the button's own colour: on the blue
+                    // of a lit control a teal bar would be a third colour
+                    // again, only smaller.
+                    HBRUSH ink=CreateSolidBrush(accent?RGB(136,197,250):ui_palette::NeuralCoverage);
                     if(ink){FillRect(dc,&fill,ink);DeleteObject(ink);}
                 }
             }
@@ -13694,6 +13705,35 @@ private:
         if(!(pace.wallMs>0.0)||!pace.frames)return 0.0;
         return double(pace.frames)*1000.0/pace.wallMs/m_decoder.FrameRate();
     }
+    // The notices that outrank the runtime detail, in reading order: the
+    // reason the picture is not what it would be, first, and what the machine
+    // is doing, last.
+    //
+    // Both lines prepend them, and that is the point. The cached line used to
+    // be built by hand, and the notices it did not know about went missing -
+    // the subtitle state above all ("Translating subtitles", "Listening to the
+    // film"), which is why the state line went quiet the moment the picture
+    // became a neural one. A notice only one of the two lines carries is a
+    // notice the other one dropped without saying so.
+    std::vector<std::wstring> StatusNotices()const{
+        std::vector<std::wstring> notices;
+        if(m_addonWorker.joinable())notices.push_back(T(L"framegen.addon.downloading"));
+        if(!m_cacheNotice.empty())notices.push_back(m_cacheNotice);
+        const std::wstring dropped=m_dropNote.Visible(m_loaded,m_path);
+        if(!dropped.empty())notices.push_back(dropped);
+        if(!m_decodeNotice.empty())notices.push_back(m_decodeNotice);
+        // The subtitle state lives in the source notice, because the subtitle
+        // track IS the source when the file carries none of its own.
+        if(!m_sourceNotice.empty())notices.push_back(m_sourceNotice);
+        if(!m_neuralNotice.empty())notices.push_back(m_neuralNotice);
+        if(m_seeking||m_seekPending)notices.push_back(T(L"status.seeking"));
+        if(SourcePrefetchActive())notices.push_back(T(L"status.preparing_source"));
+        return notices;
+    }
+    static std::wstring PrependNotices(std::wstring text,const std::vector<std::wstring>& notices){
+        for(auto it=notices.rbegin();it!=notices.rend();++it)text=*it+L" \u00b7 "+text;
+        return text;
+    }
     std::wstring BuildStatusText()const{
         // The menu path the hint names has to be the one the menu has: the
         // cancel item lives under DLSS > Convert & export, not under File.
@@ -13762,8 +13802,11 @@ private:
             if(!m_cachedTemporal.IsDefault())text+=L"/"+Utf8ToWide(CanonicalTemporalSettings(m_cachedTemporal));
             if(const std::wstring passthrough=AudioPassthroughNote();!passthrough.empty())text=passthrough+L" \u00b7 "+text;
             if(m_liveSession)text=LiveSessionStatusText()+L" \u00b7 "+text;
-            if(m_seeking||m_seekPending)text=T(L"status.seeking")+L" \u00b7 "+text;
-            if(const std::wstring dropped=m_dropNote.Visible(m_loaded,m_path);!dropped.empty())text=dropped+L" \u00b7 "+text;
+            // The same notices the ordinary line carries, in the same order.
+            // The subtitle state among them: a film rendered by the neural
+            // pipeline is still a film whose subtitles are being translated,
+            // and the line that says so has to be this one too.
+            text=PrependNotices(text,StatusNotices());
             return text;
         }
         const PlayerRuntimeStatus runtime=RuntimeStatus();status.mediaLoaded=true;status.runtimeConfiguration=runtime.configuration;status.dlssState=runtime.dlssState;status.sourceWidth=m_decoder.NativeWidth();status.sourceHeight=m_decoder.NativeHeight();status.inputWidth=m_renderer->DLSSInputW();status.inputHeight=m_renderer->DLSSInputH();status.outputWidth=m_renderer->OutputW();status.outputHeight=m_renderer->OutputH();status.quality=QualityNameW(m_activeQuality);
@@ -13780,22 +13823,19 @@ private:
         // the HDR one the file carries, and what the model will be shown.
         if(const std::wstring hdr=HdrStatusText();!hdr.empty())text=hdr+L" \u00b7 "+text;
         if(m_liveSession)text=LiveSessionStatusText()+L" \u00b7 "+text;
-        if(SourcePrefetchActive())text=T(L"status.preparing_source")+L" \u00b7 "+text;
-        if(m_seeking||m_seekPending)text=T(L"status.seeking")+L" \u00b7 "+text;
-        // Ahead of everything else: it is the reason the picture on screen is the
-        // original rather than a rendered one.
-        if(!m_neuralNotice.empty())text=m_neuralNotice+L" \u00b7 "+text;
-        // A source the resolver had to settle for outranks everything except the
-        // neural notice: no render can put back what the stream never carried.
-        if(!m_sourceNotice.empty())text=m_sourceNotice+L" \u00b7 "+text;
-        // Why the picture stopped, for as long as it is stopped (RequestSeek
-        // clears it), and which file of a drop is playing, for as long as it is.
-        if(!m_decodeNotice.empty())text=m_decodeNotice+L" \u00b7 "+text;
-        if(const std::wstring dropped=m_dropNote.Visible(m_loaded,m_path);!dropped.empty())text=dropped+L" \u00b7 "+text;
-        // Ahead of even that: nothing this player can do about the picture is
-        // worth reading while its cache cannot be written to.
-        if(!m_cacheNotice.empty())text=m_cacheNotice+L" \u00b7 "+text;
-        if(m_addonWorker.joinable())text=T(L"framegen.addon.downloading")+L" \u00b7 "+text;
+        // The notices, in one list and in one order, so that the cached line
+        // cannot end up carrying a different set than this one. What the list
+        // does not say, and the order says, is this:
+        //
+        //  - the neural notice outranks the source one, because it is the
+        //    reason the picture on screen is the original rather than a
+        //    rendered one;
+        //  - the source notice outranks the decode one, because a source the
+        //    resolver had to settle for is a thing no render can put back;
+        //  - the cache notice outranks all of them, because nothing this
+        //    player can do about the picture is worth reading while its cache
+        //    cannot be written to.
+        text=PrependNotices(text,StatusNotices());
         return text;
     }
     // An HDR source is decoded tone mapped to SDR (HdrPolicy.h), because the

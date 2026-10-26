@@ -539,6 +539,35 @@ struct PlayerAppTestAccess {
         CHECK(cachedStatus.find(frameGenerationSegment) != std::wstring::npos);
     }
 
+    // The subtitle state belongs to the status line whoever draws it. The
+    // cached line used to be built by hand and left the subtitle notice out,
+    // so the line went quiet exactly when the picture became a neural one -
+    // which is when the notice matters most, because the render is the slow
+    // part and the translation runs alongside it.
+    static void subtitle_state_reaches_the_neural_line_test()
+    {
+        PlayerApp& app = fixture->app;
+        // Every case in this suite shares one PlayerApp, and the case after
+        // this one reads the CACHED line (that is where "Range" and the NR
+        // summary live). So the state this one changes is put back.
+        const bool cachedBefore = app.m_cachedPlayback;
+        const std::wstring noticeBefore = app.m_sourceNotice;
+        app.m_loaded = true;
+        app.m_cachedPlayback = true;
+        app.m_renderer = MakeD3D12Renderer();
+        app.m_sourceNotice = L"Translating subtitles 3/10";
+        const std::wstring neuralLine = app.BuildStatusText();
+        CHECK(neuralLine.find(L"Translating subtitles 3/10") != std::wstring::npos);
+        // The ordinary line carries the same notice: the two lines are one
+        // line, and a notice only one of them knows about is a notice the
+        // other one dropped.
+        app.m_cachedPlayback = false;
+        const std::wstring ordinaryLine = app.BuildStatusText();
+        CHECK(ordinaryLine.find(L"Translating subtitles 3/10") != std::wstring::npos);
+        app.m_cachedPlayback = cachedBefore;
+        app.m_sourceNotice = noticeBefore;
+    }
+
     static void markers_and_timecode_test()
     {
         PlayerApp& app = fixture->app;
@@ -867,10 +896,10 @@ struct PlayerAppTestAccess {
                 CHECK(GetTextExtentPoint32W(dc, feature.label.c_str(),
                                             static_cast<int>(feature.label.size()), &textSize));
                 SelectObject(dc, previous);
-                const wchar_t glyph = GlyphForIcon(feature.icon);
+                const std::wstring glyph = GlyphForIcon(feature.icon);
                 const HGDIOBJ previousIcon = SelectObject(dc, app.m_iconFont);
                 SIZE iconSize{};
-                CHECK(GetTextExtentPoint32W(dc, &glyph, 1, &iconSize));
+                CHECK(GetTextExtentPoint32W(dc, glyph.c_str(), static_cast<int>(glyph.size()), &iconSize));
                 SelectObject(dc, previousIcon);
                 const RECT button{0, 0, MulDiv(feature.widthDip, static_cast<int>(dpi), 96),
                                   MulDiv(kToolbarMinHitHeightDip, static_cast<int>(dpi), 96)};
@@ -1005,7 +1034,7 @@ struct PlayerAppTestAccess {
             CHECK(FeaturePillStateLabel(label) != label);
             states.emplace_back(FeaturePillStateLabel(label));
         }
-        const wchar_t glyph = GlyphForIcon(UiIcon::Sparkles);
+        const std::wstring glyph = GlyphForIcon(UiIcon::Sparkles);
         struct ChipCase { status_chips::Chip chip; const wchar_t* widest; };
         const std::array chips{
             // The widest of each chip's strings, in the form each mode prints:
@@ -1019,7 +1048,7 @@ struct PlayerAppTestAccess {
         for (const UINT dpi : {96u, 120u, 144u, 192u}) {
             app.UpdateFontsForDpi(dpi);
             const HFONT font = app.m_fontSmall ? app.m_fontSmall : app.m_font;
-            const SIZE icon = measure(app.m_iconFont, std::wstring_view(&glyph, 1));
+            const SIZE icon = measure(app.m_iconFont, std::wstring_view(glyph));
             const int pill = MulDiv(kFeaturePillNarrowWidthDip, static_cast<int>(dpi), 96);
             const int chrome = icon.cx + MulDiv(2 * kButtonHorizontalInsetDip + kButtonIconLabelGapDip, static_cast<int>(dpi), 96);
             for (const auto& state : states) CHECK(measure(font, state).cx + chrome <= pill);
@@ -2319,15 +2348,15 @@ struct PlayerAppTestAccess {
         auto saved = std::move(app.m_trailerThumbnails);
         app.m_trailerThumbnails = std::make_unique<TrailerThumbnails>();
         const auto& first = trailers[0];
-        app.DrawStartTile(dc, tile, first, false);
+        app.DrawStartTile(dc, tile, first, false, false);
         CHECK(centre() != RGB(250, 20, 20));   // the placeholder until a picture arrives
         auto poster = std::make_shared<TrailerPicture>();
         poster->size = SIZE{16, 9}; poster->bgra = solid(16, 9, 20, 20, 250);
         app.m_trailerThumbnails->Publish(first.thumbId, poster);
-        app.DrawStartTile(dc, tile, first, false);
+        app.DrawStartTile(dc, tile, first, false, false);
         CHECK(centre() == RGB(250, 20, 20));
         // Another tile's picture is not this one's.
-        app.DrawStartTile(dc, tile, trailers[1], false);
+        app.DrawStartTile(dc, tile, trailers[1], false, false);
         CHECK(centre() != RGB(250, 20, 20));
         // The user's own render frame outranks the publisher's thumbnail.
         {
@@ -2340,7 +2369,7 @@ struct PlayerAppTestAccess {
             app.m_startAnswers = answers;
             auto rendered = first;
             rendered.renderKey = key;
-            app.DrawStartTile(dc, tile, rendered, false);
+            app.DrawStartTile(dc, tile, rendered, false, false);
             CHECK(centre() == RGB(20, 20, 250));
             app.m_startAnswers = previous;
         }
@@ -3028,6 +3057,7 @@ struct PlayerAppTestAccess {
         UI_CASE(recent_rollover_keeps_the_cache_test),
         UI_CASE(neural_button_label_and_upscaling_rungs_test),
         UI_CASE(feature_menu_mirrors_the_toolbar_test),
+        UI_CASE(subtitle_state_reaches_the_neural_line_test),
         UI_CASE(markers_and_timecode_test),
         UI_CASE(comparison_availability_test),
         UI_CASE(neural_strength_dial_test),
