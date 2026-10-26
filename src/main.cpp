@@ -3832,12 +3832,19 @@ private:
         // guessed from the audio.
         const bool local=!m_path.empty()&&_wcsnicmp(m_path.c_str(),L"http://",7)!=0&&
                          _wcsnicmp(m_path.c_str(),L"https://",8)!=0;
-        const bool speechAble=local&&!m_subtitleWanted&&
-            subtitle_speech::SpeechToText::Available(SpeechEngine());
+        const bool speechEngineInstalled=subtitle_speech::SpeechToText::Available(SpeechEngine());
+        const bool speechAble=local&&!m_subtitleWanted&&speechEngineInstalled;
         const bool speechRunning=m_speech&&m_speechStatus.Running();
+        // Which hardware transcribes, for a machine that has both builds: the
+        // entry says what is in force now, and is greyed where there is no
+        // second build to move to.
+        const bool speechBackendEnabled=speechEngineInstalled&&SpeechGpuInstalled()&&
+                                        IniString(L"Speech",L"Runtime").empty();
+        const std::wstring backendLabel=T(SpeechUsesGpu()?L"menu.subtitles_speech_gpu":L"menu.subtitles_speech_cpu");
         app_menu::UpdateSubtitles(menu,T(L"menu.subtitles_off"),labels,file,chosen,m_loaded,modeCommand,
                                   translatable,speechAble,
-                                  T(speechRunning?L"menu.subtitles_speech_stop":L"menu.subtitles_speech"));
+                                  T(speechRunning?L"menu.subtitles_speech_stop":L"menu.subtitles_speech"),
+                                  backendLabel,SpeechUsesGpu(),speechBackendEnabled);
         std::wstring reset=T(L"menu.subtitles_delay_reset");
         if(m_subtitleDelayMs)reset+=L" ("+SubtitleDelayText()+L")";
         if(const HMENU owner=app_menu::FindMenuContainingCommand(menu,IDM_SUBTITLE_DELAY_RESET))
@@ -3889,11 +3896,34 @@ private:
     }
     std::filesystem::path TranslationRoot()const{return HelperRoot(L"translation");}
     std::filesystem::path SpeechRoot()const{return HelperRoot(L"asr");}
+    // ---- Which build of the speech engine runs ------------------------------
+    // Two copies of whisper-server sit under the speech root: `runtime`, which
+    // computes on the cores, and `runtime-gpu`, the same tools with the Vulkan
+    // backend beside them. Nothing in the engine's own command line picks
+    // between them - it is the directory its own DLLs are loaded from - so the
+    // choice is a directory, made here and asked about by nothing else. The
+    // graphics card is the default because recognition is the heaviest thing the
+    // player ever starts: 4.98 core-seconds per second of film on the cores
+    // against 0.04 on a 9070 XT, both measured, same transcript out.
+    bool SpeechGpuInstalled()const{
+        std::error_code error;
+        return std::filesystem::is_regular_file(
+            SpeechRoot()/subtitle_speech::kGpuRuntimeDirectory/subtitle_speech::kServerFileName,error);
+    }
+    bool SpeechPrefersGpu()const{
+        return subtitle_speech::SpeechPrefersGpu(
+            GetPrivateProfileIntW(L"Speech",L"Gpu",1,SettingsPath().c_str()));
+    }
+    bool SpeechUsesGpu()const{return subtitle_speech::SpeechUsesGpu(SpeechPrefersGpu(),SpeechGpuInstalled());}
+    std::filesystem::path SpeechRuntimeDirectory()const{
+        const std::wstring runtime=IniString(L"Speech",L"Runtime");
+        if(!runtime.empty())return std::filesystem::path(runtime);  // an explicit path outranks the choice
+        return SpeechRoot()/subtitle_speech::SpeechRuntimeSubdirectory(SpeechUsesGpu());
+    }
     // whisper-server and one ggml model, configured the way the translator is.
     subtitle_speech::Engine SpeechEngine()const{
         subtitle_speech::Engine engine;
-        const std::wstring runtime=IniString(L"Speech",L"Runtime");
-        engine.runtimeDirectory=runtime.empty()?SpeechRoot()/L"runtime":std::filesystem::path(runtime);
+        engine.runtimeDirectory=SpeechRuntimeDirectory();
         const std::wstring model=IniString(L"Speech",L"Model");
         if(!model.empty()){
             engine.model=std::filesystem::path(model);
@@ -4267,7 +4297,8 @@ private:
         m_speech->Start(job);
         m_sourceNotice=T(L"subtitles.speech_starting");UpdateCachedStatus();UpdateSubtitleMenu();
         LOG("Subtitles: listening to "<<WideToUtf8(m_path)<<" from "<<from<<" s of "<<duration
-            <<" s ("<<engine.threads<<" threads, "<<job.plan.leadSeconds<<" s ahead).");
+            <<" s ("<<engine.threads<<" threads, "<<job.plan.leadSeconds<<" s ahead, "
+            <<WideToUtf8(engine.runtimeDirectory.wstring())<<").");
     }
     // Stops listening but keeps what was already heard on screen: the viewer
     // asked for the subtitles to stop growing, not to disappear.
@@ -4280,6 +4311,24 @@ private:
     void ToggleSpeech(){
         if(!m_loaded)return;
         if(m_speech&&m_speechStatus.Running())StopSpeech();else StartSpeech();
+    }
+    // Switches which build of the engine the transcript is written by. Because
+    // the build is decided by where whisper-server.exe is loaded from, and the
+    // engine is started once per run, a run in progress has to be dropped and
+    // begun again: it would otherwise keep using the cores the viewer just turned
+    // off. Starting again from the playhead is what seeking past what has been
+    // heard already does, so nothing earlier than the picture is lost on screen.
+    void ToggleSpeechBackend(){
+        if(!m_loaded)return;
+        if(!IniString(L"Speech",L"Runtime").empty()||!SpeechGpuInstalled())return;  // nothing to choose between
+        const bool gpu=!SpeechPrefersGpu();
+        WritePrivateProfileStringW(L"Speech",L"Gpu",gpu?L"1":L"0",SettingsPath().c_str());
+        const bool running=m_speech&&m_speechStatus.Running();
+        if(m_speech){m_speech->Cancel();m_speech.reset();}
+        m_sourceNotice=T(gpu?L"subtitles.speech_gpu":L"subtitles.speech_cpu");
+        UpdateCachedStatus();UpdateSubtitleMenu();
+        LOG("Subtitles: transcribing on the "<<(gpu?"graphics card":"processor")<<" from now on.");
+        if(running)StartSpeech();
     }
     void PollSpeech(){
         if(!m_speech)return;
@@ -14363,6 +14412,7 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
         case IDM_SUBTITLE_MODE_CHINESE:SetSubtitleMode(subtitle_translate::Mode::Translation);break;
         case IDM_SUBTITLE_MODE_DUAL:SetSubtitleMode(subtitle_translate::Mode::Dual);break;
         case IDM_SUBTITLE_SPEECH:ToggleSpeech();break;
+        case IDM_SUBTITLE_SPEECH_BACKEND:ToggleSpeechBackend();break;
         case IDM_SUBTITLE_DELAY_RESET:StepSubtitleDelay(0);break;
         case IDM_COMPARE_TOGGLE:ToggleSideBySide();break;
         case IDM_COMPARE_HDR_AT_SDR:ToggleCompareHdrAtSdr();break;

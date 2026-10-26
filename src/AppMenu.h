@@ -67,6 +67,10 @@ inline constexpr UINT IDM_SUBTITLE_MODE_DUAL = 255;
 // The player's own producer of a source track, for a film that has none: it
 // listens to the audio and writes subtitles. One command that starts and stops.
 inline constexpr UINT IDM_SUBTITLE_SPEECH = 256;
+// Which build of the engine above transcribes with: the one that uses the
+// graphics card, or the one that uses the cores. A radio group of one, so its
+// checkmark says which is in force rather than competing with the track's.
+inline constexpr UINT IDM_SUBTITLE_SPEECH_BACKEND = 258;
 // The toolbar switch beside Mute: one press gets subtitles out of the film, the
 // next stops them. The menu row and this are the same command, so whatever
 // reaches one reaches the other.
@@ -256,9 +260,14 @@ void UpdateAudioTracks(HMENU menuBar, std::span<const std::wstring> labels, int 
 // The translation entries below the last separator are a radio group of their
 // own: `modeCommand` is which of the three is checked, and they are enabled only
 // when the engine is installed and there is a track it could translate.
+// Below those, `speechLabel` is the start/stop command for a film with no track
+// of its own, and `backendLabel` chooses which build of that engine transcribes:
+// checked when the graphics card is the one in force, and greyed when only one
+// build is installed and there is therefore nothing to choose between.
 void UpdateSubtitles(HMENU menuBar, const std::wstring& offLabel, std::span<const std::wstring> trackLabels,
                      const std::wstring& fileLabel, UINT chosen, bool loaded, UINT modeCommand,
-                     bool translationEnabled, bool speechEnabled, const std::wstring& speechLabel);
+                     bool translationEnabled, bool speechEnabled, const std::wstring& speechLabel,
+                     const std::wstring& backendLabel, bool backendOnGpu, bool backendEnabled);
 HMENU CreateDebugViewMenu(UINT selectedCommand);
 bool RoutesToRehook(PlayerCommandRoute route, UINT value);
 // Shows, relabels or removes the right-justified update item in the menu bar.

@@ -460,6 +460,41 @@ inline Heard ParseHeard(std::string_view json)
 
 // ---- The engine's command lines ----------------------------------------------
 
+// ---- Which build of the engine to run ---------------------------------------
+
+// The engine ships in two builds, side by side under the speech root:
+// `runtime` computes on the cores and `runtime-gpu` carries the Vulkan backend
+// beside the same tools. Recognition is the single most expensive thing the
+// player asks a machine to do - measured at 4.98 core-seconds per second of film
+// on the cores against 0.04 with the model on the graphics card - so which build
+// it is matters more than any other number here.
+inline constexpr const wchar_t* kCpuRuntimeDirectory = L"runtime";
+inline constexpr const wchar_t* kGpuRuntimeDirectory = L"runtime-gpu";
+inline constexpr const wchar_t* kServerFileName = L"whisper-server.exe";
+
+// What `[Speech] Gpu=` means. The graphics card is the answer worth having, so a
+// setting nobody has written yet asks for it; anything but a zero keeps asking.
+inline bool SpeechPrefersGpu(int iniFlag)
+{
+    return iniFlag != 0;
+}
+
+// A preference is not an installation. The GPU build is the optional one: it is
+// what a machine has after its owner copies the Vulkan backend beside the
+// tools, or nothing at all. Wanting it without having it falls back to the cores
+// rather than to silence, which is what the preference is really about - nobody
+// asked for the transcript not to happen.
+inline bool SpeechUsesGpu(bool prefersGpu, bool gpuInstalled)
+{
+    return prefersGpu && gpuInstalled;
+}
+
+// The leaf under the speech root holding the engine to run.
+inline const wchar_t* SpeechRuntimeSubdirectory(bool usesGpu)
+{
+    return usesGpu ? kGpuRuntimeDirectory : kCpuRuntimeDirectory;
+}
+
 // whisper-server keeps the model loaded, which is the whole reason for using it
 // over the one-shot CLI: a film is a hundred windows, and loading a 1.5 GB model
 // for each of them would cost more than the recognition.

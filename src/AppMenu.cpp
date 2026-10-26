@@ -115,6 +115,9 @@ HMENU CreateMenuBar(const Localizer& localizer, bool youtubeAvailable)
     // and it is the only entry here that is a verb.
     AppendMenuW(subtitles, MF_SEPARATOR, 0, nullptr);
     addGrayed(IDM_SUBTITLE_SPEECH, L"menu.subtitles_speech");
+    // Which hardware writes the speech track above. Greyed until there is a
+    // choice to make; UpdateSubtitles says what it is doing now.
+    addGrayed(IDM_SUBTITLE_SPEECH_BACKEND, L"menu.subtitles_speech_cpu");
     CheckMenuRadioItem(subtitles, 0, 0, 0, MF_BYPOSITION);
     AppendMenuW(play, MF_POPUP, reinterpret_cast<UINT_PTR>(subtitles),
                 localizer.Get(L"menu.subtitles").c_str());
@@ -505,7 +508,8 @@ void UpdateAudioTracks(HMENU menuBar, std::span<const std::wstring> labels, int 
 
 void UpdateSubtitles(HMENU menuBar, const std::wstring& offLabel, std::span<const std::wstring> trackLabels,
                      const std::wstring& fileLabel, UINT chosen, bool loaded, UINT modeCommand,
-                     bool translationEnabled, bool speechEnabled, const std::wstring& speechLabel)
+                     bool translationEnabled, bool speechEnabled, const std::wstring& speechLabel,
+                     const std::wstring& backendLabel, bool backendOnGpu, bool backendEnabled)
 {
     HMENU menu=find_menu_containing_command(menuBar,IDM_SUBTITLE_OFF);
     if(!menu)return;
@@ -553,6 +557,13 @@ void UpdateSubtitles(HMENU menuBar, const std::wstring& offLabel, std::span<cons
     if(const HMENU owner=find_menu_containing_command(menuBar,IDM_SUBTITLE_SPEECH))
         ModifyMenuW(owner,IDM_SUBTITLE_SPEECH,MF_BYCOMMAND|MF_STRING|speechEnabledFlags,
                     IDM_SUBTITLE_SPEECH,speechLabel.c_str());
+    // Choosing hardware needs two builds installed, which is not something every
+    // machine has: one running on its cores cannot be talked into more.
+    const UINT backendFlags=(loaded&&backendEnabled)?MF_ENABLED:MF_GRAYED;
+    if(const HMENU owner=find_menu_containing_command(menuBar,IDM_SUBTITLE_SPEECH_BACKEND))
+        ModifyMenuW(owner,IDM_SUBTITLE_SPEECH_BACKEND,
+                    MF_BYCOMMAND|MF_STRING|backendFlags|(backendOnGpu?MF_CHECKED:MF_UNCHECKED),
+                    IDM_SUBTITLE_SPEECH_BACKEND,backendLabel.c_str());
 }
 
 bool RoutesToRehook(PlayerCommandRoute route, UINT value)

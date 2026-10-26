@@ -14393,7 +14393,8 @@ void subtitle_menu_lists_off_the_streams_and_the_file_test()
 
     const std::wstring labels[] = {L"1. English - SRT", L"2. French - Styled & Co - ASS"};
     app_menu::UpdateSubtitles(menu, L"Off", labels, L"File: Film.srt", app_menu::IDM_SUBTITLE_TRACK_FIRST + 1,
-                              true, app_menu::IDM_SUBTITLE_MODE_ORIGINAL, true, false, L"Subtitles from speech");
+                              true, app_menu::IDM_SUBTITLE_MODE_ORIGINAL, true, false, L"Subtitles from speech",
+                              L"Transcribe on the processor", false, false);
     entries.clear();
     collect_menu_entries(menu, entries);
     CHECK(has_menu_entry(entries, L"Off", app_menu::IDM_SUBTITLE_OFF));
@@ -14408,7 +14409,7 @@ void subtitle_menu_lists_off_the_streams_and_the_file_test()
     // Rebuilt for a source with no streams: the old rows go, the commands stay.
     app_menu::UpdateSubtitles(menu, L"Off", {}, L"", app_menu::IDM_SUBTITLE_OFF, true,
                               app_menu::IDM_SUBTITLE_MODE_ORIGINAL, false, false,
-                              L"Subtitles from speech");
+                              L"Subtitles from speech", L"Transcribe on the processor", false, false);
     entries.clear();
     collect_menu_entries(menu, entries);
     CHECK(!has_menu_entry(entries, labels[0], app_menu::IDM_SUBTITLE_TRACK_FIRST));
@@ -14427,14 +14428,21 @@ void subtitle_menu_lists_off_the_streams_and_the_file_test()
     // no speech engine on this machine it is grey.
     CHECK(has_menu_entry(entries, L"Subtitles from speech", app_menu::IDM_SUBTITLE_SPEECH));
     CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_SPEECH, MF_BYCOMMAND) & MF_GRAYED);
+    // Below it, which hardware writes that transcript. A machine with one build
+    // installed has nothing to choose between, so it is grey here; the label says
+    // what is in force either way.
+    CHECK(has_menu_entry(entries, L"Transcribe on the processor", app_menu::IDM_SUBTITLE_SPEECH_BACKEND));
+    CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_SPEECH_BACKEND, MF_BYCOMMAND) & MF_GRAYED);
+    CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_SPEECH_BACKEND, MF_BYCOMMAND) & MF_CHECKED);
     const HMENU popup = app_menu::FindMenuContainingCommand(menu, app_menu::IDM_SUBTITLE_OFF);
     CHECK(popup != nullptr);
-    if (popup) CHECK_EQ(14, GetMenuItemCount(popup));
+    if (popup) CHECK_EQ(15, GetMenuItemCount(popup));
 
     // With the engine installed the three modes become selectable, and only one
     // of them is checked: the choice is exclusive.
     app_menu::UpdateSubtitles(menu, L"Off", labels, L"File: Film.srt", app_menu::IDM_SUBTITLE_TRACK_FIRST,
-                              true, app_menu::IDM_SUBTITLE_MODE_DUAL, true, false, L"Subtitles from speech");
+                              true, app_menu::IDM_SUBTITLE_MODE_DUAL, true, false, L"Subtitles from speech",
+                              L"Transcribe on the processor", false, false);
     CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_DUAL, MF_BYCOMMAND) & MF_GRAYED);
     CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_DUAL, MF_BYCOMMAND) & MF_CHECKED);
     CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_MODE_ORIGINAL, MF_BYCOMMAND) & MF_CHECKED);
@@ -14445,16 +14453,34 @@ void subtitle_menu_lists_off_the_streams_and_the_file_test()
     // With an engine installed and nothing chosen, the verb is live and says what
     // it will do; running, the same row is its own off switch.
     app_menu::UpdateSubtitles(menu, L"Off", {}, L"", app_menu::IDM_SUBTITLE_OFF, true,
-                              app_menu::IDM_SUBTITLE_MODE_ORIGINAL, false, true, L"Subtitles from speech");
+                              app_menu::IDM_SUBTITLE_MODE_ORIGINAL, false, true, L"Subtitles from speech",
+                              L"Transcribe on the processor", false, false);
     CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_SPEECH, MF_BYCOMMAND) & MF_GRAYED);
     entries.clear();
     collect_menu_entries(menu, entries);
     CHECK(has_menu_entry(entries, L"Subtitles from speech", app_menu::IDM_SUBTITLE_SPEECH));
     app_menu::UpdateSubtitles(menu, L"Off", {}, L"", app_menu::IDM_SUBTITLE_OFF, true,
-                              app_menu::IDM_SUBTITLE_MODE_ORIGINAL, false, true, L"Stop listening");
+                              app_menu::IDM_SUBTITLE_MODE_ORIGINAL, false, true, L"Stop listening",
+                              L"Transcribe on the processor", false, false);
     entries.clear();
     collect_menu_entries(menu, entries);
     CHECK(has_menu_entry(entries, L"Stop listening", app_menu::IDM_SUBTITLE_SPEECH));
+
+    // Two builds installed: the entry is live, says which one is running now, and
+    // carries a check while the graphics card is the one in force. Pressing it is
+    // the only way either changes, so the check is the answer to "which is it".
+    app_menu::UpdateSubtitles(menu, L"Off", {}, L"", app_menu::IDM_SUBTITLE_OFF, true,
+                              app_menu::IDM_SUBTITLE_MODE_ORIGINAL, false, true, L"Stop listening",
+                              L"Transcribe on the graphics card", true, true);
+    CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_SPEECH_BACKEND, MF_BYCOMMAND) & MF_GRAYED);
+    CHECK(GetMenuState(menu, app_menu::IDM_SUBTITLE_SPEECH_BACKEND, MF_BYCOMMAND) & MF_CHECKED);
+    entries.clear();
+    collect_menu_entries(menu, entries);
+    CHECK(has_menu_entry(entries, L"Transcribe on the graphics card", app_menu::IDM_SUBTITLE_SPEECH_BACKEND));
+    app_menu::UpdateSubtitles(menu, L"Off", {}, L"", app_menu::IDM_SUBTITLE_OFF, true,
+                              app_menu::IDM_SUBTITLE_MODE_ORIGINAL, false, true, L"Stop listening",
+                              L"Transcribe on the processor", false, true);
+    CHECK_EQ(UINT{0}, GetMenuState(menu, app_menu::IDM_SUBTITLE_SPEECH_BACKEND, MF_BYCOMMAND) & MF_CHECKED);
     DestroyMenu(menu);
 }
 
@@ -16630,6 +16656,33 @@ void speech_request_body_carries_the_audio_as_bytes_test()
     CHECK(body.ends_with("\r\n--BOUND--\r\n"));
 }
 
+// Which build of the engine the transcript is written by. A preference is not an
+// installation: the GPU build is the optional one, and wanting it without having
+// it has to fall back to the cores rather than to nothing at all.
+void speech_build_choice_falls_back_to_the_cores_when_the_gpu_one_is_missing_test()
+{
+    namespace sp = subtitle_speech;
+    CHECK(sp::SpeechPrefersGpu(1));
+    CHECK(!sp::SpeechPrefersGpu(0));
+    // Nothing written yet asks for the graphics card: it is the answer worth
+    // having, and a machine without it loses nothing by asking.
+    CHECK(sp::SpeechPrefersGpu(7));
+
+    CHECK(sp::SpeechUsesGpu(true, true));
+    CHECK(!sp::SpeechUsesGpu(true, false));   // asked for, not installed
+    CHECK(!sp::SpeechUsesGpu(false, true));   // installed, not asked for
+    CHECK(!sp::SpeechUsesGpu(false, false));
+
+    CHECK(std::wstring(sp::kCpuRuntimeDirectory) == L"runtime");
+    CHECK(std::wstring(sp::kGpuRuntimeDirectory) == L"runtime-gpu");
+    CHECK(std::wstring(sp::kServerFileName) == L"whisper-server.exe");
+    // The build is chosen by the directory the engine is loaded from, so the two
+    // never overlap and a symlinked name cannot be mistaken for either.
+    CHECK(std::wstring(sp::SpeechRuntimeSubdirectory(true)) == sp::kGpuRuntimeDirectory);
+    CHECK(std::wstring(sp::SpeechRuntimeSubdirectory(false)) == sp::kCpuRuntimeDirectory);
+    CHECK(std::wstring(sp::SpeechRuntimeSubdirectory(sp::SpeechUsesGpu(true, false))) == sp::kCpuRuntimeDirectory);
+}
+
 constexpr test_support::TestCase kCases[] = {
     TEST_CASE(harness_isolates_a_failing_case_from_the_ones_after_it_test),
     TEST_CASE(runtime_shutdown_releases_player_before_media_foundation_and_com_test),
@@ -17005,6 +17058,7 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(speech_windows_are_merged_onto_the_film_clock_test),
     TEST_CASE(speech_long_cues_are_split_at_sentence_marks_test),
     TEST_CASE(speech_request_body_carries_the_audio_as_bytes_test),
+    TEST_CASE(speech_build_choice_falls_back_to_the_cores_when_the_gpu_one_is_missing_test),
     TEST_CASE(subtitle_translate_wrap_budget_matches_the_measurement_test),
     TEST_CASE(subtitle_translate_cache_key_tracks_what_the_translation_depends_on_test),
     TEST_CASE(subtitle_choice_round_trips_through_the_settings_file_test),

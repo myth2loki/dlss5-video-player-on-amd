@@ -974,6 +974,22 @@ listen to. `Lead=` (180) is how far ahead of the picture the transcript may run
 before the engine waits; the rest of a two-hour film is not going anywhere, and
 writing it an hour early would cost the picture its cores for an hour.
 
+**Which hardware writes the transcript** is below it in the menu: *Transcribe on
+the graphics card* or *on the processor*, ticked to show which is in force, and
+greyed on a machine that only has one build installed. Recognition is the
+heaviest thing the player ever starts, and the two are not close - one minute of
+film measured at 31 s of wall clock and 4.98 core-seconds **per second** on the
+cores against 2.0 s and 0.04 on a 9070 XT, both from the same build of the same
+model with the same transcript out at the end. Nothing in the engine's command
+line picks between them: whisper chooses by the DLLs it finds beside itself, so
+the graphics card build is a second directory, `asr\runtime-gpu`, holding the
+same tools with `ggml-vulkan.dll` beside them - copy `asr\runtime` and drop that
+one file in (any whisper.cpp Vulkan build's is the same file, and the subtitle
+translation engine ships one in `translation\runtime\`). `[Speech] Gpu=` (1) is
+the same choice in the ini, and asking for a build that is not installed falls
+back to the one that is rather than to no subtitles at all. `Threads=` only bites
+on the processor build; on the graphics card the threads mostly wait.
+
 Listening begins **where the viewer is**, not at the beginning. A film picked up
 twelve minutes in has twelve minutes of audio nobody needs written down, and at
 a little over twice real time the transcript would take minutes to reach the
