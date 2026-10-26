@@ -23,6 +23,14 @@ config keeps `DLSS5_MULTI_PASS=2`, because the package's own default is now the
 fast-history mode read. See
 [the runtime package](third_party/lmxxf/README.md).
 
+Subtitles are this fork's other addition. A film that carries no subtitle track
+is transcribed from its own audio by whisper.cpp, translated locally by
+llama.cpp, and both lines are drawn over the render — the model never touches
+the text. The recogniser runs on the graphics card when its second build is
+installed: 60 s of audio costs 298 s of CPU time on 12 cores against 2.63 s on
+an RX 9070 XT, for the same transcript.
+[How the chain works](#subtitles-listen-to-the-film-then-translate-it).
+
 ![The player on an AMD card, whole window: Bumblebee in Split, neural rendering and FSR 4 upscaling on, interpolation on at 48 of 24 fps, a subtitle under the picture, and the render filling in behind the playhead](docs/media/amd/overview.png)
 
 The whole window, on an AMD card: *Bumblebee* at 1280x720 in **Split**, source
