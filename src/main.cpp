@@ -9308,12 +9308,116 @@ private:
         return self?self->ConvertVideoRunWndProc(h,m,w,l):DefWindowProcW(h,m,w,l);
     }
 
-    // The picture stages, then the mux, on the same RunStageExport the export
-    // dialog drives - so the three boxes here and the three boxes there write
-    // the same file, and a fix to one reaches both. What is still missing is
-    // the sound: the transcript, the translation and the dub. Those boxes are
-    // refused rather than ignored, because a conversion that quietly skipped
-    // two of them would be a wrong file that looks finished.
+    // The text stage, then the picture stages, then the mux, on the same
+    // RunStageExport the export dialog drives - so the three picture boxes here
+    // and the three boxes there write the same file, and a fix to one reaches
+    // both. The transcript and the translation run before them and hand the mux
+    // a subtitle file; a soft track is written from it.
+    //
+    // What is still missing is the dub that would follow the translation, and
+    // burning the text into the picture. Those are refused rather than ignored,
+    // because a conversion that quietly skipped them would be a wrong file
+    // that looks finished.
+    // ---- The text stage of a conversion -------------------------------------
+    // What the worker needs in order to write the subtitle file the container
+    // will carry. Built on the UI thread, where the settings and the media's own
+    // track list live; the worker only reads it.
+    //
+    // Nothing is generated when the source's own track is the one being carried:
+    // the mux already copies the source's subtitle streams, so "subtitles, not
+    // translated" is the export that has always happened and needs no engine at
+    // all. Only a translated track is work.
+    struct ConvertTextPlan{
+        bool needed{};       // a translated track was asked for
+        bool transcribe{};   // the source carries no text: listen to the speech first
+        int stream{};        // the source's own text track, when there is one
+        std::wstring mediaPath;
+        std::wstring identity;
+        subtitle_speech::Engine speech;
+        subtitle_translate::Engine translation;
+        std::filesystem::path helpers;
+        std::filesystem::path cacheDirectory;
+        subtitle_speech::Job speechJob;
+        subtitle_translate::Languages languages;
+        uint32_t width{1920},height{1080};
+        // The transcript, then the translation. A source that already has words
+        // skips the first.
+        uint32_t Phases()const{return transcribe?2u:1u;}
+    };
+    struct ConvertTextResult{
+        bool ok{};
+        bool cancelled{};
+        std::filesystem::path file;
+        std::wstring detail;
+    };
+
+    // Runs the stage on the export worker's thread and blocks until it is done or
+    // cancelled. Being on that thread is the point: this is minutes of work, and
+    // `stop` is the dialog's Cancel.
+    //
+    // Both engines are local to the run. The player has its own pair for the
+    // subtitles on screen, and a conversion that drove those would publish its
+    // transcript over what the viewer is watching and cancel on the next seek.
+    static ConvertTextResult RunConvertVideoText(const ConvertTextPlan& plan,std::stop_token stop,
+        const std::function<void(const wchar_t*,uint64_t,uint64_t)>& report)
+    {
+        ConvertTextResult result;
+        std::filesystem::path cues;
+        if(plan.transcribe){
+            subtitle_speech::SpeechToText speech(plan.helpers,plan.speech,plan.cacheDirectory);
+            // Batch, not live: SetPlayhead is never called, so the playhead stays
+            // negative, WaitForLead returns at once and every window of the film
+            // is heard rather than only what is ahead of a viewer who is not
+            // watching - there is no playback to stay ahead of here.
+            speech.Start(plan.speechJob);
+            for(;;){
+                if(stop.stop_requested()){speech.Cancel();result.cancelled=true;return result;}
+                const auto status=speech.Poll();
+                if(report)report(L"convert.progress.transcript",uint64_t(status.chunksDone),
+                                 uint64_t(status.chunksTotal?status.chunksTotal:1));
+                if(!status.Running()){
+                    if(status.state!=subtitle_speech::State::Done||status.finalTrack.empty()){
+                        result.detail=status.notice.empty()
+                            ?L"The speech could not be transcribed.":status.notice;
+                        return result;
+                    }
+                    cues=status.finalTrack;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            }
+        }
+        subtitle_translate::Translator translator(plan.helpers,plan.translation,plan.cacheDirectory);
+        subtitle_translate::Job job;
+        if(plan.transcribe){
+            // What listening produced. The translator reads a file, not a stream,
+            // and an SRT has one stream of its own, so the two spellings meet here.
+            job.path=cues.wstring();job.stream=0;job.external=true;
+        }else{
+            job.path=plan.mediaPath;job.stream=plan.stream;job.external=false;
+        }
+        job.identity=plan.identity;
+        job.languages=plan.languages;
+        job.width=plan.width;job.height=plan.height;
+        translator.Start(job);
+        for(;;){
+            if(stop.stop_requested()){translator.Cancel();result.cancelled=true;return result;}
+            const auto status=translator.Poll();
+            if(report)report(L"convert.progress.translate",uint64_t(status.done),
+                             uint64_t(status.total?status.total:1));
+            if(!status.Running()){
+                if(status.state==subtitle_translate::State::Done&&!status.result.empty()){
+                    result.file=status.result;result.ok=true;
+                }else{
+                    result.detail=status.notice.empty()
+                        ?L"The subtitles could not be translated.":status.notice;
+                }
+                return result;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+
     void StartConvertVideo(){
         LoadConvertVideoSelection();
         const std::wstring title=T(L"convert.title");
@@ -9321,11 +9425,26 @@ private:
         if(!ConvertVideoUsable()){MessageBoxW(m_hwnd,T(L"convert.refusal.nothing").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         if(!ConvertVideoRangeValid()){MessageBoxW(m_hwnd,T(L"convert.refusal.range").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         if(m_convert.translate&&!ConvertVoiceTranslatable()){MessageBoxW(m_hwnd,T(L"convert.refusal.engine").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
-        if(m_convert.subtitles!=0||m_convert.translate){MessageBoxW(m_hwnd,T(L"convert.refusal.voice").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        // A generated track is transcribed and translated from the source's own
+        // timeline, and the mux carries it as it stands - a range is cut out of
+        // the stream source, not out of this. Translating a range would
+        // therefore carry cues from either side of it, so the combination is
+        // refused rather than written wrong.
+        if(m_convert.translate&&m_convert.ranged){MessageBoxW(m_hwnd,T(L"convert.refusal.range_text").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        // A soft track is written. Burning re-encodes the picture - it is the one
+        // choice in this row whose cost is a second encode of the whole film, and
+        // it is refused rather than done badly until the encoder the picture
+        // stages do not run is wired in behind it.
+        if(m_convert.subtitles==2){MessageBoxW(m_hwnd,T(L"convert.refusal.burn").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         const std::filesystem::path source=ExportSourceFile();
         if(source.empty()){MessageBoxW(m_hwnd,T(L"convert.no_source").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         const ExportPlan plan=CurrentConvertVideoPlan();
-        if(!plan.valid){MessageBoxW(m_hwnd,T(ExportRefusalKey(plan.refusal)).c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        // The plan is about the picture, so it is only refused when there is a
+        // picture stage to refuse. With none chosen the plan reads "nothing
+        // selected" by construction, and that is the right answer for a
+        // conversion of the subtitles alone: the picture is copied as it stands
+        // rather than objected to, which is what the summary line promises.
+        if(ConvertVideoHasPictureStage()&&!plan.valid){MessageBoxW(m_hwnd,T(ExportRefusalKey(plan.refusal)).c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         // The intermediate passes land beside the other derived carriers, the
         // same directory the export dialog uses, and are swept whatever way
         // this ends - they are minutes of GPU work and never the deliverable.
@@ -9362,26 +9481,119 @@ private:
             <<" passes="<<ExportStageCount(plan)
             <<" size="<<plan.outputWidth<<"x"<<plan.outputHeight<<" fps="<<plan.outputFps
             <<" ranged="<<m_convert.ranged<<" source="<<WideToUtf8(source.wstring()));
+        // ---- The text stage -------------------------------------------------
+        // Decided here, on the thread that owns the settings and the media's own
+        // track list; the worker only reads what this fills in. Only a translated
+        // track is work: carrying the source's own subtitles is what the mux
+        // already does, so that case has no engine to run and no phase to show.
+        ConvertTextPlan text;
+        if(m_convert.subtitles==1&&m_convert.translate){
+            text.needed=true;
+            text.mediaPath=source.wstring();
+            text.helpers=ExecutableDirectory();
+            text.cacheDirectory=TranslationCacheDirectory();
+            text.speech=SpeechEngine();
+            text.translation=TranslationEngine();
+            // A source that carries text is translated from its own words; one
+            // that does not is listened to first. Which of the two it is has
+            // already been answered by ConvertVoiceTranslatable, and asking
+            // again here would be a second place for the answer to be given.
+            const subtitle::Track* own=nullptr;
+            for(const auto& track:m_subtitleTracks)
+                if(track.Drawn()==subtitle::Kind::Text){own=&track;break;}
+            if(own){
+                text.stream=own->subtitleIndex;
+                text.identity=L"convert|"+source.wstring()+L"|"+std::to_wstring(text.stream);
+            }else{
+                text.transcribe=true;
+                text.speechJob.path=source.wstring();
+                text.speechJob.audioStream=int(GetPrivateProfileIntW(L"Speech",L"AudioStream",0,SettingsPath().c_str()));
+                text.speechJob.duration=m_decoder.DurationSeconds();
+                text.speechJob.language=WideToUtf8(IniString(L"Speech",L"Language"));
+                // The whole film from the beginning: a conversion has no viewer
+                // to stay ahead of, so nothing is left for later.
+                text.speechJob.plan.startSeconds=0.0;
+                text.speechJob.plan.leadSeconds=double(GetPrivateProfileIntW(L"Speech",L"Lead",180,SettingsPath().c_str()));
+                text.identity=L"convert|"+source.wstring()+L"|speech";
+            }
+            text.languages=subtitle_translate::LanguagesFor(
+                own?own->language:WideToUtf8(IniString(L"Speech",L"Language")),
+                WideToUtf8(m_convert.language));
+            text.width=m_renderer?m_renderer->BackbufferW():uint32_t(m_decoder.Width());
+            text.height=m_renderer?m_renderer->BackbufferH():uint32_t(m_decoder.Height());
+            if(!text.width||!text.height){text.width=1920;text.height=1080;}
+            LOG("Convert video text stage: "<<(text.transcribe
+                    ?"transcribe then translate":"translate the source's own track")
+                <<" to "<<text.languages.targetName<<" ("<<text.languages.targetCode<<")");
+        }
+        const uint32_t textPhases=text.needed?text.Phases():0u;
+        const uint32_t totalPasses=textPhases+ExportStageCount(plan);
+        // One bar for the whole conversion, so the text stage and the picture
+        // passes divide it: a quarter is the transcript and the translation, the
+        // rest is the picture, whose own weighted count RunStageExport still
+        // keeps. The quarter is an estimate rather than a measurement - the text
+        // stage has no frames to price - and it is the only number in this bar
+        // the worker owns instead of reading.
+        constexpr uint64_t kBarTotal=1000;
+        constexpr double kTextBarShare=0.25;
+        const double textShare=text.needed?kTextBarShare:0.0;
         HWND target=m_hwnd;auto* completions=&m_exportCompletions;
         try{
-            m_exportWorker=std::jthread([=](std::stop_token stop){
+            m_exportWorker=std::jthread([=](std::stop_token stop)mutable{
                 auto completion=std::make_unique<ExportCompletion>();
                 completion->output=job.destination;
+                const auto send=[&](StageExportProgress update){
+                    auto* posted=new StageExportProgress(update);
+                    if(!PostMessageW(target,WM_STAGE_EXPORT_PROGRESS,0,reinterpret_cast<LPARAM>(posted)))delete posted;
+                };
+                const auto finish=[&](const MaterializeResult& result){
+                    completion->result=result;
+                    completions->RegisterAndPost(std::move(completion),[&](uint64_t token){return PostMessageW(target,WM_EXPORT_COMPLETE,static_cast<WPARAM>(token),0)!=FALSE;});
+                };
+                if(text.needed){
+                    const ConvertTextResult produced=RunConvertVideoText(text,stop,
+                        [&](const wchar_t* key,uint64_t done,uint64_t total){
+                            // Which of the stage's two phases is reporting: the
+                            // transcript is the first when there is one.
+                            const uint32_t at=(text.transcribe&&key&&
+                                std::wcscmp(key,L"convert.progress.transcript")==0)?0u:(text.transcribe?1u:0u);
+                            const double fraction=total?double(std::min(done,total))/double(total):0.0;
+                            const uint64_t overall=uint64_t(double(kBarTotal)*textShare*
+                                (double(at)+fraction)/double(textPhases));
+                            send({true,at+1,totalPasses,key,done,total,overall,kBarTotal,{},false});
+                        });
+                    if(produced.cancelled||stop.stop_requested()){
+                        finish({false,MaterializeError::Cancelled,produced.detail});return;
+                    }
+                    if(!produced.ok){
+                        finish({false,MaterializeError::ProcessFailed,produced.detail});return;
+                    }
+                    // What the mux carries, tagged with the language in the B
+                    // set: the mov muxer drops a T-code tag silently, and a
+                    // track with no language is one a player will not offer.
+                    job.subtitleFile=produced.file;
+                    job.subtitleLanguage=Utf8ToWide(subtitle_translate::MuxLanguageCode(
+                        text.languages.targetCode));
+                }
                 const StageExportOutcome outcome=RunStageExport(job,stop,[&](const StageExportUpdate& u){
                     // No pass key is the last step, not the end of the job: the
                     // file is being written from the passes' carrier, which is a
                     // phase worth a panel and worth a bar that stays full.
+                    const uint64_t scaled=u.overallTotal
+                        ?uint64_t(double(kBarTotal)*textShare)
+                         +uint64_t(double(kBarTotal)*(1.0-textShare)
+                            *double(std::min(u.overallCompleted,u.overallTotal))/double(u.overallTotal))
+                        :kBarTotal;
                     auto* update=u.passKey
-                        ?new StageExportProgress{true,u.pass,u.passes,u.passKey,u.completedFrames,u.totalFrames,
-                                                 u.overallCompleted,u.overallTotal,{},false}
-                        :new StageExportProgress{true,0,0,nullptr,0,0,u.overallCompleted,u.overallTotal,{},true};
+                        ?new StageExportProgress{true,u.pass+textPhases,totalPasses,u.passKey,u.completedFrames,u.totalFrames,
+                                                 scaled,kBarTotal,{},false}
+                        :new StageExportProgress{true,0,0,nullptr,0,0,kBarTotal,kBarTotal,{},true};
                     if(!PostMessageW(target,WM_STAGE_EXPORT_PROGRESS,0,reinterpret_cast<LPARAM>(update)))delete update;
                 });
                 const bool done=outcome.status==StageExportStatus::Done;
-                completion->result={done,done?MaterializeError::None
-                                        :outcome.status==StageExportStatus::Cancelled?MaterializeError::Cancelled
-                                        :MaterializeError::ProcessFailed,outcome.detail};
-                completions->RegisterAndPost(std::move(completion),[&](uint64_t token){return PostMessageW(target,WM_EXPORT_COMPLETE,static_cast<WPARAM>(token),0)!=FALSE;});
+                finish({done,done?MaterializeError::None
+                                :outcome.status==StageExportStatus::Cancelled?MaterializeError::Cancelled
+                                :MaterializeError::ProcessFailed,outcome.detail});
             });
         }catch(const std::system_error&){
             if(resumeAfterFolder)SetPaused(false);

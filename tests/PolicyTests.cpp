@@ -49,6 +49,7 @@
 #include "FrameGenBackend.h"
 #include "RenderCommandLine.h"
 #include "StageExport.h"
+#include "MediaPipeline.h"
 #include "FrameResample.h"
 #include "UntaggedColorPolicy.h"
 #include "DisplayOrientationPolicy.h"
@@ -16775,7 +16776,70 @@ void speech_build_choice_falls_back_to_the_cores_when_the_gpu_one_is_missing_tes
     CHECK(std::wstring(sp::SpeechRuntimeSubdirectory(sp::SpeechUsesGpu(true, false))) == sp::kCpuRuntimeDirectory);
 }
 
+// A generated subtitle track is an addition to what the mux already carries, and
+// naming no file is the export that has always been written. Both halves are one
+// builder, so the export dialog and the Convert video dialog cannot drift apart:
+// the dialog that has no track cannot reach the branch that adds one.
+void stage_export_mux_generated_subtitle_is_an_addition_test()
+{
+    const auto adjacent = [](const std::vector<std::wstring>& arguments, const std::wstring& first,
+                             const std::wstring& second) {
+        for (size_t at = 0; at + 1 < arguments.size(); ++at)
+            if (arguments[at] == first && arguments[at + 1] == second) return true;
+        return false;
+    };
+    const auto inputs = [](const std::vector<std::wstring>& arguments) {
+        return int(std::count(arguments.begin(), arguments.end(), std::wstring(L"-i")));
+    };
+    // One audio stream and nothing else, so the generated track is output 2 and
+    // the specifiers it is written under are known rather than counted.
+    const std::vector<MediaStreamInfo> source{{1, "audio", "aac"}};
+    StageExportMuxRequest request;
+    request.video = L"C:/scratch/stage1.mkv";
+    request.streamSource = L"C:/media/film.mkv";
+    request.output = L"C:/out/film.mkv";
+
+    const auto plain = BuildStageExportMuxArguments(request, L"C:/scratch/out.mkv", "h264", source);
+    CHECK(!plain.empty());
+    // Two inputs: the carrier and the source. Nothing is added.
+    CHECK_EQ(2, inputs(plain));
+    // `-map` and its stream are two arguments, as they are for the source's own.
+    CHECK(!adjacent(plain, L"-map", L"2:s:0"));
+    CHECK(adjacent(plain, L"-c:1", L"copy"));
+
+    request.subtitleFile = L"C:/scratch/generated.ass";
+    request.subtitleLanguage = L"chi";
+    const auto carried = BuildStageExportMuxArguments(request, L"C:/scratch/out.mkv", "h264", source);
+    CHECK(!carried.empty());
+    CHECK_EQ(3, inputs(carried));
+    CHECK(adjacent(carried, L"-i", L"C:/scratch/generated.ass"));
+    CHECK(adjacent(carried, L"-map", L"2:s:0"));
+    // Matroska carries the ASS as it stands - the styling the dialog promises it
+    // keeps - and the source's own stream is untouched beside it.
+    CHECK(adjacent(carried, L"-c:2", L"ass"));
+    CHECK(adjacent(carried, L"-c:1", L"copy"));
+    CHECK(adjacent(carried, L"-metadata:s:2", L"language=chi"));
+
+    // MP4 keeps only the words, and the container is read off the output's name.
+    StageExportMuxRequest mp4 = request;
+    mp4.output = L"C:/out/film.mp4";
+    const auto words = BuildStageExportMuxArguments(mp4, L"C:/scratch/out.mp4", "h264", source);
+    CHECK(!words.empty());
+    CHECK(adjacent(words, L"-c:2", L"mov_text"));
+    CHECK(adjacent(words, L"-map", L"2:s:0"));
+
+    // Untagged is better than mis-tagged: no language leaves the metadata off
+    // rather than writing a tag the container would drop.
+    StageExportMuxRequest untagged = request;
+    untagged.subtitleLanguage.clear();
+    const auto bare = BuildStageExportMuxArguments(untagged, L"C:/scratch/out.mkv", "h264", source);
+    CHECK(bare.end() == std::find_if(bare.begin(), bare.end(), [](const std::wstring& argument) {
+        return argument.rfind(L"language=", 0) == 0;
+    }));
+}
+
 constexpr test_support::TestCase kCases[] = {
+    TEST_CASE(stage_export_mux_generated_subtitle_is_an_addition_test),
     TEST_CASE(harness_isolates_a_failing_case_from_the_ones_after_it_test),
     TEST_CASE(runtime_shutdown_releases_player_before_media_foundation_and_com_test),
     TEST_CASE(runtime_shutdown_rethrows_only_after_single_ordered_cleanup_test),

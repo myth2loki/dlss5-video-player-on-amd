@@ -60,7 +60,11 @@ bool ValidRangeSeconds(double value) { return std::isfinite(value) && value >= 0
 // every MKV of an MP4's timed text and every MP4 of a disc's picture
 // subtitles. `encodeAudio` encodes every kept audio stream to AAC where the
 // policy would copy it, which is what "Save converted video" gives MP4.
-void AppendSourceStreams(ExportContainer container, const std::vector<MediaStreamInfo>& sourceStreams,
+// Returns the next free output-stream index. The `-c:N` specifiers ffmpeg reads
+// are positional over the mapped streams, so a caller that adds one of its own
+// has to continue where these left off rather than assume a count - and a
+// caller that maps nothing carries the source's streams alone.
+uint32_t AppendSourceStreams(ExportContainer container, const std::vector<MediaStreamInfo>& sourceStreams,
                          bool encodeAudio, std::vector<std::wstring>& arguments, std::vector<std::wstring>& codecs)
 {
     uint32_t outputIndex = 1;
@@ -79,6 +83,7 @@ void AppendSourceStreams(ExportContainer container, const std::vector<MediaStrea
         default: codecs.insert(codecs.end(), {L"-c:" + specifier, L"copy"}); break;
         }
     }
+    return outputIndex;
 }
 
 // What an export says about the subtitles AppendSourceStreams left out, or
@@ -1924,11 +1929,34 @@ std::vector<std::wstring> BuildStageExportMuxArguments(const StageExportMuxReque
     if (request.streamSourceStartSeconds > 0.0)
         arguments.insert(arguments.end(), {L"-itsoffset", FrameRateText(request.streamSourceStartSeconds)});
     arguments.insert(arguments.end(), {L"-i", request.streamSource.wstring(), L"-map", L"0:v:0"});
+    // A generated track, as its own input behind the source: input 2, so every
+    // map above is untouched and the export dialog, which names no file, cannot
+    // reach this branch at all.
+    if (!request.subtitleFile.empty())
+        arguments.insert(arguments.end(), {L"-i", request.subtitleFile.wstring()});
     std::vector<std::wstring> codecs{L"-c:v", L"copy"};
     if (const std::wstring tag = ExportVideoTag(*container, videoCodec); !tag.empty())
         codecs.insert(codecs.end(), {L"-tag:v", tag});
     // Audio MP4 can hold as it stands is copied, as the policy says.
-    AppendSourceStreams(*container, sourceStreams, false, arguments, codecs);
+    const uint32_t nextStream = AppendSourceStreams(*container, sourceStreams, false, arguments, codecs);
+    if (!request.subtitleFile.empty()) {
+        // Mapped after the source's own, so the generated track is an addition
+        // and never a replacement: a player offered both keeps them in one
+        // order, and the source's own track is still the first.
+        arguments.insert(arguments.end(), {L"-map", L"2:s:0"});
+        const std::wstring specifier = std::to_wstring(nextStream);
+        // ASS in Matroska, mov_text in MP4: which is exactly the difference the
+        // dialog's tooltip promises - Matroska keeps the styling, MP4 keeps only
+        // the words. The track was generated as ASS, so Matroska carries it as
+        // it stands and only the MP4 container costs anything.
+        codecs.insert(codecs.end(), {L"-c:" + specifier,
+                                     *container == ExportContainer::Mp4 ? L"mov_text" : L"ass"});
+        // `chi`, not `zho`: the mov muxer writes the ISO 639-2/B code and
+        // silently drops a T-code tag, leaving the track with no language.
+        if (!request.subtitleLanguage.empty())
+            codecs.insert(codecs.end(), {L"-metadata:s:" + specifier,
+                                         L"language=" + request.subtitleLanguage});
+    }
     arguments.insert(arguments.end(), {L"-map_metadata", L"1", L"-map_chapters", L"1"});
     arguments.insert(arguments.end(), codecs.begin(), codecs.end());
     // An anamorphic source's shape, which the passes encoded without.

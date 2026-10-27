@@ -598,6 +598,37 @@ inline Languages LanguagesFor(std::string_view sourceTag, std::string_view targe
     return languages;
 }
 
+// The ISO 639-2/B code a container tags a subtitle stream with, from the tag the
+// language table is written in.
+//
+// B, not T: the mov muxer writes the bibliographic set and drops a T-code tag
+// silently, so "zho" leaves the finished track with no language at all and a
+// player choosing subtitles by language cannot see it. The two sets differ in
+// exactly the languages a dub is made in - chi/zho, fre/fra, ger/deu - which is
+// why the pair is spelled out here rather than derived from the code above.
+//
+// Empty for a tag with no B code, which is not the same as unknown: an untagged
+// track is a track a player still offers, and a mis-tagged one is a track it
+// offers to the wrong reader.
+inline std::string MuxLanguageCode(std::string_view tag)
+{
+    static constexpr std::pair<std::string_view, std::string_view> kBibliographic[] = {
+        {"zh", "chi"}, {"zh-hans", "chi"}, {"zh-cn", "chi"}, {"zho", "chi"}, {"cmn", "chi"},
+        {"zh-hant", "chi"}, {"zh-tw", "chi"}, {"zh-hk", "chi"},
+        {"en", "eng"}, {"ja", "jpn"}, {"ko", "kor"}, {"yue", "chi"},
+        {"fr", "fre"}, {"de", "ger"}, {"es", "spa"}, {"it", "ita"}, {"pt", "por"},
+        {"ru", "rus"}, {"th", "tha"}, {"vi", "vie"}, {"id", "ind"}, {"ar", "ara"},
+        {"hi", "hin"},
+    };
+    if (tag.empty()) return {};
+    std::string lowered;
+    lowered.reserve(tag.size());
+    for (const char c : tag) lowered.push_back(char(std::tolower(static_cast<unsigned char>(c))));
+    for (const auto& entry : kBibliographic)
+        if (entry.first == lowered) return std::string(entry.second);
+    return {};
+}
+
 // Bumped when the wording below changes: it is part of the cache key, so a
 // prompt change must not read translations produced by the old one.
 inline constexpr std::string_view kPromptVersion = "t1";

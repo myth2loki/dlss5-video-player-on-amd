@@ -162,6 +162,21 @@ struct StageExportJob {
     // stage is handed the encoder settings the cache would use, and this one
     // changes what the model is shown as well as what the pipe carries.
     bool gpuSourceConversion{false};
+    // A subtitle file the finished container has to carry, written before the
+    // picture passes run by whatever produced it (the Convert video dialog's
+    // transcript-and-translate stage). Empty for the export dialog, which
+    // carries the source's own streams and nothing else - so an empty field is
+    // exactly the export that has always been made, and every branch below it
+    // is one the export dialog cannot reach.
+    std::filesystem::path subtitleFile;
+    // Whether that file is drawn into every frame rather than carried as a
+    // stream. Burning re-encodes the picture, which is the cost the dialog's
+    // tooltip names; a soft track leaves the bitstream the passes wrote.
+    bool burnSubtitles{false};
+    // The ISO 639-2/B code the generated track is tagged with on its way in
+    // ("chi"), so a player choosing a subtitle by language can see it. Empty
+    // leaves the metadata off, which is what the export dialog writes today.
+    std::wstring subtitleLanguage;
     // Ends the player's idle resident helper before this export's helper
     // starts in the same runtime directory. Empty for `--render`, which runs in
     // a process of its own and has none.

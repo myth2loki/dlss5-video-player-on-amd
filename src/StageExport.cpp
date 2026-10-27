@@ -356,6 +356,12 @@ StageExportOutcome RunStageExport(const StageExportJob& job,std::stop_token stop
     // is the cached-range export's.
     StageExportMuxRequest finish{produced,job.source,job.destination};
     finish.displayAspect=job.displayAspect;
+    // What the Convert video dialog's text stage produced, if it ran. Empty for
+    // the export dialog: the mux then carries only the source's own streams,
+    // which is the file it has always written.
+    finish.subtitleFile=job.subtitleFile;
+    finish.burnSubtitles=job.burnSubtitles;
+    finish.subtitleLanguage=job.subtitleLanguage;
     if(!job.range.Whole()){
         finish.rangeStartSeconds=double(job.range.start100ns)*1e-7;
         if(job.range.end100ns>job.range.start100ns)finish.rangeDurationSeconds=double(job.range.end100ns-job.range.start100ns)*1e-7;

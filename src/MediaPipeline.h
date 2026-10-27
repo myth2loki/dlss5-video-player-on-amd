@@ -536,6 +536,15 @@ struct StageExportMuxRequest {
     // The source's display aspect as -aspect takes it (ExportDisplayAspect);
     // empty for square pixels. MKV and MP4 only.
     std::wstring displayAspect;
+    // A generated subtitle file to carry into the finished container, and
+    // whether it is drawn into the picture instead. Empty means what it has
+    // always meant: the source's own streams and nothing added. See
+    // StageExportJob::subtitleFile.
+    std::filesystem::path subtitleFile;
+    bool burnSubtitles{false};
+    // The ISO 639-2/B code the generated track is tagged with, so a player
+    // choosing by language can see it. Empty leaves the metadata off.
+    std::wstring subtitleLanguage;
 };
 
 // The FFmpeg arguments for MuxStageExport, from what the two inputs were
