@@ -5,6 +5,7 @@
 #include <cwchar>
 #include <string_view>
 #include <system_error>
+#include <algorithm>
 
 #include "AmdLmxxfPolicy.h"
 #include "AmdLmxxfRuntime.h"
@@ -103,13 +104,72 @@ StageExportOutcome RunStageExport(const StageExportJob& job,std::stop_token stop
     const auto sweep=[&]{std::error_code ec;
         std::filesystem::remove(stageOne,ec);
         std::filesystem::remove(stageTwo,ec);};
-    const auto report=[&](StageExportUpdate update){if(progress)progress(update);};
     // Asked before the passes rather than by the last step after them: the
     // file is replaced, and a source replaced by its own export is gone.
     {std::error_code sameError;
         if(std::filesystem::equivalent(job.source,job.destination,sameError)&&!sameError)
             return {StageExportStatus::Refused,L"The export cannot replace its own source. Choose a new filename."};}
     const uint32_t passes=ExportStageCount(plan);
+    // ---- What one frame of each pass is worth ---------------------------------
+    //
+    // Every pass runs over the same footage, so counting frames alone says a
+    // two-pass export is half done when the first pass ends - but the passes
+    // are not the same work, and the bar would then spend half its travel on
+    // the last fifth of the clock. These are the costs measured here on the AMD
+    // path at 640x360 over a 60 s / 1440 frame clip: the neural pass ran 9.5 ms
+    // a frame, the interpolator 2.6 ms, and the stream copy that finishes the
+    // file 0.5 s in all. Only the ratios matter, and only a pass being an order
+    // of magnitude cheaper or dearer than another would make the bar's pace
+    // wrong by more than a fraction of itself.
+    //
+    // VSR is the one no machine here can measure (no RTX card): it is a fixed
+    // function upscale feeding NVENC, so it is priced below the neural pass and
+    // above the interpolator rather than left at parity arbitrarily.
+    const auto passCost=[](const wchar_t* key)->double{
+        // No key is the last step, which has no frames of its own and is
+        // reported as a finished film rather than priced per frame.
+        if(!key)return 0.0;
+        if(std::wcscmp(key,L"export.progress.pass_framegen")==0)return 0.27;
+        if(std::wcscmp(key,L"export.progress.pass_vsr")==0)return 0.30;
+        return 1.0;
+    };
+    double planCost=0.0;
+    if(plan.vsrStage)planCost+=passCost(L"export.progress.pass_vsr");
+    if(plan.workerStage)planCost+=passCost(L"export.progress.pass_neural");
+    if(plan.frameGenStage)planCost+=passCost(L"export.progress.pass_framegen");
+    if(planCost<=0.0)planCost=1.0;
+    // The account, in frames of the cheapest kind: `planCost` is what the whole
+    // film is worth, and a finished pass is banked at its own weight so the
+    // running total never has to be revised. It cannot be: a denominator that
+    // grows when the next pass announces itself is the same backwards step this
+    // is here to remove.
+    uint64_t passFrames=0;      // what one pass covers, from the first report
+    double totalCost=0.0;
+    double bankedCost=0.0;
+    uint32_t bankedPass=0;
+    const wchar_t* bankedKey=nullptr;
+    const auto report=[&](StageExportUpdate update){
+        if(!passFrames&&update.passKey&&update.totalFrames){
+            passFrames=update.totalFrames;
+            totalCost=double(passFrames)*planCost;
+        }
+        if(update.passKey&&update.pass!=bankedPass){
+            if(bankedPass&&passFrames)bankedCost+=double(passFrames)*passCost(bankedKey);
+            bankedPass=update.pass;bankedKey=update.passKey;
+        }
+        if(passFrames){
+            update.overallTotal=static_cast<uint64_t>(totalCost+0.5);
+            if(update.passKey){
+                const double done=bankedCost+
+                    double(std::min<uint64_t>(update.completedFrames,passFrames))*passCost(update.passKey);
+                update.overallCompleted=static_cast<uint64_t>(std::min(done,totalCost));
+            }else{
+                // The last step has no frames of its own: they are all rendered.
+                update.overallCompleted=update.overallTotal;
+            }
+        }
+        if(progress)progress(update);
+    };
     if(plan.vsrStage){
         VsrUpscaleRequest request{};
         request.source=produced;request.output=stageOne;

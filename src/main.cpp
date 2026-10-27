@@ -460,6 +460,9 @@ static constexpr int IDC_CV_RANGE_TO = 7612;
 static constexpr int IDC_CV_SUMMARY = 7613;
 static constexpr int IDC_CV_RUN = 7614;
 static constexpr int IDC_CV_CLOSE = 7615;
+// The run's own panel, not a control of this dialog: a run lasts minutes and
+// the dialog has one line of text to say so with.
+static constexpr int IDC_CV_PROGRESS_CANCEL = 7616;
 
 static constexpr int IDC_TIMECODE_EDIT = 7501;
 static constexpr int IDC_TIMECODE_SET_IN = 7502;
@@ -4724,14 +4727,32 @@ private:
         // what makes the queued completion find nothing, so CompleteExport
         // returns before its own reset runs. Without this the export panel
         // covers the video until some later export happens to finish.
-        m_stageExport={};SyncActivityFeedback();if(m_hwnd&&IsWindow(m_hwnd)){SyncFeatureMenuState();UpdateCachedStatus();}}
+        m_stageExport={};SyncActivityFeedback();if(m_hwnd&&IsWindow(m_hwnd)){SyncFeatureMenuState();UpdateCachedStatus();}
+        // The Export menu and the app closing are the other two ways a run ends,
+        // and the panel must not outlive the job it is reporting.
+        FinishConvertVideoRun();}
     void CompleteExport(uint64_t token){auto completion=m_exportCompletions.Take(token);if(!completion)return;
+        // Whether this was the convert flow decides two things below: which
+        // window the panel belongs to, and whether "Exported" is the right word
+        // for a file the user asked to have converted.
+        const bool convertRun=m_convertRunWnd&&IsWindow(m_convertRunWnd);
         // Whatever happened, the export is over and the panel says so.
-        m_stageExport={};SyncActivityFeedback();if(m_exportWorker.joinable()){m_exportWorker.join();m_exportWorker=std::jthread{};}SyncFeatureMenuState();UpdateCachedStatus();if(completion->result.ok){std::wstring message=L"Exported to:\n"+completion->output.wstring();
+        m_stageExport={};SyncActivityFeedback();if(m_exportWorker.joinable()){m_exportWorker.join();m_exportWorker=std::jthread{};}SyncFeatureMenuState();UpdateCachedStatus();
+        // The run panel closes before any message box: a prompt raised over a
+        // window that still claims a job is running reads as a contradiction.
+        FinishConvertVideoRun();
+        // The convert dialog is a separate window and owns its own summary, so
+        // the end of a run has to be pushed to it as well as to this one.
+        if(m_convertWnd&&IsWindow(m_convertWnd)){
+            SetDlgItemTextW(m_convertWnd,IDC_CV_SUMMARY,ConvertVideoSummary().c_str());
+            if(HWND run=GetDlgItem(m_convertWnd,IDC_CV_RUN))
+                EnableWindow(run,ConvertVideoUsable()&&ConvertVideoRangeValid()&&!ExportStagesBusy());
+        }
+        if(completion->result.ok){std::wstring message=(convertRun?T(L"convert.done"):T(L"export.done"))+completion->output.wstring();
             // What the file left out (subtitles MP4 cannot hold) is the note a
             // finished export carries; it used to be dropped here (P1.33).
             if(!completion->result.detail.empty())message+=L"\n\n"+completion->result.detail;
-            MessageBoxW(m_hwnd,message.c_str(),T(L"export.title.complete").c_str(),MB_OK|MB_ICONINFORMATION);}else if(completion->result.error!=MaterializeError::Cancelled)MessageBoxW(m_hwnd,completion->result.detail.c_str(),T(L"export.title.failed").c_str(),MB_OK|MB_ICONERROR);}
+            MessageBoxW(m_hwnd,message.c_str(),T(convertRun?L"convert.title":L"export.title.complete").c_str(),MB_OK|MB_ICONINFORMATION);}else if(completion->result.error!=MaterializeError::Cancelled)MessageBoxW(m_hwnd,completion->result.detail.c_str(),T(L"export.title.failed").c_str(),MB_OK|MB_ICONERROR);}
 
     // Frame generation runs as a conversion, not as live presentation: the pass
     // writes a new file at the planned multiple of the source rate, the user
@@ -8555,8 +8576,18 @@ private:
         return m_frameGenCapability->available?1u+m_frameGenCapability->multiFrameCountMax:0u;
     }
 
+    // Which backend the worker stage runs on belongs to the machine, not to a
+    // dialog: neither the export dialog nor Convert video has a row for it. It
+    // used to be left at the struct's default, NVIDIA, so on an AMD card both
+    // dialogs asked for nvngx_dlss.dll and refused the run before a single
+    // frame was rendered.
+    ExportSelection SelectionForThisMachine(ExportSelection selection)const{
+        selection.backend=m_opt.neuralBackend;
+        return selection;
+    }
+
     ExportPlan CurrentExportPlan()const{
-        return PlanExport(m_exportSelection,m_decoder.Width(),m_decoder.Height(),
+        return PlanExport(SelectionForThisMachine(m_exportSelection),m_decoder.Width(),m_decoder.Height(),
                           m_decoder.FrameRate(),ExportMaxMultiplier(),m_decoder.IsStillImage(),
                           VsrExportReady(ExecutableDirectory(),m_opt.detectedGpu.generation));
     }
@@ -8720,6 +8751,10 @@ private:
     // transcript and its translation) or after it (how the text reaches the
     // container), never inside it.
     static constexpr int kConvertDesignW=470,kConvertDesignH=522;
+    // The run panel. Small on purpose: one bar, four lines, one button, and it
+    // stays that size because nothing on it is worth resizing a window for.
+    static constexpr int kConvertRunDesignW=430,kConvertRunDesignH=176;
+    static constexpr UINT_PTR kConvertRunTimer=1;
 
     // Read once per session, like every other preference here: the file is the
     // only thing that remembers, and a dialog reopened from the menu keeps what
@@ -8803,7 +8838,7 @@ private:
     ExportPlan CurrentConvertVideoPlan()const{
         // The interpolator's ceiling is 2x whatever this GPU's DLSS-G capability
         // query would say, and that query is not run for this dialog at all.
-        return PlanExport(ConvertVideoExportSelection(),m_decoder.Width(),m_decoder.Height(),
+        return PlanExport(SelectionForThisMachine(ConvertVideoExportSelection()),m_decoder.Width(),m_decoder.Height(),
                           m_decoder.FrameRate(),2u,m_decoder.IsStillImage(),
                           VsrExportReady(ExecutableDirectory(),m_opt.detectedGpu.generation));
     }
@@ -8871,6 +8906,16 @@ private:
         // What it would write, once a folder has been picked: the one thing the
         // user cannot read off the controls, because the name is derived.
         if(!m_convert.planned.empty())text+=L"\n\u2192 "+m_convert.planned.wstring();
+        // Which pass is running, and how far through it. The same report the
+        // export dialog's panel reads, so the two windows cannot disagree about
+        // what the machine is doing.
+        if(m_stageExport.running){
+            text+=L"\n\u00b7 "+T(L"convert.running");
+            if(m_stageExport.writing)text+=L": "+T(L"export.progress.all_rendered");
+            else if(m_stageExport.passKey)text+=L": "+T(m_stageExport.passKey);
+            if(m_stageExport.passes)
+                text+=L" ("+std::to_wstring(m_stageExport.pass)+L"/"+std::to_wstring(m_stageExport.passes)+L")";
+        }
         return text;
     }
 
@@ -9067,12 +9112,208 @@ private:
         return self?self->ConvertVideoWndProc(h,m,w,l):DefWindowProcW(h,m,w,l);
     }
 
-    // Where the file would go, and nothing else yet: the transcript, the
-    // translation, the picture stages and the mux are the next step. What this
-    // does today is refuse what cannot be run, ask for the folder, name the
-    // file the way dlss5-convert names it, and say where it would be written -
-    // so the naming and the refusals can be judged before any of the minutes
-    // are spent.
+    // ---- The run's own panel ------------------------------------------------
+    //
+    // A conversion is minutes of GPU work and the dialog that starts it has one
+    // line of text to say so with, plus no way out: Run greys itself, Close only
+    // closes the dialog, and the one cancel in the program lives in the Export
+    // menu of another window. So a run raises this panel instead - the pass, the
+    // frames, an estimate, the bar, and a Cancel that stops the job - and the
+    // dialog behind it is disabled while it is up. Disabling the owner is what
+    // makes a window modal; a second message loop would have had to re-enter the
+    // progress and completion handlers this panel is fed by.
+
+    void ShowConvertVideoRun(){
+        if(m_convertRunWnd&&IsWindow(m_convertRunWnd))return;
+        static constexpr const wchar_t* kClassName=L"DLSSVideoConvertRunClassV1";
+        WNDCLASSW n{};n.lpfnWndProc=ConvertVideoRunWndProcStatic;n.hInstance=GetModuleHandleW(nullptr);
+        n.lpszClassName=kClassName;n.hCursor=LoadCursor(nullptr,IDC_ARROW);n.hbrBackground=DarkDialogBrush();
+        if(!RegisterClassW(&n)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return;
+        constexpr DWORD style=WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_CLIPCHILDREN|WS_VISIBLE;
+        const RECT wr=SettingsWindowRect(kConvertRunDesignW,kConvertRunDesignH,style,WS_EX_TOOLWINDOW,ActiveWindowDpi(m_hwnd));
+        const int w=int(wr.right-wr.left),h=int(wr.bottom-wr.top);
+        HWND owner=(m_convertWnd&&IsWindow(m_convertWnd))?m_convertWnd:m_hwnd;
+        RECT box{};GetWindowRect(owner,&box);
+        const int ow=int(box.right-box.left),oh=int(box.bottom-box.top);
+        m_convertRunWnd=CreateWindowExW(WS_EX_TOOLWINDOW,kClassName,T(L"convert.title").c_str(),style,
+            int(box.left)+std::max(0,(ow-w)/2),int(box.top)+std::max(0,(oh-h)/2),w,h,
+            owner,nullptr,GetModuleHandleW(nullptr),this);
+        if(!m_convertRunWnd)return;
+        ApplyDarkTitleBar(m_convertRunWnd);
+        if(owner!=m_hwnd)EnableWindow(owner,FALSE);
+        SetForegroundWindow(m_convertRunWnd);
+        // Only matters before the first frame count arrives (the upscaler and
+        // the mux report none) and for the elapsed clock, which is worth
+        // watching either way.
+        SetTimer(m_convertRunWnd,kConvertRunTimer,120,nullptr);
+        LOG("Convert video run panel opened");
+    }
+
+    void LayoutConvertVideoRun(HWND h){
+        const UINT dpi=ActiveWindowDpi(h);
+        const auto S=[dpi](int value){return MulDiv(value,int(dpi),USER_DEFAULT_SCREEN_DPI);};
+        RECT client{};GetClientRect(h,&client);
+        if(HWND cancel=GetDlgItem(h,IDC_CV_PROGRESS_CANCEL))
+            SetWindowPos(cancel,nullptr,client.right-S(20)-S(96),client.bottom-S(14)-S(28),S(96),S(28),SWP_NOZORDER|SWP_NOACTIVATE);
+    }
+
+    void PaintConvertVideoRun(HDC dc,HWND h,const RECT& client){
+        HBRUSH background=CreateSolidBrush(dark_mode::DialogBackground);FillRect(dc,&client,background);DeleteObject(background);
+        if(!m_convertRunFont||!m_convertRunFontSmall)return;
+        const UINT dpi=ActiveWindowDpi(h);
+        const auto S=[dpi](int value){return MulDiv(value,int(dpi),USER_DEFAULT_SCREEN_DPI);};
+        SetBkMode(dc,TRANSPARENT);
+        const auto line=[&](const std::wstring& text,int top,int height,HFONT font,COLORREF colour){
+            HGDIOBJ previous=SelectObject(dc,font);
+            SetTextColor(dc,colour);
+            RECT row{S(20),S(top),client.right-S(20),S(top+height)};
+            DrawTextW(dc,text.c_str(),-1,&row,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+            SelectObject(dc,previous);
+        };
+        line(T(L"convert.run.title"),16,26,m_convertRunFont,dark_mode::Text);
+        // Which pass, how far into it, how long it has left: the same three
+        // things the export panel draws on the player, read from the same
+        // StageExportProgress, so the two surfaces cannot disagree about what
+        // the machine is doing.
+        std::wstring phase=T(L"convert.run.preparing");
+        if(m_stageExport.writing)phase=T(L"export.progress.writing");
+        else if(m_stageExport.running&&m_stageExport.passKey){
+            wchar_t buffer[192];
+            swprintf_s(buffer,L"Pass %u of %u \u00b7 %s",m_stageExport.pass,
+                       std::max<uint32_t>(1,m_stageExport.passes),T(m_stageExport.passKey).c_str());
+            phase=buffer;
+        }
+        line(phase,48,20,m_convertRunFontSmall,ui_palette::SecondaryText);
+        // The whole film, not this pass: StageExport adds it up, weighted by
+        // what a frame of each pass costs.
+        const uint64_t total=m_stageExport.overallTotal;
+        const uint64_t done=std::min(m_stageExport.overallCompleted,total);
+        RECT track{S(20),S(78),client.right-S(20),S(86)};
+        HBRUSH trackBrush=CreateSolidBrush(RGB(68,71,77));FillRect(dc,&track,trackBrush);DeleteObject(trackBrush);
+        HBRUSH fillBrush=CreateSolidBrush(ui_palette::NeuralCoverage);
+        if(m_stageExport.writing){
+            // Every frame is rendered and the last step is a stream copy: the
+            // bar says so by staying full instead of restarting at nothing.
+            FillRect(dc,&track,fillBrush);
+        }else if(total>0){
+            RECT filled=track;
+            filled.right=track.left+int((track.right-track.left)*double(done)/double(total));
+            if(filled.right>filled.left)FillRect(dc,&filled,fillBrush);
+        }else{
+            // No frame count to follow yet. A segment that keeps moving says
+            // "working" where a bar pinned at zero says "wedged".
+            const int span=track.right-track.left;
+            const int width=std::max(S(48),span/5);
+            const int travel=std::max(1,span-width);
+            const int offset=int((GetTickCount64()/6)%uint64_t(travel*2));
+            RECT filled=track;
+            filled.left=track.left+(offset<=travel?offset:travel*2-offset);
+            filled.right=std::min(track.right,filled.left+width);
+            FillRect(dc,&filled,fillBrush);
+        }
+        DeleteObject(fillBrush);
+        if(m_stageExport.writing){
+            line(T(L"export.progress.all_rendered"),92,20,m_convertRunFontSmall,dark_mode::Text);
+        }else if(total>0){
+            wchar_t buffer[128];
+            swprintf_s(buffer,L"%u%% \u00b7 %llu / %llu frames",
+                       unsigned(100.0*double(done)/double(total)),
+                       static_cast<unsigned long long>(done),static_cast<unsigned long long>(total));
+            line(buffer,92,20,m_convertRunFontSmall,dark_mode::Text);
+        }
+        const double elapsed=m_stageExport.running
+            ?std::chrono::duration<double>(std::chrono::steady_clock::now()-m_stageExport.started).count():0.0;
+        std::wstring timing=L"Elapsed "+TimeText(elapsed);
+        if(total>0&&done>4&&elapsed>2.0){
+            const double remaining=elapsed/double(done)*double(total-done);
+            if(remaining>0.0)timing+=L" \u00b7 ETA "+TimeText(remaining);
+        }
+        line(timing,114,20,m_convertRunFontSmall,ui_palette::SecondaryText);
+    }
+
+    // Whoever ends the run has to come through here - the worker, the menu, the
+    // button, the app closing - or the dialog stays disabled with no way back.
+    void FinishConvertVideoRun(){
+        HWND window=m_convertRunWnd;m_convertRunWnd=nullptr;
+        if(window&&IsWindow(window)){KillTimer(window,kConvertRunTimer);DestroyWindow(window);}
+        if(m_convertWnd&&IsWindow(m_convertWnd)){
+            EnableWindow(m_convertWnd,TRUE);
+            if(HWND run=GetDlgItem(m_convertWnd,IDC_CV_RUN))
+                EnableWindow(run,ConvertVideoUsable()&&ConvertVideoRangeValid()&&!ExportStagesBusy());
+        }
+    }
+
+    void CancelConvertVideoRun(){
+        if(!m_exportWorker.joinable()){FinishConvertVideoRun();return;}
+        LOG("Convert video cancelled from the run panel");
+        // Joins the worker, which is what lets the notice below be true: by the
+        // time it is set, nothing is writing into the cache any more.
+        CancelExport();
+        m_sourceNotice=T(L"convert.run.cancelled");
+        UpdateCachedStatus();
+    }
+
+    LRESULT ConvertVideoRunWndProc(HWND h,UINT m,WPARAM w,LPARAM l){
+        // The panel is drawn here, not laid out as child controls, so a dpi
+        // change moves nothing but the font - and the button, in WM_SIZE.
+        if(m==WM_DPICHANGED){
+            // `small` is a macro in the Windows headers (rpcndr.h defines it as
+            // char), so the local cannot be called that.
+            if(HFONT titleFont=CreateUiFont(16,HIWORD(w))){if(m_convertRunFont)DeleteObject(m_convertRunFont);m_convertRunFont=titleFont;}
+            if(HFONT quietFont=CreateUiFont(12,HIWORD(w))){if(m_convertRunFontSmall)DeleteObject(m_convertRunFontSmall);m_convertRunFontSmall=quietFont;}
+        }
+        if(LRESULT result=0;SettingsDialogChrome(h,m,w,l,result))return result;
+        switch(m){
+        case WM_CREATE:
+            m_convertRunFont=CreateUiFont(16,ActiveWindowDpi(h));
+            m_convertRunFontSmall=CreateUiFont(12,ActiveWindowDpi(h));
+            DialogButton(h,L"convert.run.cancel",IDC_CV_PROGRESS_CANCEL,0,0,96,28);
+            LayoutConvertVideoRun(h);
+            return 0;
+        case WM_SIZE:LayoutConvertVideoRun(h);return 0;
+        case WM_TIMER:if(w==kConvertRunTimer)InvalidateRect(h,nullptr,FALSE);return 0;
+        case WM_ERASEBKGND:return 1;
+        case WM_PAINT:{
+            PAINTSTRUCT paint{};HDC target=BeginPaint(h,&paint);
+            RECT client{};GetClientRect(h,&client);
+            // Straight onto the window, not through a memory bitmap: the panel
+            // is one bar and four lines, and a compatible bitmap taken from a
+            // window DC came back unusable on this machine (nothing drew at all
+            // and the client stayed the default white).
+            PaintConvertVideoRun(target,h,client);
+            EndPaint(h,&paint);
+            return 0;
+        }
+        case WM_COMMAND:
+            if(LOWORD(w)==IDC_CV_PROGRESS_CANCEL){CancelConvertVideoRun();return 0;}
+            break;
+        // The title bar's X is the Cancel button: the run stops either way, and
+        // closing the panel without stopping the job would be a lie.
+        case WM_CLOSE:CancelConvertVideoRun();return 0;
+        case WM_DESTROY:
+            KillTimer(h,kConvertRunTimer);
+            if(h==m_convertRunWnd)m_convertRunWnd=nullptr;
+            return 0;
+        case WM_NCDESTROY:
+            if(m_convertRunFont){DeleteObject(m_convertRunFont);m_convertRunFont=nullptr;}
+            if(m_convertRunFontSmall){DeleteObject(m_convertRunFontSmall);m_convertRunFontSmall=nullptr;}
+            break;
+        }
+        return DefWindowProcW(h,m,w,l);
+    }
+
+    static LRESULT CALLBACK ConvertVideoRunWndProcStatic(HWND h,UINT m,WPARAM w,LPARAM l){
+        if(m==WM_NCCREATE){SetWindowLongPtrW(h,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams));return DefWindowProcW(h,m,w,l);}
+        auto* self=reinterpret_cast<PlayerApp*>(GetWindowLongPtrW(h,GWLP_USERDATA));
+        return self?self->ConvertVideoRunWndProc(h,m,w,l):DefWindowProcW(h,m,w,l);
+    }
+
+    // The picture stages, then the mux, on the same RunStageExport the export
+    // dialog drives - so the three boxes here and the three boxes there write
+    // the same file, and a fix to one reaches both. What is still missing is
+    // the sound: the transcript, the translation and the dub. Those boxes are
+    // refused rather than ignored, because a conversion that quietly skipped
+    // two of them would be a wrong file that looks finished.
     void StartConvertVideo(){
         LoadConvertVideoSelection();
         const std::wstring title=T(L"convert.title");
@@ -9080,25 +9321,78 @@ private:
         if(!ConvertVideoUsable()){MessageBoxW(m_hwnd,T(L"convert.refusal.nothing").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         if(!ConvertVideoRangeValid()){MessageBoxW(m_hwnd,T(L"convert.refusal.range").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         if(m_convert.translate&&!ConvertVoiceTranslatable()){MessageBoxW(m_hwnd,T(L"convert.refusal.engine").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        if(m_convert.subtitles!=0||m_convert.translate){MessageBoxW(m_hwnd,T(L"convert.refusal.voice").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         const std::filesystem::path source=ExportSourceFile();
         if(source.empty()){MessageBoxW(m_hwnd,T(L"convert.no_source").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
-        if(ConvertVideoHasPictureStage()){
-            const ExportPlan plan=CurrentConvertVideoPlan();
-            if(!plan.valid){MessageBoxW(m_hwnd,T(ExportRefusalKey(plan.refusal)).c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
-        }
+        const ExportPlan plan=CurrentConvertVideoPlan();
+        if(!plan.valid){MessageBoxW(m_hwnd,T(ExportRefusalKey(plan.refusal)).c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        // The intermediate passes land beside the other derived carriers, the
+        // same directory the export dialog uses, and are swept whatever way
+        // this ends - they are minutes of GPU work and never the deliverable.
+        NeuralCacheManager cache(m_cacheRoot);
+        if(!cache.Valid()){MessageBoxW(m_hwnd,CacheFailureText().DescribeRoot(cache.LastFailure()).c_str(),title.c_str(),MB_OK|MB_ICONERROR);return;}
+        const std::filesystem::path scratch=cache.Root()/L"convert-video";
+        std::error_code directoryError;std::filesystem::create_directories(scratch,directoryError);
+        if(directoryError){MessageBoxW(m_hwnd,T(L"framegen.cache_failed").c_str(),title.c_str(),MB_OK|MB_ICONERROR);return;}
+        // Converting is GPU work with a deadline; playback is GPU work without
+        // one. Left running they share the card and the conversion gets the
+        // slower half of it, so the picture stops here - before the folder
+        // dialog, so no sound plays under it either - and comes back only if
+        // the answer to that dialog turns out to be "never mind".
+        const bool resumeAfterFolder=m_playing;
+        if(resumeAfterFolder){SetPaused(true);LOG("Convert video paused playback");}
         const std::filesystem::path folder=PickConvertVideoFolder(m_hwnd,m_loc,source.parent_path());
-        if(folder.empty())return;
+        if(folder.empty()){if(resumeAfterFolder)SetPaused(false);return;}
         const std::wstring extension=m_convert.container==1?L".mp4":L".mkv";
         m_convert.planned=ConvertVideoDestination(source,folder,extension);
         SaveConvertVideoSelection();
-        LOG("Convert video planned: output="<<WideToUtf8(m_convert.planned.wstring())
+        StageExportJob job=MakeStageExportJob(plan,source,m_convert.planned,scratch);
+        // Both ends are already 100 ns timestamps from the same parser the
+        // range box validates with, so they travel as they are: the neural
+        // pass reads them and the final trim cuts the sound and the chapters
+        // to match.
+        if(m_convert.ranged){
+            const double fps=m_decoder.FrameRate();
+            const auto start=ParseTimecode(m_convert.rangeStart,fps),end=ParseTimecode(m_convert.rangeEnd,fps);
+            if(start&&end){job.range.start100ns=*start;job.range.end100ns=*end;}
+        }
+        LOG("Convert video starting: output="<<WideToUtf8(m_convert.planned.wstring())
             <<" upscale="<<m_convert.upscale<<" neural="<<m_convert.neural<<" framegen="<<m_convert.frameGeneration
-            <<" subtitles="<<m_convert.subtitles<<" translate="<<m_convert.translate
             <<" container="<<(m_convert.container==1?"mp4":"mkv")
+            <<" passes="<<ExportStageCount(plan)
+            <<" size="<<plan.outputWidth<<"x"<<plan.outputHeight<<" fps="<<plan.outputFps
             <<" ranged="<<m_convert.ranged<<" source="<<WideToUtf8(source.wstring()));
+        HWND target=m_hwnd;auto* completions=&m_exportCompletions;
+        try{
+            m_exportWorker=std::jthread([=](std::stop_token stop){
+                auto completion=std::make_unique<ExportCompletion>();
+                completion->output=job.destination;
+                const StageExportOutcome outcome=RunStageExport(job,stop,[&](const StageExportUpdate& u){
+                    // No pass key is the last step, not the end of the job: the
+                    // file is being written from the passes' carrier, which is a
+                    // phase worth a panel and worth a bar that stays full.
+                    auto* update=u.passKey
+                        ?new StageExportProgress{true,u.pass,u.passes,u.passKey,u.completedFrames,u.totalFrames,
+                                                 u.overallCompleted,u.overallTotal,{},false}
+                        :new StageExportProgress{true,0,0,nullptr,0,0,u.overallCompleted,u.overallTotal,{},true};
+                    if(!PostMessageW(target,WM_STAGE_EXPORT_PROGRESS,0,reinterpret_cast<LPARAM>(update)))delete update;
+                });
+                const bool done=outcome.status==StageExportStatus::Done;
+                completion->result={done,done?MaterializeError::None
+                                        :outcome.status==StageExportStatus::Cancelled?MaterializeError::Cancelled
+                                        :MaterializeError::ProcessFailed,outcome.detail};
+                completions->RegisterAndPost(std::move(completion),[&](uint64_t token){return PostMessageW(target,WM_EXPORT_COMPLETE,static_cast<WPARAM>(token),0)!=FALSE;});
+            });
+        }catch(const std::system_error&){
+            if(resumeAfterFolder)SetPaused(false);
+            MessageBoxW(m_hwnd,T(L"export.worker_failed").c_str(),title.c_str(),MB_OK|MB_ICONERROR);return;
+        }
+        // The panel goes up only once the worker exists: it reports a run, and a
+        // window that appeared before there was one would be reporting nothing.
+        ShowConvertVideoRun();
         m_sourceNotice=T(L"convert.destination")+m_convert.planned.filename().wstring();
-        UpdateCachedStatus();
-        if(m_convertWnd&&IsWindow(m_convertWnd))UpdateWindow(m_convertWnd);
+        SyncFeatureMenuState();UpdateCachedStatus();
+        if(m_convertWnd&&IsWindow(m_convertWnd)){SyncConvertVideoControls(m_convertWnd);UpdateWindow(m_convertWnd);}
     }
 
     // Runs the plan on the export thread, one stage at a time, and hands the
@@ -9143,9 +9437,13 @@ private:
                 completion->output=job.destination;
                 // The worker has always reported frames; this is what listens.
                 const StageExportOutcome outcome=RunStageExport(job,stop,[&](const StageExportUpdate& u){
+                    // No pass key is the last step, not the end of the job: the
+                    // file is being written from the passes' carrier, which is a
+                    // phase worth a panel and worth a bar that stays full.
                     auto* update=u.passKey
-                        ?new StageExportProgress{true,u.pass,u.passes,u.passKey,u.completedFrames,u.totalFrames,{}}
-                        :new StageExportProgress{};
+                        ?new StageExportProgress{true,u.pass,u.passes,u.passKey,u.completedFrames,u.totalFrames,
+                                                 u.overallCompleted,u.overallTotal,{},false}
+                        :new StageExportProgress{true,0,0,nullptr,0,0,u.overallCompleted,u.overallTotal,{},true};
                     if(!PostMessageW(target,WM_STAGE_EXPORT_PROGRESS,0,reinterpret_cast<LPARAM>(update)))delete update;
                 });
                 const bool done=outcome.status==StageExportStatus::Done;
@@ -11646,7 +11944,12 @@ private:
         // thing to keep consistent for no benefit.
         if(m_stageExport.running){
             const PreRenderSurfaceLayout surface=LayoutPreRenderSurface(static_cast<int>(c.right-c.left),static_cast<int>(c.bottom-c.top),ActiveWindowDpi(m_hwnd));
-            const uint64_t total=m_stageExport.totalFrames,done=std::min(m_stageExport.completedFrames,total?total:m_stageExport.completedFrames);
+            // The whole film: every pass runs over the same footage, but a
+            // frame of each is not the same work, so the numbers are weighted
+            // by what a frame of each pass costs - a two-pass export does not
+            // fall back to zero between them.
+            const uint64_t total=m_stageExport.overallTotal;
+            const uint64_t done=std::min(m_stageExport.overallCompleted,total);
             const auto visual=ResolveActivityVisual(surface.progressTrack,ActivityElapsedMs(),done,total,total>0,m_activityMotionEnabled);
             DrawActivitySpinner(dc,surface.spinner,visual.spinnerStep);
             SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(242,243,245));HGDIOBJ oldFont=SelectObject(dc,m_font);
@@ -11654,20 +11957,33 @@ private:
             DrawTextW(dc,title.c_str(),-1,&row,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
             SelectObject(dc,m_fontSmall);SetTextColor(dc,ui_palette::SecondaryText);
             // "Pass 1 of 2 - Super Resolution and neural rendering": which of
-            // the two long things is happening, and how many are left.
-            wchar_t phase[256];
-            swprintf_s(phase,L"Pass %u of %u · %s",m_stageExport.pass,std::max<uint32_t>(1,m_stageExport.passes),
-                       T(m_stageExport.passKey?m_stageExport.passKey:L"export.progress.writing").c_str());
-            row=surface.phase;DrawTextW(dc,phase,-1,&row,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+            // the two long things is happening, and how many are left. The last
+            // step has no pass of its own, so it names itself.
+            std::wstring phase;
+            if(m_stageExport.writing){
+                phase=T(L"export.progress.writing");
+            }else{
+                wchar_t buffer[256];
+                swprintf_s(buffer,L"Pass %u of %u \u00b7 %s",m_stageExport.pass,std::max<uint32_t>(1,m_stageExport.passes),
+                           T(m_stageExport.passKey?m_stageExport.passKey:L"export.progress.writing").c_str());
+                phase=buffer;
+            }
+            row=surface.phase;DrawTextW(dc,phase.c_str(),-1,&row,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
             std::wstring frames;
-            if(total>0){
+            if(m_stageExport.writing){
+                // The count is the passes' own, and the last step has none to
+                // add: saying "100%" over a stream copy that is still running
+                // would be a lie the phase line above already covers better.
+                frames=T(L"export.progress.all_rendered");
+            }else if(total>0){
                 wchar_t line[128];swprintf_s(line,L"%u%% · %llu / %llu frames",visual.percent,
                                              static_cast<unsigned long long>(done),static_cast<unsigned long long>(total));
                 frames=line;
             }
             row=surface.frameCount;DrawTextW(dc,frames.c_str(),-1,&row,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
             // Elapsed from this export's own start, and an estimate only once
-            // there are enough frames for one to mean anything.
+            // there are enough frames for one to mean anything. The rate is the
+            // whole film's, so it no longer restarts with every pass.
             const double elapsedSeconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-m_stageExport.started).count();
             std::wstring timing=L"Elapsed "+TimeText(elapsedSeconds);
             if(total>0&&done>4&&elapsedSeconds>2.0){
@@ -11678,7 +11994,8 @@ private:
             row=surface.size;const std::wstring hint=T(L"menu.cancel_export_running");
             DrawTextW(dc,hint.c_str(),-1,&row,DT_CENTER|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);
             HBRUSH track=CreateSolidBrush(RGB(68,71,77));FillRect(dc,&surface.progressTrack,track);DeleteObject(track);
-            HBRUSH fill=CreateSolidBrush(ui_palette::NeuralCoverage);FillRect(dc,&visual.fill,fill);DeleteObject(fill);
+            const RECT filled=m_stageExport.writing?surface.progressTrack:visual.fill;
+            HBRUSH fill=CreateSolidBrush(ui_palette::NeuralCoverage);FillRect(dc,&filled,fill);DeleteObject(fill);
             SelectObject(dc,oldFont);
             return;
         }
@@ -14733,6 +15050,16 @@ private:
                 m_stageExport=*update;m_stageExport.started=started;
                 SyncActivityFeedback();UpdateCachedStatus();InvalidateControls();
                 InvalidateRect(h,nullptr,FALSE);
+                // Convert video is a window of its own, so it would otherwise sit
+                // on the summary it drew before the run began and leave Run lit.
+                if(m_convertWnd&&IsWindow(m_convertWnd)){
+                    SetDlgItemTextW(m_convertWnd,IDC_CV_SUMMARY,ConvertVideoSummary().c_str());
+                    if(HWND run=GetDlgItem(m_convertWnd,IDC_CV_RUN))
+                        EnableWindow(run,ConvertVideoUsable()&&ConvertVideoRangeValid()&&!ExportStagesBusy());
+                }
+                // And the run panel is a third surface reading the same progress:
+                // its bar only moves if it is told to repaint.
+                if(m_convertRunWnd&&IsWindow(m_convertRunWnd))InvalidateRect(m_convertRunWnd,nullptr,FALSE);
             }
             return 0;
         }
@@ -14960,15 +15287,27 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     std::filesystem::path m_cacheRoot;
     std::filesystem::path m_neuralPath;
     // What the export is doing right now, posted from the worker thread and
-    // read by the activity panel. Two passes at most, so "pass N of M" is the
-    // honest shape rather than one bar that jumps backwards when stage two
-    // starts counting its own frames from zero.
+    // read by the activity panel and the run panel, so the two cannot disagree
+    // about what the machine is doing.
     struct StageExportProgress{
         bool running{};
         uint32_t pass{},passes{};
         const wchar_t* passKey{};
+        // This pass's own count.
         uint64_t completedFrames{},totalFrames{};
+        // The whole film's, weighted by what a frame of each pass costs. RunStageExport
+        // adds them up (StageExportUpdate::overallCompleted) - the bar divides by these,
+        // so a second pass opens where the first closed rather than at zero, and the
+        // interpolated pass - a quarter of a neural frame's work - does not get half
+        // the bar. Read, never derived here: a second copy of that arithmetic in the
+        // UI is a second place for the two to disagree.
+        uint64_t overallCompleted{},overallTotal{};
         std::chrono::steady_clock::time_point started{};
+        // The passes are done and the last step is writing the file into place.
+        // Kept apart from `running` rather than spelled as its absence: the
+        // panel used to vanish here, because a report with no pass read as "the
+        // job is over" while the job was still muxing (P1.34).
+        bool writing{};
     };
     StageExportProgress m_stageExport{};
     HWND m_exportStagesWnd{};
@@ -15000,6 +15339,12 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     };
     ConvertVideoSelection m_convert{};
     HWND m_convertWnd{};
+    // The modal panel a run puts up, and the fonts it draws with. Separate from
+    // m_convertWnd because the dialog has no room for a bar and must stay put
+    // behind it; the run window owns the only control that ends the wait.
+    HWND m_convertRunWnd{};
+    HFONT m_convertRunFont{};
+    HFONT m_convertRunFontSmall{};
     CompletionRegistry<ExportCompletion> m_exportCompletions;
     std::jthread m_exportWorker;
     CompletionRegistry<FrameGenerationCompletion> m_frameGenCompletions;

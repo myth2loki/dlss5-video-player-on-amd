@@ -177,6 +177,16 @@ struct StageExportUpdate {
     uint32_t pass{},passes{};
     const wchar_t* passKey{};
     uint64_t completedFrames{},totalFrames{};
+    // The whole film, not the pass: this is what a progress bar divides by.
+    // Each pass runs over the same footage, but a frame of one is not a frame
+    // of the other - a neural frame is several times the work of an
+    // interpolated one - so the two numbers are frames weighted by what a
+    // frame of each pass costs, and a second pass opens where the first one
+    // closed instead of starting again at zero.
+    //
+    // Zero until the first pass reports a frame count; a bar has no
+    // denominator before that, which is the only time it may move on its own.
+    uint64_t overallCompleted{},overallTotal{};
 };
 
 enum class StageExportStatus { Done, Refused, Failed, Cancelled };
