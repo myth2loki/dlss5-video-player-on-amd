@@ -329,7 +329,10 @@ struct DubStageRequest {
 > 本文早前版本（Kokoro / 取消克隆）作废。最终结论见 `tts-engine-recommendation.md` §10–§11。
 
 - **引擎 XTTS-v2**，零样本克隆（每角色 8–10 秒参考音频，无需训练）。
-- 合成恒 `speed=1.0` + `do_sample=False`；溢出只用外部 `atempo`（上限 1.20）。
+- 合成恒 `speed=1.0`；溢出只用外部 `atempo`。
+  > **已修订（2026-10-27 整片实测）**：上限不是 1.20，是 **1.25，短窗（<1.2 s）1.50**；
+  > 而且 atempo 之前要先借静音、之后才轮到重写译文。完整规则与实测数字见
+  > [`docs/DUBBING-FIT-RULES-zh.md`](../docs/DUBBING-FIT-RULES-zh.md)。
 - 实测：**7/7 句装进窗口（6 句无需拉伸）**，克隆指标同人 0.30 / 异人 0.03，**0/7 判错**。
 - 成本：CPU RTF 1.87× → **2 小时片约 90 分钟 TTS**（+ 人声分离 89 分钟，若保留）。
 - **克隆机制回到方案里**：D2（每角色一个音色）恢复，diarization 恢复（纯度 8/9）。
@@ -342,11 +345,11 @@ struct DubStageRequest {
 | 1 | XTTS 接入（权重分发、进程内加载、逐句合成） | 2–3 |
 | 2 | 参考音频选段（diarization + 每角色最长干净段） | 2–3 |
 | 3 | 译文字数预算 + 专名表 | 1–1.5 |
-| 4 | 逐句时长拟合（1.0 合成 → 量长 → 外部 atempo ≤1.20） | 1–1.5 |
+| 4 | 逐句时长拟合（合成 → 裁静音 → 借静音 → atempo 1.25/1.50 → 按预算重写）<br>规则与实测见 `docs/DUBBING-FIT-RULES-zh.md` | 1–1.5 |
 | 5 | 混音 + mux 第二条音轨 | 1–1.5 |
 | 6 | UI（配音行、音色策略、失败态）+ 进度 | 1 |
 | 7 | 验收（片段全链路、两容器、取消无残留） | 1–1.5 |
-| 8 | 许可与分发（CPML 附件、`THIRD_PARTY_LICENSES`） | 0.5–1 || 8 | 许可与分发（CPML 附件、`THIRD_PARTY_LICENSES`） | 0.5–1 |
+| 8 | 许可与分发（CPML 附件、`THIRD_PARTY_LICENSES`） | 0.5–1 |
 
 **许可（已定：保持开源，非商用）**——CPML 1.0.0 三条义务见 `tts-engine-recommendation.md` §12：
 
