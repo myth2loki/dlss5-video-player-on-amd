@@ -80,7 +80,10 @@ def main():
         # reference still needs an entry, or it never reaches the borrow fallback.
         candidates.setdefault(row.get("speaker") or "unknown", [])
         length = row["end"] - row["start"]
-        if not (MIN_LINE <= length <= MAX_LINE):
+        # The old man's lines are short; let them all in so his reference is built from
+        # everything he says rather than borrowed from the young lead.
+        min_line = 0.6 if row.get("speaker") == "elder" else MIN_LINE
+        if not (min_line <= length <= MAX_LINE):
             continue
         start, end = int(row["start"] * vrate), int(row["end"] * vrate)
         chunk = vocal[start:end]
@@ -119,7 +122,12 @@ def main():
         chosen.sort(key=lambda c: c["start"])
 
         total_len = sum(item["length"] for item in chosen)
-        if total_len < MIN_TOTAL:
+        if speaker == "elder":
+            # The old man never has enough material to meet MIN_TOTAL, but borrowing the
+            # lead voice would make him sound like Tom -- exactly the defect we are fixing.
+            # Build his clip from whatever he says and let the cloner work with it.
+            pass
+        elif total_len < MIN_TOTAL:
             # A 2.7 s clip models too little prosody to clone from reliably; the pipeline
             # already borrowed the lead voice by hand for minor roles, so do it here.
             print(f"{speaker:8s} only {total_len:.2f}s of material, will borrow")

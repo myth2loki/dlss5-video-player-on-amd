@@ -36,6 +36,7 @@ ROOT = pathlib.Path(os.environ.get("DUB_ROOT", "F:/tmp/s2st"))
 WORK = ROOT / "work"
 WORK.mkdir(parents=True, exist_ok=True)
 VOCALS = os.environ.get("DUB_VOCALS", str(ROOT / "stems_out/vocals.wav"))
+BED = os.environ.get("DUB_BED", str(ROOT / "stems_out/no_vocals.wav"))
 TRANSCRIPT = os.environ.get("DUB_TRANSCRIPT", "F:/tmp/dub-verify/transcript.json")
 # How close two lines have to be before they count as the same voice. Only used when
 # the film has no known lines to anchor on -- see the clustering block below.
@@ -71,6 +72,13 @@ subprocess.run([FFMPEG, "-v", "error", "-y", "-i", VOCALS, "-ac", "1", "-ar", "1
                 "-c:a", "pcm_s16le", str(vox16k)], check=True)
 vox, rate = sf.read(str(vox16k), always_2d=True)
 vox = vox.mean(axis=1)
+
+# 同一采样率的伴奏轨，供 voice.py 在「人声压倒音乐」的帧上测基频（与审计同一过滤）。
+bed16k = WORK / "bed16k.wav"
+subprocess.run([FFMPEG, "-v", "error", "-y", "-i", BED, "-ac", "1", "-ar", "16000",
+                "-c:a", "pcm_s16le", str(bed16k)], check=True)
+_bed, _brate = sf.read(str(bed16k), always_2d=True)
+bed = _bed.mean(axis=1)
 
 from spk import SpeakerEmbedder  # noqa: E402
 
@@ -260,6 +268,13 @@ TRUTH = [
     ("Oh, whatever", "celia"),
     ("Robot's memory synced", "robot"),
     ("This is pretty freaky", "unknown"),
+    # The old man -- an octave below the young lead, so the centroid folds him into
+    # "tom". He is locked to his own "elder" voice here (voice.repair_lines' truth
+    # override then re-labels him), instead of being caught by a floor split that
+    # would also mis-catch Tom's genuinely-low lines (see repair_lines).
+    ("I heard you guys", "elder"),
+    ("Listen Celia, I was", "elder"),
+    ("But there's no reason", "elder"),
 ]
 
 
@@ -495,6 +510,7 @@ for index, row in enumerate(candidates):
     lines.append({"index": index, "start": row["start"], "end": row["end"], "speaker": label,
                   "text": row["text"], "scores": scores, "margin": round(margin, 3),
                   "confidence": confidence, "quality": row.get("quality", "span"),
+                  "truth": row.get("truth"),
                   "rough_start": row.get("rough_start", row["start"]),
                   "rough_end": row.get("rough_end", row["end"])})
     print(f"  #{index:2d} {row['start']:8.2f}-{row['end']:8.2f} {label:7s} {confidence:3s} "
@@ -508,8 +524,9 @@ for index, row in enumerate(candidates):
 if ref_vectors:
     import voice
 
-    changes = voice.repair_turns(lines, vox, rate, voices=tuple(ref_vectors))
-    print(f"  基频否决：{len(changes)} 句改了声线"
+    voices = tuple(list(ref_vectors) + ["elder"])  # elder 目标始终可用，step11 会建参考音
+    changes = voice.repair_lines(lines, vox, bed, rate, voices=voices)
+    print(f"  音色对齐修正：{len(changes)} 句改了声线"
           + ("" if not changes else "，见上面的 turn 行"))
 
 json.dump(lines, open(WORK / "lines.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)

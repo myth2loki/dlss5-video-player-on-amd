@@ -1,84 +1,92 @@
-"""Pitch band veto: prove a line is male when the speaker embedding cannot.
+"""Align each line's assigned speaker with the gender (and, within male, the
+register) actually audible on screen.
 
-step1_align labels a line by cosine against per-speaker centroids, and asks for a
-0.15 margin. On this film 29 of 70 lines miss that margin, and the misses are all
-0.4-1.0 s interjections -- "Now.", "Be honest.", "Be tender." -- where ECAPA's
-absolute cosine drops to 0.03-0.17 and the winner is decided by noise. Four of those
-came out as the female lead while the scene is a man talking to the robot, which is
-audible in the finished dub.
+The diariser (ECAPA, in step1_align) and the hand truth table get *who* right on the
+main characters but misfire on two things pitch settles cleanly:
 
-Pitch cannot identify *which* speaker (two men share a range), but it can rule one out.
-Measured with Praat's autocorrelation on the vocal stem:
+  * short, weakly-scored lines where the embedding has no real opinion -- a 0.4 s
+    "Be honest." lands on whichever voice the noise picked, and a scene of them came
+    out female while a man is on screen;
+  * the old man, whose register sits a full octave below the young lead. Both are
+    male, so the embedding (and the truth table) fold him into "tom", and the clone
+    then speaks him an octave too high.
 
-    tom (male, truth lines)   voiced coverage 165-350 Hz  0.14 - 0.31
-    celia (female, truth)                                0.63 - 0.88
-    the 232-248 s block                                  0.00 - 0.37
+Pitch is measured with YIN (tools/dub-metrics/pitch.py) on the frames where the voice
+clearly dominates the music -- the same filter audit_voice_identity.source_reading uses.
+Measuring it here the same way means the correction and the gate cannot disagree.
 
-A voice with no periodicity at all above 165 Hz is not the female lead, so the test is
-one-sided: `hi_coverage` below VETO proves male, anything above it says nothing. That
-asymmetry is the point -- it can only ever move a line onto the male voice, so a wrong
-read costs the existing label rather than inventing a new one.
+Three moves, each guarded so it cannot invent an error:
 
-Parselmouth wraps Praat (MIT, ~3 MB) -- nothing like the torch dependency this engine
-was built to avoid, and stage 1 is the only consumer.
+0. Truth override. A hand-verified label the embedding overrode is restored. This is
+   how the old man enters: his lines carry truth="elder" and would otherwise be parked
+   on Tom by the centroid. Film-specific, like the rest of the truth table.
+
+1. Gender correction, single line, bidirectional, guarded by weak(). On-screen female
+   parked on a male voice, and the diariser was not confident -> celia. Mirror: on-screen
+   male parked on a female voice, diariser weak -> tom, or elder when the register is low.
+   weak() is the guard: a line the embedding is sure of is never overridden, because a
+   lone pitch trace in overlapping dialogue can be the other actor's voice bleeding
+   through. That is exactly the "I'm not freaked out" exchange -- Tom speaks over Celia
+   there and the trace flips female; overriding would put a woman's voice where Tom is.
+
+2. Neighbour sweep for still-unlabelled lines (unchanged from before).
 """
+
+import os
+import sys
 
 import numpy as np
 
-# 165 Hz = the male/female split; 350 Hz keeps Praat from chasing F0 of a child voice.
-LOW_BAND = (60.0, 165.0)
-HIGH_BAND = (165.0, 350.0)
-VETO = 0.40          # high-band coverage below this: this voice is male
-TIME_STEP = 0.01
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "dub-metrics"))
+import pitch  # noqa: E402  (pure-numpy YIN; no parselmouth)
 
+# Gender bands and the clean-frame filter mirror audit_voice_identity, so a correction
+# and the gate that checks it cannot disagree.
+FEMALE = 195.0       # on-screen floor >= this reads female
+MALE = 165.0         # on-screen floor <= this reads male; between the two is unstated
+ELDER_FLOOR = 115.0  # a *male* line below this is the old man, not the young lead
+MIN_FRAMES = 20      # fewer clean voiced frames -> the reading is not believed
+SEPARATION = 9.0     # dB the voice must sit above the bed before a frame is kept
+MUSIC_FLOOR = 0.03   # ... and the bed must be quiet in absolute terms
 
-def _coverage(samples, sr, floor, ceiling):
-    """(voiced fraction, median F0) of one band, via Praat autocorrelation."""
-    import parselmouth
-
-    sound = parselmouth.Sound(np.asarray(samples, dtype=np.float64),
-                              sampling_frequency=int(sr))
-    pitch = sound.to_pitch_ac(time_step=TIME_STEP, pitch_floor=floor,
-                              pitch_ceiling=ceiling)
-    values = pitch.selected_array["frequency"]
-    voiced = values[values > 0]
-    fraction = float(len(voiced) / max(1, len(values)))
-    median = float(np.median(voiced)) if len(voiced) else float("nan")
-    return fraction, median
-
-
-def profile(samples, sr):
-    """Pitch evidence for one clip of speech."""
-    samples = np.asarray(samples, dtype=np.float32).reshape(-1)
-    if len(samples) < int(0.15 * sr):
-        return None
-    low_cov, low_f0 = _coverage(samples, sr, *LOW_BAND)
-    high_cov, high_f0 = _coverage(samples, sr, *HIGH_BAND)
-    if low_cov + high_cov <= 0:
-        return None
-    return {
-        "low_coverage": round(low_cov, 3),
-        "low_f0": None if not np.isfinite(low_f0) else round(low_f0, 1),
-        "high_coverage": round(high_cov, 3),
-        "high_f0": None if not np.isfinite(high_f0) else round(high_f0, 1),
-        "male": high_cov < VETO,
-    }
-
-
-# --- turn-level repair -------------------------------------------------------------
-# The veto is applied per *turn*, not per line. A single 0.4 s clip ("Be honest.") can
-# read high or low depending on where the sentence falls in it, but a scene is 6-16 s of
-# one voice, and the block at 232-248 s reads high-band coverage 0.00-0.39 on all eight
-# lines -- no female voice can do that across a whole scene.
-#
-# A turn is a run of lines separated by less than TURN_GAP. Silence is the only turn
-# boundary this pipeline can see (there is no diarizer), and 6 s is well above the
-# 1-3 s gaps inside a scene while still below the 7 s+ gaps between scenes here.
-TURN_GAP = 6.0
-# Voices that the veto may not rewrite a line *to*. Everything else is fair game,
-# including "unknown": step3_tts borrows Tom's voice for it.
 FEMALE_VOICES = ("celia",)
 DEFAULT_MALE = "tom"
+ELDER = "elder"
+
+
+def _frame_rms(samples, count, size, hop):
+    """RMS of the frame each F0 reading was taken from, aligned to the YIN grid."""
+    squares = np.concatenate(([0.0], np.cumsum(np.asarray(samples, dtype=np.float64) ** 2)))
+    starts = np.arange(count) * hop
+    ends = np.minimum(starts + size, len(samples))
+    starts = np.minimum(starts, len(samples))
+    return np.sqrt(np.maximum(squares[ends] - squares[starts], 0.0) / np.maximum(ends - starts, 1))
+
+
+def source_floor(vocal_seg, bed_seg, rate):
+    """YIN pitch-floor of the on-screen voice, on frames where it beats the music.
+
+    Returns (floor_or_None, voiced_frames). Identical filter to the audit's
+    source_reading, so a line judged here is judged the same way at the gate.
+    """
+    track = pitch.yin_track(vocal_seg, rate)
+    if not len(track):
+        return None, 0
+    size, hop = int(pitch.WINDOW * rate), int(pitch.HOP * rate)
+    loud = _frame_rms(vocal_seg, len(track), size, hop)
+    music = _frame_rms(bed_seg, len(track), size, hop)
+    keep = (track > 0) & (loud > music * 10 ** (SEPARATION / 20)) & (music < MUSIC_FLOOR)
+    return pitch.floor_of(track[keep])
+
+
+def gender_of(floor):
+    if floor is None:
+        return None
+    if floor >= FEMALE:
+        return "f"
+    if floor <= MALE:
+        return "m"
+    return None
 
 
 def weak(line):
@@ -88,72 +96,78 @@ def weak(line):
     return best < 0.35 or float(line.get("margin", 0.0)) < 0.15
 
 
-def _turns(lines):
-    turn = []
-    for line in lines:
-        if turn and line["start"] - turn[-1]["end"] > TURN_GAP:
-            yield turn
-            turn = []
-        turn.append(line)
-    if turn:
-        yield turn
+def repair_lines(lines, vocal, bed, sr, voices=(), log=print):
+    """Re-label lines whose on-screen gender / male register contradicts the
+    assignment. Returns (index, before, after) changes.
 
-
-def repair_turns(lines, samples, sr, voices=(), log=print):
-    """Relabel lines the pitch veto proves male, then sweep up what is still unlabelled.
-
-    Only lines that landed on a female voice or on no voice at all are rewritten -- a
-    line the embedding gave to another *male* label (the robot) is left alone, because
-    pitch can never tell two male voices apart.
-
-    Returns the changes as (index, before, after).
+    `vocal` and `bed` are the separated stems at `sr` (any rate -- floors come back in
+    Hz). `voices` is the set of speakers that have, or will have, a reference; "elder"
+    is always accepted as a target so step11 can then build its clip.
     """
-    samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+    vocal = np.asarray(vocal, dtype=np.float32).reshape(-1)
+    bed = np.asarray(bed, dtype=np.float32).reshape(-1)
     changes = []
-    for turn in _turns(lines):
-        profiled = []
-        for line in turn:
-            seg = samples[int(line["start"] * sr):int(line["end"] * sr)]
-            evidence = profile(seg, sr)
-            if evidence is not None:
-                line["pitch"] = evidence
-                profiled.append((line, evidence))
-        if len(profiled) < 2 or not all(e["male"] for _, e in profiled):
+    for line in lines:
+        if line.get("skip"):
             continue
-        male = [line["speaker"] for line, _ in profiled
-                if line["speaker"] not in FEMALE_VOICES and line["speaker"] in voices]
-        if male:
-            owner = max(set(male), key=male.count)
-        elif DEFAULT_MALE in voices:
-            owner = DEFAULT_MALE
-        else:
+        a, b = int(line["start"] * sr), int(line["end"] * sr)
+        seg, bseg = vocal[a:b], bed[a:b]
+        floor, n = source_floor(seg, bseg, sr)
+        line["pitch"] = {
+            "floor": round(floor, 1) if floor else None,
+            "n": int(n),
+            "gender": gender_of(floor),
+        }
+        spk = line["speaker"]
+        truth = line.get("truth")
+
+        # 0. Truth override: a hand-verified label the embedding overrode is restored.
+        #    This is how the old man enters -- his lines carry truth="elder" and would
+        #    otherwise be parked on Tom by the centroid.
+        if truth and truth in voices and truth != spk:
+            _reassign(line, truth, changes, log)
             continue
-        touched = []
-        for line, _ in profiled:
-            before = line["speaker"]
-            if before in FEMALE_VOICES or before not in voices:
-                line["speaker"] = owner
-                if before != owner:
-                    line["speaker_before"] = before
-                    touched.append((line["index"], before, owner))
-        if touched:
-            log(f"  turn {turn[0]['start']:.1f}-{turn[-1]['end']:.1f}s, high-band "
-                f"coverage {min(e['high_coverage'] for _, e in profiled):.2f}-"
-                f"{max(e['high_coverage'] for _, e in profiled):.2f} -> {owner}: "
-                + ", ".join(f"#{i} {b}" for i, b, _ in touched))
-            changes.extend(touched)
+
+        if floor is None or n < MIN_FRAMES:
+            continue
+        src_g = gender_of(floor)
+        cur_g = "f" if spk in FEMALE_VOICES else "m" if spk in voices else None
+
+        # 1. Gender correction -- only when the diariser was not confident, so a pitch
+        #    trace contaminated by the other actor's overlapping voice cannot override a
+        #    real assignment (the "I'm not freaked out" trap).
+        if src_g and cur_g and src_g != cur_g:
+            if truth and truth == spk:
+                continue
+            if not weak(line):
+                continue
+            target = (FEMALE_VOICES[0] if src_g == "f"
+                      else (ELDER if floor < ELDER_FLOOR else DEFAULT_MALE))
+            if target != spk and target in voices:
+                _reassign(line, target, changes, log)
+            continue
+
     changes += _neighbour_sweep(lines, voices, log)
     return changes
+
+
+def _reassign(line, target, changes, log):
+    before = line["speaker"]
+    line["speaker"] = target
+    line["speaker_before"] = before
+    changes.append((line["index"], before, target))
+    log(f"  #{line['index']:2d} {before} -> {target} "
+        f"(pitch floor {line['pitch']['floor']} Hz, on-screen {line['pitch']['gender']})")
 
 
 def _neighbour_sweep(lines, voices, log):
     """Give every still-unlabelled line the voice of the nearest labelled line.
 
-    step11_refs_auto cannot leave a label without a reference, so "unknown" borrows
-    whichever voice carries the most lines -- on this film that is the female lead, and
-    every too-short-to-embed interjection ("Be honest.", "I know.") came out female. A
-    line that is 0.4 s long has no timbre to measure, but it does sit inside somebody's
-    turn, so its neighbour is the better guess.
+    step11 cannot leave a label without a reference, so "unknown" borrows whichever
+    voice carries the most lines -- on this film that is the female lead, and every
+    too-short-to-embed interjection came out female. A line that is 0.4 s long has no
+    timbre to measure, but it does sit inside somebody's turn, so its neighbour is the
+    better guess.
     """
     known = [line for line in lines if line["speaker"] in voices]
     if not known:

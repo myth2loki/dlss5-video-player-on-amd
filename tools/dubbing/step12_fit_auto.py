@@ -346,7 +346,8 @@ def main():
             # is on disk -- so re-runs converge instead of compounding the slowdown.
             prior = prev_fit.get(index)
             if (path.exists() and prior and prior.get("text") == text
-                    and prior.get("natural_seconds")):
+                    and prior.get("natural_seconds")
+                    and prior.get("speaker") == speaker):
                 audio, rate = sf.read(str(path), always_2d=True)
                 seconds = len(audio) / rate              # current final on disk
                 natural_seconds = prior["natural_seconds"]
