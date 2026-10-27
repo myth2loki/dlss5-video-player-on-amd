@@ -52,6 +52,9 @@ Python：`numpy`、`soundfile`、`onnxruntime`、`parselmouth`；`probe_metrics.
 | `DUB_TTS_BIN` / `DUB_TTS_MODEL` / `DUB_TTS_MMPROJ` | 引擎目录 | |
 | `DUB_TR_MODEL` | `translation/models/*` | 翻译用 gguf |
 | `DUB_LANG` | `en` | 源语言 |
+| `DUB_PEAK_LIMIT` | `0.794`（−2 dBTP） | 母版真峰上限，`alimiter` 的 `limit` |
+| `DUB_LIMIT_OVERSAMPLE` | `4` | 限幅前的过采样倍数（必须 >1，否则限的是样点峰不是真峰） |
+| `DUB_VIDEO_CRF` | 未设（画面 `-c:v copy`） | 设了就按 h264 crf 重编画面，交付小文件时用（crf 30 → 86 MB） |
 
 ## 不在这里的东西
 
