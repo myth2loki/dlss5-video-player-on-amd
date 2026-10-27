@@ -54,6 +54,12 @@ EXTEND = 1.5          # max seconds a line may borrow past its own end
 SAFETY = 0.92         # aim slightly under the window
 MAX_ROUNDS = 2
 MAX_TEMPO = 1.25
+# Floor on the rate. Lines that came back shorter than their window used to simply end
+# early, with the original voice already removed and only the bed behind the actor's
+# moving mouth. Stretching them toward the window closes that gap; the 0.85 floor caps
+# the slowdown at ~17%, which is as far as a sentence can be drawn out before it sounds
+# as if it were dubbed the wrong way.
+MIN_TEMPO = 0.85
 # How far a line may be rushed before compressing it is the better answer. Kept equal
 # to MAX_TEMPO on purpose: every overrun the speed-up can absorb is one the translator
 # is not asked about, and the translator is what breaks the sentence when asked.
@@ -90,6 +96,14 @@ translations = {row["index"]: row for row in json.load(open(WORK / "zh_final.jso
 OVERRIDES = WORK / "zh_overrides.json"
 overrides = json.load(open(OVERRIDES, encoding="utf-8")) if OVERRIDES.exists() else {}
 refs = json.load(open(WORK / "refs_auto.json", encoding="utf-8"))
+
+# Earlier fit, if any, so an unchanged line can reuse its synthesised clip instead of
+# being re-synthesised every time the fit is re-run (e.g. to let lines slow down).
+prev_fit = {}
+fit_auto_path = WORK / "fit_auto.json"
+if fit_auto_path.exists():
+    with open(fit_auto_path, encoding="utf-8") as _fh:
+        prev_fit = {r["index"]: r for r in json.load(_fh)}
 
 
 def features(text):
@@ -324,7 +338,21 @@ def main():
                     print(f"   #{index:2d} predicted {predicted:.2f}s > reachable "
                           f"{reachable:.2f}s, rewritten before synthesis")
 
-            seconds = synth(text, ref, path)
+            # Reuse a previous synthesis when this exact line is unchanged AND we still
+            # have its natural duration on record, so a re-fit does not re-synthesise 71
+            # lines and discard the render we already have. The clip on disk is whatever
+            # tempo the previous run left it; the atempo step below re-derives the desired
+            # length from the stored NATURAL duration and applies atempo relative to what
+            # is on disk -- so re-runs converge instead of compounding the slowdown.
+            prior = prev_fit.get(index)
+            if (path.exists() and prior and prior.get("text") == text
+                    and prior.get("natural_seconds")):
+                audio, rate = sf.read(str(path), always_2d=True)
+                seconds = len(audio) / rate              # current final on disk
+                natural_seconds = prior["natural_seconds"]
+            else:
+                seconds = synth(text, ref, path)          # natural, now on disk
+                natural_seconds = seconds
 
             # Rushing before rewriting, in that order. A line that overruns its window
             # by a fifth can simply be said a fifth faster; asking the translator to
@@ -339,6 +367,7 @@ def main():
                     break
                 text, stage = gloss(candidate), f"budget-{rounds + 1}"
                 seconds = synth(text, ref, path)
+                natural_seconds = seconds
                 rounds += 1
 
             # Borrow the silence first, speed the voice second. The order used to be the
@@ -356,14 +385,39 @@ def main():
                     anchor -= shift
                     shifted = shift
 
-            tempo = 1.0
-            if seconds and seconds > window + shifted:
-                tempo = min(seconds / (window + shifted), ceiling)
-                if tempo > 1.02:
-                    stretched = DUB / f"zh{index:02d}_t.wav"
-                    atempo(path, stretched, tempo)
-                    stretched.replace(path)
-                    seconds = seconds / tempo
+            # Desired final length is derived from the NATURAL duration, so the atempo
+            # factor is a property of the line, not of whatever tempo the disk already
+            # holds. The atempo call itself is applied relative to the current file, which
+            # is what makes re-runs converge.
+            desired = natural_seconds
+            applied = 1.0
+            if natural_seconds and natural_seconds > window + shifted:
+                # Rush the voice to fit the turn.
+                applied = min(natural_seconds / (window + shifted), ceiling)
+                if applied > 1.02:
+                    desired = natural_seconds / applied
+                else:
+                    applied = 1.0
+            elif natural_seconds and natural_seconds < (window + shifted) * SAFETY:
+                # The Chinese came back shorter than the actor's turn: stretch it to cover
+                # the actor's own speech -- the "mouth moves, no sound" complaint -- rather
+                # than the silence until the next line, so a line whose window is wide only
+                # because the next speaker is far does not get drawn out into dead air.
+                # Capped at MIN_TEMPO: a one-word exclamation should not be stretched to
+                # fill a multi-second gap it can never honestly cover.
+                base = row["end"] - row["start"]
+                target = min(base, window + shifted) * SAFETY
+                applied = max(natural_seconds / target, MIN_TEMPO)
+                if applied < 0.98:
+                    desired = natural_seconds / applied
+                else:
+                    applied = 1.0
+            if abs(seconds - desired) / max(desired, 1e-6) > 0.01:
+                stretched = DUB / f"zh{index:02d}_t.wav"
+                atempo(path, stretched, seconds / desired)
+                stretched.replace(path)
+                seconds = desired
+            tempo = applied
 
             room_total = window + shifted + (OVERLAP if window <= 0.55 else 0.0)
             ratio = (seconds / room_total) if seconds else float("nan")
@@ -372,6 +426,7 @@ def main():
                         "start": row["start"], "end": row["end"], "source": source,
                         "draft": draft, "text": text, "stage": stage,
                         "seconds": round(seconds, 2) if seconds else None,
+                        "natural_seconds": round(natural_seconds, 3),
                         "tempo": round(tempo, 3), "ratio": round(ratio, 3),
                         "needs_human": bool(seconds and seconds > room_total * 1.02)})
             mark = "!" if seconds and seconds > room_total else " "
@@ -389,9 +444,10 @@ def main():
     kept = sum(1 for r in out if r["stage"] == "draft")
     squeezed = sum(1 for r in out if r["stage"].startswith("budget"))
     stretched = sum(1 for r in out if r["tempo"] > 1.02)
+    slowed = sum(1 for r in out if r["tempo"] < 0.98)
     over = [r for r in out if r["needs_human"]]
     print(f"\n=== {len(out)} 句 ===")
-    print(f"  初稿直接用 {kept}  重写压缩 {squeezed}  额外 atempo {stretched}")
+    print(f"  初稿直接用 {kept}  重写压缩 {squeezed}  加速 {stretched}  放慢 {slowed}")
     print(f"  仍超窗 {len(over)}" + (": " + ", ".join(
         f"#{r['index']}({r['ratio']:.2f})" for r in over) if over else ""))
     if out:
