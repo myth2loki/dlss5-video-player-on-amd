@@ -5,9 +5,10 @@ first: a number that changed, a negation that vanished, a name that drifted. All
 three survive any amount of "does it read well", so they belong in a gate rather
 than in a review.
 
-Operates on what was actually spoken (fit_auto.json.text), because that is the
-line the audience hears - the stored translation is a different string on 13 of
-71 lines.
+Operates on what was actually spoken (fit_auto.json.text) and on what the subtitle
+file shows. Those used to come from different files and disagreed on 13 of 71
+lines; the fit stage now writes the subtitle from the rows it spoke, so the check
+is a guard against that wiring coming apart rather than a measurement of it.
 """
 import json
 import os
@@ -20,7 +21,6 @@ load = lambda n: json.load(open(WORK / n, encoding="utf-8"))
 
 lines = {r["index"]: r for r in load("lines.json")}
 fit = {r["index"]: r for r in load("fit_auto.json")}
-stored = {r["index"]: (r["zh"] or "") for r in load("zh_final.json")}
 
 CN_DIGIT = {"0": "零", "1": "一", "2": "二", "3": "三", "4": "四", "5": "五",
             "6": "六", "7": "七", "8": "八", "9": "九", "10": "十",
@@ -51,8 +51,16 @@ for index, f in sorted(fit.items()):
     # 1. numbers
     for token in re.findall(r"\b\d{1,4}\b", en):
         want = CN_DIGIT.get(token, token)
-        if token not in zh and want not in zh:
-            note(index, "number", f"源「{token}」→ 译「{zh}」")
+        if token in zh or want in zh:
+            continue
+        # "90%" is as often 九成 as 百分之九十 in spoken Chinese, and only the first
+        # one fits a two-second window. A round percentage written as tenths is the
+        # same number, not a lost one.
+        if "%" in en and len(token) == 2 and token.endswith("0"):
+            tenths = CN_DIGIT.get(str(int(token) // 10), "")
+            if tenths and f"{tenths}成" in zh:
+                continue
+        note(index, "number", f"源「{token}」→ 译「{zh}」")
 
     # 2. negation
     if NEG_EN.search(en) and not NEG_CN.search(zh):
@@ -91,23 +99,35 @@ for kind in ("name-wrong", "name-missing", "number", "negation", "question", "sh
         print(f"  #{index:<3} {detail[:110]}")
 
 print()
-# The other half of translation accuracy: the subtitle and the voice disagree.
-diff = [i for i in fit if stored.get(i, "").strip() != (fit[i].get("text") or "").strip()]
-print(f"spoken text differs from the stored translation: {len(diff)}/{len(fit)}")
-print("  " + ", ".join(f"#{i}" for i in diff))
+# The two files are now derived from one another - the fit stage writes the
+# subtitle from the rows it spoke - so this is a guard against that wiring
+# coming apart, not a measurement of it. It used to compare the voice against
+# `zh_final.json` and find 13 disagreements, none of which mattered to a viewer
+# until the subtitle file existed.
+subtitle_file = JOB / "subtitles.ass"
+shown = []
+if subtitle_file.exists():
+    for line in subtitle_file.read_text(encoding="utf-8").splitlines():
+        if line.startswith("Dialogue:"):
+            shown.append(line.split(",", 9)[9].strip().replace("\\N", ""))
+spoken = [(i, (fit[i].get("text") or "").strip()) for i in sorted(fit)
+          if (fit[i].get("text") or "").strip() and fit[i].get("seconds")]
+print(f"subtitle cues / spoken lines: {len(shown)} / {len(spoken)}")
+diff = [i for (i, text), cue in zip(spoken, shown) if text != cue]
+if len(shown) != len(spoken):
+    print(f"  !!! {abs(len(shown) - len(spoken))} lines have no counterpart")
+print(f"subtitle text differs from the voice: {len(diff)}/{len(spoken)}"
+      + (": " + ", ".join(f"#{i}" for i in diff) if diff else ""))
 
 print()
-print("=== the stored translation (what a subtitle would show) ===")
+print("=== the names on screen ===")
 wrong = 0
-for index, raw in sorted(stored.items()):
+for (index, _), cue in zip(spoken, shown):
     en = (lines[index]["text"] or "").strip()
-    zh = (raw or "").strip()
-    if not zh:
-        continue
     for latin, chinese in NAMES.items():
-        if re.search(rf"\b{latin}\b", en, re.I) and chinese not in zh:
-            others = [v for k, v in NAMES.items() if k != latin and v in zh]
+        if re.search(rf"\b{latin}\b", en, re.I) and chinese not in cue:
+            others = [v for k, v in NAMES.items() if k != latin and v in cue]
             wrong += 1
-            shown = f"，这里写作「{others[0]}」" if others else ""
-            print(f"  #{index:<3} {latin} 应作「{chinese}」{shown}→「{zh}」")
-print(f"name drift in the stored translation: {wrong} line(s)")
+            printed = f"，这里写作「{others[0]}」" if others else ""
+            print(f"  #{index:<3} {latin} 应作「{chinese}」{printed}→「{cue}」")
+print(f"name drift on screen: {wrong} line(s)")
