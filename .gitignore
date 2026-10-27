@@ -117,3 +117,9 @@ site/dist/
 
 # Speech recognition runtime + GGML model (downloaded on first use)
 /asr/
+
+# The dubbing-chain experiment workspace: TTS/ASR runtimes, model weights and
+# the clips they were measured on, 3 GB in total. Nothing in the build reads it
+# and none of it is redistributable, so it is local material like the two rules
+# above rather than something to commit.
+/ast/
