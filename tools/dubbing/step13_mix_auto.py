@@ -13,6 +13,7 @@ when every individual line meets its own window.
 import json
 import os
 import pathlib
+import re
 import subprocess
 
 import numpy as np
@@ -29,6 +30,15 @@ RATE = 44100
 GAIN_BACKING = 0.85
 HARD_TEMPO = 1.35     # ceiling when rushing a line is the only way to avoid a collision
 MIN_GAP = 0.03        # silence left between two lines so they do not butt together
+
+# The master leaves 2 dB of headroom, not one. The mix is flat-topped by design -- a bed
+# plus a voice on top of it -- and the AAC encoder puts part of that back: a master cut at
+# -0.1 dBTP reached the viewer at +0.9 dBFS, i.e. clipped. At -2 dBTP and 256 kbit/s the
+# decoded track now has 2 samples above full scale in 12 minutes, against 249 in the
+# source film's own MP3. Going lower does not help -- a -3 dBTP master came back at
+# +0.4 dBFS -- because past a point the overs are the codec's, not the level's.
+PEAK_LIMIT = float(os.environ.get("DUB_PEAK_LIMIT", "0.794"))       # -2 dBTP
+LIMIT_RATE = RATE * int(os.environ.get("DUB_LIMIT_OVERSAMPLE", "4"))
 
 
 def stretch(path, ratio, temp):
@@ -65,6 +75,50 @@ def resample_any(samples, rate):
     if samples.ndim == 1:
         return resample(samples, rate)
     return np.stack([resample(samples[:, c], rate) for c in range(samples.shape[1])], axis=1)
+
+
+def measure(path):
+    """(sample peak, true peak, integrated loudness) of a finished file, in dBFS / LUFS.
+
+    Read back from the written file rather than computed from the array in hand: the number
+    that matters is the one a player will see, and only the file is what the player sees.
+    """
+    done = subprocess.run(
+        [FFMPEG, "-hide_banner", "-nostats", "-i", str(path),
+         "-af", "astats=measure_overall=Peak_level:measure_perchannel=none,ebur128=peak=true",
+         "-f", "null", "-"], capture_output=True, text=True)
+    log = done.stderr
+    # astats prints its summary before ebur128 prints its own, so the two are read from the
+    # whole log: splitting on "Summary:" throws the sample peak away.
+    summary = log.split("Summary:")[-1]
+    sample = re.search(r"Peak level dB:\s*(-?[\d.]+)", log)
+    true = re.search(r"Peak:\s*(-?[\d.]+) dBFS", summary)
+    loud = re.search(r"^\s+I:\s*(-?[\d.]+) LUFS", summary, re.M)
+    pick = lambda m: float(m.group(1)) if m else float("nan")
+    return pick(sample), pick(true), pick(loud)
+
+
+def master(scene, target):
+    """Write the mix through a true-peak limiter and say what came out.
+
+    Limiting at 4x the sample rate is what makes this a *true* peak limit: a limiter that
+    only sees 44.1 kHz samples cannot see the peak that lives between two of them, which is
+    exactly the peak a resampling player will reproduce.
+    """
+    loudest = float(np.abs(scene).max()) or 1.0
+    if loudest > 2.0:
+        # Something is 6 dB hot -- a mis-scaled clip, not a mix. Bring the body of the film
+        # down first, so the limiter does the last decibel instead of flattening the voice.
+        scene = scene / loudest * 0.95
+    raw = target.with_name(target.stem + ".raw.wav")
+    sf.write(str(raw), scene.astype(np.float32), RATE)
+    chain = (f"aresample={LIMIT_RATE}:resampler=soxr:precision=28,"
+             f"alimiter=limit={PEAK_LIMIT}:level=disabled:latency=true,"
+             f"aresample={RATE}:resampler=soxr:precision=28")
+    subprocess.run([FFMPEG, "-v", "error", "-y", "-i", str(raw), "-af", chain,
+                    "-c:a", "pcm_s24le", str(target)], check=True)
+    raw.unlink()
+    return measure(target)
 
 
 def main():
@@ -117,20 +171,35 @@ def main():
 
     # Loudness. Qwen3-TTS returns a different level for every line -- across one film the
     # clips ranged 0.010 to 0.11 RMS, so the quietest sat 20 dB under the rest and simply
-    # vanished under the music ("this line has no sound"). Each clip is brought to the
-    # median level of the set, with the correction capped at +-12 dB so a line that is
-    # genuinely whispered stays whispered.
+    # vanished under the music ("this line has no sound"). Every clip is brought to one
+    # level, with the correction capped at +-12 dB so a line that is genuinely whispered
+    # stays whispered.
+    #
+    # Measured the way the line is judged, not the way it is easy: the level of a line is
+    # its speech, i.e. the 75th percentile of its 20 ms blocks, not the RMS of the whole
+    # clip including the silence around it. Normalising by RMS and checking by this measure
+    # is how four lines ended up 3 dB and one 4.9 dB off (a long tail of silence reads as
+    # "quiet" to RMS, so the clip gets boosted past its own speech level).
+    #
+    # A target per scene instead of per film was tried and measured worse: 6.1 dB spread
+    # against 2.7. The per-line level differences are the generator's, not the scene's, so
+    # a local median only adds a per-scene offset.
     levels = {}
     for row in rows:
         clip = DUB / f"zh{row['index']:02d}.wav"
         if clip.exists():
             data, _ = sf.read(str(clip), always_2d=True)
             data = data.mean(axis=1)
-            levels[row["index"]] = float(np.sqrt(np.mean(data ** 2))) if len(data) else 0.0
+            hop = RATE // 50
+            blocks = len(data) // hop
+            if blocks:
+                loud = 20 * np.log10(np.sqrt((data[:blocks * hop].reshape(blocks, hop) ** 2)
+                                             .mean(axis=1)) + 1e-9)
+                levels[row["index"]] = float(np.percentile(loud, 75))
     target = float(np.median(list(levels.values()))) if levels else 0.0
     if levels:
-        print(f"clip level: median {target:.3f}, "
-              f"range {min(levels.values()):.3f}-{max(levels.values()):.3f}")
+        print(f"clip speech level: film median {target:.1f} dBFS, "
+              f"range {min(levels.values()):.1f} to {max(levels.values()):.1f} dBFS")
 
     for position, row in enumerate(order):
         index = row["index"]
@@ -174,7 +243,7 @@ def main():
 
         gain = 1.0
         if target and levels.get(index):
-            gain = min(max(target / levels[index], 0.25), 4.0)   # +-12 dB
+            gain = min(max(10 ** ((target - levels[index]) / 20), 0.25), 4.0)   # +-12 dB
             audio = audio * gain
 
         begin = int(row["anchor"] * RATE)
@@ -218,16 +287,15 @@ def main():
         print(f"  original voice restored for {len(restored)} line(s) that never got a "
               f"Chinese clip: {restored}")
 
-    peak = float(np.abs(scene).max()) or 1.0
-    if peak > 0.95:
-        scene = scene / peak * 0.95
-
     mono = ROOT / "dubbed_full_zh2.wav"
-    sf.write(str(mono), scene.astype(np.float32), RATE)
+    sample_peak, true_peak, loudness = master(scene, mono)
+    print(f"master  sample peak {sample_peak:+.1f} dBFS, true peak {true_peak:+.1f} dBTP, "
+          f"{loudness:.1f} LUFS  (limit {20 * np.log10(PEAK_LIMIT):+.1f} dB)")
+    # The MP3 is for listening to a line, not for delivery; it is cut from the mastered wav
+    # so it inherits the headroom instead of the pre-limiter mix.
     subprocess.run([FFMPEG, "-v", "error", "-y", "-i", str(mono),
                     "-c:a", "libmp3lame", "-b:a", "192k",
                     str(ROOT / "dubbed_full_zh2.mp3")], check=True)
-    print(f"wrote {mono.name}  ({len(scene)/RATE:.1f}s, peak {float(np.abs(scene).max()):.2f})")
 
     # Line-by-line A/B: original English, then the Chinese that replaced it.
     original, original_rate = sf.read(str(ROOT / "full44k.wav"), always_2d=True)

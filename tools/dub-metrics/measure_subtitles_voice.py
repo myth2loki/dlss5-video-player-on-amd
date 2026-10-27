@@ -8,10 +8,11 @@ import json
 import os
 import re
 import unicodedata
-import wave
 from pathlib import Path
 
 import numpy as np
+
+import wavio
 
 # DUB_JOB points at the job directory the dubbing chain wrote; everything below
 # is read out of it rather than out of the finished file, because most of what
@@ -34,18 +35,7 @@ def cue_text(row):
     return "".join(c for c in row.get("zh") or "" if c not in "\ufeff")
 
 
-def read_wav(path):
-    with wave.open(str(path)) as w:
-        rate, width_, channels = w.getframerate(), w.getsampwidth(), w.getnchannels()
-        raw = w.readframes(w.getnframes())
-    if width_ != 2:
-        raise SystemExit(f"unexpected sample width {width_}: {path}")
-    data = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-    if channels > 1:
-        data = data.reshape(-1, channels).mean(axis=1)
-    return data, rate
-
-
+read_wav = wavio.read_wav
 def db(x):
     return 20 * np.log10(max(float(x), 1e-9))
 

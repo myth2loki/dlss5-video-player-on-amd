@@ -8,24 +8,18 @@ window that was mis-measured or too small to begin with.
 """
 import json
 import os
-import wave
 from pathlib import Path
 
 import numpy as np
+
+import wavio
 
 JOB = Path(os.environ.get("DUB_JOB", "F:/tmp/s2st/jobs/t5"))
 WORK = JOB / "work"
 load = lambda n: json.load(open(WORK / n, encoding="utf-8"))
 
 
-def read_wav(path):
-    with wave.open(str(path)) as w:
-        rate, ch = w.getframerate(), w.getnchannels()
-        raw = w.readframes(w.getnframes())
-    d = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-    return (d.reshape(-1, ch).mean(axis=1) if ch > 1 else d), rate
-
-
+read_wav = wavio.read_wav
 lines = {r["index"]: r for r in load("lines.json")}
 fit = {r["index"]: r for r in load("fit_auto.json")}
 zh = {r["index"]: (r["zh"] or "") for r in load("zh_final.json")}

@@ -4,10 +4,11 @@ import json
 import os
 import re
 import unicodedata
-import wave
 from pathlib import Path
 
 import numpy as np
+
+import wavio
 
 JOB = Path(os.environ.get("DUB_JOB", "F:/tmp/s2st/jobs/t5"))
 WORK, DUB = JOB / "work", JOB / "dub_auto"
@@ -18,15 +19,7 @@ def width(t):
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in t)
 
 
-def read_wav(path):
-    with wave.open(str(path)) as w:
-        rate, channels = w.getframerate(), w.getnchannels()
-        raw = w.readframes(w.getnframes())
-    data = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
-    if channels > 1:
-        data = data.reshape(-1, channels).mean(axis=1)
-    return data, rate
-
+read_wav = wavio.read_wav
 
 lines = {r["index"]: r for r in load("lines.json")}
 fit = {r["index"]: r for r in load("fit_auto.json")}
@@ -59,7 +52,9 @@ print(f"gaps under 0.08 s            : {sum(1 for g,_,_ in gaps if 0 <= g < 0.08
 print()
 print("=== delivered voice levels (synthesis + mix gain) ===")
 delivered, notes = {}, {}
-for path in sorted(DUB.glob("zh*.wav")):
+# Only the clips as synthesised: the mixer leaves zhNN_p.wav behind when it had to
+# rush a line, and a glob that picks those up measures the same line twice.
+for path in sorted(DUB.glob("zh[0-9][0-9].wav")):
     i = int(re.sub(r"\D", "", path.stem) or -1)
     if i not in fit or i not in mix:
         continue

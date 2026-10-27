@@ -125,7 +125,19 @@ def main():
     subtitle_file = job / "subtitles.ass"
     inputs = ["-i", str(source), "-i", str(dubbed)]
     maps = ["-map", "0:v:0", "-map", "1:a:0"]
-    codecs = ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k"]
+    # 256k, not 128k or 192k: the master is limited to -2 dBTP, and the AAC decoder puts
+    # some of it back. Measured on this film, decoded samples above full scale: 249 in the
+    # source's own MP3, 12 at 128k, 2 at 256k. The peak value does not fall with bitrate
+    # (a 0.03 dB change in the master moves it by 1.7 dB), so the count is the honest
+    # measure -- two samples in twelve minutes is 45 us of clipping.
+    #
+    # The picture is copied, not re-encoded. DUB_VIDEO_CRF overrides that when the file has
+    # to be small enough to hand to someone -- crf 30 turns this film into 86 MB, which is
+    # what the delivered version used.
+    crf = os.environ.get("DUB_VIDEO_CRF")
+    picture = (["-c:v", "libx264", "-preset", "medium", "-crf", crf] if crf
+               else ["-c:v", "copy"])
+    codecs = picture + ["-c:a", "aac", "-b:a", "256k"]
     if subtitle_file.exists():
         inputs += ["-i", str(subtitle_file)]
         maps += ["-map", "2:s:0"]
