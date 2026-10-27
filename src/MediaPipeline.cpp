@@ -5,6 +5,7 @@
 #include "HardErrorSuppression.h"
 #include "KillOnCloseJob.h"
 #include "MediaTools.h"
+#include "SubtitlePolicy.h"
 #include "Utf8Text.h"
 
 #include <windows.h>
@@ -1929,17 +1930,36 @@ std::vector<std::wstring> BuildStageExportMuxArguments(const StageExportMuxReque
     if (request.streamSourceStartSeconds > 0.0)
         arguments.insert(arguments.end(), {L"-itsoffset", FrameRateText(request.streamSourceStartSeconds)});
     arguments.insert(arguments.end(), {L"-i", request.streamSource.wstring(), L"-map", L"0:v:0"});
-    // A generated track, as its own input behind the source: input 2, so every
-    // map above is untouched and the export dialog, which names no file, cannot
+    // Burning reads the text through the ass filter by path, so the file is no
+    // input here; a soft track is, as input 2 behind the source, so every map
+    // above is untouched and the export dialog, which names no file, cannot
     // reach this branch at all.
-    if (!request.subtitleFile.empty())
+    const bool burn = request.burnSubtitles && !request.subtitleFile.empty();
+    if (!request.subtitleFile.empty() && !burn)
         arguments.insert(arguments.end(), {L"-i", request.subtitleFile.wstring()});
-    std::vector<std::wstring> codecs{L"-c:v", L"copy"};
-    if (const std::wstring tag = ExportVideoTag(*container, videoCodec); !tag.empty())
-        codecs.insert(codecs.end(), {L"-tag:v", tag});
+    std::vector<std::wstring> codecs;
+    if (burn) {
+        // The text is drawn into every frame on the way to the encoder, which
+        // is the second encode the dialog's tooltip names - the picture stages
+        // cannot take the filter (their encoders are the child processes'), so
+        // the mux pays it. The recipe is the cached export's own software
+        // re-encode (BuildCachedExportArguments), and the pad is the even-size
+        // guard that builder carries: ass does not change the size, but a
+        // subtitles-only conversion renders the source itself, which may be odd.
+        codecs.insert(codecs.end(), {L"-c:v", L"libx264", L"-preset", L"medium", L"-crf", L"18",
+                                     L"-vf", L"ass=" + subtitle::EscapeFilterValue(request.subtitleFile.wstring())
+                                         + L",pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                                     L"-pix_fmt", L"yuv420p"});
+        // No -tag:v: the encoded video is H.264 now, and the source's hvc1
+        // sample entry would name a stream that is not HEVC.
+    } else {
+        codecs.insert(codecs.end(), {L"-c:v", L"copy"});
+        if (const std::wstring tag = ExportVideoTag(*container, videoCodec); !tag.empty())
+            codecs.insert(codecs.end(), {L"-tag:v", tag});
+    }
     // Audio MP4 can hold as it stands is copied, as the policy says.
     const uint32_t nextStream = AppendSourceStreams(*container, sourceStreams, false, arguments, codecs);
-    if (!request.subtitleFile.empty()) {
+    if (!request.subtitleFile.empty() && !burn) {
         // Mapped after the source's own, so the generated track is an addition
         // and never a replacement: a player offered both keeps them in one
         // order, and the source's own track is still the first.

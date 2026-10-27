@@ -128,3 +128,26 @@ Stage export wrote …
 
 体积涨 5 倍不是缺陷：源是 366 kbps 的糊片，神经渲染重编在 `--encode` 默认档，码率由质量决定，不由源码率决定。
 **要判断"有没有变糊"，得看 PSNR/VMAF，不是看码率**——而这一项现在没有基准，是最大的验收缺口。
+
+## 7. 字幕轨与烧录（2026-10-28 接入，验收口径）
+
+Convert Video 的 Subtitles 行三态现在都是真的：None 照抄源；A track（软轨）把转写+翻译的
+ASS 作为自己的流挂进容器（MKV 保样式、MP4 转 mov_text，`language=chi`——mov 封装丢 T 码）；
+Burned into the picture 在 mux 里用 `ass` 滤镜把字画进每一帧并重编码
+（`libx264 -preset medium -crf 18`，与缓存导出的软件重编码同一配方）。配音（TTS）仍未接。
+
+**仍被拒绝的组合**（弹窗，不静默跳过）：范围+生成轨/烧录（文本是全片时间轴）；
+烧录但源无文本轨且未开翻译（没字可烧）；翻译但引擎未装。
+
+验收取法：
+
+| # | 指标 | 取法 | 门槛 |
+|---|---|---|---|
+| 1 | 软轨存在与语言 | `ffprobe -show_streams` 数 `codec_type=subtitle`，读 `language` | 源自带轨 +1，tag 非空 |
+| 2 | 烧录无残留流 | 同上，burn 产物 | 不新增字幕流 |
+| 3 | 字真的在画面里 | 抽台词区间中点帧人查 | 文字可读、无方框（字体 fallback 失败会出 □） |
+| 4 | 命令行契约 | `PolicyTests::stage_export_mux_generated_subtitle_is_an_addition_test` | 全过（含空轨逐字节不变断言） |
+
+已知坑：冒烟测试**不能**用 `-ss` 截源再烧——输入时间轴被重置到 0，ASS 的 cue 按
+全片时间轴排，片段里永远等不到字。产品里范围导出走 `-itsoffset` 保留时间轴（且
+范围+文本直接拒绝），不受此影响；手工验证要抽帧就用 `-t` 限长，别用输入 `-ss`。

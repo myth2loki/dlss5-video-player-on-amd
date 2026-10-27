@@ -16836,6 +16836,32 @@ void stage_export_mux_generated_subtitle_is_an_addition_test()
     CHECK(bare.end() == std::find_if(bare.begin(), bare.end(), [](const std::wstring& argument) {
         return argument.rfind(L"language=", 0) == 0;
     }));
+
+    // Burning draws the text into every frame, so the video is re-encoded and
+    // no subtitle stream is mapped at all: the same file, with the words in the
+    // picture, that any player shows. The path is the ass filter's option and
+    // graph level at once, so a Windows drive colon arrives escaped - which is
+    // exactly what the player's own overlay does with the same escaper.
+    StageExportMuxRequest burned = request;
+    burned.burnSubtitles = true;
+    const auto drawn = BuildStageExportMuxArguments(burned, L"C:/scratch/out.mkv", "h264", source);
+    CHECK(!drawn.empty());
+    // Two inputs again: the text is read through the filter by path, so the
+    // generated file is no input of its own.
+    CHECK_EQ(2, inputs(drawn));
+    CHECK(!adjacent(drawn, L"-map", L"2:s:0"));
+    CHECK(adjacent(drawn, L"-c:v", L"libx264"));
+    CHECK(adjacent(drawn, L"-vf",
+        L"ass=C\\\\:/scratch/generated.ass,pad=ceil(iw/2)*2:ceil(ih/2)*2"));
+    CHECK(adjacent(drawn, L"-pix_fmt", L"yuv420p"));
+
+    // The encoded video is H.264 now, so the source's sample entry would name
+    // a stream that is not HEVC: the tag stays off rather than mis-tagging.
+    StageExportMuxRequest hevcBurn = burned;
+    hevcBurn.output = L"C:/out/film.mp4";
+    const auto drawnMp4 = BuildStageExportMuxArguments(hevcBurn, L"C:/scratch/out.mp4", "hevc", source);
+    CHECK(!drawnMp4.empty());
+    CHECK(drawnMp4.end() == std::find(drawnMp4.begin(), drawnMp4.end(), std::wstring(L"-tag:v")));
 }
 
 constexpr test_support::TestCase kCases[] = {

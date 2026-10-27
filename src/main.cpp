@@ -9330,8 +9330,10 @@ private:
     struct ConvertTextPlan{
         bool needed{};       // a translated track was asked for
         bool transcribe{};   // the source carries no text: listen to the speech first
+        bool extract{};      // burn without translating: dump the source's own track to a file the ass filter can read
         int stream{};        // the source's own text track, when there is one
         std::wstring mediaPath;
+        std::filesystem::path extractFile;
         std::wstring identity;
         subtitle_speech::Engine speech;
         subtitle_translate::Engine translation;
@@ -9362,6 +9364,22 @@ private:
         const std::function<void(const wchar_t*,uint64_t,uint64_t)>& report)
     {
         ConvertTextResult result;
+        if(plan.extract){
+            // The source's own track, as a file the mux's ass filter can draw:
+            // one ffmpeg demux, no engine and no model. It is the whole film's
+            // timeline, which is why a ranged burn is refused before this runs.
+            const auto output=RunToolCapture(plan.helpers/L"ffmpeg.exe",
+                {L"-hide_banner",L"-nostdin",L"-loglevel",L"error",L"-xerror",L"-y",
+                 L"-i",plan.mediaPath,L"-map",L"0:s:"+std::to_wstring(plan.stream),
+                 L"-f",L"ass",plan.extractFile.wstring()},
+                stop,std::chrono::minutes(10),64*1024);
+            if(stop.stop_requested()){result.cancelled=true;return result;}
+            if(!output){
+                result.detail=L"The source's subtitle track could not be extracted for burning.";
+                return result;
+            }
+            result.file=plan.extractFile;result.ok=true;return result;
+        }
         std::filesystem::path cues;
         if(plan.transcribe){
             subtitle_speech::SpeechToText speech(plan.helpers,plan.speech,plan.cacheDirectory);
@@ -9425,17 +9443,21 @@ private:
         if(!ConvertVideoUsable()){MessageBoxW(m_hwnd,T(L"convert.refusal.nothing").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         if(!ConvertVideoRangeValid()){MessageBoxW(m_hwnd,T(L"convert.refusal.range").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         if(m_convert.translate&&!ConvertVoiceTranslatable()){MessageBoxW(m_hwnd,T(L"convert.refusal.engine").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
-        // A generated track is transcribed and translated from the source's own
-        // timeline, and the mux carries it as it stands - a range is cut out of
-        // the stream source, not out of this. Translating a range would
-        // therefore carry cues from either side of it, so the combination is
-        // refused rather than written wrong.
-        if(m_convert.translate&&m_convert.ranged){MessageBoxW(m_hwnd,T(L"convert.refusal.range_text").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
-        // A soft track is written. Burning re-encodes the picture - it is the one
-        // choice in this row whose cost is a second encode of the whole film, and
-        // it is refused rather than done badly until the encoder the picture
-        // stages do not run is wired in behind it.
-        if(m_convert.subtitles==2){MessageBoxW(m_hwnd,T(L"convert.refusal.burn").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        // The source's own text track, once, here: the burn refusal and the
+        // text plan below both need the same answer.
+        const subtitle::Track* ownText=nullptr;
+        for(const auto& track:m_subtitleTracks)
+            if(track.Drawn()==subtitle::Kind::Text){ownText=&track;break;}
+        // Burning needs words. A translated track is made when none exists -
+        // the speech is heard - but without the translation there is nothing
+        // to draw, so the choice is refused rather than burned empty.
+        if(m_convert.subtitles==2&&!m_convert.translate&&!ownText){MessageBoxW(m_hwnd,T(L"convert.refusal.burn_empty").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        // A generated or burned track is written from the source's own
+        // timeline, and the mux carries it as it stands - a range is cut out
+        // of the stream source, not out of this. Text against a range would
+        // therefore carry the lines from either side of it, so the combination
+        // is refused rather than written wrong.
+        if(m_convert.ranged&&(m_convert.translate||m_convert.subtitles==2)){MessageBoxW(m_hwnd,T(L"convert.refusal.range_text").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         const std::filesystem::path source=ExportSourceFile();
         if(source.empty()){MessageBoxW(m_hwnd,T(L"convert.no_source").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         const ExportPlan plan=CurrentConvertVideoPlan();
@@ -9466,6 +9488,10 @@ private:
         m_convert.planned=ConvertVideoDestination(source,folder,extension);
         SaveConvertVideoSelection();
         StageExportJob job=MakeStageExportJob(plan,source,m_convert.planned,scratch);
+        // Burning draws the text into the picture at the mux, which re-encodes
+        // the video the passes wrote - the one choice in the subtitles row
+        // whose cost is a second encode of every frame, as its tooltip says.
+        job.burnSubtitles=m_convert.subtitles==2;
         // Both ends are already 100 ns timestamps from the same parser the
         // range box validates with, so they travel as they are: the neural
         // pass reads them and the final trim cuts the sound and the chapters
@@ -9483,11 +9509,13 @@ private:
             <<" ranged="<<m_convert.ranged<<" source="<<WideToUtf8(source.wstring()));
         // ---- The text stage -------------------------------------------------
         // Decided here, on the thread that owns the settings and the media's own
-        // track list; the worker only reads what this fills in. Only a translated
-        // track is work: carrying the source's own subtitles is what the mux
-        // already does, so that case has no engine to run and no phase to show.
+        // track list; the worker only reads what this fills in. A translated
+        // track runs the engines; a burn without one extracts the source's own
+        // track for the ass filter instead. Carrying the source's own subtitles
+        // as they are is what the mux already does, so that case has no stage
+        // to run and no phase to show.
         ConvertTextPlan text;
-        if(m_convert.subtitles==1&&m_convert.translate){
+        if(m_convert.subtitles!=0&&m_convert.translate){
             text.needed=true;
             text.mediaPath=source.wstring();
             text.helpers=ExecutableDirectory();
@@ -9498,9 +9526,7 @@ private:
             // that does not is listened to first. Which of the two it is has
             // already been answered by ConvertVoiceTranslatable, and asking
             // again here would be a second place for the answer to be given.
-            const subtitle::Track* own=nullptr;
-            for(const auto& track:m_subtitleTracks)
-                if(track.Drawn()==subtitle::Kind::Text){own=&track;break;}
+            const subtitle::Track* own=ownText;
             if(own){
                 text.stream=own->subtitleIndex;
                 text.identity=L"convert|"+source.wstring()+L"|"+std::to_wstring(text.stream);
@@ -9525,6 +9551,19 @@ private:
             LOG("Convert video text stage: "<<(text.transcribe
                     ?"transcribe then translate":"translate the source's own track")
                 <<" to "<<text.languages.targetName<<" ("<<text.languages.targetCode<<")");
+        }else if(m_convert.subtitles==2){
+            // Burn without translating: the words are the source's own, drawn
+            // by the mux's ass filter once they are a file. The track's whole
+            // -film timeline is why a ranged burn is refused above.
+            text.needed=true;
+            text.extract=true;
+            text.mediaPath=source.wstring();
+            text.helpers=ExecutableDirectory();
+            text.stream=ownText->subtitleIndex;
+            text.extractFile=scratch/(source.stem().wstring()+L".burn.ass");
+            text.languages=subtitle_translate::LanguagesFor(ownText->language,ownText->language);
+            LOG("Convert video text stage: extract the source's own track "
+                <<text.stream<<" for burning (language "<<text.languages.targetCode<<")");
         }
         const uint32_t textPhases=text.needed?text.Phases():0u;
         const uint32_t totalPasses=textPhases+ExportStageCount(plan);
