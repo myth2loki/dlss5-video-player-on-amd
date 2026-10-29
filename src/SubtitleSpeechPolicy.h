@@ -344,6 +344,19 @@ inline std::string MultipartBody(std::string_view boundary, std::string_view fil
     // which is decided once for the whole film.
     field("response_format", format);
     field("language", language.empty() ? std::string_view("auto") : language);
+    // Beam search, or the answer's times are wrong.
+    //
+    // The engine's default search is greedy, and on this film's dialogue greedy
+    // decided a window holding thirteen seconds of quiet score and then two
+    // lines was ONE line: it returned 2.0 s - 18.0 s for "You're a jerk, Tom"
+    // (0.7 s of speech, actually spoken at 23.2 s) and handed the word times out
+    // by dividing the span between the tokens. Everything downstream inherited
+    // it - the dub played thirteen seconds ahead of the picture, and every voice
+    // reference was cut from the wrong second, so a woman's lines were cloned
+    // from a man's voice. With beam search the same window answers 15.0 s -
+    // 16.0 s, which is where the line really is, and it also costs nothing worth
+    // having: the engine is not the bottleneck here, the voice model is.
+    field("beam_size", "5");
     body += "--";
     body += boundary;
     body += "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"";
@@ -521,6 +534,98 @@ inline std::wstring ServerArguments(const std::wstring& modelPath, int port, int
     // all but the first are dropped as already covered. SRT output hid this,
     // because that writer needs the times and forces them back.
     return args;
+}
+
+// ---- Where the words actually are ------------------------------------------
+//
+// The engine answers with sentences, not with where each sentence's sound
+// starts. Given a window holding thirteen seconds of quiet score and then two
+// lines, whisper returned one cue spanning the score and both lines; the split
+// below then hands time out in proportion to text, so "You're a jerk, Tom" -
+// 0.7 s of speech spoken at 23.2 s - was written down at 10.0 s. Every later
+// cue in the film inherited it, and with it every voice reference was cut from
+// the wrong second of audio, which is why a woman's lines were cloned from a
+// man's voice.
+//
+// So the window's own samples are read and the sentences are pulled onto the
+// stretches that carry sound. The gate is the one the mix analysis uses: a frame
+// counts when it is above a fraction of the window's loud part, which adapts to
+// a scene scored loud and one that is nearly silent.
+
+struct SpeechSpan
+{
+    double start{};
+    double end{};
+};
+
+inline std::vector<SpeechSpan> SpeechSpans(const std::vector<int16_t>& mono, int rate,
+                                           double frameSeconds = 0.02, double gapSeconds = 0.30,
+                                           double minSpanSeconds = 0.12, double gateFraction = 0.08)
+{
+    std::vector<SpeechSpan> spans;
+    if (rate <= 0 || mono.empty()) return spans;
+    const size_t frame = std::max<size_t>(1, size_t(frameSeconds * double(rate)));
+    std::vector<double> energy;
+    energy.reserve(mono.size() / frame + 1);
+    for (size_t at = 0; at + frame <= mono.size(); at += frame) {
+        double sum = 0.0;
+        for (size_t i = 0; i < frame; ++i) {
+            const double value = double(mono[at + i]) / 32768.0;
+            sum += value * value;
+        }
+        energy.push_back(std::sqrt(sum / double(frame)));
+    }
+    if (energy.empty()) return spans;
+    std::vector<double> ordered = energy;
+    std::sort(ordered.begin(), ordered.end());
+    const double loud = ordered[size_t(double(ordered.size() - 1) * 0.90)];
+    const double gate = std::max(loud * gateFraction, 1.0 / 32768.0);
+
+    bool inside = false;
+    double began = 0.0, last = 0.0;
+    for (size_t index = 0; index < energy.size(); ++index) {
+        const double at = double(index) * frameSeconds;
+        if (energy[index] > gate) {
+            if (!inside) { inside = true; began = at; }
+            last = at + frameSeconds;
+        } else if (inside && at - last >= gapSeconds) {
+            if (last - began >= minSpanSeconds) spans.push_back({began, last});
+            inside = false;
+        }
+    }
+    if (inside && last - began >= minSpanSeconds) spans.push_back({began, last});
+    return spans;
+}
+
+// Pulls each sentence onto the stretch of sound it belongs to: the one it
+// overlaps most, searched forward so the lines stay in order. A sentence that
+// overlaps nothing is left where the engine put it - it may be a sound effect
+// the engine turned into words, and moving it would be inventing evidence.
+inline void SnapCuesToSpans(std::vector<subtitle_translate::Cue>& cues,
+                            const std::vector<SpeechSpan>& spans)
+{
+    if (spans.empty() || cues.empty()) return;
+    size_t from = 0;
+    double takenUntil = 0.0;
+    for (subtitle_translate::Cue& cue : cues) {
+        size_t best = spans.size();
+        double bestOverlap = 0.0;
+        for (size_t index = from; index < spans.size(); ++index) {
+            const double overlap = std::min(cue.end, spans[index].end) -
+                                   std::max(cue.start, spans[index].start);
+            if (overlap > bestOverlap) { bestOverlap = overlap; best = index; }
+            if (spans[index].start > cue.end) break;
+        }
+        if (best == spans.size() || bestOverlap <= 0.0) continue;
+        // Two lines inside one stretch share it rather than both starting where
+        // it does: the second keeps its own beginning.
+        const double start = std::max(spans[best].start, takenUntil);
+        if (spans[best].end - start < 0.10) continue;
+        cue.start = start;
+        cue.end = spans[best].end;
+        takenUntil = cue.end;
+        from = best;
+    }
 }
 
 // One window of audio as 16 kHz mono signed 16-bit PCM: what the engine was

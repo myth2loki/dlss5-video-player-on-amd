@@ -33,6 +33,31 @@ std::string ReadWholeFile(const fs::path& path)
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
+// The samples out of the WAV that ffmpeg was told to write: 16 kHz mono signed
+// 16-bit, but the exact header is walked rather than assumed, because a LIST
+// chunk in front of `data` would otherwise be read as audio.
+std::vector<int16_t> PcmFromWav(const std::string& bytes)
+{
+    std::vector<int16_t> samples;
+    if (bytes.size() < 44) return samples;
+    size_t at = 12;  // past "RIFF" + size + "WAVE"
+    while (at + 8 <= bytes.size()) {
+        const auto* header = reinterpret_cast<const unsigned char*>(bytes.data() + at);
+        const uint32_t size = uint32_t(header[4]) | (uint32_t(header[5]) << 8) |
+                              (uint32_t(header[6]) << 16) | (uint32_t(header[7]) << 24);
+        const bool isData = header[0] == 'd' && header[1] == 'a' && header[2] == 't' && header[3] == 'a';
+        at += 8;
+        if (isData) {
+            const size_t count = std::min<size_t>(size, bytes.size() - at) / sizeof(int16_t);
+            samples.resize(count);
+            if (count) std::memcpy(samples.data(), bytes.data() + at, count * sizeof(int16_t));
+            return samples;
+        }
+        at += size_t(size) + (size & 1u);
+    }
+    return samples;
+}
+
 // Every window publishes "<base>.<seconds>.asr.srt" and the finished transcript
 // is "<base>.asr.srt". A per-window one is only ever useful to the run that wrote
 // it, so they are swept for every film rather than only this one: a run that was
@@ -442,11 +467,20 @@ std::optional<std::vector<subtitle_translate::Cue>> SpeechToText::Listen(const J
         return std::nullopt;
     }
     // The engine's times are in the window's own time; the merge puts them on
-    // the film's clock.
+    // the film's clock. Before that, pull them onto the window's actual sound -
+    // see SpeechSpans for what goes wrong when that is skipped.
+    const auto placeOnSound = [&](std::vector<subtitle_translate::Cue> cues) {
+        if (cues.empty()) return cues;
+        std::vector<int16_t> samples = PcmFromWav(audio);
+        if (samples.empty()) return cues;
+        const auto spans = subtitle_speech::SpeechSpans(samples, 16000);
+        if (!spans.empty()) subtitle_speech::SnapCuesToSpans(cues, spans);
+        return cues;
+    };
     if (probe) {
         Heard heard = ParseHeard(answer->body);
         if (!heard.language.empty()) language = heard.language;
-        if (!heard.cues.empty()) return heard.cues;
+        if (!heard.cues.empty()) return placeOnSound(subtitle_speech::SplitLongCues(heard.cues));
         // An engine that ignored the format will ignore it again: stop asking,
         // and let the translation fall back to its default source.
         if (language.empty()) language = "und";
@@ -454,7 +488,7 @@ std::optional<std::vector<subtitle_translate::Cue>> SpeechToText::Listen(const J
     // An engine that answered SRT instead of verbose_json still has its lines
     // where they were expected; only the language is lost.
     auto fallback = subtitle_translate::ParseSrt(answer->body);
-    if (!fallback.empty()) return fallback;
+    if (!fallback.empty()) return placeOnSound(subtitle_speech::SplitLongCues(fallback));
     // Neither shape: say what came back, because "no subtitles appeared" is
     // otherwise indistinguishable from silence in the film.
     LOG("Speech: the engine's answer for " << chunk.start << " s could not be read ("

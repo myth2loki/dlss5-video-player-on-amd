@@ -177,6 +177,10 @@ struct StageExportJob {
     // ("chi"), so a player choosing a subtitle by language can see it. Empty
     // leaves the metadata off, which is what the export dialog writes today.
     std::wstring subtitleLanguage;
+    // The dub the Convert video dialog's dub stage wrote, and the language it
+    // is tagged with. See StageExportMuxRequest::dubTrack.
+    std::filesystem::path dubTrack;
+    std::wstring dubLanguage;
     // Ends the player's idle resident helper before this export's helper
     // starts in the same runtime directory. Empty for `--render`, which runs in
     // a process of its own and has none.

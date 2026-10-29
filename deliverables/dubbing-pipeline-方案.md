@@ -126,6 +126,11 @@
 | 控件 | ID | 标签 key | 默认 |
 |---|---|---|---|
 | 配音语言（下拉，第一行「Do not dub」） | `IDC_CV_DUB` = 7616 | `convert.dub` | 0（不配音） |
+
+> **已落地时改号（2026-10-28）**：7616 在代码里已经是转换进度面板的 Cancel
+> （`IDC_CV_PROGRESS_CANCEL`，先于本方案存在，不移动）。配音行顺延为
+> **`IDC_CV_DUB` = 7617**，`IDC_CV_VOICES` = 7618、`IDC_CV_DUB_RIGHTS` = 7619。
+> 本轮只落 7617（配音行 + 拒绝态 + 引擎探测），音色策略与权利确认待克隆一起做。
 | 音色来源（下拉：每个角色 / 单一音色） | `IDC_CV_VOICES` = 7617 | `convert.voices` | 每个角色 |
 | 权利确认（勾选框，仅 DUB>0 时出现） | `IDC_CV_DUB_RIGHTS` = 7618 | `convert.dub_rights` | 不勾 |
 
@@ -381,3 +386,327 @@ struct DubStageRequest {
 **可选项**：砍掉人声分离（改用"纯配音轨 + 原声轨保留"），再省 3–5 人天与每片 89 分钟。
 
 如果只做短片段，实际是 **6–10 人天**（不含选型验证），因为分离与混音可以只对片段做。
+
+
+---
+
+## 14. 2026-10-28 实测：引擎换成 Qwen3-TTS 后，§13 的「不可交付」不再成立
+
+§13 的 14 小时/不可交付，是 **F5-TTS + PyTorch** 的量（CPU RTF 17.5×，且 Windows+AMD 无 GPU 路径）。
+本仓库自带的 `translation/runtime/llama-tts.exe` 是 **ggml/llama.cpp 的 Qwen3-TTS**，不走 PyTorch，实测：
+
+| 项 | 实测 |
+|---|---|
+| 输入 | 15 个汉字（`你好，这是一段中文配音的测试。`） |
+| 输出 | 4.96 s 语音，24 kHz **单声道** pcm_s16le |
+| 耗时 | prompt 0.20 s + 生成 2.36 s + vocoder 1.00 s = **3.56 s** |
+| 速度 | **1.39× 实时**（audio time / process time） |
+
+推论：2 小时片按 60~70% 有对白估算，TTS 约 **1~1.4 小时**（不再是 14 小时）。
+**§13.2 的「整片配音不可交付」应据此重估**；短片段配音则降到分钟级。
+
+代价与待办：
+
+- 输出是 **24 kHz 单声道**，而 §4-D10 定的工作格式是 48 kHz 立体声 —— 混音阶段必须重采样+上混（不能改 D10，改的是 TTS 之后）。
+- 本次是**固定音色**（未传 `--tts-speaker-file`）。克隆要参考音频 + 说话人嵌入，属下一期。
+- 单次合成的模型加载时间未计入上表（本次含在 3.56 s 内）；逐句合成若每句重启进程会放大这块，
+  实现时要么复用一个常驻进程，要么按句批量喂。
+
+
+---
+
+## 15. Python 调研 → C++ 实现的映射（2026-10-28）
+
+`tools/dubbing` 的六阶段 Python 链已跑通整片（Tears of Steel 734 s / 71 句，
+端到端 7m40s，0 超窗 0 重叠），这些经验**不是参考，是实现依据**。固化情况：
+
+### 已固化进 `src/DubFitPolicy.h`（常量 + 纯函数，PolicyTests 430 钉住）
+
+| 经验（实测） | 落地 |
+|---|---|
+| 窗口 = `next_start - start`，不是 `end - start`；帽 +1.5 s、地板 0.5 s | `WindowSeconds()` |
+| 让步顺序 借静音(≤2.0/留0.15) → atempo(1.25，短窗<1.2 给 1.50) → 重写(≤2 轮) → 报出来 | `ConcessionFor()` / `ShiftFor()` / `TempoCeilingFor()` |
+| `REWRITE_ABOVE` 故意 == `MAX_TEMPO`：加速能吸收的绝不去问翻译引擎 | `kRewriteAbove` |
+| atempo **下限 0.85**（放慢）：中文比台词短会提前停，原声已挖走只剩音乐 | `kMinTempo` / `ClampTempo(...,allowSlower)` |
+| 节奏模型 `秒 = 0.1425×汉字 + 0.665×逗号 + 0.399`（R²0.924 / MAE 0.236） | `kQwen3TtsPace` / `PredictSeconds()` |
+| 预检只往「没救」方向用（MAE 0.236 s） | `ReachableSeconds()` / `IsHopelessBeforeSynthesis()` |
+| 合成后必须裁静音（−48 dBFS，两端留 40 ms）：不裁则窗口全用来加速静音 | `kTrimSilenceDb` / `kTrimPadSeconds` |
+| 音轨语言必须写 B 码 `chi`（写 `zho` 被 mov 静默丢弃） | `TrackLanguageCode()` |
+| 母版限幅 `limit=0.794`，**必须 4× 过采样**（44.1k 看不见样点间的峰） | `kPeakLimit` / `kLimitOversample` |
+| 电平按 20 ms 块 75 分位（整段 RMS 会推高 3~4.9 dB）；增益夹 ±12 dB | `kLevelBlockSeconds` / `kLevelPercentile` / `kGainClampDb` |
+| bed 只在该响处压 −3 dB + 150 ms 斜坡（常数压会让真静场听起来像断音） | `kBackingGain` / `kDuckDb` / `kDuckRampSeconds` |
+| 撞车硬上限 1.35（比拟合 1.25 高一档），行间 ≥0.03 s | `kHardTempo` / `kMinGapSeconds` |
+| 字幕文本/起止**必须取自配音实际念的行**（曾 13/71 不一致） | `kMinSubtitleHoldSeconds` / `kMaxSubtitleLineUnits` |
+
+### 引擎事实（会改变实现方式，不是调参）
+
+- **llama-tts 没有 speed 参数**（只有 `--temp`）→ XTTS 那套「合成时设语速」不能沿用，
+  调速只能事后 atempo。
+- **`--temp 0.7` 采样 → 同一句两次时长不同**（实测 1.12 / 1.68 s）→ 超窗集合每轮都变，
+  调参要跑 2~3 轮看集合是否收敛；单次合成波动 ±0.72 s，节奏模型只能初筛。
+- **输出 24 kHz 单声道**，工作格式 48 kHz 立体声 → 混音前必须重采样 + 上混。
+  重采样走 ffmpeg `-resampler soxr -precision 28`，**该选项必须在输出侧**（放输入侧 ffmpeg 非零退出）。
+
+### 还没搬过来的（下一期实现时逐条处理）
+
+1. **ASR 幻觉过滤**：whisper 在音乐段会刷屏（392 段里 373 段是同一句）→
+   「每种文本只取首次出现」+ 内容白名单正则（credit / `*...*`）+ 相对能量门槛 `0.03 × 句中位数`。
+2. **whisper 的段落时间不可信** → 只信人声轨能量：rough ±0.8 s 内找最长连续语音段，
+   已认领区间要屏蔽（两句会抢同一段），找不到语音判幻觉丢弃。
+3. **长段重切**：`span > max(3.0, 词数/2.6*1.8)` 的 whisper 行单独重转写，
+   只接受 ≥2 行且最长行与原文词重合 ≥0.5 的结果。
+4. **翻译层必须留 translategemma**（Granite AST 当翻译不可用：18 句里短句成片崩）。
+   且要防三种废输出：答非所问（服务话术正则）、不遵守字数预算（比初稿长就弃用）、
+   截断（无 `。？！…` 结尾视为无效）。
+5. **覆盖表** `zh_overrides.json`（null = 整句不配，专治两句共用一段语音）。
+6. **术语表** `glossary.json`（译名漂移：Celia 在四种写法间跳）。
+7. **响度对齐到集合中位数**，增益夹 ±12 dB（TTS 自身响度差 20 dB）。
+8. **没配上中文的行补回原声**，只能逐行补（扫未覆盖语音段会灌进 60 s 英文）。
+
+### 进度分档（接线时照做）
+
+Python 链实测耗时（9070XT，66 句整片）：prepare 77 s / align 8 s / refs 2 s /
+translate 6 s / **fit 336 s** / mix 8 s。TTS 合成占绝对大头。
+接线时进度应并入已有进度条（文本相位占前 25%，画面按 75% 缩放，见字幕链的现成做法），
+**复用 `StageExportProgress::writing` 相位**，不要新造一个没有帧数的阶段
+（那会让进度面板消失一次，见 `StageExport.h` 注释）。
+
+
+---
+
+## 16. 配音阶段已实现（2026-10-28，C++ 原生）
+
+`src/Dubbing.h/.cpp` + mux/对话框接线，本轮落地：
+
+- **阶段**：读文字阶段产出的双语 ASS（`{Zh}` 行）→ 逐句 llama-tts（`-n 900 --temp 0.7`，
+  **不带这两个参数实测 ~1/5 概率整句静音**，静音自动重试一次）→ 裁静音 → 窗口/让步
+  （全部走 `DubFitPolicy.h`）→ ffmpeg atempo+soxr 重采样 48k 立体声 → PCM 混音
+  （20ms 块 75 分位对齐中位数、夹 ±12dB、bed 压低 0.85）→ f32 中转 → 4× 过采样 alimiter → s16 配音轨。
+- **mux**：配音作为第三输入第二条音轨（aac 256k + `language=chi` + `-disposition` 配音 default、
+  原声 0）。源音轨不动。
+- **进度**：bar 分摊 文本 0.25 / 配音 0.35 / 画面 0.40（fit 实测 336s vs 翻译 6s 的比例依据）。
+- **本轮实测修掉的四个 bug**（都是新写的）：
+  1. `TrimSilence` 把 `erase(lo,hi)` 用反——删掉的是**有声段**留下头尾静音（keep 数与尾部静音完全吻合才定位到）。
+  2. 混音循环帧步进写成 `frame += 2`（声音 2 倍拉伸+半数零填充）。
+  3. 引擎调用缺 `-n 900 --temp 0.7` → 静音/拖长音率高（对齐 Python 管线参数后 5/5 稳定）。
+  4. `DubTextOf` 未在 `{Src}` 处截断（把英文原文也念了）。
+- **冒烟验证**：手编 `dub_smoke.exe`（cl 直接编 Dubbing.cpp + 3 行双语 ASS + 合成 bed 的 mka）
+  三轮全绿：10.00s 轨、peak 0.23~0.40（限幅内）、过零 3.6~4.1 万。素材在 F:/tmp/dub_smoke_run。
+- **未做（记入下一期）**：每说话人音色（克隆）、重写档（超 ceiling 直接掐尾并计数）、
+  覆盖表/术语表、ASR 幻觉过滤（转换链走字幕既有链，风险较低）、双声道 bed 分离。
+- ⚠️ 引擎纪律：新增 `CreateProcessW` 必须过 `InheritedHandles`（PolicyTests 扫源码，已踩过一次）。
+
+## 17. 端到端首次跑通（2026-10-28，播放器自己的管线）
+
+**为什么需要无头入口**：Convert Video 只有 GUI 入口，且 `StartConvertVideo` 中途要弹文件夹选择框，
+脚本/沙箱无法自动化；`--render` / `dlss5-convert` 只做画面（`dlss5-convert` 只是包了 `--render`）。
+
+**做法（重构 + 一个不发布的 e2e 目标）**：
+- `RunToolCapture` 抽到 `src/ToolCapture.h`（原来在 main.cpp 文件作用域）。
+- 文本阶段 `ConvertTextPlan / ConvertTextResult / RunConvertVideoText` 整体抽到 `src/ConvertTextStage.h`，
+  main.cpp 只留调用点——行为未变，`RunConvertVideoText` 成为自由函数。
+- 新增 `tests/DubConvertE2E.cpp`（CMake 目标 `DubConvertE2E`，非 ctest）：
+  直接调 `RunConvertVideoText` → `dub::RunDub` → `RunStageExport`，
+  plan 走「无画面阶段」这条路（对话框本来就允许：画面与源流原样拷贝）。
+  支持 `--text-only <ass>` / `--from-ass <ass>` 把整片分两次跑（单次工具调用/单次要塞）。
+- 产物：`F:/dlss5-video/test-media/tos_720p_excerpt_dubbed.mkv`（3 分钟片段）。
+
+**本轮实测修掉的 bug（续 §16 的四个）**：
+5. mux 后的音轨守恒校验把新增的配音轨算成「多出来的」：
+   `carried.audioStreams != audioKept` 报 *"The export carries 2 of the source's 1 audio streams"*。
+   期望值改为 `audioKept + (dubTrack 非空 ? 1 : 0)`（MediaPipeline.cpp）。**这是唯一的 mux 侧改动**。
+6. e2e 工具探测参数把 `-nostdin` 给了 ffprobe（那是 ffmpeg 的选项），探测直接失败。
+
+**结果（3 分钟片段，720p，无自带字幕轨 → 走转写）**：
+| 阶段 | 结果 |
+|---|---|
+| 转写（whisper large-v3-turbo q5_0，CPU 8 线程） | 29 段 |
+| 翻译（translategemma-4b Q4_K_M） | 29 段全译 |
+| 配音（Qwen3-TTS 1.7B Q4_K_M） | 29 句 / 30 步（含混音） |
+| 封装 | 视频 copy + 原声 mp3(eng) + ass(chi) + aac 256k(chi) |
+| 流结构 | `0 video(default) / 1 audio eng(default=0) / 2 sub chi / 3 audio chi(default=1)` ✅ |
+| 配音轨电平 | mean −18.9 dB / peak −1.8 dB（母版 −2 dBTP，AAC 过冲 0.2 dB） |
+| 回听（fit0.wav 过 whisper） | 「主發動機已啟動」= 译文，语音可辨识 ✅ |
+
+**发现的质量问题（下一期）**：
+- **音效标注被念出来**：源字幕含 `*马里奥的音乐*` / `*砰！*` / `枪声` / `*Loud music*`，
+  译文保留后配音照念（`LinesFromAss` 只去 `{\...}`、`\N`、`\h`，没有「整行是标注就跳过」的规则）。
+- **超长 cue 触发模型跑飞**：2:44–3:00 的 16s cue 生成到 `-n 900` 上限（72s 音频），
+  随后只能 atempo 0.85 + 混音掐尾（本轮 30 步里 23 步压缩、11 步掐尾，多数来自这类行）。
+  可行修法：`newTokens` 按 `PredictSeconds(text)×1.2` 上限而不是固定 900。
+- 每说话人音色、重写档、term 表仍缺（同 §16「未做」）。
+
+## 18. 「中英文一起响、中文偏小」的两个根因（2026-10-28 修复）
+
+**症状**（用户实测）：播放成片时英文和中文叠在一起，中文比英文小声。
+
+**根因 1：双轨导出还在垫 bed。** `dub::Plan::bed` 默认 `true`，而 bed 是
+`-map 0:a:0` 抽出的**整条原声（含英文人声）**——Python 管线敢加 bed 是因为它先做了人声分离
+（`stems_out/no_vocals.wav`），C++ 端口没有分离器。更糟的是 bed 只乘 `kBackingGain = 0.85`
+（≈ −1.4 dB），`kDuckDb / kDuckRampSeconds` 这两个常量**只搬进来没实现**，所以英文几乎满电平
+压在中文底下。而封装同时又单独保留了原声轨 → 同一个英文在两条轨上都存在。
+
+**根因 2：人声没有绝对电平锚点。** 混音只把每句对齐到「各句电平的中位数」（相对齐平），
+中位数本身落在哪完全由引擎决定。实测纯人声母版 peak −7.8 dBFS、对话窗 LUFS −24.9，
+比源片（peak −0.2、同窗 −11.1 LUFS）低一大截，限幅器全程没参与。
+
+**修复**：
+1. `src/main.cpp`（Convert 路径）与 `tests/DubConvertE2E.cpp` 都显式 `dubPlan.bed=false`；
+   `dub::Plan::bed` 默认改为 `false`，注释说明「只有这一轨是文件唯一音轨时才开，且需要 stem 分离」。
+2. 新增 `kFillHeadroom / kDialoguePeak(0.5 = −6 dBFS) / kMaxNormalizeGain(4.0)`：
+   混音后按**各句峰值的中位数**把中位句顶到 −6 dBFS，超出的交给限幅器。
+   ⚠️ 不能按「全局最响一句」对齐：实测 29 句峰值跨度 −20.5 ~ −3.5 dB（17 dB），
+   按最响句对齐会让普通句整体低 6 dB（第一版就是这么做的，LUFS 只到 −24.9）。
+
+**验收**：
+| 指标 | 修复前（有 bed） | 修复后（纯人声） |
+|---|---|---|
+| 配音轨 mean / peak | −18.9 / −1.8 dB | −26.1 / **−2.0** dB |
+| 对话窗 LUFS（0:10–0:45） | −24.9 | **−18.0** |
+| whisper 回听配音轨 | 中英混杂 | **全中文**（唯一拉丁词是专有名词 Celia） |
+
+**遗留（产品取舍，需要你定）**：没有 M&E（音乐/音效）分离，所以纯配音轨在非对白时段是静音，
+背景音乐只在原声轨上。要「中文 + 原音乐音效」两全，得在 dub/ 里接一个 stem 分离引擎
+（Python 侧用过 demucs 一类），或退回 bed 但必须实现真正的闪避（−12 dB 以上）且接受英文仍隐约可闻。
+
+## 19. 「音色变了」：引擎每句换人（2026-10-28 修复）
+
+**症状**：听感上配音音色不对/不稳定。
+
+**根因**：C++ 端口调 llama-tts 时**没传 `--tts-speaker-file`**。
+Python 管线每句都传（`step12_fit_auto.py:256`，参考音来自 `step11_refs_auto.py` 从**分离出的人声**
+剪的 10–15 s，按角色一份）。没有这个参数时，`--temp 0.7` 的采样在**每句换一个说话人**——
+所以音色逐句漂移，也与片中演员无关。
+
+**修复**（三处）：
+1. `dub::Plan::voiceReference` + RunDub 自动选参考：取**最长的一条非标注 cue** 的片源音频 10 s
+   （一条 cue = 一个人在说话），`-ac 1 -ar 24000` 后作为 `--tts-speaker-file`，全片统一音色。
+   ⚠️ 参考音必须来自**干净连续的人声**：Python 用的是 vocal stem，我们只有混音，所以只能挑单句；
+   用带音乐/中途截断的段落会让模型**复读循环**（实测上一轮 fit3 把「好了Celia我们必须按照…」念了 7 遍）。
+2. `LinesFromAss` 增加**舞台指示过滤**：源语言侧整段被 `*…*` / `[…]` / `【…】` / `（…）` 包住的行
+   不配音（`*Gunshot*` 译文会丢星号，所以按 `{\rSrc}` 判断）。字幕保留，声音跳过。29 句 → 25 句。
+3. **逐句 token 上限**：`kTokenHeadroom 1.6` × `PredictSeconds(kQwen3TtsPace)` × 12 Hz，
+   下限 48（4 s）、上限仍是 900。此前固定 900 = 75 s，13 个字能生成 7.68 s、
+   16 s 的 cue 直接顶到 72 s，事后只能 atempo 硬压——**变速正是「音色变了」的第二个来源**。
+
+**验证**（长时平均谱相似度，对参考音）：
+| 合成方式 | LTAS 相似度 |
+|---|---|
+| 不带参考音 ×3 | 0.817 / 0.899 / 0.825 |
+| 带参考音 ×3 | **0.976 / 0.880 / 0.925** |
+
+→ 克隆确实生效。whisper 抽查 v2 的 fit0/3/10/20：文本完整、无循环、无截断。
+
+**仍未做**：**按角色**音色（需要说话人分离/嵌入，Python 的 `spk.py` + `step11_refs_auto.py` 那条链）。
+现在全片一个嗓音，男女角色同声——这是「听起来不像原片」的剩余部分。
+
+## 20. 按角色分音色 + 时间轴错位修正（2026-10-28）
+
+**用户反馈**：「每一句都对不上，男女声音错配」。
+
+**根因 A（时间轴，真的是 bug）**：`shift` 是**让步**（句子放不下才提前），但代码无条件
+`shift = ShiftFor(room)`，于是前面只要有 ≥2 s 空白，句子就被提前整整 2 s——
+字幕还没出来声音先到（实测 cue 60.00 → 58.00、117.00 → 115.04，每处长停顿都精确 −2.00）。
+修正：`shift = min(ShiftFor(room), max(0, natural − window))`，放得下就不提前。
+结果：中位偏差 0.60 s → **0.28 s**，长间隔句 +0.00~+0.56 s（密集段仍有合理让步）。
+
+**根因 B（男女错配）**：全片只有一个参考音色，男女角色同声。
+Python 的做法是「ECAPA 嵌入 + 人声分离 → 每角色 10–15 s 参考音」，C++ 两者都没有
+（项目未引入 ONNX Runtime，也没有人声分离器）。按同样的**配置形状**用可得手段实现：
+1. 抽取整片 16 kHz 单声道（一次 ffmpeg），逐句测 YIN 音高（40 ms 窗/20 ms 步，CMNDF，
+   与 Python `_yin.py` 同算法）+ 浊音帧占比；
+2. 以 **165 Hz** 分两组（男声 85–180、女声 165–255 的重叠中点），浊音占比 <0.2 的句子
+   取最近邻句子的组；
+3. 每组取「浊音占比 × 时长」最高的那句，剪 10 s 作该组参考音；
+4. 逐句用本组参考 `--tts-speaker-file` 合成。
+实测：低音参考 129 Hz / 高音参考 260 Hz，25 句分 4 低 + 21 高，逐句 F0 102–294 Hz 双峰分布。
+
+**与 Python 仍有差距（明确记录）**：
+| 项 | Python | 现在 |
+|---|---|---|
+| 说话人判定 | ECAPA 嵌入 + 分离后的人声 | 逐句音高 + 最近邻兜底 |
+| 音色数 | 4（tom/celia/robot/elder） | 2（低/高） |
+| 参考音来源 | 分离后 vocal stem，10–15 s | 混音里挑单句，≤10 s |
+| 超窗处理 | 重写（≤2 轮） | 只 atempo + 掐尾 |
+| 音效标注 | 有覆盖表 | 只过滤 `*…*`/`[…]`/`【…】`，无标记的（如「令人不安的音乐」）仍会念 |
+
+## 21. 按角色音色：真接 ECAPA + 人声分离（2026-10-28，对齐 Python 全链路）
+
+用户要求「完全参考 Python 的配置」。Python 的链路是：**人声分离 → ECAPA 说话人嵌入 →
+0.55 余弦贪心聚类 → 每角色从 vocal stem 拼 10 s 参考音 → 逐句按角色克隆 → 伴奏垫底**。
+本轮把这五步全部搬进播放器。
+
+### 组件
+
+| 文件 | 作用 |
+|---|---|
+| `src/SpeakerEmbedding.{h,cpp}` | ONNX Runtime **运行时动态加载**（`LoadLibrary` + `OrtGetApiBase`），ECAPA 图 192 维嵌入 |
+| `external/onnxruntime/include/` | ORT C API 头（v1.31.1，4 个头文件；放在 external/ 以走 `/external:W0`） |
+| `dub/runtime/onnxruntime.dll` | 19 MB，跟着 dub 目录走 |
+| `dub/models/ecapa_voxceleb.onnx` | 84 MB |
+| `dub/stems/stems-split.exe` + `models/htdemucs-42M-v1.0-F32.gguf` | 人声分离（Vulkan，**13.2× 实时**，180 s 片 13.7 s） |
+
+**没有新增链接依赖**：ORT 只被 `SpeakerEmbedding.cpp` 一个文件 include，`/W4 /WX` 零警告。
+缺 DLL 或模型时 `Ready()` 为假，退回音高分组，日志写明缺哪个文件。
+
+### 关键发现：0.55 这个阈值在本片是错的
+
+把 Python 自己标好的 19 句（`F:/tmp/s2st/work/lines.json` 的 `speaker` 字段：robot/celia/tom）
+当真值，在**整片** vocal stem 上跑阈值扫描：
+
+| 阈值 | 声线数 | 纯度 | 合并了不同人(对) | 拆开了同一人(对) |
+|---|---|---|---|---|
+| 0.10 | 5 | 0.61 | 48 | 27 |
+| **0.125** | **6** | **0.89** | **8** | **27** |
+| 0.25 | 10 | 0.89 | 6 | 45 |
+| 0.375 | 15 | 1.00 | 0 | 52 |
+| 0.55 | 18 | 1.00 | 0 | 58 |
+
+0.55 的「纯度 1.00」是假象——每句自成一簇当然不会混。**实测同人 0.18–0.39、异人 0.07–0.16**，
+0.55 高于同人上限，等于不聚类。**改为 0.125**（`kClusterThreshold`），并加两级修正：
+1. 簇中心相似 > `kClusterMergeThreshold`(0.15) 的合并（撤销过度切分）；
+2. 句数 < 2 的声线并入**最近**的声线（不是「最多」的——两个主角时是抛硬币）。
+
+### 排除的两条路（别再试）
+
+- **CAM++**（`models/diar/speaker_campplus.onnx`，需 80 维 fbank）：同人 0.43 / **异人 0.67**，比 ECAPA 差。
+- **sherpa-onnx 完整 diarization**（pyannote 分割 + CAM++）：同一段 180 s **分成 20 个说话人**。
+- **音高**：本片男主自己的长句测出 **210–285 Hz**，与女主重叠；`_yin.py` 和 C++ 的 CMNDF 都一样。
+  （这是 ECAPA 成为主判据、音高只做 fallback 的原因。）
+
+### 参考音：拼接而不是单句
+
+按 `step11_refs_auto.py` 的规则：同一声线取 1.2–6 s 的句子、**长的优先**、累加到 10 s
+（上限 15 s），按**出场顺序**拼接，每段 5 ms 淡入淡出、段间 0.12 s 静音。总长 < 6 s 时
+拒绝该声线（借用最近的）。实测 4 个声线剪出 12.2 s / 12.4 s / —（第 3 个句子太短借用）/ 10.5 s。
+
+### 伴奏垫底（双轨导出也开）
+
+分离有了 `no_vocals.wav`，于是 bed 从「整条原声（含英文）」换成**干净伴奏**，
+并实现 Python 的闪避曲线：台词处 `kBackingGain`(0.85 × 单声道校正)、台词外 `kBackingRest`(1.0)、
+150 ms 斜坡、台词前后各 0.2 s 预压。**不是**常压——常压会让片中真正的停顿听起来像断了音。
+
+### 音效标注：补一条词表规则
+
+`*…*`/`[…]` 标记能滤掉大部分，但译文常丢标记（`*Ominous music*` → 「令人不安的音乐」）。
+加 `IsSoundDescription()`：整行 ≤10 字、以音乐/枪声/笑声…结尾、**不含人称与常用动词**才丢。
+保守设计——漏掉一个音效词只多念一句；误删一句台词是观众丢失一句。25 句 → 24 句。
+
+### 本轮实测（3 分钟片段，720p）
+
+| 项 | 之前（音高 2 组） | 现在（ECAPA + 分离） |
+|---|---|---|
+| 声线数 | 2（21 高 + 4 低，严重错配） | **4**（5 / 9 / 6 / 4 句） |
+| 参考音 | 混音里剪单句 ≤10 s | vocal stem 拼接 10–12 s |
+| 伴奏 | 无（配音轨纯干声） | 分离伴奏 + 闪避 |
+| 音效标注 | 「令人不安的音乐」被念 | 已滤掉 |
+| 流结构 | video / mp3 eng / ass chi / aac chi(default) | 同（未变） |
+| whisper 回听 | — | 「…为什么不直接承认…我有点害怕了…我们已经结束了」全部可辨识 |
+
+### 仍未做
+
+- **超窗重写**：`Concession::Rewrite` 这一档仍只报不执行。需要把翻译引擎的单句请求从
+  `SubtitleTranslator`（整轨批处理）里拆出来并重管 llama-server 生命周期，风险高于收益。
+  当前超窗走 atempo 到 ceiling + 混音掐尾（本轮 24 句里 21 句压缩、5 句掐尾）。
+- **按句重试合成**：句子生成为静音时报错中止，Python 的做法是把该句原声补回去
+  （`kRestoreUnvoicedLines`）。

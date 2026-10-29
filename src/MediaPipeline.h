@@ -545,6 +545,16 @@ struct StageExportMuxRequest {
     // The ISO 639-2/B code the generated track is tagged with, so a player
     // choosing by language can see it. Empty leaves the metadata off.
     std::wstring subtitleLanguage;
+    // A finished dub track (48 kHz stereo WAV) to carry as a second audio
+    // track, spoken by the Convert video dialog's dub stage. The source's own
+    // audio stays first and untouched; the dub is an addition the player
+    // defaults to, which is the two-track promise the dialog's row makes:
+    // the dub is what plays, and the original is one menu away. Empty means
+    // the export has always meant what it has always meant.
+    std::filesystem::path dubTrack;
+    // The ISO 639-2/B code the dub is tagged with ("chi"), for the same
+    // reason the subtitle's is.
+    std::wstring dubLanguage;
 };
 
 // The FFmpeg arguments for MuxStageExport, from what the two inputs were

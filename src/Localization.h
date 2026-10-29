@@ -327,6 +327,12 @@ private:
             {L"convert.subtitles.burn", L"Burned into the picture"},
             {L"convert.translate", L"Translate the speech"},
             {L"convert.translate.none", L"Do not translate"},
+            // A dub is a second question, not a mode of the translation: the
+            // words are the same, but a text track and a voice are different
+            // work, and one day different languages.
+            {L"convert.dub", L"Dub it into that language"},
+            {L"convert.dub.none", L"Do not dub"},
+            {L"convert.dub.voice", L"Chinese"},
             {L"convert.format", L"Container"},
             {L"convert.format.mkv", L"Matroska (mkv)"},
             {L"convert.format.mp4", L"MP4"},
@@ -342,9 +348,12 @@ private:
             {L"convert.summary.burn_suffix", L" subtitles burned in"},
             {L"convert.summary.soft_source", L"The source's own subtitle track"},
             {L"convert.summary.burn_source", L"The source's subtitles burned in"},
+            // A language name goes in front of this one too.
+            {L"convert.summary.dub_suffix", L" dubbed voice"},
             {L"convert.refusal.nothing", L"Choose at least one thing to do."},
             {L"convert.refusal.range", L"Both ends of the range have to be times this source has, and the end has to be after the start."},
             {L"convert.refusal.engine", L"The subtitle engines are not installed, so the speech cannot be translated."},
+            {L"convert.refusal.dub_engine", L"The voice engine is not installed, so the speech cannot be dubbed."},
             {L"convert.refusal.burn_empty", L"There are no subtitles to burn: this source carries no text track, and without the translation none is made. Turn Translate on to burn the speech's words, or choose None, to convert."},
             {L"convert.refusal.range_text", L"Text is written for the whole film's own timeline, and a range would carry the lines from either side of it - carried, translated or burned. Turn off Only part of it, or turn off the translation, to convert."},
             {L"convert.busy", L"Another conversion is running."},
@@ -361,10 +370,18 @@ private:
             // The text stage's two phases, in the panel the picture stages share.
             {L"convert.progress.transcript", L"Listening to the speech"},
             {L"convert.progress.translate", L"Translating the subtitles"},
+            {L"convert.progress.dub", L"Speaking the dub"},
             {L"convert.tip.picture", L"The picture stages are the export dialog's, in the same order: Super Resolution, then neural rendering on the upscaled frame, then interpolation."},
             {L"convert.tip.interpolate", L"Generates one frame between each pair, writing a file at twice the frame rate: AMD's FidelityFX interpolator - the same generator the Interpolate pill runs during playback - or DLSS-G on an NVIDIA card. 2x is the rate because one frame per pair is what both make, so there is no multiplier to choose. Greyed only when this machine has neither runtime."},
             {L"convert.tip.subtitles", L"None leaves the file's subtitle streams as they are. A track adds the translated text as its own stream and keeps the original beside it; Matroska keeps the styling, MP4 keeps only the words. Burned into the picture re-encodes the video so the text is part of every frame - any player, any phone, but a second encode of every one of them. Without the translation it burns the source's own text track, when there is one."},
             {L"convert.tip.translate", L"Listens to the audio track, writes the speech down and translates it into the language chosen. Greyed when the translation engine or a transcriber is missing from this install: both ship separately from the player. Choosing a language also sets Subtitles, because a translation that is thrown away has still cost the time it took to make."},
+            {L"convert.tip.dub", L"Speaks the translated words over the picture instead of only writing them: a second audio track, played by default, with the original kept beside it. It is made from the same translated lines the subtitle track is, so it cannot disagree with what is on screen. Greyed when the voice engine is missing from this install - it ships separately from the player, like the transcriber and the translator."},
+            // Four reasons a row can be greyed, and the tip names the one that
+            // applies: "the voice engine is missing" tells nobody what to fetch.
+            {L"convert.tip.dub.no_runtime", L"No voice runtime: the directory that would hold the speech engine is not beside the player."},
+            {L"convert.tip.dub.no_runner", L"The voice engine is incomplete: llama-tts is missing from the voice runtime directory."},
+            {L"convert.tip.dub.no_model", L"The voice engine is incomplete: no speech model (.gguf) in the voice model directory."},
+            {L"convert.tip.dub.no_mmproj", L"The voice engine is incomplete: the speech model's projector (mmproj-*.gguf) is missing from the voice model directory."},
             {L"convert.tip.format", L"Matroska carries the subtitle styling and any number of tracks, and copies the video stream without re-encoding. MP4 is what a phone or a chat app expects, but its subtitles are plain text."},
             {L"convert.tip.range", L"Converts only the part between the two times, typed as 1:23.5 or f0-f300. Empty means the whole file. The sound is trimmed to the same part before it is transcribed."},
             {L"export.stages.no_source", L"Open a local video first. A stream has to finish copying before it can be exported."},

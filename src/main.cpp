@@ -43,6 +43,8 @@
 #include "SubtitleOverlay.h"
 #include "SpeechToText.h"
 #include "SubtitleTranslator.h"
+#include "ToolCapture.h"
+#include "ConvertTextStage.h"
 #include "Localization.h"
 #include "AppMenu.h"
 #include "UiLayout.h"
@@ -110,6 +112,7 @@ inline std::optional<std::string> MemoisedSourceDigest(SharedSourceDigest& memo,
 }
 #include "RecentMedia.h"
 #include "MediaPipeline.h"
+#include "Dubbing.h"
 #include "JsonEscape.h"
 #include "OfflineNeuralRenderer.h"
 #include "NeuralWorker.h"
@@ -463,6 +466,13 @@ static constexpr int IDC_CV_CLOSE = 7615;
 // The run's own panel, not a control of this dialog: a run lasts minutes and
 // the dialog has one line of text to say so with.
 static constexpr int IDC_CV_PROGRESS_CANCEL = 7616;
+// The dub row. The dubbing plan froze 7616 for this, but that number is the
+// run panel's Cancel above, which came first and is not moving; the dub takes
+// the next free pair and the plan's 7617/7618 are held for the two controls
+// that follow it - the voice strategy and the rights confirmation.
+static constexpr int IDC_CV_DUB = 7617;
+static constexpr int IDC_CV_VOICES = 7618;
+static constexpr int IDC_CV_DUB_RIGHTS = 7619;
 
 static constexpr int IDC_TIMECODE_EDIT = 7501;
 static constexpr int IDC_TIMECODE_SET_IN = 7502;
@@ -1973,60 +1983,8 @@ static EncoderQuality ReadCacheQuality(const std::filesystem::path& settings){
 // frame the player is paused on.
 enum class NeuralJobKind { Offline, Live, Preview };
 
-// Runs one of the staged FFmpeg tools and hands back what it wrote to stdout,
-// or nothing when it could not start, failed, overran `limit` bytes or ran past
-// `timeout`. For the timeline's two small questions only - a chapter list and
-// one thumbnail - so it holds the whole answer in memory and never asks the
-// user anything. The child is in a kill-on-close job, so a player that goes
-// away mid-question takes it along.
-static std::optional<std::string> RunToolCapture(const std::filesystem::path& executable,
-                                                 const std::vector<std::wstring>& arguments,
-                                                 std::stop_token stop, std::chrono::milliseconds timeout,
-                                                 size_t limit)
-{
-    SECURITY_ATTRIBUTES security{sizeof(security),nullptr,TRUE};
-    HANDLE readPipe=nullptr,writePipe=nullptr;
-    if(!CreatePipe(&readPipe,&writePipe,&security,0))return std::nullopt;
-    SetHandleInformation(readPipe,HANDLE_FLAG_INHERIT,0);
-    HANDLE job=CreateJobObjectW(nullptr,nullptr);
-    if(job){JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};limits.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        SetInformationJobObject(job,JobObjectExtendedLimitInformation,&limits,sizeof(limits));}
-    const InheritedHandles inherit{writePipe};
-    STARTUPINFOEXW startup{};startup.StartupInfo.cb=sizeof(startup);startup.StartupInfo.dwFlags=STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdOutput=writePipe;startup.lpAttributeList=inherit.AttributeList();
-    PROCESS_INFORMATION process{};
-    std::wstring commandLine=BuildWindowsCommandLine(executable.native(),arguments);
-    BOOL created=FALSE;
-    {const ScopedHardErrorSuppression noHardErrorDialog;
-     created=inherit.Ready()&&CreateProcessW(executable.c_str(),commandLine.data(),nullptr,nullptr,inherit.InheritHandles(),
-                            CREATE_NO_WINDOW|CREATE_SUSPENDED|inherit.CreationFlags(),
-                            nullptr,executable.parent_path().c_str(),&startup.StartupInfo,&process);}
-    CloseHandle(writePipe);
-    if(!created){CloseHandle(readPipe);if(job)CloseHandle(job);return std::nullopt;}
-    if(job&&!AssignProcessToJobObject(job,process.hProcess)){CloseHandle(job);job=nullptr;}
-    ResumeThread(process.hThread);CloseHandle(process.hThread);
-    std::string output;bool failed=false;
-    const auto deadline=std::chrono::steady_clock::now()+timeout;
-    char buffer[16384];
-    for(bool exited=false;;){
-        DWORD available=0;
-        while(PeekNamedPipe(readPipe,nullptr,0,nullptr,&available,nullptr)&&available){
-            DWORD read=0;
-            if(!ReadFile(readPipe,buffer,std::min<DWORD>(available,DWORD(sizeof(buffer))),&read,nullptr)||!read)break;
-            if(output.size()+read>limit){failed=true;break;}
-            output.append(buffer,read);
-        }
-        if(failed||exited)break;
-        exited=WaitForSingleObject(process.hProcess,10)==WAIT_OBJECT_0;
-        if(!exited&&(stop.stop_requested()||std::chrono::steady_clock::now()>=deadline)){failed=true;break;}
-    }
-    DWORD exitCode=1;
-    if(failed){if(job)TerminateJobObject(job,1);else TerminateProcess(process.hProcess,1);WaitForSingleObject(process.hProcess,2000);}
-    else GetExitCodeProcess(process.hProcess,&exitCode);
-    CloseHandle(process.hProcess);CloseHandle(readPipe);if(job)CloseHandle(job);
-    if(failed||exitCode!=0)return std::nullopt;
-    return output;
-}
+// RunToolCapture lives in ToolCapture.h: the Convert video text stage's burn
+// path asks the same staged-FFmpeg question.
 
 // The timeline's two background questions about the loaded file: its chapter
 // list, asked once per file, and a thumbnail for wherever the cursor rests.
@@ -3970,6 +3928,10 @@ private:
     }
     std::filesystem::path TranslationRoot()const{return HelperRoot(L"translation");}
     std::filesystem::path SpeechRoot()const{return HelperRoot(L"asr");}
+    // <player>/dub/{runtime,models}, by the same rule as the other two. Empty
+    // on a stock install: the voice is an opt-in download, not part of the
+    // player, so the dub row is greyed there rather than failing a run.
+    std::filesystem::path DubRoot()const{return HelperRoot(L"dub");}
     // ---- Which build of the speech engine runs ------------------------------
     // Two copies of whisper-server sit under the speech root: `runtime`, which
     // computes on the cores, and `runtime-gpu`, the same tools with the Vulkan
@@ -7538,6 +7500,18 @@ private:
         info.uId=reinterpret_cast<UINT_PTR>(control);info.lpszText=text.back()->data();
         SendMessageW(host,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&info));
     }
+    // The same tip with text of its own. A row greyed because one file out of
+    // four is missing has to name that file, and a table of keys cannot hold a
+    // path that is only known when the dialog opens.
+    void AddTipText(HWND dialog,HWND control,std::wstring text){
+        if(!control)return;
+        HWND host=EnsureTipHost(dialog);if(!host)return;
+        auto& held=m_tipText[dialog];
+        held.push_back(std::make_unique<std::wstring>(std::move(text)));
+        TTTOOLINFOW info{};info.cbSize=TTTOOLINFOW_V2_SIZE;info.uFlags=TTF_IDISHWND|TTF_SUBCLASS;info.hwnd=dialog;
+        info.uId=reinterpret_cast<UINT_PTR>(control);info.lpszText=held.back()->data();
+        SendMessageW(host,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&info));
+    }
     // ---- Settings dialogs: design units, fonts, anchoring ----------------
     //
     // Every settings dialog is laid out in design units - 96-dpi pixels - and
@@ -8750,7 +8724,7 @@ private:
     // the same file. Everything this dialog adds sits before that run (the
     // transcript and its translation) or after it (how the text reaches the
     // container), never inside it.
-    static constexpr int kConvertDesignW=470,kConvertDesignH=522;
+    static constexpr int kConvertDesignW=470,kConvertDesignH=554;
     // The run panel. Small on purpose: one bar, four lines, one button, and it
     // stays that size because nothing on it is worth resizing a window for.
     static constexpr int kConvertRunDesignW=430,kConvertRunDesignH=176;
@@ -8767,6 +8741,11 @@ private:
         m_convert.neural=flag(L"Neural");
         m_convert.frameGeneration=flag(L"FrameGeneration");
         m_convert.translate=flag(L"Translate");
+        // The dub's own answer, kept apart from the translation's: they are two
+        // questions and one day two languages.
+        m_convert.dub=flag(L"Dub");
+        const std::wstring dubTarget=IniString(L"ConvertVideo",L"DubTarget");
+        m_convert.dubLanguage=dubTarget.empty()?L"zho":dubTarget;
         const int height=GetPrivateProfileIntW(L"ConvertVideo",L"TargetHeight",1440,SettingsPath().c_str());
         m_convert.targetHeight=height==1080?1080u:height==2160?2160u:1440u;
         m_convert.subtitles=std::clamp(int(GetPrivateProfileIntW(L"ConvertVideo",L"Subtitles",0,SettingsPath().c_str())),0,2);
@@ -8779,6 +8758,11 @@ private:
         // A translation with nowhere to go was never a choice: it costs minutes
         // to make and a file is the only thing it can be put in.
         if(m_convert.translate&&m_convert.subtitles==0)m_convert.subtitles=1;
+        // A dub is the translation read aloud, so it cannot be asked for
+        // without the translation, and it cannot outlive a file with no text
+        // track in it - the plan's own rule, applied here so a preference read
+        // back off disk can never be a combination the run would refuse.
+        if(m_convert.dub){m_convert.translate=true;if(m_convert.subtitles==0)m_convert.subtitles=1;}
     }
 
     void SaveConvertVideoSelection()const{
@@ -8792,6 +8776,8 @@ private:
         WritePrivateProfileStringW(L"ConvertVideo",L"Subtitles",number(static_cast<uint32_t>(m_convert.subtitles)).c_str(),SettingsPath().c_str());
         WritePrivateProfileStringW(L"ConvertVideo",L"Container",number(static_cast<uint32_t>(m_convert.container)).c_str(),SettingsPath().c_str());
         WritePrivateProfileStringW(L"ConvertVideo",L"Target",m_convert.language.c_str(),SettingsPath().c_str());
+        WritePrivateProfileStringW(L"ConvertVideo",L"Dub",word(m_convert.dub),SettingsPath().c_str());
+        WritePrivateProfileStringW(L"ConvertVideo",L"DubTarget",m_convert.dubLanguage.c_str(),SettingsPath().c_str());
     }
 
     // The upscaler is the export dialog's, not a second one: there is one answer
@@ -8848,6 +8834,109 @@ private:
     // install this is false and the row is greyed with the reason on its tip.
     // A source that already carries a text track needs only the translator; one
     // without needs the transcriber as well.
+    // ---- The voice engine: where it is, and whether it is there at all -----
+    //
+    // A dub is a third engine beside the transcriber and the translator, and
+    // like both of them it ships separately from the player - it is gigabytes
+    // of weights, not part of the installer. So on a stock install the row is
+    // greyed rather than failing at the end of a run.
+    //
+    // Four things have to be present, and the tip names the one that is not:
+    // "the voice engine is not installed" tells nobody what to fetch.
+    struct DubVoiceFiles{
+        std::filesystem::path runtimeDirectory;
+        std::filesystem::path runner;      // llama-tts, the speech engine
+        std::filesystem::path model;       // the backbone .gguf
+        std::filesystem::path mmproj;      // the backbone's projector
+    };
+    DubVoiceFiles DubVoiceEngine()const{
+        DubVoiceFiles files;
+        const std::wstring runtime=IniString(L"Dub",L"Runtime");
+        files.runtimeDirectory=runtime.empty()?DubRoot()/L"runtime":std::filesystem::path(runtime);
+        files.runner=files.runtimeDirectory/L"llama-tts.exe";
+        const std::wstring model=IniString(L"Dub",L"Model"),mmproj=IniString(L"Dub",L"Mmproj");
+        if(!model.empty())files.model=std::filesystem::path(model);
+        if(!mmproj.empty())files.mmproj=std::filesystem::path(mmproj);
+        if(!files.model.empty()&&!files.mmproj.empty())return files;
+        // Discovered rather than listed, as the other two engines' models are:
+        // the first .gguf is the backbone and an mmproj-* beside it is its
+        // projector, whichever order the directory hands them over in.
+        std::error_code error;
+        for(std::filesystem::directory_iterator it(DubRoot()/L"models",error),end;!error&&it!=end;it.increment(error)){
+            if(it->path().extension()!=L".gguf")continue;
+            const std::wstring name=it->path().filename().wstring();
+            const bool projector=name.rfind(L"mmproj",0)==0;
+            if(projector){if(files.mmproj.empty())files.mmproj=it->path();}
+            else if(files.model.empty())files.model=it->path();
+        }
+        return files;
+    }
+    // Which of the four is absent, the runtime before what sits inside it: a
+    // directory that is not there explains every file missing from it.
+    enum class DubMissing{Runtime,Runner,Model,Mmproj};
+    std::optional<DubMissing> DubVoiceMissing()const{
+        const DubVoiceFiles files=DubVoiceEngine();
+        std::error_code error;
+        if(!std::filesystem::is_directory(files.runtimeDirectory,error))return DubMissing::Runtime;
+        if(!std::filesystem::exists(files.runner,error))return DubMissing::Runner;
+        if(files.model.empty()||!std::filesystem::exists(files.model,error))return DubMissing::Model;
+        if(files.mmproj.empty()||!std::filesystem::exists(files.mmproj,error))return DubMissing::Mmproj;
+        return std::nullopt;
+    }
+    bool ConvertDubAvailable()const{return !DubVoiceMissing().has_value();}
+    // ---- The two optional pieces of a dub ------------------------------------
+    // Told apart the way every other engine is: discovered under dub/, and
+    // absent is not a refusal. Without the embedding the voices fall back to a
+    // pitch split, without the separator there is no clean vocal stem to clone
+    // and no backing to lay under the Chinese - RunDub says which in its log.
+    struct DubSpeakerFiles{
+        std::filesystem::path library;  // onnxruntime.dll, loaded at run time
+        std::filesystem::path model;    // the ECAPA ONNX graph
+        bool Complete()const{return !library.empty()&&!model.empty();}
+    };
+    DubSpeakerFiles DubSpeakerEngine()const{
+        DubSpeakerFiles files;
+        const std::wstring runtime=IniString(L"Dub",L"Runtime");
+        files.library=(runtime.empty()?DubRoot()/L"runtime":std::filesystem::path(runtime))/L"onnxruntime.dll";
+        const std::wstring model=IniString(L"Dub",L"SpeakerModel");
+        if(!model.empty())files.model=std::filesystem::path(model);
+        else{
+            std::error_code error;
+            const std::filesystem::path guessed=DubRoot()/L"models"/L"ecapa_voxceleb.onnx";
+            if(std::filesystem::exists(guessed,error))files.model=guessed;
+        }
+        std::error_code error;
+        if(!std::filesystem::exists(files.library,error)||
+           files.model.empty()||!std::filesystem::exists(files.model,error))
+            return DubSpeakerFiles{};
+        return files;
+    }
+    struct DubStemFiles{
+        std::filesystem::path separator;  // stems-split.exe
+        std::filesystem::path model;      // the htdemucs gguf beside it
+    };
+    DubStemFiles DubStems()const{
+        DubStemFiles files;
+        const std::filesystem::path root=DubRoot()/L"stems";
+        files.separator=root/L"stems-split.exe";
+        std::error_code error;
+        if(!std::filesystem::exists(files.separator,error))return DubStemFiles{};
+        for(std::filesystem::directory_iterator it(root/L"models",error),end;!error&&it!=end;it.increment(error)){
+            if(it->path().extension()==L".gguf"){files.model=it->path();break;}
+        }
+        if(files.model.empty())return DubStemFiles{};
+        return files;
+    }
+    static const wchar_t* DubMissingTipKey(DubMissing missing){
+        switch(missing){
+        case DubMissing::Runtime:return L"convert.tip.dub.no_runtime";
+        case DubMissing::Runner:return L"convert.tip.dub.no_runner";
+        case DubMissing::Model:return L"convert.tip.dub.no_model";
+        case DubMissing::Mmproj:return L"convert.tip.dub.no_mmproj";
+        }
+        return L"convert.tip.dub";
+    }
+
     bool ConvertVoiceTranslatable(){
         if(!m_loaded||m_path.empty())return false;
         if(!subtitle_translate::Translator::Available(TranslationEngine()))return false;
@@ -8885,6 +8974,26 @@ private:
         return 1;
     }
 
+    // The voices this build can actually speak. One, because one is what has
+    // been measured: a translator's seventeen languages are not a speech
+    // engine's, and a list that offers a voice it cannot make is a worse lie
+    // than a short one. The tag is ISO 639-2, which is what an audio track is
+    // written with - "zho", not the translator's "zh".
+    struct DubVoice{const wchar_t* tag;const wchar_t* nameKey;};
+    static constexpr DubVoice kDubVoices[]={{L"zho",L"convert.dub.voice"}};
+
+    int ConvertVideoDubRow()const{
+        if(!m_convert.dub)return 0;
+        for(size_t index=0;index<std::size(kDubVoices);++index)
+            if(m_convert.dubLanguage==kDubVoices[index].tag)return int(index)+1;
+        return 1;
+    }
+    std::wstring ConvertVideoDubName()const{
+        for(const DubVoice& voice:kDubVoices)
+            if(m_convert.dubLanguage==voice.tag)return T(voice.nameKey);
+        return T(kDubVoices[0].nameKey);
+    }
+
     std::wstring ConvertVideoSummary(){
         if(!ConvertVideoUsable())return T(L"convert.refusal.nothing");
         if(!ConvertVideoRangeValid())return T(L"convert.refusal.range");
@@ -8903,6 +9012,9 @@ private:
                 text+=L" \u00b7 "+T(m_convert.subtitles==2?L"convert.summary.burn_source":L"convert.summary.soft_source");
             }
         }
+        // The voice, after the text: it is the same lines read aloud, so the
+        // two are named together and in the same shape.
+        if(m_convert.dub)text+=L" \u00b7 "+ConvertVideoDubName()+T(L"convert.summary.dub_suffix");
         // What it would write, once a folder has been picked: the one thing the
         // user cannot read off the controls, because the name is derived.
         if(!m_convert.planned.empty())text+=L"\n\u2192 "+m_convert.planned.wstring();
@@ -8966,27 +9078,46 @@ private:
             AddTip(h,label,L"convert.tip.translate");
             AddTip(h,languages,L"convert.tip.translate");
         }
-        CreateSettingsGroupHeading(h,L"convert.group_output",262);
+        // The dub, in its own row under the translation it speaks: the same
+        // lines, read aloud into a second audio track. Its first row is
+        // "Do not dub", so the choice is visible before anything is turned on.
+        {
+            HWND label=DialogControl(h,L"STATIC",T(L"convert.dub").c_str(),SS_LEFT,16,259,116,20);
+            HWND voices=DialogControl(h,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST,132,256,kColumnW,260,IDC_CV_DUB);
+            const std::wstring off=T(L"convert.dub.none");
+            SendMessageW(voices,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(off.c_str()));
+            for(const DubVoice& voice:kDubVoices){
+                const std::wstring name=T(voice.nameKey);
+                SendMessageW(voices,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(name.c_str()));
+            }
+            // Which of the four is missing, named: a row greyed for "the engine
+            // is not installed" tells nobody what to fetch.
+            const auto missing=DubVoiceMissing();
+            const std::wstring tip=missing?T(DubMissingTipKey(*missing)):T(L"convert.tip.dub");
+            AddTipText(h,label,tip);
+            AddTipText(h,voices,tip);
+        }
+        CreateSettingsGroupHeading(h,L"convert.group_output",294);
         {
             const std::wstring matroska=T(L"convert.format.mkv"),mp4=T(L"convert.format.mp4");
-            CreateNeuralCombo(h,IDC_CV_CONTAINER,L"convert.format",286,{matroska.c_str(),mp4.c_str()},L"convert.tip.format",0,kColumnW);
+            CreateNeuralCombo(h,IDC_CV_CONTAINER,L"convert.format",318,{matroska.c_str(),mp4.c_str()},L"convert.tip.format",0,kColumnW);
         }
-        CreateNeuralCheck(h,IDC_CV_RANGE,L"convert.range",16,320,150,L"convert.tip.range");
+        CreateNeuralCheck(h,IDC_CV_RANGE,L"convert.range",16,352,150,L"convert.tip.range");
         const auto timecodeEdit=[&](int id,int x,const std::wstring& text){
             HWND control=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",text.c_str(),WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL,
-                                         Sd(h,x),Sd(h,319),Sd(h,110),Sd(h,26),h,
+                                         Sd(h,x),Sd(h,351),Sd(h,110),Sd(h,26),h,
                                          reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),nullptr,nullptr);
             if(control){ApplyDarkControlTheme(control);SendMessageW(control,WM_SETFONT,reinterpret_cast<WPARAM>(DialogFont(h)),TRUE);SendMessageW(control,EM_SETLIMITTEXT,32,0);}
             return control;
         };
         timecodeEdit(IDC_CV_RANGE_START,176,m_convert.rangeStart);
-        DialogControl(h,L"STATIC",T(L"convert.range.to").c_str(),SS_CENTER,292,323,18,20);
+        DialogControl(h,L"STATIC",T(L"convert.range.to").c_str(),SS_CENTER,292,355,18,20);
         timecodeEdit(IDC_CV_RANGE_END,314,m_convert.rangeEnd);
-        CreateSettingsGroupHeading(h,L"export.stages.group_result",354);
-        DialogControl(h,L"STATIC",L"",SS_LEFT,16,378,436,36,IDC_CV_SUMMARY);
-        DialogControl(h,L"STATIC",T(L"convert.note").c_str(),SS_LEFT,16,418,436,52);
-        DialogButton(h,L"convert.run",IDC_CV_RUN,232,478,120,30,true);
-        DialogButton(h,L"convert.close",IDC_CV_CLOSE,362,478,90,30);
+        CreateSettingsGroupHeading(h,L"export.stages.group_result",386);
+        DialogControl(h,L"STATIC",L"",SS_LEFT,16,410,436,36,IDC_CV_SUMMARY);
+        DialogControl(h,L"STATIC",T(L"convert.note").c_str(),SS_LEFT,16,450,436,52);
+        DialogButton(h,L"convert.run",IDC_CV_RUN,232,510,120,30,true);
+        DialogButton(h,L"convert.close",IDC_CV_CLOSE,362,510,90,30);
         SyncConvertVideoControls(h);
         CaptureSettingsDesignLayout(h);
     }
@@ -9000,6 +9131,7 @@ private:
         check(IDC_CV_FRAMEGEN,m_convert.frameGeneration);
         check(IDC_CV_RANGE,m_convert.ranged);
         select(IDC_CV_LANGUAGE,ConvertVideoLanguageRow());
+        select(IDC_CV_DUB,ConvertVideoDubRow());
         int rung=1;for(size_t i=0;i<std::size(kUpscaleRungHeights);++i)if(kUpscaleRungHeights[i]==m_convert.targetHeight)rung=int(i);
         select(IDC_CV_RESOLUTION,rung);
         select(IDC_CV_SUBTITLES,std::clamp(m_convert.subtitles,0,2));
@@ -9025,6 +9157,14 @@ private:
             m_convert.translate=false;
             select(IDC_CV_LANGUAGE,0);
         }
+        // The voice is an opt-in download like the other two engines, so the
+        // row is greyed with the reason on its tip rather than failing the run.
+        const bool dubable=ConvertDubAvailable();
+        enable(IDC_CV_DUB,dubable);
+        if(!dubable&&m_convert.dub){
+            m_convert.dub=false;
+            select(IDC_CV_DUB,0);
+        }
         enable(IDC_CV_SUBTITLES,true);
         enable(IDC_CV_RANGE_START,m_convert.ranged);
         enable(IDC_CV_RANGE_END,m_convert.ranged);
@@ -9048,6 +9188,13 @@ private:
             m_convert.translate=row>0&&ConvertVoiceTranslatable();
             if(row>0)m_convert.language=Utf8ToWide(std::string(languages[size_t(row-1)].tag));
         }
+        // Row 0 is "Do not dub"; every row past it is a voice this build can
+        // actually speak, taken from the same table the row was filled from.
+        {
+            const int row=std::clamp(sel(IDC_CV_DUB,0),0,int(std::size(kDubVoices)));
+            m_convert.dub=row>0&&ConvertDubAvailable();
+            if(row>0)m_convert.dubLanguage=kDubVoices[size_t(row-1)].tag;
+        }
         m_convert.targetHeight=kUpscaleRungHeights[std::clamp(sel(IDC_CV_RESOLUTION,1),0,int(std::size(kUpscaleRungHeights))-1)];
         m_convert.subtitles=std::clamp(sel(IDC_CV_SUBTITLES,0),0,2);
         m_convert.container=std::clamp(sel(IDC_CV_CONTAINER,0),0,1);
@@ -9061,6 +9208,10 @@ private:
         // time it took to make.
         if(m_convert.translate&&m_convert.subtitles==0)m_convert.subtitles=1;
         if(m_convert.subtitles==0)m_convert.translate=false;
+        // A dub is the translation read aloud, so it brings the translation
+        // with it and cannot survive a file with no text track in it.
+        if(m_convert.dub){m_convert.translate=true;if(m_convert.subtitles==0)m_convert.subtitles=1;}
+        if(m_convert.subtitles==0)m_convert.dub=false;
         // Anything that changes what would be written invalidates a name shown
         // for the old answer.
         m_convert.planned.clear();
@@ -9088,7 +9239,7 @@ private:
                 if(HWND box=GetDlgItem(h,id))SetCheckBoxState(box,!CheckBoxState(box));
                 ReadConvertVideoControls(h);return 0;
             }
-            if((id==IDC_CV_RESOLUTION||id==IDC_CV_SUBTITLES||id==IDC_CV_CONTAINER||id==IDC_CV_LANGUAGE)&&code==CBN_SELCHANGE){ReadConvertVideoControls(h);return 0;}
+            if((id==IDC_CV_RESOLUTION||id==IDC_CV_SUBTITLES||id==IDC_CV_CONTAINER||id==IDC_CV_LANGUAGE||id==IDC_CV_DUB)&&code==CBN_SELCHANGE){ReadConvertVideoControls(h);return 0;}
             if((id==IDC_CV_RANGE_START||id==IDC_CV_RANGE_END)&&code==EN_CHANGE){
                 wchar_t buffer[64]{};
                 GetDlgItemTextW(h,id,buffer,int(std::size(buffer)));
@@ -9308,133 +9459,13 @@ private:
         return self?self->ConvertVideoRunWndProc(h,m,w,l):DefWindowProcW(h,m,w,l);
     }
 
-    // The text stage, then the picture stages, then the mux, on the same
-    // RunStageExport the export dialog drives - so the three picture boxes here
-    // and the three boxes there write the same file, and a fix to one reaches
-    // both. The transcript and the translation run before them and hand the mux
-    // a subtitle file; a soft track is written from it.
-    //
-    // What is still missing is the dub that would follow the translation, and
-    // burning the text into the picture. Those are refused rather than ignored,
-    // because a conversion that quietly skipped them would be a wrong file
-    // that looks finished.
-    // ---- The text stage of a conversion -------------------------------------
-    // What the worker needs in order to write the subtitle file the container
-    // will carry. Built on the UI thread, where the settings and the media's own
-    // track list live; the worker only reads it.
-    //
-    // Nothing is generated when the source's own track is the one being carried:
-    // the mux already copies the source's subtitle streams, so "subtitles, not
-    // translated" is the export that has always happened and needs no engine at
-    // all. Only a translated track is work.
-    struct ConvertTextPlan{
-        bool needed{};       // a translated track was asked for
-        bool transcribe{};   // the source carries no text: listen to the speech first
-        bool extract{};      // burn without translating: dump the source's own track to a file the ass filter can read
-        int stream{};        // the source's own text track, when there is one
-        std::wstring mediaPath;
-        std::filesystem::path extractFile;
-        std::wstring identity;
-        subtitle_speech::Engine speech;
-        subtitle_translate::Engine translation;
-        std::filesystem::path helpers;
-        std::filesystem::path cacheDirectory;
-        subtitle_speech::Job speechJob;
-        subtitle_translate::Languages languages;
-        uint32_t width{1920},height{1080};
-        // The transcript, then the translation. A source that already has words
-        // skips the first.
-        uint32_t Phases()const{return transcribe?2u:1u;}
-    };
-    struct ConvertTextResult{
-        bool ok{};
-        bool cancelled{};
-        std::filesystem::path file;
-        std::wstring detail;
-    };
-
-    // Runs the stage on the export worker's thread and blocks until it is done or
-    // cancelled. Being on that thread is the point: this is minutes of work, and
-    // `stop` is the dialog's Cancel.
-    //
-    // Both engines are local to the run. The player has its own pair for the
-    // subtitles on screen, and a conversion that drove those would publish its
-    // transcript over what the viewer is watching and cancel on the next seek.
-    static ConvertTextResult RunConvertVideoText(const ConvertTextPlan& plan,std::stop_token stop,
-        const std::function<void(const wchar_t*,uint64_t,uint64_t)>& report)
-    {
-        ConvertTextResult result;
-        if(plan.extract){
-            // The source's own track, as a file the mux's ass filter can draw:
-            // one ffmpeg demux, no engine and no model. It is the whole film's
-            // timeline, which is why a ranged burn is refused before this runs.
-            const auto output=RunToolCapture(plan.helpers/L"ffmpeg.exe",
-                {L"-hide_banner",L"-nostdin",L"-loglevel",L"error",L"-xerror",L"-y",
-                 L"-i",plan.mediaPath,L"-map",L"0:s:"+std::to_wstring(plan.stream),
-                 L"-f",L"ass",plan.extractFile.wstring()},
-                stop,std::chrono::minutes(10),64*1024);
-            if(stop.stop_requested()){result.cancelled=true;return result;}
-            if(!output){
-                result.detail=L"The source's subtitle track could not be extracted for burning.";
-                return result;
-            }
-            result.file=plan.extractFile;result.ok=true;return result;
-        }
-        std::filesystem::path cues;
-        if(plan.transcribe){
-            subtitle_speech::SpeechToText speech(plan.helpers,plan.speech,plan.cacheDirectory);
-            // Batch, not live: SetPlayhead is never called, so the playhead stays
-            // negative, WaitForLead returns at once and every window of the film
-            // is heard rather than only what is ahead of a viewer who is not
-            // watching - there is no playback to stay ahead of here.
-            speech.Start(plan.speechJob);
-            for(;;){
-                if(stop.stop_requested()){speech.Cancel();result.cancelled=true;return result;}
-                const auto status=speech.Poll();
-                if(report)report(L"convert.progress.transcript",uint64_t(status.chunksDone),
-                                 uint64_t(status.chunksTotal?status.chunksTotal:1));
-                if(!status.Running()){
-                    if(status.state!=subtitle_speech::State::Done||status.finalTrack.empty()){
-                        result.detail=status.notice.empty()
-                            ?L"The speech could not be transcribed.":status.notice;
-                        return result;
-                    }
-                    cues=status.finalTrack;
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            }
-        }
-        subtitle_translate::Translator translator(plan.helpers,plan.translation,plan.cacheDirectory);
-        subtitle_translate::Job job;
-        if(plan.transcribe){
-            // What listening produced. The translator reads a file, not a stream,
-            // and an SRT has one stream of its own, so the two spellings meet here.
-            job.path=cues.wstring();job.stream=0;job.external=true;
-        }else{
-            job.path=plan.mediaPath;job.stream=plan.stream;job.external=false;
-        }
-        job.identity=plan.identity;
-        job.languages=plan.languages;
-        job.width=plan.width;job.height=plan.height;
-        translator.Start(job);
-        for(;;){
-            if(stop.stop_requested()){translator.Cancel();result.cancelled=true;return result;}
-            const auto status=translator.Poll();
-            if(report)report(L"convert.progress.translate",uint64_t(status.done),
-                             uint64_t(status.total?status.total:1));
-            if(!status.Running()){
-                if(status.state==subtitle_translate::State::Done&&!status.result.empty()){
-                    result.file=status.result;result.ok=true;
-                }else{
-                    result.detail=status.notice.empty()
-                        ?L"The subtitles could not be translated.":status.notice;
-                }
-                return result;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        }
-    }
+    // The text stage, then the dub, then the picture stages, then the mux, on
+    // the same RunStageExport the export dialog drives - so the three picture
+    // boxes here and the three boxes there write the same file, and a fix to
+    // one reaches both. The transcript and the translation run before them and
+    // hand the mux a subtitle file; a soft track is written from it, and the
+    // dub reads its lines from the same file. The stage itself is
+    // ConvertTextStage.h, shared with the headless e2e tool.
 
     void StartConvertVideo(){
         LoadConvertVideoSelection();
@@ -9443,6 +9474,13 @@ private:
         if(!ConvertVideoUsable()){MessageBoxW(m_hwnd,T(L"convert.refusal.nothing").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         if(!ConvertVideoRangeValid()){MessageBoxW(m_hwnd,T(L"convert.refusal.range").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         if(m_convert.translate&&!ConvertVoiceTranslatable()){MessageBoxW(m_hwnd,T(L"convert.refusal.engine").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
+        // A dub is asked for only when its four engine files are here - it is
+        // gigabytes of weights, not part of the installer - and a conversion
+        // that came out with no voice in it would be a wrong file that looks
+        // finished, which is the one thing this dialog has always refused to
+        // do. So the missing engine is a refusal up front rather than a
+        // silently skipped stage.
+        if(m_convert.dub&&!ConvertDubAvailable()){MessageBoxW(m_hwnd,T(L"convert.refusal.dub_engine").c_str(),title.c_str(),MB_OK|MB_ICONINFORMATION);return;}
         // The source's own text track, once, here: the burn refusal and the
         // text plan below both need the same answer.
         const subtitle::Track* ownText=nullptr;
@@ -9566,16 +9604,64 @@ private:
                 <<text.stream<<" for burning (language "<<text.languages.targetCode<<")");
         }
         const uint32_t textPhases=text.needed?text.Phases():0u;
-        const uint32_t totalPasses=textPhases+ExportStageCount(plan);
-        // One bar for the whole conversion, so the text stage and the picture
-        // passes divide it: a quarter is the transcript and the translation, the
-        // rest is the picture, whose own weighted count RunStageExport still
-        // keeps. The quarter is an estimate rather than a measurement - the text
-        // stage has no frames to price - and it is the only number in this bar
-        // the worker owns instead of reading.
+        // ---- The dub stage ---------------------------------------------------
+        // Filled here, on the thread that owns the settings: the engine files
+        // the row's tip already named, and the length the track has to span.
+        // A dub is only asked for with a translation - the row's own link - so
+        // its lines are read out of the text stage's file, and its share of
+        // the bar is booked beside that stage's.
+        dub::Plan dubPlan;
+        if(m_convert.dub){
+            const DubVoiceFiles engine=DubVoiceEngine();  // absent engines were refused above
+            dubPlan.engine.runner=engine.runner;
+            dubPlan.engine.model=engine.model;
+            dubPlan.engine.mmproj=engine.mmproj;
+            dubPlan.helpers=ExecutableDirectory();
+            dubPlan.work=scratch/L"dub";
+            dubPlan.logFile=dubPlan.work/L"dub.log";
+            dubPlan.mediaPath=source.wstring();
+            dubPlan.track=scratch/L"dub"/L"dub-track.wav";
+            dubPlan.durationSeconds=m_decoder.DurationSeconds();
+            dubPlan.language=WideToUtf8(m_convert.dubLanguage);
+            // Who says what: the ECAPA embedding decides, exactly as the Python
+            // pipeline's clustering did, and every voice gets its own reference
+            // clip cut from the separated vocal stem. Without that stem the
+            // film's music leaks into the clip and the model repeats itself.
+            const DubSpeakerFiles voices=DubSpeakerEngine();
+            dubPlan.voiceEngine.library=voices.library;
+            dubPlan.voiceEngine.model=voices.model;
+            const DubStemFiles stems=DubStems();
+            dubPlan.stemSeparator=stems.separator;
+            dubPlan.stemModel=stems.model;
+            // The engine that can say a line in fewer words: a dense exchange
+            // holds more Chinese than its cues hold, and tempo is capped.
+            dubPlan.rewriter=TranslationEngine();
+            dubPlan.rewrite=subtitle_translate::Translator::Available(dubPlan.rewriter);
+            // The bed is the separated backing - the score and the effects, not
+            // the dialogue - so the default track can carry the film's music
+            // under the Chinese voice. It is skipped, not degraded, when the
+            // separator is not installed: the source's own mix under a dub
+            // plays the English a second time, which is the bug this replaced.
+            dubPlan.bed=true;
+            LOG("Convert video dub stage: "<<WideToUtf8(m_convert.dubLanguage)<<" voice, "
+                <<dubPlan.durationSeconds<<" s of film, "
+                <<(voices.Complete()?"speaker embedding":"pitch split")
+                <<(stems.separator.empty()?", no stems":", stems"));
+        }
+        const uint32_t dubPhases=m_convert.dub?1u:0u;
+        const uint32_t totalPasses=textPhases+dubPhases+ExportStageCount(plan);
+        // One bar for the whole conversion, so the stages divide it: the text
+        // stage and the dub share the first part, the picture the rest. The
+        // text's quarter is an estimate rather than a measurement - it has no
+        // frames to price - and so is the dub's share, but the measured runs
+        // (66 lines: translation 6 s, synthesis and fitting 336 s) are why the
+        // dub is priced like the picture and the text like a footnote.
         constexpr uint64_t kBarTotal=1000;
         constexpr double kTextBarShare=0.25;
+        constexpr double kDubBarShare=0.35;
         const double textShare=text.needed?kTextBarShare:0.0;
+        const double dubShare=dubPhases?kDubBarShare:0.0;
+        const double pictureShare=1.0-textShare-dubShare;
         HWND target=m_hwnd;auto* completions=&m_exportCompletions;
         try{
             m_exportWorker=std::jthread([=](std::stop_token stop)mutable{
@@ -9589,6 +9675,7 @@ private:
                     completion->result=result;
                     completions->RegisterAndPost(std::move(completion),[&](uint64_t token){return PostMessageW(target,WM_EXPORT_COMPLETE,static_cast<WPARAM>(token),0)!=FALSE;});
                 };
+                std::filesystem::path textFile;  // the translated ASS, which the dub's lines are read from
                 if(text.needed){
                     const ConvertTextResult produced=RunConvertVideoText(text,stop,
                         [&](const wchar_t* key,uint64_t done,uint64_t total){
@@ -9611,16 +9698,50 @@ private:
                     // set: the mov muxer drops a T-code tag silently, and a
                     // track with no language is one a player will not offer.
                     job.subtitleFile=produced.file;
+                    textFile=produced.file;
                     job.subtitleLanguage=Utf8ToWide(subtitle_translate::MuxLanguageCode(
                         text.languages.targetCode));
+                }
+                // ---- The dub ---------------------------------------------------
+                // The lines the text stage wrote are the lines the dub speaks:
+                // the same words are what the file carries as a subtitle track
+                // and what the voice reads, so the two cannot tell different
+                // stories. A run without a translation has no dub - the row's
+                // own link forbids the combination before either stage runs.
+                if(dubPhases){
+                    std::string ass;
+                    {
+                        std::ifstream file(textFile,std::ios::binary);
+                        if(file)ass.assign(std::istreambuf_iterator<char>(file),std::istreambuf_iterator<char>());
+                    }
+                    dubPlan.lines=dub::LinesFromAss(ass);
+                    if(dubPlan.lines.empty()){
+                        finish({false,MaterializeError::ProcessFailed,
+                                L"The translation has no lines a voice can speak."});return;
+                    }
+                    const dub::Result dubbed=dub::RunDub(dubPlan,stop,[&](const dub::Progress& p){
+                        const double fraction=p.total?double(p.done)/double(p.total):0.0;
+                        const uint64_t overall=uint64_t(double(kBarTotal)*(textShare+dubShare*fraction));
+                        send({true,textPhases+1,totalPasses,L"convert.progress.dub",
+                              uint64_t(p.done),uint64_t(p.total),overall,kBarTotal,{},false});
+                    });
+                    if(dubbed.cancelled||stop.stop_requested()){
+                        finish({false,MaterializeError::Cancelled,dubbed.detail});return;
+                    }
+                    if(!dubbed.ok){
+                        finish({false,MaterializeError::ProcessFailed,dubbed.detail});return;
+                    }
+                    job.dubTrack=dubPlan.track;
+                    job.dubLanguage=Utf8ToWide(subtitle_translate::MuxLanguageCode(
+                        dubPlan.language));
                 }
                 const StageExportOutcome outcome=RunStageExport(job,stop,[&](const StageExportUpdate& u){
                     // No pass key is the last step, not the end of the job: the
                     // file is being written from the passes' carrier, which is a
                     // phase worth a panel and worth a bar that stays full.
                     const uint64_t scaled=u.overallTotal
-                        ?uint64_t(double(kBarTotal)*textShare)
-                         +uint64_t(double(kBarTotal)*(1.0-textShare)
+                        ?uint64_t(double(kBarTotal)*(textShare+dubShare))
+                         +uint64_t(double(kBarTotal)*pictureShare
                             *double(std::min(u.overallCompleted,u.overallTotal))/double(u.overallTotal))
                         :kBarTotal;
                     auto* update=u.passKey
@@ -15581,6 +15702,13 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
         // Chinese. Empty would mean the pair the prompt defaults to, so it is
         // never empty here.
         std::wstring language{L"zh"};
+        // The dub: a second question, asked in its own row, because a text
+        // track and a voice are different work - and one day, different
+        // languages. `dubLanguage` is the ISO 639-2 tag the audio track is
+        // written with ("zho"), deliberately not the translator's tag ("zh"):
+        // the two lists are not the same length and never will be.
+        bool dub{};
+        std::wstring dubLanguage{L"zho"};
         int container{};  // 0 Matroska, 1 MP4
         bool ranged{};
         std::wstring rangeStart,rangeEnd;

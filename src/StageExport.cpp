@@ -362,6 +362,8 @@ StageExportOutcome RunStageExport(const StageExportJob& job,std::stop_token stop
     finish.subtitleFile=job.subtitleFile;
     finish.burnSubtitles=job.burnSubtitles;
     finish.subtitleLanguage=job.subtitleLanguage;
+    finish.dubTrack=job.dubTrack;
+    finish.dubLanguage=job.dubLanguage;
     if(!job.range.Whole()){
         finish.rangeStartSeconds=double(job.range.start100ns)*1e-7;
         if(job.range.end100ns>job.range.start100ns)finish.rangeDurationSeconds=double(job.range.end100ns-job.range.start100ns)*1e-7;

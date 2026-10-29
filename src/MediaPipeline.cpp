@@ -1929,14 +1929,26 @@ std::vector<std::wstring> BuildStageExportMuxArguments(const StageExportMuxReque
     // A cut keeps its own timeline (StageExportMuxRequest::streamSourceStartSeconds).
     if (request.streamSourceStartSeconds > 0.0)
         arguments.insert(arguments.end(), {L"-itsoffset", FrameRateText(request.streamSourceStartSeconds)});
-    arguments.insert(arguments.end(), {L"-i", request.streamSource.wstring(), L"-map", L"0:v:0"});
-    // Burning reads the text through the ass filter by path, so the file is no
-    // input here; a soft track is, as input 2 behind the source, so every map
-    // above is untouched and the export dialog, which names no file, cannot
-    // reach this branch at all.
+    arguments.insert(arguments.end(), {L"-i", request.streamSource.wstring()});
     const bool burn = request.burnSubtitles && !request.subtitleFile.empty();
     if (!request.subtitleFile.empty() && !burn)
         arguments.insert(arguments.end(), {L"-i", request.subtitleFile.wstring()});
+    // The dub rides in as its own input, after the subtitle's: it is mapped by
+    // input number below, and every -i has to come before the first -map.
+    const bool dub = !request.dubTrack.empty();
+    int dubInput = -1;
+    if (dub) {
+        dubInput = 2 + (!request.subtitleFile.empty() && !burn ? 1 : 0);  // 0 video, 1 streamSource
+        arguments.insert(arguments.end(), {L"-i", request.dubTrack.wstring()});
+    }
+    // Map the rendered video as output 0 only once every input (-i) is in.
+    // -map is an output option: written right after "-i streamSource" it would
+    // fall to the next file, the subtitle -i, and FFmpeg would reject it with
+    // "Option map cannot be applied to input url ...ass". All maps (this 0:v:0,
+    // AppendSourceStreams' 1:0.., and the generated 2:s:0) must follow the last
+    // -i, so the no-file export dialog still reaches this branch with no map
+    // bound to a phantom input.
+    arguments.insert(arguments.end(), {L"-map", L"0:v:0"});
     std::vector<std::wstring> codecs;
     if (burn) {
         // The text is drawn into every frame on the way to the encoder, which
@@ -1958,13 +1970,13 @@ std::vector<std::wstring> BuildStageExportMuxArguments(const StageExportMuxReque
             codecs.insert(codecs.end(), {L"-tag:v", tag});
     }
     // Audio MP4 can hold as it stands is copied, as the policy says.
-    const uint32_t nextStream = AppendSourceStreams(*container, sourceStreams, false, arguments, codecs);
+    uint32_t nextStream = AppendSourceStreams(*container, sourceStreams, false, arguments, codecs);
     if (!request.subtitleFile.empty() && !burn) {
         // Mapped after the source's own, so the generated track is an addition
         // and never a replacement: a player offered both keeps them in one
         // order, and the source's own track is still the first.
         arguments.insert(arguments.end(), {L"-map", L"2:s:0"});
-        const std::wstring specifier = std::to_wstring(nextStream);
+        const std::wstring specifier = std::to_wstring(nextStream++);
         // ASS in Matroska, mov_text in MP4: which is exactly the difference the
         // dialog's tooltip promises - Matroska keeps the styling, MP4 keeps only
         // the words. The track was generated as ASS, so Matroska carries it as
@@ -1976,6 +1988,30 @@ std::vector<std::wstring> BuildStageExportMuxArguments(const StageExportMuxReque
         if (!request.subtitleLanguage.empty())
             codecs.insert(codecs.end(), {L"-metadata:s:" + specifier,
                                          L"language=" + request.subtitleLanguage});
+    }
+    // The dub, after everything the source carries: a second audio track, the
+    // one the player defaults to. The source's own audio stays exactly as it
+    // was and one menu away, which is the promise the row makes - the dub is
+    // what plays, and switching back costs nothing but the switch. AAC at the
+    // rate the dubbing pipeline's masters were measured at.
+    if (dub) {
+        arguments.insert(arguments.end(), {L"-map", std::to_wstring(dubInput) + L":a:0"});
+        const std::wstring specifier = std::to_wstring(nextStream++);
+        codecs.insert(codecs.end(), {L"-c:" + specifier, L"aac", L"-b:" + specifier, L"256k"});
+        if (!request.dubLanguage.empty())
+            codecs.insert(codecs.end(), {L"-metadata:s:" + specifier,
+                                         L"language=" + request.dubLanguage});
+        // Exactly one default audio track, and it is the dub. The disposition
+        // counts by type: however many audio streams the source carried, the
+        // dub is the last of them.
+        uint32_t sourceAudio = 0;
+        for (const MediaStreamInfo& stream : sourceStreams)
+            if (stream.type == "audio" &&
+                ExportStreamActionFor(*container, stream.type, stream.codec) != ExportStreamAction::Drop)
+                ++sourceAudio;
+        codecs.insert(codecs.end(), {L"-disposition:a:" + std::to_wstring(sourceAudio), L"default"});
+        if (sourceAudio)
+            codecs.insert(codecs.end(), {L"-disposition:a:0", L"0"});
     }
     arguments.insert(arguments.end(), {L"-map_metadata", L"1", L"-map_chapters", L"1"});
     arguments.insert(arguments.end(), codecs.begin(), codecs.end());
@@ -2156,6 +2192,12 @@ MaterializeResult MuxStageExport(const std::filesystem::path& helperDirectory,
             if (stream.type == "audio" &&
                 ExportStreamActionFor(*container, stream.type, stream.codec) != ExportStreamAction::Drop)
                 ++audioKept;
+        // The dub is an addition beside every kept stream, not a replacement:
+        // the finished file carries one more audio track than the source kept,
+        // and the count below has to expect it or a correct export reads as a
+        // lost one. A dub that failed to be mapped then shows up as a count
+        // one short, which is exactly what the check is for.
+        if (!request.dubTrack.empty()) ++audioKept;
         // Every frame the passes rendered, too: a cut that drops a copied
         // video's packets still leaves its track header behind, so a file
         // with a video stream and no picture reads as a video until played.

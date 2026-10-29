@@ -8,6 +8,7 @@
 #include "SubtitlePolicy.h"
 #include "SubtitleTranslatePolicy.h"
 #include "SubtitleSpeechPolicy.h"
+#include "DubFitPolicy.h"
 #include "SourceDigestMemo.h"
 #include "AudioEndpointPolicy.h"
 #include "AudioPassthroughPolicy.h"
@@ -5818,6 +5819,155 @@ void convert_video_offers_only_languages_the_prompt_can_name_test()
     // A tag nobody offered reads as nothing rather than as a language.
     CHECK(subtitle_translate::TargetLanguageName("").empty());
     CHECK(subtitle_translate::TargetLanguageName("tlh").empty());
+}
+
+// A line owns the silence after it, up to the next line's start. This is the
+// single rule the pipeline got wrong longest: measuring to the line's own end
+// makes nearly every line overflow, and the whole fit then spends itself
+// compressing lines that already had room.
+void dub_fit_window_is_measured_to_the_next_line_not_to_the_lines_own_end_test()
+{
+    // Speaks for 0.41 s, and the next line does not begin for another 0.79 s.
+    // That 0.79 s is where a Chinese line needing 1.0 s actually lives.
+    const double window = dub_fit::WindowSeconds(389.30, 389.71, 390.50);
+    CHECK(std::abs(window - 1.20) < 1e-9);
+    // end - start would have answered 0.41, and every line would have "overflowed".
+    CHECK(window > 389.71 - 389.30);
+
+    // The cap stops one long pause from handing a line a fifteen second window.
+    const double gulf = dub_fit::WindowSeconds(10.0, 11.0, 90.0);
+    CHECK(std::abs(gulf - (1.0 + dub_fit::kWindowCapSeconds)) < 1e-9);
+
+    // And with no next line at all the cap applies on its own.
+    CHECK(std::abs(dub_fit::WindowSeconds(10.0, 11.0, 0.0) - gulf) < 1e-9);
+
+    // The floor: below it neighbours are already touching.
+    CHECK(dub_fit::WindowSeconds(10.0, 10.1, 10.15) >= dub_fit::kWindowFloorSeconds);
+    CHECK(std::abs(dub_fit::WindowSeconds(10.0, 10.1, 10.15) - dub_fit::kWindowFloorSeconds) < 1e-9);
+}
+
+// The order is the product. Borrowing silence cannot be heard, tempo can faintly
+// be heard, and asking the translator to shorten a line loses meaning - it once
+// dropped "I'm freaked out" entirely to save one second.
+void dub_fit_gives_ground_in_one_order_and_rewriting_comes_last_test()
+{
+    const double window = 2.0;
+    // It fits: nothing is given up.
+    CHECK(dub_fit::ConcessionFor(1.5, window, 0.0) == dub_fit::Concession::Fits);
+
+    // Too long, but there is silence in front of it: move, do not squeeze.
+    CHECK(dub_fit::ConcessionFor(2.4, window, 1.0) == dub_fit::Concession::Shift);
+    // Same line with no silence to borrow has to be squeezed instead.
+    CHECK(dub_fit::ConcessionFor(2.4, window, 0.0) == dub_fit::Concession::Tempo);
+    // Past what tempo can absorb, and only then, the translator is asked.
+    CHECK(dub_fit::ConcessionFor(9.0, window, 0.0) == dub_fit::Concession::Rewrite);
+
+    // Whatever tempo can absorb must never be sent to the translator, because
+    // asking is the step that damages the sentence.
+    CHECK(std::abs(dub_fit::kRewriteAbove - dub_fit::kMaxTempo) < 1e-12);
+
+    // The short-window ceiling and its threshold are one setting.
+    CHECK(std::abs(dub_fit::TempoCeilingFor(1.19) - 1.50) < 1e-9);
+    CHECK(std::abs(dub_fit::TempoCeilingFor(1.21) - 1.25) < 1e-9);
+    CHECK(std::abs(dub_fit::TempoCeilingFor(6.0) - 1.25) < 1e-9);
+
+    // Borrowing leaves a clearance, and is capped however much silence there is.
+    CHECK(dub_fit::ShiftFor(0.05) == 0.0);
+    CHECK(std::abs(dub_fit::ShiftFor(0.65) - 0.50) < 1e-9);
+    CHECK(std::abs(dub_fit::ShiftFor(99.0) - dub_fit::kMaxShiftForward) < 1e-9);
+}
+
+// Slowing down is allowed, and for a reason that is easy to miss: when the
+// Chinese is shorter than the line it replaces the dub stops talking while the
+// mouth is still moving, and the original voice has already been lifted - so what
+// is left under a speaking face is music.
+void dub_fit_allows_slowing_down_as_well_as_speeding_up_test()
+{
+    CHECK(dub_fit::kMinTempo < 1.0);
+    CHECK(std::abs(dub_fit::kMinTempo - 0.85) < 1e-9);
+    // A line half as long as its slot is slowed, not left hanging.
+    const double tempo = dub_fit::TempoFor(1.0, 2.0);
+    CHECK(std::abs(dub_fit::ClampTempo(tempo, 2.0, true) - 0.85) < 1e-9);
+    // ...but only when filling is what is being asked for.
+    CHECK(std::abs(dub_fit::ClampTempo(tempo, 2.0, false) - 1.0) < 1e-9);
+    // And never past what fits either way.
+    CHECK(dub_fit::ClampTempo(9.0, 6.0, true) <= dub_fit::kMaxTempo);
+}
+
+// Who speaks, and the clip each voice is cloned from. Both numbers here were
+// measured rather than inherited, because both inherited ones were wrong for
+// this material: 0.55 hands every line a voice of its own, and one reference
+// per film reads every woman with a man's voice.
+void dub_voice_clustering_is_calibrated_against_the_films_own_labels_test()
+{
+    // The voices are found by k-means over two means, every seed pair tried,
+    // least inertia winning - not by a cosine threshold. This film's own lines
+    // measure 0.18-0.39 against another line of the same speaker and up to 0.16
+    // across speakers, so the two bands overlap and no threshold can cut them
+    // apart. Comparing a line to both means does: 10 of 10 lines land on the
+    // speaker the dialogue names.
+    //
+    // What is left to calibrate is when a cluster is worth splitting again: the
+    // sub-means have to be further apart than one actor heard at two distances
+    // (measured ~0.5 for the same voice) yet this stays above the different-
+    // speaker centroid distance (0.183 on this film's two leads) so a split is
+    // a real second person rather than noise inside one voice.
+    CHECK(dub_fit::kClusterSplitCeiling > 0.183);
+    CHECK(dub_fit::kClusterSplitCeiling < 0.45);
+    // A voice with one line has no material for a clip and borrows the nearest
+    // voice rather than being spoken by a stranger.
+    CHECK(dub_fit::kClusterMinLines >= 2);
+
+    // The reference clip is bounded by the engine's own window: ~10 s aimed at,
+    // 15 s ceiling, and under 6 s prosody cannot be cloned at all.
+    CHECK(dub_fit::kReferenceMinLine < dub_fit::kReferenceMaxLine);
+    CHECK(dub_fit::kReferenceMinTotal < dub_fit::kReferenceTarget);
+    CHECK(dub_fit::kReferenceTarget <= dub_fit::kReferenceCap);
+    CHECK(dub_fit::kReferenceFade > 0.0);
+    CHECK(dub_fit::kReferenceGap > 0.0);
+
+    // The fallback split sits inside the overlap of the male (85-180 Hz) and
+    // female (165-255 Hz) bands.
+    CHECK(dub_fit::kVoiceSplitHz > 120.0);
+    CHECK(dub_fit::kVoiceSplitHz < 200.0);
+    CHECK(dub_fit::kVoiceMinVoiced > 0.0);
+    CHECK(dub_fit::kVoiceMinVoiced < 1.0);
+
+    // The bed: down while a line plays, back up between them, ramped. A constant
+    // duck made the film's real pauses read as the audio dropping out.
+    CHECK(dub_fit::kBackingGain < dub_fit::kBackingRest);
+    CHECK(dub_fit::kDuckRampSeconds > 0.0);
+    CHECK(dub_fit::kDuckPadSeconds > dub_fit::kDuckRampSeconds);
+}
+
+void dub_fit_pace_model_charges_for_punctuation_and_track_language_is_bibliographic_test()
+{
+    const auto& pace = dub_fit::kQwen3TtsPace;
+    // A comma costs more than three characters; nothing modelled it before, and
+    // it is the reason long lines overflowed.
+    CHECK(pace.perComma > 3.0 * pace.perChar);
+    CHECK(std::abs(dub_fit::PredictSeconds(pace, 0, 0) - pace.base) < 1e-9);
+    // Longer text can only be longer.
+    CHECK(dub_fit::PredictSeconds(pace, 10, 1) > dub_fit::PredictSeconds(pace, 10, 0));
+    CHECK(dub_fit::PredictSeconds(pace, 11, 0) > dub_fit::PredictSeconds(pace, 10, 0));
+    // The model is a first pass only: it misses by nearly a quarter second, so
+    // it may condemn a line but must never promise one fits.
+    CHECK(pace.mae > 0.2);
+
+    // The audio track's language is written in the bibliographic code. Writing
+    // the terminological one into a MOV is dropped silently, and the track then
+    // has no language at all - the same trap the subtitle track fell into.
+    CHECK_EQ(std::string("chi"), dub_fit::TrackLanguageCode("zho"));
+    CHECK_EQ(std::string("chi"), dub_fit::TrackLanguageCode("zh"));
+    CHECK(dub_fit::TrackLanguageCode("tlh").empty());
+
+    // True peaks only exist between samples, so limiting is oversampled.
+    CHECK(dub_fit::kLimitOversample > 1);
+    CHECK(dub_fit::kPeakLimit < 1.0);
+    // The engine emits mono at half the working rate; both have to be undone
+    // before a line reaches the mix.
+    CHECK(dub_fit::kEngineSampleRate < dub_fit::kWorkingSampleRate);
+    CHECK(dub_fit::kWorkingChannels == 2);
 }
 
 // The Convert video dialog's frame generation is interpolation, and the request
@@ -16819,6 +16969,14 @@ void stage_export_mux_generated_subtitle_is_an_addition_test()
     CHECK(adjacent(carried, L"-c:2", L"ass"));
     CHECK(adjacent(carried, L"-c:1", L"copy"));
     CHECK(adjacent(carried, L"-metadata:s:2", L"language=chi"));
+    // Regression: -map is an output option and must follow every -i. With the
+    // generated subtitle present, "-map 0:v:0" used to be written before
+    // "-i generated.ass", which bound it to the .ass input and made FFmpeg fail
+    // with "Option map cannot be applied to input url ...ass". The last input
+    // (the subtitle) must come before the first -map.
+    const auto lastInputIt = std::find(carried.rbegin(), carried.rend(), std::wstring(L"-i")).base() - 1;
+    const auto firstMapIt = std::find(carried.begin(), carried.end(), std::wstring(L"-map"));
+    CHECK(lastInputIt < firstMapIt);
 
     // MP4 keeps only the words, and the container is read off the output's name.
     StageExportMuxRequest mp4 = request;
@@ -16827,6 +16985,26 @@ void stage_export_mux_generated_subtitle_is_an_addition_test()
     CHECK(!words.empty());
     CHECK(adjacent(words, L"-c:2", L"mov_text"));
     CHECK(adjacent(words, L"-map", L"2:s:0"));
+
+    // The dub rides in as one more input and one more audio track, after the
+    // subtitle's, and it - not the source's own audio - is the track a player
+    // defaults to. The original stays first and untouched: switching back to
+    // it is one menu item, which is the promise the dialog's row makes.
+    StageExportMuxRequest dubbed = request;
+    dubbed.dubTrack = L"C:/scratch/dub-track.wav";
+    dubbed.dubLanguage = L"chi";
+    const auto spoken = BuildStageExportMuxArguments(dubbed, L"C:/scratch/out.mkv", "h264", source);
+    CHECK(!spoken.empty());
+    CHECK_EQ(4, inputs(spoken));
+    CHECK(adjacent(spoken, L"-i", L"C:/scratch/dub-track.wav"));
+    CHECK(adjacent(spoken, L"-map", L"3:a:0"));
+    CHECK(adjacent(spoken, L"-c:3", L"aac"));
+    CHECK(adjacent(spoken, L"-b:3", L"256k"));
+    CHECK(adjacent(spoken, L"-metadata:s:3", L"language=chi"));
+    // Exactly one default audio track, and it is the dub - the source's own is
+    // output stream 1 here, and the dispositions count by type.
+    CHECK(adjacent(spoken, L"-disposition:a:1", L"default"));
+    CHECK(adjacent(spoken, L"-disposition:a:0", L"0"));
 
     // Untagged is better than mis-tagged: no language leaves the metadata off
     // rather than writing a tag the container would drop.
@@ -17087,6 +17265,11 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(feature_pills_are_visually_distinguishable_test),
     TEST_CASE(menus_group_two_to_seven_related_items_per_block_test),
     TEST_CASE(convert_video_offers_only_languages_the_prompt_can_name_test),
+    TEST_CASE(dub_fit_window_is_measured_to_the_next_line_not_to_the_lines_own_end_test),
+    TEST_CASE(dub_fit_gives_ground_in_one_order_and_rewriting_comes_last_test),
+    TEST_CASE(dub_fit_allows_slowing_down_as_well_as_speeding_up_test),
+    TEST_CASE(dub_voice_clustering_is_calibrated_against_the_films_own_labels_test),
+    TEST_CASE(dub_fit_pace_model_charges_for_punctuation_and_track_language_is_bibliographic_test),
     TEST_CASE(convert_video_frame_generation_asks_for_the_interpolator_by_name_test),
     TEST_CASE(interpolate_frame_generation_is_two_times_and_says_so_in_the_plan_test),
     TEST_CASE(export_plan_runs_super_resolution_and_neural_as_one_pass_test),

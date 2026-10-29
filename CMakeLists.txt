@@ -340,6 +340,10 @@ add_library(player_app OBJECT
     src/AudioPlayer.cpp src/AudioPlayer.h src/WasapiRenderer.cpp
     src/SubtitleOverlay.cpp src/SubtitleOverlay.h src/SubtitlePolicy.h
     src/SubtitleTranslator.cpp src/SubtitleTranslator.h src/SubtitleTranslatePolicy.h
+    src/Dubbing.cpp src/Dubbing.h
+    src/DubFitPolicy.h
+    src/TextRewriter.cpp src/TextRewriter.h
+    src/SpeakerEmbedding.cpp src/SpeakerEmbedding.h
     src/SpeechToText.cpp src/SpeechToText.h src/SubtitleSpeechPolicy.h src/EngineChild.h
     src/RecentMedia.cpp src/RecentMedia.h
     src/SynchronizedPlayback.cpp src/SynchronizedPlayback.h
@@ -352,6 +356,11 @@ set(PLAYER_OBJECT_LIBRARIES player_media player_render player_neural player_app)
 foreach(object_library IN LISTS PLAYER_OBJECT_LIBRARIES)
     target_link_libraries(${object_library} PUBLIC dlss_video_player_common PRIVATE dlss_video_player_shipped_code)
 endforeach()
+# ONNX Runtime is a header the build reads and a DLL the player loads at run
+# time: SpeakerEmbedding.cpp is the only file that includes it, and it links
+# nothing (see the file's own note). The header is under external/ so the
+# /external:W0 rule in the analyze configuration covers it.
+target_include_directories(player_app PRIVATE "${CMAKE_SOURCE_DIR}/external/onnxruntime/include")
 # Every target that compiles D3D12Renderer.cpp also compiles the flow backend.
 # PUBLIC so a test that includes the renderer's headers sees the same
 # definition the objects were built with.
@@ -465,6 +474,15 @@ if(NOT DLSS_VIDEO_PLAYER_ASAN)
     target_link_options(dlss5-convert PRIVATE /DEPENDENTLOADFLAG:0x800)
 endif()
 add_dependencies(DLSSVideoPlayer NeuralWorker)
+
+# DubConvertE2E: a headless drive of the Convert video pipeline's text and dub
+# stages (tests/DubConvertE2E.cpp) - the same RunConvertVideoText, dub::RunDub
+# and RunStageExport the dialog's worker runs, with no picture stage. Not a
+# ctest: a run is minutes of engine work and needs the asr/, translation/ and
+# dub/ engines installed beside the player, so it is run by hand when a dub or
+# a translation changes.
+add_executable(DubConvertE2E tests/DubConvertE2E.cpp)
+target_link_libraries(DubConvertE2E PRIVATE ${PLAYER_OBJECT_LIBRARIES})
 
 add_custom_command(TARGET DLSSVideoPlayer POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

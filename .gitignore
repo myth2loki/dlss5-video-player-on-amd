@@ -48,6 +48,12 @@
 # Screenshot dumps from manual A/B eyeballing.
 /_style-shots/
 
+# The voice engine the Convert video dub row looks for: llama-tts with its DLLs and
+# the Qwen3-TTS weights, staged locally at dub/ (1.4 GB), the way the ASR and
+# translation engines sit beside it. Opt-in, never committed.
+/dub/runtime/
+/dub/models/
+
 # Runtime files that should not be committed
 *.dll
 *.exe
