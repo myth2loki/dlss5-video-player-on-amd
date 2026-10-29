@@ -54,6 +54,11 @@
 /dub/runtime/
 /dub/models/
 
+# Same rule for the stem separator the dub stage calls: its htdemucs GGUF
+# (160 MB) is fetched on first use, like the voices and the ASR model. The
+# licences beside it are committed, the weights are not.
+/dub/stems/models/
+
 # Runtime files that should not be committed
 *.dll
 *.exe
