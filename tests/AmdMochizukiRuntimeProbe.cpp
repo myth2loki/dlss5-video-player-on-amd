@@ -939,6 +939,49 @@ int main(int argc, char** argv)
         return kExitFailed;
     }
     Line("  assets directory: " + Narrow(runtimeDirectory) + " -> Create OK");
+
+    // Step 6b: the control block, after Create but before PrepareSession. ACO is
+    // fixed when the Vulkan device comes up, which is PrepareSession, and the
+    // runtime refuses a block handed over before Create exists ("set-controls
+    // before the session exists"). The player's order is the same, in
+    // AmdLmxxfEvaluator: Create -> ApplyMochizukiControls -> PrepareSession.
+    Step("step 6b SetControls (aco_mode is decided here)");
+    {
+        wchar_t acoBuffer[8]{};
+        const DWORD acoLength = ::GetEnvironmentVariableW(
+            L"DLSS5_MZ_ACO", acoBuffer,
+            static_cast<DWORD>(sizeof(acoBuffer) / sizeof(acoBuffer[0])));
+        const uint32_t acoMode =
+            (acoLength == 0 || acoLength >= sizeof(acoBuffer) / sizeof(acoBuffer[0]))
+                ? 1u
+                : (acoBuffer[0] == L'0' ? 0u : 1u);
+        MochizukiNrControls controls{};
+        controls.struct_size = sizeof(controls);
+        controls.intensity = 1.0f;
+        controls.local_tone = 2.0f;
+        controls.local_structure = 1.0f;
+        controls.skin_structure = -1.0f;
+        controls.automatic_mask = 1u;
+        controls.max_ratio = 2.0f;
+        controls.history_strength = 1.0f;
+        controls.white_point = 1.0f;
+        controls.apply_model = 1u;
+        controls.aco_mode = acoMode;
+        std::wstring controlsError;
+        if (!runtime.SetControls(controls, &controlsError)) {
+            Line("  SetControls -> FAILED: " + Narrow(controlsError) + " | " +
+                 Narrow(runtime.LastError()));
+            ++failures;
+            Line("");
+            Line("RESULT: FAIL " + std::to_string(failures) + " step(s)");
+            if (SUCCEEDED(comResult)) ::CoUninitialize();
+            return kExitFailed;
+        }
+        Line("  SetControls -> OK (struct_size " + std::to_string(controls.struct_size) +
+             "), aco_mode requested=" + std::to_string(acoMode) +
+             " (DLSS5_MZ_ACO=0 turns it off)");
+    }
+
     std::wstring prepareError;
     if (!runtime.PrepareSession(&prepareError)) {
         const std::string lastError = runtime.LastError();
@@ -1204,6 +1247,28 @@ int main(int argc, char** argv)
         if (!status.empty()) Line("  status: " + status);
         const std::string lastError = runtime.LastError();
         if (!lastError.empty()) Line("  last_error: " + lastError);
+    }
+
+    // Read after the network exists, not after PrepareSession: ACO takes effect
+    // while the pipelines are built, and before that aco_effective is still 0.
+    // Requested is not effective - the runtime falls back to the driver compiler
+    // when the record bundle does not match its own network, and it says why in
+    // aco_fallback. Read it rather than assuming the switch took.
+    {
+        MochizukiNrInfo sessionInfo{};
+        if (runtime.Info(sessionInfo)) {
+            Line("  ACO: requested=" + std::to_string(sessionInfo.aco_requested) +
+                 " effective=" + std::to_string(sessionInfo.aco_effective) +
+                 (sessionInfo.aco_fallback[0] != '\0'
+                      ? std::string(" (") + sessionInfo.aco_fallback + ")"
+                      : std::string()));
+            Line("  session: network " + std::to_string(sessionInfo.model_w) + "x" +
+                 std::to_string(sessionInfo.model_h) + ", passes=" +
+                 std::to_string(sessionInfo.max_passes) + ", build " +
+                 std::to_string(sessionInfo.build_seconds) + " s");
+        } else {
+            Line("  GetInfo -> unavailable, ACO state not readable");
+        }
     }
 
     // Step 14: the gate. The ABI calls job.private_output the SR result and the

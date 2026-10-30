@@ -567,3 +567,73 @@ python tools/ab-metrics/ab_metrics.py <workdir> 1280 720 --frames frames
 - 只测了 `--amd-nr-runtime` 两条默认路径，没测 INT4 / Preprocess / 不同 Highlight guard。
 - 素材是 1080p 录制下采样 + x264 重压，不是真实低码率片源。
 
+## 14. ACO 到底开没开：读哪一行才算数（2026-10-31）
+
+**结论：默认开着，而且在本机（9070 XT / 26.10.1 LLPC）确实生效。**
+
+代码侧：`AmdLmxxfEvaluator::ApplyMochizukiControls()` 里 `controls.aco_mode =
+AcoModeFromEnvironment()`，即**默认 1（开）**，只有环境变量 `DLSS5_MZ_ACO=0` 才关。
+面板上没有这个开关——ACO 在 Vulkan 设备创建时就定死了，改它必须重建会话，所以只留了
+环境变量这一个逃生口。
+
+### 14.1 判据（三个来源，按可信度排）
+
+1. **运行时自己的日志** `amd-neural-runtime/mochizuki_nr.log`，建网时会连着写三行：
+
+   ```
+   [mochizuki] ACO records 58/58 match aco/shaders; shells native=53 alias=5 self=0
+   [nr] ACO network: pipeline binaries on AMD Radeon RX 9070 XT, 26.10.1 (LLPC) (driverVersion 0x008001a0)
+   [mochizuki] ACO network ready: 29 imported pipelines
+   ```
+
+   以及每帧 input 行里的 `aco=1`。**必须看到 `ACO network ready: 29 imported pipelines`**，
+   光有 `ACO records 58/58 match` 只说明包里的记录文件对得上，不代表导入成功。
+
+2. **探针读数**（`build-mz/AmdMochizukiRuntimeProbe.exe`，见 14.3 复现）：
+
+   ```
+   --- step 6b SetControls (aco_mode is decided here) ---
+     SetControls -> OK (struct_size 532), aco_mode requested=1 (DLSS5_MZ_ACO=0 turns it off)
+     ACO: requested=1 effective=1
+     session: network 1920x1080, passes=1, build 1.719839 s
+   ```
+
+   `requested` 是我们给的值，`effective` 是运行时实际走成的。**两者都是 1 才算开**；
+   失败时 `effective=0` 且括号里带 `aco_fallback` 的原因文本（驱动编译 / PAL 拒绝）。
+
+3. 播放器日志 `run-fg/DLSSVideoPlayer.log` 的 `  ACO: requested=1 effective=?` 行
+   （`AmdLmxxfEvaluator` 在建网后打印）。**这行只在网络真的建起来后才出现**，
+   receipt 里 `failure=cancelled` 的会话不会有。
+
+### 14.2 🐞 三个会让"ACO 没开"被误判成"开了"的坑
+
+- **别用建网耗时判断。** 冷启动时 ACO 是 1.5 s vs 驱动编译 66 s，看着很好分；
+  但 `dlssnr-amd/pipeline.cache` 一旦命中，**关掉 ACO 也只有 1.38 s**（实测），
+  和开着的 1.72 s 分不开。所以耗时是旁证，`aco_effective` 才是判据。
+- **别在 `PrepareSession` 之后立刻读 `GetInfo`。** 那时网络还没建，
+  `aco_effective` 恒 0、`model_w/h` 是 0x0、`build_seconds` 是 0——
+  这是"还没发生"，不是"失败"。必须在首帧建网之后读（播放器在
+  `WaitForMochizukiNetwork()` 之后读，探针在 step 9-13 之后读）。
+- **`SetControls` 夹在 Create 与 PrepareSession 中间。** 早于 Create 会被拒：
+  `set-controls before the session exists | GetApi: unsupported abi_version`；
+  晚于 PrepareSession 则 ACO 已经定死，值到了也不改（运行时原话是"next game start"）。
+
+### 14.3 复现
+
+```bash
+source /f/tmp/msvcenv.sh
+cl /nologo /std:c++20 /EHsc /MD /O2 /W4 /WX /D NOMINMAX /D _CRT_SECURE_NO_WARNINGS \
+   /D WIN32_LEAN_AND_MEAN /D UNICODE /D _UNICODE /c /Fo:build-mz/AmdMochizukiRuntimeProbe.obj \
+   tests/AmdMochizukiRuntimeProbe.cpp /I src /I third_party/lmxxf /I third_party/mochizuki
+link /nologo /OUT:build-mz/AmdMochizukiRuntimeProbe.exe \
+   build-mz/AmdMochizukiRuntimeProbe.obj build-mz/AmdLmxxfRuntime.obj \
+   bcrypt.lib d3d12.lib dxgi.lib ole32.lib
+
+./build-mz/AmdMochizukiRuntimeProbe.exe 'F:\dlss5-video\dlss5-video-amd\amd-neural-runtime'
+# 对照（已知坏）：关掉，requested=0 effective=0
+DLSS5_MZ_ACO=0 ./build-mz/AmdMochizukiRuntimeProbe.exe 'F:\dlss5-video\dlss5-video-amd\amd-neural-runtime'
+```
+
+探针要传**绝对路径**的 runtime 目录：传相对路径 `amd-neural-runtime` 会在
+`LoadLibraryExW` 上失败（GetLastError=87），看着像包坏了其实是参数问题。
+
