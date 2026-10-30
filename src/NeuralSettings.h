@@ -24,7 +24,11 @@
 // render time, which the pace forecast already measures and reports.
 struct NeuralSettings {
     float intensity{1.0f};       // NRIntensity
-    float localTone{1.0f};       // NRLocalTone
+    // 2.0 is the shipped default, not NVIDIA's 1.0: it is the value this fork's
+    // default picture was tuned at, and the Mochizuki panel reads it too
+    // (job.mochizuki.localTone). Raising it above 1.0 applies local tone on
+    // every pass, which is what the higher rungs of this slider always did.
+    float localTone{2.0f};       // NRLocalTone
     float localStructure{1.0f};  // NRLocalStructure
     float skinStructure{-1.0f};  // NRSkinStructure; -1 (skin_structure::kOff) follows localStructure
     float colorStrength{1.0f};   // NRColorStrength

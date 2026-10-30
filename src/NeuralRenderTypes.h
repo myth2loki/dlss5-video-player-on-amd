@@ -98,8 +98,12 @@ constexpr std::optional<AmdNrRuntime> ParseAmdNrRuntime(std::string_view name) n
 struct MochizukiOptions {
     // 0..2, default 1: above 1 raises the luminance ratio rather than "more NR".
     float intensity{1.0f};
-    // 0..2, default 1: tone re-applied per frame.
-    float localTone{1.0f};
+    // 0..2, default 2: tone re-applied per frame. It matches
+    // NeuralSettings::localTone, which is where the value actually comes from
+    // (main.cpp copies it into this struct when a job is built) - the two are the
+    // same knob, and a default that disagreed would make MochizukiOptionsAreDefault
+    // say "not default" about the product's own default.
+    float localTone{2.0f};
     // 0..2, default 1.
     float localStructure{1.0f};
     // -1..2, default -1: negative follows local structure. Needs automatic mask.

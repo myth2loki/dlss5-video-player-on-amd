@@ -473,13 +473,13 @@ void amd_runtime_layout_requires_every_checked_component_test()
 // byte.
 void amd_accumulation_rung_is_on_by_default_and_off_keeps_the_old_key_test()
 {
-    // Off is not the neutral setting here: the runtime relights every frame on
-    // its own, so Off is the picture with the model's own frame-to-frame jitter
-    // left in place, and the pass is what takes it out. Low rather than a
-    // stronger rung because this is a default and not a choice - the rungs trade
-    // steadiness for detail monotonically, and Low moves the picture least
-    // (AmdLmxxfPolicy.h).
-    CHECK_EQ(TemporalStability::Low, amd_lmxxf::kAmdDefaultStability);
+    // Off is the shipped default, and the reason is the runtime's frame contract
+    // rather than a taste for detail: every rung blends the previous output
+    // through the motion field, and mochizuki's 88-byte struct carries no depth,
+    // so a wrong vector at an occlusion edge puts one frame's content where the
+    // next one's should be. Off is the rung that cannot do that; the steadiness
+    // it gives up is available in Neural settings (AmdLmxxfPolicy.h).
+    CHECK_EQ(TemporalStability::Off, amd_lmxxf::kAmdDefaultStability);
 
     // The pre-pass document, spelled out. Any added or renamed line here is a
     // change to every AMD key on disk at the defaults, so the check is against

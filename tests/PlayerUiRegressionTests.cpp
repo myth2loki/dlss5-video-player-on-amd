@@ -3183,8 +3183,11 @@ struct PlayerAppTestAccess {
         CHECK(!app.m_markers.in100ns.has_value() && !app.m_markers.out100ns.has_value());
         CHECK(app.BuildStatusText().find(L"In ") == std::wstring::npos);
         // Cached range playback names its range and the settings it was rendered with.
+        // Local tone is set rather than left at the default: this case is about the
+        // status line's shape, and a default that moves would otherwise rewrite it.
         app.m_cachedRange = NeuralRenderRange{15000000, 30000000};
-        app.m_cachedSettings.intensity = 1.25f; app.m_cachedGuides.depth = false;
+        app.m_cachedSettings.intensity = 1.25f; app.m_cachedSettings.localTone = 1.0f;
+        app.m_cachedGuides.depth = false;
         const std::wstring rangeStatus = app.BuildStatusText();
         CHECK(rangeStatus.find(L"Range 00:00:01:15\u201300:00:03:00") != std::wstring::npos);
         CHECK(rangeStatus.find(L"NR 1.25/struct 1.00/tone 1.00/mv=1,depth=0") != std::wstring::npos);
