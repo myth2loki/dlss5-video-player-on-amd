@@ -64,9 +64,15 @@ inline std::string AmdNeuralSettingsDocument(TemporalStability accumulation, uin
                                              bool smallModel = false,
                                              bool skinProtect = false, bool multiPassPredict = true,
                                              bool laterPassSkip = false, uint32_t style = 1,
-                                             uint32_t temporalMode = 0)
+                                             uint32_t temporalMode = 0,
+                                             std::string_view runtime = "lmxxf",
+                                             std::string_view mochizukiOptions = {})
 {
-    std::string document = "backend=amd-lmxxf\n"
+    // The runtime names the whole network: two runtimes in one pack are two
+    // differently trained models behind two DLLs, so `backend=amd-<runtime>` is
+    // the first key term rather than a detail of how it was loaded. The default
+    // reproduces the string every render before the choice existed keyed.
+    std::string document = "backend=amd-" + std::string(runtime) + "\n"
                            "temporal=off\n"
                            "motion=constant(0,0)\n"
                            "depth=constant(1)\n";
@@ -88,6 +94,13 @@ inline std::string AmdNeuralSettingsDocument(TemporalStability accumulation, uin
     // reuse term (the helper relaunches on it because the digest moves).
     if (style != 1)
         document += "style=" + std::to_string(style) + "\n";
+    // The Mochizuki runtime's own controls, only on that runtime and only off its
+    // defaults: they change the picture, so a key that ignored them would hand a
+    // cached render made with a highlight guard of 2 to a job that asked for 8.
+    // Empty on lmxxf and on a default panel, which is what keeps every earlier
+    // key byte-identical.
+    if (!mochizukiOptions.empty())
+        document += "mochizuki=" + std::string(mochizukiOptions) + "\n";
     // Only with a count: the runtime blends the skin mask in only when later
     // passes exist, so at one pass this switch renders exactly what an off
     // switch renders, and a key term that claims otherwise would retire

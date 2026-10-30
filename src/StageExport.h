@@ -134,6 +134,15 @@ struct StageExportJob {
     // The AMD runtime's own style (DLSS5_STYLE, 0..2); see
     // RenderSettings::amdStyle in the player.
     uint32_t amdStyle{1};
+    // Which runtime inside the AMD pack this export drives. Part of the plan
+    // because it is a different network behind a different DLL: two exports that
+    // differ here are two different pictures, and the runtime directory alone
+    // cannot say which was asked for.
+    AmdNrRuntime amdNrRuntime{AmdNrRuntime::Lmxxf};
+    // The Mochizuki runtime's own controls for this export. Carried by the plan
+    // because they change the picture and therefore the cache entry: two exports
+    // that differ only here are two different renders.
+    MochizukiOptions mochizuki{};
     // The CAS strength on an upscaled capture (AmdUpscaleShader.h). Only the
     // command line names it today; the dialog's export leaves the default.
     float upscaleSharpness{0.6f};

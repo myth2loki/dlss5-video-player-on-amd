@@ -112,6 +112,15 @@ struct NeuralRenderRequest {
     // parent. Set it to pin a specific tree - a second runtime version, or a
     // checkout the environment does not name. Ignored on the NVIDIA backend.
     std::filesystem::path amdRuntimeDirectory;
+    // Which runtime in that directory the job drives. Two DLLs can live in one
+    // pack, so this is a choice the job carries rather than something inferred
+    // from the directory; absent means lmxxf, the backend every earlier job ran.
+    AmdNrRuntime amdNrRuntime{AmdNrRuntime::Lmxxf};
+    // What that runtime's own panel would set (MochizukiOptions). Ignored by
+    // lmxxf, whose options are lines in the configuration file this job writes
+    // before the runtime loads; on Mochizuki they are session state and are
+    // handed over before the network is built.
+    MochizukiOptions mochizuki{};
     // The resolution the model runs at, as a percentage of the source: one of
     // kProcessingScaleRungs (UpscalingPolicy.h). Below 100 the job area-reduces
     // each frame to ProcessingSize, runs the carrier as true Super Resolution

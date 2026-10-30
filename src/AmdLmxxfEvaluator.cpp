@@ -2,6 +2,7 @@
 
 #include "AmdDepthExpandShader.h"
 #include "AmdLmxxfPolicy.h"
+#include "AmdMochizukiApi.h"
 #include "AmdTemporalAccumulationShader.h"
 #include "AmdUpscaleShader.h"
 #include "GuideFiles.h"
@@ -1403,18 +1404,29 @@ bool AmdLmxxfEvaluator::BringUpRuntime()
     // The runtime reads its weights and shaders through the environment rather
     // than through Create. It says so in its own error text: "set
     // LMXXF_WEIGHTS_DIR to tiled assets, not 0.24.2 HIP/".
+    const bool mochizuki = config_.kind == amd_lmxxf::NrKind::Mochizuki;
+    // LMXXF_WEIGHTS_DIR is the lmxxf runtime's own channel; a Mochizuki tree
+    // reads dlssnr-amd/ from its assets directory and would only be confused by
+    // a weight path pointing at the other backend's tiled assets.
     std::error_code weightsError;
-    if (std::filesystem::exists(config_.weightsDirectory, weightsError)) {
+    if (!mochizuki && std::filesystem::exists(config_.weightsDirectory, weightsError)) {
         ::SetEnvironmentVariableW(L"LMXXF_WEIGHTS_DIR", config_.weightsDirectory.wstring().c_str());
         Log("LMXXF_WEIGHTS_DIR = " + NarrowPath(config_.weightsDirectory));
-    } else {
+    } else if (!mochizuki) {
         Log("LMXXF_WEIGHTS_DIR not set: " + NarrowPath(config_.weightsDirectory) + " is absent");
     }
 
     std::wstring loadError;
-    if (!runtime_.Load(config_.runtimeDirectory, &loadError))
+    if (!runtime_.Load(config_.runtimeDirectory, config_.kind, &loadError))
         return Refuse("Runtime::Load: " + Narrow(loadError));
-    Log("LmxxfNrRuntime loaded from " + NarrowPath(runtime_.ModulePath()));
+    Log(Narrow(std::wstring(amd_lmxxf::NrKindName(config_.kind))) + " runtime loaded from " +
+        NarrowPath(runtime_.ModulePath()));
+    // The Mochizuki runtime keeps its own log off unless asked, and every ACO
+    // decision, pipeline fallback and build phase is in it. Asked for here rather
+    // than in a debug build: a machine where the network builds slowly is exactly
+    // the machine whose log is needed.
+    if (config_.kind == amd_lmxxf::NrKind::Mochizuki && !runtime_.EnableLogging(true))
+        Log("  note: this runtime exports no MochizukiNrSetLogging; its own log stays off");
     Log("  abi_version " + std::to_string(runtime_.Api().abi_version) + ", table " +
         std::to_string(runtime_.Api().struct_size) + " bytes");
 
@@ -1440,28 +1452,50 @@ bool AmdLmxxfEvaluator::BringUpRuntime()
     }
 
     std::error_code directoryError;
-    if (!std::filesystem::is_directory(config_.modulesDirectory, directoryError))
+    if (!mochizuki && !std::filesystem::is_directory(config_.modulesDirectory, directoryError))
         return Refuse("the modules directory " + NarrowPath(config_.modulesDirectory) +
                       " does not exist; Create wants the 40-per-arch lmxxf-modules layout, not "
                       "native-game-tiled-assets/HIP");
+    // Create's assets_directory means two different things. lmxxf wants the
+    // module tree (it reads weights through LMXXF_WEIGHTS_DIR); Mochizuki reads
+    // <assets>/dlssnr-amd for its model, shaders and ACO bundle, so it is handed
+    // the pack root - the directory the DLL itself lives in.
+    const std::filesystem::path assetsDirectory =
+        mochizuki ? config_.runtimeDirectory : config_.modulesDirectory;
     // The temporal model runs under the lease lifecycle and nowhere else, so the
     // create flag and the frame path are one decision rather than two. Asking
     // for history without it is what makes the status line answer
     // "unsupported-lifecycle" before a single guide check runs.
-    leases_ = config_.temporalHistory;
+    // The lease lifecycle is optional on lmxxf (it is what turns the temporal
+    // model on) and mandatory on Mochizuki: its Create accepts
+    // RECORDING_LEASES, or RECORDING_LEASES|INLINE_QUEUE, and answers
+    // "current package recording ABI required" for anything else - including the
+    // no-flags session the lmxxf path may create.
+    leases_ = config_.temporalHistory || mochizuki;
     const uint32_t createFlags =
         config_.createFlags | (leases_ ? LMXXF_NR_CREATE_FLAG_RECORDING_LEASES : 0u);
+    if (mochizuki && createFlags != LMXXF_NR_CREATE_FLAG_RECORDING_LEASES)
+        return Refuse("Mochizuki's Create accepts exactly LMXXF_NR_CREATE_FLAG_RECORDING_LEASES "
+                      "(optionally with INLINE_QUEUE); this job asked for flags=" +
+                      std::to_string(createFlags));
 
     std::wstring createError;
-    if (!runtime_.CreateSession(device_.Get(), queue_.Get(), config_.modulesDirectory, createFlags,
+    if (!runtime_.CreateSession(device_.Get(), queue_.Get(), assetsDirectory, createFlags,
                                 &createError)) {
         std::string detail = Narrow(createError);
         const std::string last = runtime_.LastError();
         if (!last.empty()) detail += " | " + last;
-        return Refuse("CreateSession on " + NarrowPath(config_.modulesDirectory) + ": " + detail);
+        return Refuse("CreateSession on " + NarrowPath(assetsDirectory) + ": " + detail);
     }
-    Log("session created on " + NarrowPath(config_.modulesDirectory) +
+    Log("session created on " + NarrowPath(assetsDirectory) +
         (leases_ ? " with LMXXF_NR_CREATE_FLAG_RECORDING_LEASES" : " in the default job model"));
+
+    // Before PrepareSession, not after: PrepareSession is what creates the Vulkan
+    // device, and this runtime fixes its pipeline path (ACO import vs driver
+    // compile) at device creation - its own words are "ACO mode applies on the
+    // next game start" when the value arrives later. Set after PrepareSession the
+    // style would still work and the ACO choice would be silently ignored.
+    if (mochizuki && !ApplyMochizukiControls()) return false;
 
     std::wstring prepareError;
     if (!runtime_.PrepareSession(&prepareError)) {
@@ -1473,8 +1507,198 @@ bool AmdLmxxfEvaluator::BringUpRuntime()
     runtimeStatus_ = runtime_.Status();
     Log("PrepareSession OK" + (runtimeStatus_.empty() ? std::string() : " | status: " + runtimeStatus_));
 
-    session_.emplace(runtime_.Api(), runtime_.Context(), leases_);
+    session_.emplace(runtime_.Api(), runtime_.Context(), leases_, runtime_.MochizukiPrepare());
     prepared_ = true;
+    // The network is built lazily on this runtime; wait it out here so no job
+    // frame is ever the one that discovers it.
+    if (!WaitForMochizukiNetwork()) return false;
+    return true;
+}
+
+bool AmdLmxxfEvaluator::PrepareFrameForBackend(amd_lmxxf::Session& session,
+                                               const LmxxfNrFrameInfo& info)
+{
+    // The two runtimes take different frame structs from the same table. lmxxf
+    // reads LmxxfNrFrameInfo (168 bytes, exposure block, session/list identity);
+    // Mochizuki reads MochizukiNrFrameInfo (88 or 112, per-frame pass count, no
+    // exposure) and only through its standalone export - the table's own
+    // PrepareFrame on that runtime is a stub whose whole body is "use the other
+    // entry point". Converting here keeps the caller's work (colour upload,
+    // guides, reset decision) identical on both paths.
+    if (config_.kind == amd_lmxxf::NrKind::Mochizuki)
+        return session.PrepareFrame(amd_mochizuki::ConvertFrame(info, config_.modelPasses));
+    return session.PrepareFrame(info);
+}
+
+bool AmdLmxxfEvaluator::ApplyMochizukiControls()
+{
+    // A zero-initialised struct is the runtime's default only where a field's own
+    // comment says 0 is the default; the ones defaulting to 1 (local tone,
+    // structure, mask, apply, history strength, white point) and -1 (skin
+    // structure follows the structure value) are written explicitly. Everything
+    // else - linear input, max passes, preprocessing, RenoDX - is left at 0, the
+    // documented default.
+    const MochizukiOptions& asked = config_.mochizuki;
+    MochizukiNrControls controls{};
+    controls.struct_size = sizeof(controls);
+    controls.intensity = asked.intensity;
+    controls.style = config_.style > 2u ? 2u : config_.style;
+    controls.local_tone = asked.localTone;
+    controls.local_structure = asked.localStructure;
+    controls.skin_structure = asked.skinStructure;
+    controls.automatic_mask = asked.autoMask ? 1u : 0u;
+    controls.max_ratio = asked.maxRatio;
+    controls.history_strength = asked.historyStrength;
+    controls.white_point = 1.0f;
+    controls.apply_model = asked.applyModel ? 1u : 0u;
+    // Both of these rebuild the network when they differ from what it was built
+    // as, which is why the panel says so beside them.
+    controls.preprocess = asked.preprocess ? 1u : 0u;
+    if (controls.preprocess != 0u) {
+        // Auto exposure (1) and the filmic curve (3) are the pair a graded film
+        // needs: the network sees a normally-exposed picture and the grade is put
+        // back into its answer. A game's own HDR is what the model was trained
+        // on, which is why this is off by default.
+        controls.preprocess_exposure = 1;
+        controls.preprocess_curve = 3;
+    }
+    controls.int4_mixed = asked.int4Mixed ? 1u : 0u;
+    controls.drs_mode = asked.drsMode > 2u ? 0u : asked.drsMode;
+    // ACO import, the documented default and the reason the pack ships 58 record
+    // files next to 58 precompiled shaders. A zeroed struct means OFF, and off is
+    // what a first frame pays for: the driver compiles the network's 25 pipelines
+    // itself (measured 66 s). On, each pipeline is an AMD Pipeline Library import
+    // from dlssnr-amd/aco. Fixed when the Vulkan device is created, which is why
+    // this has to be handed over before PrepareSession.
+    controls.aco_mode = 1;
+
+    std::wstring error;
+    if (!runtime_.SetControls(controls, &error)) {
+        // Refused rather than logged-and-ignored: a job whose style did not land
+        // renders a picture nobody asked for, and the menu would be the only
+        // place claiming otherwise.
+        return Refuse("MochizukiNrSetControls: " + Narrow(error));
+    }
+    // Logged field by field: these are the values the picture was made from, and
+    // the only record of them once the job is gone. `defaults` in the line means
+    // nothing was moved off the runtime's own settings.
+    Log("  controls: style=" + std::to_string(controls.style) + ", passes=" +
+        std::to_string(config_.modelPasses) + ", intensity=" +
+        std::to_string(controls.intensity) + ", tone=" + std::to_string(controls.local_tone) +
+        ", structure=" + std::to_string(controls.local_structure) + ", skin=" +
+        std::to_string(controls.skin_structure) + ", mask=" +
+        std::to_string(controls.automatic_mask) + ", max_ratio=" +
+        std::to_string(controls.max_ratio) + ", history=" +
+        std::to_string(controls.history_strength) + ", apply=" +
+        std::to_string(controls.apply_model) + ", preprocess=" +
+        std::to_string(controls.preprocess) + ", int4=" + std::to_string(controls.int4_mixed) +
+        ", drs=" + std::to_string(controls.drs_mode) +
+        (MochizukiOptionsAreDefault(asked) ? " (all defaults)" : " (from the panel)"));
+    return true;
+}
+
+bool AmdLmxxfEvaluator::WaitForMochizukiNetwork()
+{
+    if (config_.kind != amd_lmxxf::NrKind::Mochizuki) return true;
+    const PFN_MochizukiNrPrepareFrame prepare = runtime_.MochizukiPrepare();
+    if (prepare == nullptr) return Refuse("the Mochizuki runtime exported no prepare entry point");
+    if (color_ == nullptr) return Refuse("the colour texture is missing, so the network cannot be built");
+
+    // The frame the build is armed against. Only its geometry, format and the
+    // pass count matter: the network is compiled for them, and the job this call
+    // hands back is released unrendered below.
+    MochizukiNrFrameInfo info = amd_mochizuki::MakeFrameInfo(
+        color_.Get(), width_, height_, static_cast<uint32_t>(colorState_), frameIndex_,
+        config_.modelPasses);
+    // The two frame-struct layouts the packages disagree about; the first
+    // accepted answer settles which one this runtime wants (see
+    // MochizukiNrApi.h). Session negotiates the same way for real frames.
+    uint32_t frameSize = MOCHIZUKI_NR_FRAME_INFO_SIZE_FULL;
+    LmxxfNrJob job = amd_lmxxf::MakeJob();
+    int32_t status = static_cast<int32_t>(LMXXF_NR_INVALID_ARGUMENT);
+    const auto started = std::chrono::steady_clock::now();
+    auto lastReport = started;
+    bool announced = false;
+    for (;;) {
+        info.struct_size = frameSize;
+        job = amd_lmxxf::MakeJob();
+        status = prepare(runtime_.Context(), &info, &job);
+        if (status == static_cast<int32_t>(LMXXF_NR_INVALID_ARGUMENT) &&
+            frameSize == MOCHIZUKI_NR_FRAME_INFO_SIZE_FULL) {
+            frameSize = MOCHIZUKI_NR_FRAME_INFO_SIZE_LEGACY;
+            Log("  the network build takes the 88-byte frame struct (this package predates the "
+                "depth block)");
+            continue;
+        }
+        if (status != static_cast<int32_t>(LMXXF_NR_UNAVAILABLE)) break;
+
+        if (!announced) {
+            announced = true;
+            Log("building the Mochizuki network; the first run of a model takes minutes, later "
+                "runs reuse the driver's pipeline cache");
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport >= std::chrono::seconds(5)) {
+            lastReport = now;
+            MochizukiNrBuildProgress progress{};
+            const bool haveProgress = runtime_.BuildProgress(progress);
+            Log("  build " + std::to_string(static_cast<long long>(
+                                   std::chrono::duration_cast<std::chrono::seconds>(now - started)
+                                       .count())) +
+                "s" +
+                (haveProgress
+                     ? ": " + std::string(progress.active ? "running" : "idle") + " " +
+                           std::to_string(progress.completed) + "/" +
+                           std::to_string(progress.total) +
+                           (progress.stage[0] != '\0' ? " " + std::string(progress.stage) : "")
+                     : std::string(": no progress report")));
+        }
+        if (now - started > std::chrono::seconds(900))
+            return Refuse("the Mochizuki network build did not finish within 900 s");
+        ::Sleep(250);
+    }
+    if (status != static_cast<int32_t>(LMXXF_NR_OK)) {
+        const std::string last = runtime_.LastError();
+        return Refuse("the Mochizuki network would not build: status=" + std::to_string(status) +
+                      (last.empty() ? "" : " | " + last));
+    }
+    // Requested is not effective: the runtime falls back to the driver compiler
+    // when the record bundle does not match its own network byte for byte, and it
+    // says which and why here. Read it rather than assuming the switch took.
+    {
+        MochizukiNrInfo sessionInfo{};
+        if (runtime_.Info(sessionInfo)) {
+            Log("  session: network " + std::to_string(sessionInfo.model_w) + "x" +
+                std::to_string(sessionInfo.model_h) + " for a " +
+                std::to_string(sessionInfo.frame_w) + "x" + std::to_string(sessionInfo.frame_h) +
+                " frame, passes=" + std::to_string(sessionInfo.max_passes) + ", build " +
+                std::to_string(sessionInfo.build_seconds) + " s");
+            Log(std::string("  ACO: requested=") + (sessionInfo.aco_requested ? "1" : "0") +
+                " effective=" + (sessionInfo.aco_effective ? "1" : "0") +
+                (sessionInfo.aco_fallback[0] != '\0'
+                     ? std::string(" (") + sessionInfo.aco_fallback + ")"
+                     : std::string()));
+        }
+    }
+    Log("Mochizuki network ready after " +
+        std::to_string(static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count())) +
+        " ms");
+    // Release the prepared job the way the lease model demands: declare no more
+    // work, then collect. Nothing was recorded against it, and the runtime
+    // documents invalidation as the release path for a job that only reached
+    // PrepareFrame. Session keeps its own phase machine at Idle, so the first
+    // real frame prepares a fresh job.
+    if (job.handle != nullptr) {
+        (void)runtime_.Api().InvalidateRecording(runtime_.Context(), job.handle);
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            if (runtime_.Api().CollectRecording(runtime_.Context(), job.handle) !=
+                static_cast<int32_t>(LMXXF_NR_UNAVAILABLE))
+                break;
+            ::Sleep(10);
+        }
+    }
     return true;
 }
 
@@ -3244,7 +3468,7 @@ bool AmdLmxxfEvaluator::SubmitFrameLease(const std::vector<uint8_t>& bgra, bool 
     temporalGuides.reset = resetRequested;
     amd_lmxxf::ApplyTemporalGuides(frameInfo, temporalGuides);
 
-    if (!session.PrepareFrame(frameInfo)) {
+    if (!PrepareFrameForBackend(session, frameInfo)) {
         Report("PrepareFrame", session.LastStatus());
         return abandon("PrepareFrame", session.LastStatus());
     }
@@ -3423,7 +3647,7 @@ bool AmdLmxxfEvaluator::SubmitFrame(const std::vector<uint8_t>& bgra, bool reset
     // the phase stuck at Prepared, so a later Retire refuses as out-of-order
     // even though every individual call returned OK - the first hardware run
     // failed exactly that way.
-    if (!session.PrepareFrame(frameInfo)) {
+    if (!PrepareFrameForBackend(session, frameInfo)) {
         Report("PrepareFrame", session.LastStatus());
         (void)list_->Close();
         return Fail(NeuralRenderFailure::Neural, "PrepareFrame: " + session.LastError());

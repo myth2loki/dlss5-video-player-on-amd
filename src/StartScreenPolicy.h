@@ -47,6 +47,10 @@ struct Facts {
     // the embedded lock's version string, or the count of digests the pack
     // publishes, because that is the identity an AMD render is held to.
     std::wstring runtimeVersion;
+    // Whether that identity is a digest of the files. The Mochizuki tree is not
+    // held to the pack's SHA256SUMS - nothing maintains them for it - so the line
+    // must not claim a check that did not happen.
+    bool runtimeDigestsPinned{true};
     // Frames per second the live render is forecast to manage, only when a
     // measurement or a measured prior backs it. Nothing is printed otherwise:
     // an invented number here is the question the screen exists to answer. The
@@ -153,8 +157,9 @@ inline std::vector<Line> CapabilityLines(const Facts& facts)
     // to, and each says its own: the lock compiled into this binary, or the
     // manifests the pack ships beside its modules, which is the only claim
     // anything maintains for that tree.
-    const std::wstring verified = amd ? std::wstring(L"Present · matches the pack's own SHA256SUMS")
-                                      : std::wstring(L"Present · matches the lock");
+    const std::wstring verified = !amd ? std::wstring(L"Present · matches the lock")
+        : facts.runtimeDigestsPinned ? std::wstring(L"Present · matches the pack's own SHA256SUMS")
+                                     : std::wstring(L"Present · checked by presence");
     switch (facts.runtime) {
     case RuntimeState::Checking: lines.push_back(Line{L"Neural runtime", L"Checking…", Mark::Pending}); break;
     case RuntimeState::Absent:

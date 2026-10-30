@@ -151,6 +151,8 @@ StageExportOutcome RunStageExport(const StageExportJob& job,std::stop_token stop
         request.amdMultiPassPredict=job.amdMultiPassPredict;
         request.amdMultiPassSkip=job.amdMultiPassSkip;
         request.amdStyle=job.amdStyle;
+        request.amdNrRuntime=job.amdNrRuntime;
+        request.mochizuki=job.mochizuki;
         request.amdTemporalMode=job.amdTemporalMode;
         request.upscaleSharpness=job.upscaleSharpness;
         request.requireNeural=plan.requireNeural;
@@ -167,11 +169,20 @@ StageExportOutcome RunStageExport(const StageExportJob& job,std::stop_token stop
         // Which tree this job's backend loads its module from. The worker
         // executable always comes from the helper package; only the module the
         // job loads is backend-specific, and on AMD it is not in that package.
+        // Resolved for the runtime this export chose: two DLLs can live in one
+        // pack, and asking for the wrong module is how an export ends up
+        // refused for a tree that is perfectly present.
+        const amd_lmxxf::NrKind nrKind=job.amdNrRuntime==AmdNrRuntime::Mochizuki
+            ?amd_lmxxf::NrKind::Mochizuki:amd_lmxxf::NrKind::Lmxxf;
         const std::filesystem::path runtimeDirectory=plan.backend==NeuralBackend::Amd
-            ?amd_lmxxf::ResolveRuntimeDirectory({})
+            ?amd_lmxxf::ResolveRuntimeDirectory({},nrKind)
             :job.helpers/L"neural-runtime";
-        if(plan.backend==NeuralBackend::Amd&&runtimeDirectory.empty())
-            return {StageExportStatus::Refused,L"The AMD neural runtime directory could not be resolved; set DLSS5_AMD_RUNTIME_DIR or put amd-neural-runtime beside the module."};
+        if(plan.backend==NeuralBackend::Amd&&runtimeDirectory.empty()){
+            std::wstring detail=L"The AMD neural runtime directory could not be resolved: ";
+            detail+=amd_lmxxf::NrKindModuleName(nrKind);
+            detail+=L" was not found in amd-neural-runtime beside the module or in DLSS5_AMD_RUNTIME_DIR.";
+            return {StageExportStatus::Refused,detail};
+        }
         // Told to the helper rather than resolved a second time there: this is
         // the tree the refusal below checks and the tree this render reports, so
         // one resolution is what keeps "what was verified" and "what was loaded"

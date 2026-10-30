@@ -15,6 +15,9 @@
 #include "TestEnvironment.h"
 
 #include "RuntimePolicy.h"
+// The Mochizuki panel's wire format and the AMD key it writes into
+// (NeuralRenderTypes.h, NeuralStabilitySettings.h).
+#include "NeuralStabilitySettings.h"
 #include "GpuPreference.h"
 #include "ReShadeConfig.h"
 #include "Localization.h"
@@ -16002,7 +16005,79 @@ void nvenc_direct_hand_off_matroska_is_laid_out_as_ebml_test()
     CHECK(!std::filesystem::exists(path));
 }
 
+// The Mochizuki panel's values have one wire format, and the only two things
+// that can go wrong with it are silent: a default that does not format as the
+// empty string would put a key on every lmxxf job's command line, and a
+// malformed line that parsed as "the defaults" would render a picture nobody
+// asked for and call it a success.
+void mochizuki_options_wire_and_key_test()
+{
+    // The runtime's own defaults are the empty string: that is what makes an
+    // unchanged job's command line identical to before the key existed, and what
+    // keeps its cache key unchanged too.
+    CHECK(FormatMochizukiOptions(MochizukiOptions{}).empty());
+
+    MochizukiOptions asked;
+    asked.intensity = 1.25f;
+    asked.localTone = 0.5f;
+    asked.localStructure = 1.5f;
+    asked.skinStructure = 0.75f;
+    asked.autoMask = false;
+    asked.maxRatio = 3.5f;
+    asked.historyStrength = 0.25f;
+    asked.applyModel = false;
+    asked.preprocess = true;
+    asked.int4Mixed = true;
+    asked.drsMode = 2;
+    const std::string line = FormatMochizukiOptions(asked);
+    CHECK(!line.empty());
+    const auto parsed = ParseMochizukiOptions(line);
+    CHECK(parsed.has_value());
+    if (parsed) {
+        CHECK_EQ(asked.intensity, parsed->intensity);
+        CHECK_EQ(asked.localTone, parsed->localTone);
+        CHECK_EQ(asked.localStructure, parsed->localStructure);
+        CHECK_EQ(asked.skinStructure, parsed->skinStructure);
+        CHECK_EQ(asked.autoMask, parsed->autoMask);
+        CHECK_EQ(asked.maxRatio, parsed->maxRatio);
+        CHECK_EQ(asked.historyStrength, parsed->historyStrength);
+        CHECK_EQ(asked.applyModel, parsed->applyModel);
+        CHECK_EQ(asked.preprocess, parsed->preprocess);
+        CHECK_EQ(asked.int4Mixed, parsed->int4Mixed);
+        CHECK_EQ(asked.drsMode, parsed->drsMode);
+    }
+    // A default value formats as nothing, so a round trip of "the defaults" is
+    // the empty string rather than a line of eleven default values.
+    MochizukiOptions defaults;
+    CHECK(ParseMochizukiOptions(FormatMochizukiOptions(defaults)) == std::nullopt);
+
+    // Malformed: a missing key, an unknown key, a number where a flag belongs,
+    // and a flag where a number belongs. All four answer nothing rather than the
+    // defaults.
+    CHECK(ParseMochizukiOptions("intensity=1.00,tone=1.00").value_or(asked) == asked);
+    CHECK(ParseMochizukiOptions("nonsense=1").value_or(asked) == asked);
+    CHECK(ParseMochizukiOptions("intensity=1.00,intensity=1.00").value_or(asked) == asked);
+
+    // The cache key carries them only when the runtime is Mochizuki and only off
+    // its defaults; a default panel on either runtime keys exactly as before.
+    const std::string plainDefault = AmdNeuralSettingsDocument(TemporalStability::Off);
+    const std::string mochizukiDefault =
+        AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, false, true, false, 1, 0,
+                                  "mochizuki", FormatMochizukiOptions(MochizukiOptions{}));
+    CHECK(mochizukiDefault.find("mochizuki=") == std::string::npos);
+    const std::string mochizukiMoved =
+        AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, false, true, false, 1, 0,
+                                  "mochizuki", FormatMochizukiOptions(asked));
+    CHECK(mochizukiMoved.find("mochizuki=") != std::string::npos);
+    // And the lmxxf key is untouched by the new term whatever it holds.
+    const std::string lmxxfKey =
+        AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, false, true, false, 1, 0,
+                                  "lmxxf", {});
+    CHECK(lmxxfKey == plainDefault);
+}
+
 constexpr test_support::TestCase kCases[] = {
+    TEST_CASE(mochizuki_options_wire_and_key_test),
     TEST_CASE(harness_isolates_a_failing_case_from_the_ones_after_it_test),
     TEST_CASE(runtime_shutdown_releases_player_before_media_foundation_and_com_test),
     TEST_CASE(runtime_shutdown_rethrows_only_after_single_ordered_cleanup_test),

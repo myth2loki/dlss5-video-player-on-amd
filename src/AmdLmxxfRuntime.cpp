@@ -2,19 +2,51 @@
 
 #include "PlatformPaths.h"
 
+#include <algorithm>
+#include <cstring>
 #include <iterator>
+#include <vector>
 #include <system_error>
 #include <utility>
 
 namespace amd_lmxxf {
 
-std::filesystem::path ResolveRuntimeDirectory(const std::filesystem::path& explicitDirectory)
+std::wstring_view NrKindName(NrKind kind) noexcept
+{
+    switch (kind) {
+        case NrKind::Lmxxf: return L"lmxxf";
+        case NrKind::Mochizuki: return L"mochizuki";
+    }
+    return L"unknown";
+}
+
+const wchar_t* NrKindModuleName(NrKind kind) noexcept
+{
+    switch (kind) {
+        case NrKind::Lmxxf: return L"LmxxfNrRuntime.dll";
+        case NrKind::Mochizuki: return L"MochizukiNrRuntime.dll";
+    }
+    return L"";
+}
+
+const char* NrKindGetApiExport(NrKind kind) noexcept
+{
+    switch (kind) {
+        case NrKind::Lmxxf: return "LmxxfNrGetApi";
+        case NrKind::Mochizuki: return "MochizukiNrGetApi";
+    }
+    return "";
+}
+
+std::filesystem::path ResolveRuntimeDirectory(const std::filesystem::path& explicitDirectory,
+                                              NrKind kind)
 {
     namespace fs = std::filesystem;
-    const auto holdsRuntime = [](const fs::path& directory) {
+    const wchar_t* moduleName = NrKindModuleName(kind);
+    const auto holdsRuntime = [moduleName](const fs::path& directory) {
         if (directory.empty()) return false;
         std::error_code error;
-        return fs::is_regular_file(directory / L"LmxxfNrRuntime.dll", error) && !error;
+        return fs::is_regular_file(directory / moduleName, error) && !error;
     };
     if (!explicitDirectory.empty())
         return holdsRuntime(explicitDirectory) ? explicitDirectory : fs::path{};
@@ -56,9 +88,11 @@ std::filesystem::path ResolveRuntimeDirectory(const std::filesystem::path& expli
 
 namespace {
 
-std::wstring FailureText(RuntimeFailure failure, std::wstring_view detail)
+std::wstring FailureText(RuntimeFailure failure, std::wstring_view detail,
+                         NrKind kind = NrKind::Lmxxf)
 {
-    std::wstring text(L"LmxxfNrRuntime: ");
+    std::wstring text(NrKindModuleName(kind));
+    text += L": ";
     text += RuntimeFailureName(failure);
     if (!detail.empty()) {
         text += L": ";
@@ -108,10 +142,19 @@ void Runtime::MoveFrom(Runtime& other) noexcept
     api_ = other.api_;
     capabilities_ = other.capabilities_;
     context_ = std::exchange(other.context_, nullptr);
+    kind_ = other.kind_;
+    mochizukiPrepare_ = std::exchange(other.mochizukiPrepare_, nullptr);
+    mochizukiProgress_ = std::exchange(other.mochizukiProgress_, nullptr);
+    mochizukiSetControls_ = std::exchange(other.mochizukiSetControls_, nullptr);
+    mochizukiGetControlDefaults_ = std::exchange(other.mochizukiGetControlDefaults_, nullptr);
+    mochizukiGetInfo_ = std::exchange(other.mochizukiGetInfo_, nullptr);
+    mochizukiGetFeatures_ = std::exchange(other.mochizukiGetFeatures_, nullptr);
+    mochizukiSetLogging_ = std::exchange(other.mochizukiSetLogging_, nullptr);
     assetsDirectory_ = std::move(other.assetsDirectory_);
     modulePath_ = std::move(other.modulePath_);
     other.api_ = {};
     other.capabilities_ = {};
+    other.kind_ = NrKind::Lmxxf;
 }
 
 void Runtime::ResetHandles() noexcept
@@ -119,6 +162,17 @@ void Runtime::ResetHandles() noexcept
     api_ = {};
     capabilities_ = {};
     context_ = nullptr;
+    kind_ = NrKind::Lmxxf;
+    mochizukiPrepare_ = nullptr;
+    mochizukiProgress_ = nullptr;
+    mochizukiSetControls_ = nullptr;
+    mochizukiGetControlDefaults_ = nullptr;
+    mochizukiGetInfo_ = nullptr;
+    mochizukiGetFeatures_ = nullptr;
+    mochizukiSetLogging_ = nullptr;
+    mochizukiInfoSize_ = 0;
+    // The payload size belongs to the loaded module, so it goes with it.
+    mochizukiControlsSize_ = 0;
     assetsDirectory_.clear();
     modulePath_.clear();
 }
@@ -135,13 +189,19 @@ void Runtime::Unload()
 
 bool Runtime::Load(const std::filesystem::path& runtimeDirectory, std::wstring* error)
 {
+    return Load(runtimeDirectory, NrKind::Lmxxf, error);
+}
+
+bool Runtime::Load(const std::filesystem::path& runtimeDirectory, NrKind kind, std::wstring* error)
+{
     Unload();
+    kind_ = kind;
+    const wchar_t* moduleName = NrKindModuleName(kind);
     std::error_code absoluteError;
-    modulePath_ = std::filesystem::absolute(runtimeDirectory / L"LmxxfNrRuntime.dll",
-                                            absoluteError);
-    if (absoluteError) modulePath_ = runtimeDirectory / L"LmxxfNrRuntime.dll";
+    modulePath_ = std::filesystem::absolute(runtimeDirectory / moduleName, absoluteError);
+    if (absoluteError) modulePath_ = runtimeDirectory / moduleName;
     if (!IsRegularFileNoReparse(modulePath_)) {
-        if (error) *error = FailureText(RuntimeFailure::MissingModule, modulePath_.wstring());
+        if (error) *error = FailureText(RuntimeFailure::MissingModule, modulePath_.wstring(), kind);
         modulePath_.clear();
         return false;
     }
@@ -150,16 +210,49 @@ bool Runtime::Load(const std::filesystem::path& runtimeDirectory, std::wstring* 
                              LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
                                  LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
     if (module_ == nullptr) {
-        if (error) *error = FailureText(RuntimeFailure::MissingModule, modulePath_.wstring());
+        if (error) *error = FailureText(RuntimeFailure::MissingModule, modulePath_.wstring(), kind);
         modulePath_.clear();
         return false;
     }
 
-    const FARPROC getApi = GetProcAddress(module_, "LmxxfNrGetApi");
+    const FARPROC getApi = GetProcAddress(module_, NrKindGetApiExport(kind));
     if (getApi == nullptr) {
-        if (error) *error = FailureText(RuntimeFailure::MissingExport, modulePath_.wstring());
+        if (error) *error = FailureText(RuntimeFailure::MissingExport, modulePath_.wstring(), kind);
         Unload();
         return false;
+    }
+
+    // A Mochizuki runtime hands the same table back but replaces one entry with
+    // a rejection stub, so the prepare step is a separate export. It is resolved
+    // here rather than at the first frame: a tree missing it can render nothing,
+    // and saying so at load time is the difference between "the pack is wrong"
+    // and "the network failed".
+    if (kind == NrKind::Mochizuki) {
+        const auto prepare = reinterpret_cast<PFN_MochizukiNrPrepareFrame>(
+            GetProcAddress(module_, "MochizukiNrPrepareFrame"));
+        if (prepare == nullptr) {
+            if (error)
+                *error = FailureText(RuntimeFailure::MissingExport, modulePath_.wstring(), kind);
+            Unload();
+            return false;
+        }
+        mochizukiPrepare_ = prepare;
+        mochizukiProgress_ = reinterpret_cast<PFN_MochizukiNrGetBuildProgress>(
+            GetProcAddress(module_, "MochizukiNrGetBuildProgress"));
+        // The picture controls. Resolved here with the rest: they are optional in
+        // the sense that a runtime without them still renders, but the menu's
+        // style and pass count would then be silently ignored, so SetControls
+        // reports the absence rather than pretending the value landed.
+        mochizukiSetControls_ = reinterpret_cast<int32_t (*)(void*, const MochizukiNrControls*)>(
+            GetProcAddress(module_, "MochizukiNrSetControls"));
+        mochizukiGetControlDefaults_ = reinterpret_cast<int32_t (*)(MochizukiNrControls*)>(
+            GetProcAddress(module_, "MochizukiNrGetControlDefaults"));
+        mochizukiGetInfo_ = reinterpret_cast<int32_t (*)(void*, MochizukiNrInfo*)>(
+            GetProcAddress(module_, "MochizukiNrGetInfo"));
+        mochizukiGetFeatures_ = reinterpret_cast<int32_t (*)()>(
+            GetProcAddress(module_, "MochizukiNrGetFeatures"));
+        mochizukiSetLogging_ =
+            reinterpret_cast<void (*)(uint32_t)>(GetProcAddress(module_, "MochizukiNrSetLogging"));
     }
 
     // One call, one contract, per version. The table this header declares is the
@@ -204,7 +297,7 @@ bool Runtime::Load(const std::filesystem::path& runtimeDirectory, std::wstring* 
         if (tableProblemVersion != 0) {
             detail = L"abi_version " + std::to_wstring(tableProblemVersion) +
                      L" was accepted but its table is " + WideAscii(ApiProblemName(tableProblem));
-            *error = FailureText(RuntimeFailure::InvalidApiTable, detail);
+            *error = FailureText(RuntimeFailure::InvalidApiTable, detail, kind_);
         } else {
             detail = L"status=" + std::to_wstring(lastStatus);
             detail += L" (" + WideAscii(LmxxfNrStatusName(lastStatus)) + L")";
@@ -216,7 +309,7 @@ bool Runtime::Load(const std::filesystem::path& runtimeDirectory, std::wstring* 
             detail += L"); it wants a ";
             detail += std::to_wstring(sizeof(LmxxfNrApi));
             detail += L"-byte table";
-            *error = FailureText(RuntimeFailure::GetApiFailed, detail);
+            *error = FailureText(RuntimeFailure::GetApiFailed, detail, kind_);
         }
     }
     Unload();
@@ -226,7 +319,7 @@ bool Runtime::Load(const std::filesystem::path& runtimeDirectory, std::wstring* 
 bool Runtime::QueryCapabilities(std::wstring* error)
 {
     if (!Loaded()) {
-        if (error) *error = FailureText(RuntimeFailure::MissingModule, L"module not loaded");
+        if (error) *error = FailureText(RuntimeFailure::MissingModule, L"module not loaded", kind_);
         return false;
     }
     capabilities_ = {};
@@ -235,7 +328,7 @@ bool Runtime::QueryCapabilities(std::wstring* error)
     if (result != static_cast<int32_t>(LMXXF_NR_OK)) {
         if (error) {
             *error = FailureText(RuntimeFailure::InvalidCapabilities,
-                                 L"status=" + std::to_wstring(result));
+                                 L"status=" + std::to_wstring(result), kind_);
         }
         return false;
     }
@@ -243,7 +336,7 @@ bool Runtime::QueryCapabilities(std::wstring* error)
         problem != ApiProblem::None) {
         if (error) {
             *error = FailureText(RuntimeFailure::InvalidCapabilities,
-                                 WideAscii(ApiProblemName(problem)));
+                                 WideAscii(ApiProblemName(problem)), kind_);
         }
         return false;
     }
@@ -256,7 +349,7 @@ bool Runtime::CreateSession(void* device, void* queue,
 {
     ResetSession();
     if (!Loaded() || device == nullptr || queue == nullptr) {
-        if (error) *error = FailureText(RuntimeFailure::CreateFailed, L"missing dependency");
+        if (error) *error = FailureText(RuntimeFailure::CreateFailed, L"missing dependency", kind_);
         return false;
     }
 
@@ -266,7 +359,7 @@ bool Runtime::CreateSession(void* device, void* queue,
     if (result != static_cast<int32_t>(LMXXF_NR_OK) || context_ == nullptr) {
         if (error) {
             *error = FailureText(RuntimeFailure::CreateFailed,
-                                 L"status=" + std::to_wstring(result));
+                                 L"status=" + std::to_wstring(result), kind_);
         }
         if (context_ != nullptr) {
             api_.Destroy(context_);
@@ -281,14 +374,14 @@ bool Runtime::CreateSession(void* device, void* queue,
 bool Runtime::PrepareSession(std::wstring* error)
 {
     if (context_ == nullptr) {
-        if (error) *error = FailureText(RuntimeFailure::PrepareFailed, L"session not created");
+        if (error) *error = FailureText(RuntimeFailure::PrepareFailed, L"session not created", kind_);
         return false;
     }
     const int32_t result = api_.PrepareSession(context_);
     if (result != static_cast<int32_t>(LMXXF_NR_OK)) {
         if (error) {
             *error = FailureText(RuntimeFailure::PrepareFailed,
-                                 L"status=" + std::to_wstring(result));
+                                 L"status=" + std::to_wstring(result), kind_);
         }
         return false;
     }
@@ -322,6 +415,112 @@ std::string Runtime::Status() const
         static_cast<int32_t>(LMXXF_NR_OK))
         return {};
     return buffer;
+}
+
+bool Runtime::BuildProgress(MochizukiNrBuildProgress& out) const
+{
+    out = MochizukiNrBuildProgress{};
+    out.struct_size = sizeof(out);
+    if (mochizukiProgress_ == nullptr || context_ == nullptr) return false;
+    return mochizukiProgress_(context_, &out) == static_cast<int32_t>(LMXXF_NR_OK);
+}
+
+uint32_t Runtime::MochizukiControlsSize()
+{
+    // The controls struct is an exact-size contract: SetControls and
+    // GetControlDefaults both reject any struct_size but the package's own, and
+    // the packages disagree (this header is the 2026-10-28 revision; the 1.12.1
+    // DLL predates it). GetControlDefaults accepts nothing else, so the accepted
+    // size IS the package's - found once per load and stamped on every payload.
+    if (mochizukiControlsSize_ != 0) return mochizukiControlsSize_;
+    if (mochizukiGetControlDefaults_ == nullptr) return 0;
+    for (uint32_t size = 8; size <= 8192; size += 4) {
+        std::vector<uint8_t> probe(size, 0);
+        std::memcpy(probe.data(), &size, sizeof(size));
+        if (mochizukiGetControlDefaults_(reinterpret_cast<MochizukiNrControls*>(probe.data())) ==
+            static_cast<int32_t>(LMXXF_NR_OK)) {
+            mochizukiControlsSize_ = size;
+            return size;
+        }
+    }
+    return 0;
+}
+
+bool Runtime::EnableLogging(bool enabled)
+{
+    if (mochizukiSetLogging_ == nullptr) return false;
+    mochizukiSetLogging_(enabled ? 1u : 0u);
+    return true;
+}
+
+bool Runtime::Info(MochizukiNrInfo& out) const
+{
+    out = MochizukiNrInfo{};
+    out.struct_size = sizeof(out);
+    if (mochizukiGetInfo_ == nullptr || context_ == nullptr) return false;
+    if (mochizukiInfoSize_ == 0) {
+        // Exact-size contract, and the packages disagree on the size: probe once
+        // rather than send a shape this binary refuses with the same sentence it
+        // uses for a null argument.
+        for (uint32_t size = 8; size <= 4096; size += 4) {
+            std::vector<uint8_t> probe(size, 0);
+            std::memcpy(probe.data(), &size, sizeof(size));
+            if (mochizukiGetInfo_(context_, reinterpret_cast<MochizukiNrInfo*>(probe.data())) ==
+                static_cast<int32_t>(LMXXF_NR_OK)) {
+                mochizukiInfoSize_ = size;
+                break;
+            }
+        }
+        if (mochizukiInfoSize_ == 0) return false;
+    }
+    std::vector<uint8_t> payload(mochizukiInfoSize_, 0);
+    const uint32_t size = mochizukiInfoSize_;
+    std::memcpy(payload.data(), &size, sizeof(size));
+    if (mochizukiGetInfo_(context_, reinterpret_cast<MochizukiNrInfo*>(payload.data())) !=
+        static_cast<int32_t>(LMXXF_NR_OK))
+        return false;
+    // Only the head is copied: the fields this host reads all sit before the tail
+    // that the 1.12.1 package does not have.
+    std::memcpy(&out, payload.data(), std::min<size_t>(sizeof(out), payload.size()));
+    out.struct_size = sizeof(out);
+    return true;
+}
+
+bool Runtime::SetControls(const MochizukiNrControls& controls, std::wstring* error)
+{
+    if (mochizukiSetControls_ == nullptr) {
+        if (error) *error = L"MochizukiNrRuntime.dll: missing-export: MochizukiNrSetControls";
+        return false;
+    }
+    if (context_ == nullptr) {
+        if (error) *error = L"MochizukiNrRuntime.dll: set-controls before the session exists";
+        return false;
+    }
+    const uint32_t size = MochizukiControlsSize();
+    if (size == 0) {
+        if (error) *error = L"MochizukiNrRuntime.dll: no accepted MochizukiNrControls size";
+        return false;
+    }
+    // The payload is the package's own size, zero-filled, with this header's
+    // leading fields copied in. Every field this host sets sits in the head of
+    // the struct (intensity, style, tone, structure, skin, mask, ratio, history
+    // strength, white point, apply), whose offsets do not move between the
+    // revisions; the tail - RenoDX, INT4, preprocessing - stays at the package's
+    // defaults instead of being written with a newer header's layout.
+    std::vector<uint8_t> payload(size, 0);
+    const size_t copyBytes = std::min<size_t>(sizeof(MochizukiNrControls), size);
+    std::memcpy(payload.data(), &controls, copyBytes);
+    std::memcpy(payload.data(), &size, sizeof(size));
+    const int32_t result = mochizukiSetControls_(
+        context_, reinterpret_cast<const MochizukiNrControls*>(payload.data()));
+    if (result != static_cast<int32_t>(LMXXF_NR_OK)) {
+        if (error) *error = L"MochizukiNrRuntime.dll: set-controls status=" +
+                            std::to_wstring(result) + L" (package struct " +
+                            std::to_wstring(size) + L" bytes, header " +
+                            std::to_wstring(sizeof(MochizukiNrControls)) + L")";
+        return false;
+    }
+    return true;
 }
 
 bool Runtime::GetTimings(LmxxfNrTimings& out, std::string* error)

@@ -1458,6 +1458,20 @@ std::vector<std::wstring> neural_worker_detail::BuildWorkerArguments(
             arguments.emplace_back(L"--amd-style");
             arguments.emplace_back(std::to_wstring(request.amdStyle));
         }
+        // Which of the two runtimes in the pack the job drives. Absent means
+        // lmxxf, which is what the helper did before this key existed.
+        if (request.amdNrRuntime != AmdNrRuntime::Lmxxf) {
+            arguments.emplace_back(L"--amd-nr-runtime");
+            const std::string runtimeName = AmdNrRuntimeName(request.amdNrRuntime);
+            arguments.emplace_back(runtimeName.begin(), runtimeName.end());
+        }
+        // Only Mochizuki reads these, and only when they are not already the
+        // runtime's defaults: the empty string means "nothing was asked for".
+        if (const std::string mochizuki = FormatMochizukiOptions(request.mochizuki);
+            !mochizuki.empty()) {
+            arguments.emplace_back(L"--amd-mochizuki");
+            arguments.emplace_back(mochizuki.begin(), mochizuki.end());
+        }
         arguments.emplace_back(L"--upscale-sharpness");
         arguments.emplace_back(WideFromFloat(request.upscaleSharpness));
     }
@@ -1603,7 +1617,7 @@ std::optional<neural_worker_detail::WorkerArguments> neural_worker_detail::Parse
                AmdRuntimeDirectoryKey, AmdPassesKey, AmdSmallModelKey, AmdSkinProtectKey, AmdPredictKey,
                AmdLaterPassSkipKey,
                AmdStyleKey,
-    UpscaleSharpnessKey, KeyCount };
+    UpscaleSharpnessKey, AmdNrRuntimeKey, AmdMochizukiKey, KeyCount };
     constexpr std::array<std::wstring_view, KeyCount> names{
         L"--metadata-handle", L"--source", L"--staging", L"--width", L"--height", L"--fps", L"--duration-100ns",
         L"--job-id", L"--range-start-100ns", L"--range-end-100ns", L"--preroll-frames", L"--frame-retry-limit",
@@ -1658,7 +1672,14 @@ std::optional<neural_worker_detail::WorkerArguments> neural_worker_detail::Parse
         // and a newer player still agree on every job that never moved it.
         L"--amd-style",
         // The capture's CAS strength, forwarded whenever the caller named it.
-        L"--upscale-sharpness"};
+        L"--upscale-sharpness",
+        // Which runtime in the pack (lmxxf or mochizuki), sent only off the
+        // default so an lmxxf job's command line is unchanged.
+        L"--amd-nr-runtime",
+        // The Mochizuki runtime's own controls, as one key=value line. Omitted
+        // when every value is the runtime's default, which is what keeps an
+        // unchanged job's command line byte-identical to before this key.
+        L"--amd-mochizuki"};
     std::array<std::optional<std::wstring_view>, KeyCount> values{};
     for (size_t index = 2; index < end; index += 2) {
         const auto found = std::find(names.begin(), names.end(), arguments[index]);
@@ -1822,6 +1843,20 @@ std::optional<neural_worker_detail::WorkerArguments> neural_worker_detail::Parse
         if (!ParseUnsigned(*values[AmdStyleKey], style) ||
             style >= amd_lmxxf::kAmdStyleCount) return std::nullopt;
         request.amdStyle = static_cast<uint32_t>(style);
+    }
+    if (values[AmdNrRuntimeKey]) {
+        const std::string name = narrow_text::StrictAscii(*values[AmdNrRuntimeKey])
+                                     .value_or(std::string{});
+        const auto runtime = ParseAmdNrRuntime(name);
+        if (!runtime) return std::nullopt;
+        request.amdNrRuntime = *runtime;
+    }
+    if (values[AmdMochizukiKey]) {
+        const std::string line =
+            narrow_text::StrictAscii(*values[AmdMochizukiKey]).value_or(std::string{});
+        const auto options = ParseMochizukiOptions(line);
+        if (!options) return std::nullopt;
+        request.mochizuki = *options;
     }
     if (values[UpscaleSharpnessKey]) {
         float sharpness = 0.0f;

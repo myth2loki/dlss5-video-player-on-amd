@@ -204,6 +204,14 @@ inline constexpr UINT IDM_NEURAL_PRESET_CUSTOM = 479;
 // where nothing reads this value.
 inline constexpr UINT IDM_NEURAL_AMD_STYLE_FIRST = 495;
 inline constexpr UINT IDM_NEURAL_AMD_STYLE_COUNT = 3;
+// Which runtime inside the AMD pack renders (AmdNrRuntime: 0 lmxxf, 1 mochizuki),
+// its own contiguous radio block in the same submenu. Same reason as the style
+// block above: nothing on the NVIDIA side reads it, and it answers a question
+// about the picture (which network) rather than about a file. Two items, which
+// is the smallest a radio block can be; greyed on NVIDIA in
+// SyncFeatureMenuState, where the value has no meaning.
+inline constexpr UINT IDM_NEURAL_AMD_RUNTIME_FIRST = 498;
+inline constexpr UINT IDM_NEURAL_AMD_RUNTIME_COUNT = 2;
 // The processing-scale rungs, one contiguous radio block in the order of
 // kProcessingScaleRungs (UpscalingPolicy.h): Source 100% first, then 75, 50.
 inline constexpr UINT IDM_PROCESSING_SCALE_FIRST = 480;

@@ -114,6 +114,26 @@ function Assert-RuntimeModules {
 
 function Assert-RuntimeLayout {
     param([string]$Root)
+    # Two runtimes can live in this tree. The layout check is whichever one the
+    # pack carries: lmxxf wants its module tree and tiled assets, mochizuki wants
+    # its own DLL plus the model, shaders and ACO bundle under dlssnr-amd\.
+    $lmxxfDll = Join-Path $Root 'LmxxfNrRuntime.dll'
+    $mochizukiDll = Join-Path $Root 'MochizukiNrRuntime.dll'
+    if (-not (Test-Path -LiteralPath $lmxxfDll)) {
+        if (-not (Test-Path -LiteralPath $mochizukiDll)) {
+            throw "Runtime pack has neither LmxxfNrRuntime.dll nor MochizukiNrRuntime.dll: $Root"
+        }
+        foreach ($required in @('MochizukiNrRuntime.dll', 'dlssnr-amd\dlssnr.bin', 'dlssnr-amd\shaders')) {
+            $path = Join-Path $Root $required
+            if (-not (Test-Path -LiteralPath $path)) { throw "Mochizuki pack is missing $required`: $path" }
+        }
+        $info = Get-Item -LiteralPath $mochizukiDll
+        Write-Host "Runtime pack (mochizuki only): $Root"
+        Write-Host ("  MochizukiNrRuntime.dll {0:N0} bytes, {1:yyyy-MM-dd HH:mm}" -f $info.Length, $info.LastWriteTime)
+        $model = Get-Item -LiteralPath (Join-Path $Root 'dlssnr-amd\dlssnr.bin')
+        Write-Host ("  dlssnr-amd/dlssnr.bin {0:N0} bytes" -f $model.Length)
+        return
+    }
     foreach ($required in @('LmxxfNrRuntime.dll', 'lmxxf-modules', 'native-game-tiled-assets', 'shaders')) {
         $path = Join-Path $Root $required
         if (-not (Test-Path -LiteralPath $path)) { throw "Runtime pack is missing $required`: $path" }
@@ -251,7 +271,15 @@ Write-Host "Staged amd-neural-runtime: $copied files ($excluded skipped)."
 $files = @(Get-OrdinalPackageFiles -Root $stageFull)
 $manifest = New-Object Collections.Generic.List[string]
 $manifest.Add("ProductVersion=$Version")
-$manifest.Add("RuntimePack=amd-neural-runtime (LmxxfNrRuntime.dll $(Get-Sha256 -Path (Join-Path $runtimeSource 'LmxxfNrRuntime.dll')))")
+$runtimePackLine = "RuntimePack=amd-neural-runtime ("
+if (Test-Path -LiteralPath (Join-Path $runtimeSource 'LmxxfNrRuntime.dll')) {
+    $runtimePackLine += "LmxxfNrRuntime.dll $(Get-Sha256 -Path (Join-Path $runtimeSource 'LmxxfNrRuntime.dll'))"
+}
+if (Test-Path -LiteralPath (Join-Path $runtimeSource 'MochizukiNrRuntime.dll')) {
+    if ($runtimePackLine -notlike '*LmxxfNrRuntime.dll*') { } else { $runtimePackLine += ", " }
+    $runtimePackLine += "MochizukiNrRuntime.dll $(Get-Sha256 -Path (Join-Path $runtimeSource 'MochizukiNrRuntime.dll'))"
+}
+$manifest.Add($runtimePackLine + ")")
 $manifest.Add('Path|Size|SHA256')
 foreach ($file in $files) {
     $relative = Get-RelativePackagePath -Root $stageFull -Path $file.FullName

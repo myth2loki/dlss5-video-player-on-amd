@@ -251,6 +251,17 @@ HMENU CreateMenuBar(const Localizer& localizer, bool youtubeAvailable)
     CheckMenuRadioItem(presets, IDM_NEURAL_AMD_STYLE_FIRST,
                        IDM_NEURAL_AMD_STYLE_FIRST + IDM_NEURAL_AMD_STYLE_COUNT - 1,
                        IDM_NEURAL_AMD_STYLE_FIRST + amd_lmxxf::kAmdStyleDefault, MF_BYCOMMAND);
+    // Which runtime inside the AMD pack draws the picture. Two networks behind
+    // two DLLs, so this is the one neural choice that changes what the model IS
+    // rather than what it is asked for - hence its own header and its own radio
+    // block. Default lmxxf, which is what every render before the choice used.
+    AppendMenuW(presets, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(presets, MF_STRING | MF_GRAYED, 0,
+                localizer.Get(L"menu.amd_runtime_header").c_str());
+    AppendMenuW(presets, MF_STRING, IDM_NEURAL_AMD_RUNTIME_FIRST,
+                localizer.Get(L"menu.amd_runtime_lmxxf").c_str());
+    AppendMenuW(presets, MF_STRING, IDM_NEURAL_AMD_RUNTIME_FIRST + 1,
+                localizer.Get(L"menu.amd_runtime_mochizuki").c_str());
     const std::wstring presetsName = localizer.Get(L"menu.neural_presets");
     AppendMenuW(dlss, MF_POPUP, reinterpret_cast<UINT_PTR>(presets), presetsName.c_str());
     add(dlss, IDM_NEURAL_SETTINGS, L"menu.neural_settings");
