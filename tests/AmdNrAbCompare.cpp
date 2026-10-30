@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -189,6 +190,35 @@ std::optional<MochizukiOptions> MochizukiOptionsFromEnvironment()
     return ParseMochizukiOptions(text);
 }
 
+// The model's style (0 standard, 1 natural, 2 cinematic) is not one of the
+// Mochizuki panel's values - it is the same DLSS5_STYLE the player's menu writes
+// - so a sweep over it needs its own channel.
+std::optional<uint32_t> StyleFromEnvironment()
+{
+    wchar_t buffer[16]{};
+    const DWORD length = ::GetEnvironmentVariableW(L"DLSS5_MZ_STYLE", buffer, 16);
+    if (length == 0 || length >= 16) return std::nullopt;
+    wchar_t* end = nullptr;
+    const unsigned long value = std::wcstoul(buffer, &end, 10);
+    if (end == buffer || value > 2) return std::nullopt;
+    return static_cast<uint32_t>(value);
+}
+
+// How many times the network runs per frame. It is not one of the panel's
+// values - it travels in the frame struct - and every extra pass is another
+// full network run, so it is the one knob that trades time for picture
+// directly.
+std::optional<uint32_t> PassesFromEnvironment()
+{
+    wchar_t buffer[16]{};
+    const DWORD length = ::GetEnvironmentVariableW(L"DLSS5_MZ_PASSES", buffer, 16);
+    if (length == 0 || length >= 16) return std::nullopt;
+    wchar_t* end = nullptr;
+    const unsigned long value = std::wcstoul(buffer, &end, 10);
+    if (end == buffer || value < 1 || value > 30) return std::nullopt;
+    return static_cast<uint32_t>(value);
+}
+
 std::filesystem::path ResolveRuntimeDirectory(const std::filesystem::path& argument)
 {
     std::vector<std::filesystem::path> candidates;
@@ -230,6 +260,14 @@ ArmResult RunArm(const std::string& name, amd_lmxxf::NrKind kind,
     config.runtimeDirectory = runtimeDirectory;
     config.kind = kind;
     config.log = [](std::string_view text) { Line(std::string("    ") + std::string(text)); };
+    if (const auto style = StyleFromEnvironment()) {
+        config.style = *style;
+        Line("  style: " + std::to_string(*style));
+    }
+    if (const auto passes = PassesFromEnvironment()) {
+        config.modelPasses = *passes;
+        Line("  passes: " + std::to_string(*passes));
+    }
     if (const auto options = MochizukiOptionsFromEnvironment()) {
         config.mochizuki = *options;
         Line("  mochizuki options: " + FormatMochizukiOptions(*options));
@@ -274,6 +312,9 @@ int main(int argc, char** argv)
 {
     if (argc < 8) {
         Line("usage: AmdNrAbCompare <runtimeDir> <input.bgra> <width> <height> <fps> <frames> <outDir>");
+        Line("                       [both|lmxxf|mochizuki]   default both");
+        Line("  DLSS5_MZ_STYLE=0..2      the model's style (product default 1)");
+        Line("  DLSS5_MZ_OPTIONS=k=v,... the mochizuki panel, all eleven keys");
         return 2;
     }
     const std::filesystem::path runtimeArgument = argv[1];
@@ -290,12 +331,20 @@ int main(int argc, char** argv)
          std::to_string(height) + "  " + std::to_string(frames) + " frames");
 
     std::vector<ArmResult> arms;
-    Step("arm 1  lmxxf");
-    arms.push_back(RunArm("lmxxf", amd_lmxxf::NrKind::Lmxxf, runtimeDirectory, inputPath,
-                          outputRoot / L"lmxxf", width, height, fps, frames));
-    Step("arm 2  mochizuki");
-    arms.push_back(RunArm("mochizuki", amd_lmxxf::NrKind::Mochizuki, runtimeDirectory, inputPath,
-                          outputRoot / L"mochizuki", width, height, fps, frames));
+    // A sweep runs the same arm many times over and has no use for the other
+    // one, so the caller may name which to run. "both" is the default because
+    // the question this tool was built for is the comparison.
+    const std::string which = argc > 8 && argv[8] != nullptr ? argv[8] : "both";
+    if (which != "mochizuki") {
+        Step("arm 1  lmxxf");
+        arms.push_back(RunArm("lmxxf", amd_lmxxf::NrKind::Lmxxf, runtimeDirectory, inputPath,
+                              outputRoot / L"lmxxf", width, height, fps, frames));
+    }
+    if (which != "lmxxf") {
+        Step("arm 2  mochizuki");
+        arms.push_back(RunArm("mochizuki", amd_lmxxf::NrKind::Mochizuki, runtimeDirectory, inputPath,
+                              outputRoot / L"mochizuki", width, height, fps, frames));
+    }
 
     Line("");
     Line("================ summary ================");
