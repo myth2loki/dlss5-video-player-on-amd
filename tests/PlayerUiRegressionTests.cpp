@@ -614,7 +614,13 @@ struct PlayerAppTestAccess {
     {
         PlayerApp& app = fixture->app;
         const NeuralBackend backend = app.m_opt.neuralBackend;
+        const AmdNrRuntime runtime = app.m_amdNrRuntime;
         app.m_opt.neuralBackend = NeuralBackend::Amd;
+        // The ladder this case walks is lmxxf's: the Small rung at the bottom
+        // and the Original model above it are that runtime's own. Mochizuki
+        // offers three passes and no model, so the runtime is named here rather
+        // than following the product default.
+        app.m_amdNrRuntime = AmdNrRuntime::Lmxxf;
         app.m_neuralSettings = {}; app.m_renderGuides = {}; app.m_temporalSettings = {};
         app.m_amdSmallModel = false; app.m_neuralSettings.passes = 3;
         app.ShowNeuralSettings();
@@ -657,7 +663,60 @@ struct PlayerAppTestAccess {
             WritePrivateProfileStringW(L"AmdMultiPass", L"SmallModel", nullptr, app.SettingsPath().c_str());
         }
         app.m_opt.neuralBackend = backend;
+        app.m_amdNrRuntime = runtime;
         app.m_neuralSettings = {}; app.m_amdSmallModel = false;
+        app.m_lastNeuralPreset = neural_presets::kPresetCount;
+    }
+
+    // The Mochizuki runtime's own column: the panel the default runtime shows.
+    // It is a different panel, not the same one with another value - lmxxf's
+    // stacking and temporal switches are absent from it, because a control that
+    // reads a value the runtime ignores is a control that lies.
+    static void neural_settings_dialog_mochizuki_test()
+    {
+        PlayerApp& app = fixture->app;
+        const NeuralBackend backend = app.m_opt.neuralBackend;
+        const AmdNrRuntime runtime = app.m_amdNrRuntime;
+        app.m_opt.neuralBackend = NeuralBackend::Amd;
+        app.m_amdNrRuntime = AmdNrRuntime::Mochizuki;
+        app.m_neuralSettings = {}; app.m_renderGuides = {}; app.m_temporalSettings = {};
+        app.m_mochizuki = MochizukiOptions{};
+        app.ShowNeuralSettings();
+        CHECK(app.m_neuralWnd != nullptr);
+        if (app.m_neuralWnd) {
+            const HWND dialog = app.m_neuralWnd;
+            // The runtime's own controls are on the panel ...
+            CHECK(GetDlgItem(dialog, IDC_NS_MZ_MAXRATIO) != nullptr);
+            CHECK(GetDlgItem(dialog, IDC_NS_MZ_HISTORY) != nullptr);
+            CHECK(GetDlgItem(dialog, IDC_NS_MZ_APPLY) != nullptr);
+            CHECK(GetDlgItem(dialog, IDC_NS_MZ_PREPROCESS) != nullptr);
+            CHECK(GetDlgItem(dialog, IDC_NS_MZ_INT4) != nullptr);
+            // ... and lmxxf's own are not.
+            CHECK(GetDlgItem(dialog, IDC_NS_SKIN_PROTECT) == nullptr);
+            CHECK(GetDlgItem(dialog, IDC_NS_CHAINED) == nullptr);
+            CHECK(GetDlgItem(dialog, IDC_NS_MP_SKIP) == nullptr);
+            // Three passes, not four: the Small rung belongs to lmxxf, and a
+            // Mochizuki session handed it would run the Original at one pass
+            // while the panel said otherwise.
+            CHECK_EQ(int(SendMessageW(GetDlgItem(dialog, IDC_NS_PASSES), CB_GETCOUNT, 0, 0)), 3);
+            // The runtime's own defaults are what the panel shows, and moving
+            // one of its controls moves that runtime's own value.
+            CHECK(std::abs(app.m_mochizuki.maxRatio - 2.0f) < 0.001f);
+            CHECK(std::abs(app.m_mochizuki.historyStrength - 1.0f) < 0.001f);
+            CHECK(app.m_mochizuki.applyModel);
+            CHECK(!app.m_mochizuki.preprocess);
+            CHECK(!app.m_mochizuki.int4Mixed);
+            SendMessageW(GetDlgItem(dialog, IDC_NS_MZ_MAXRATIO), TBM_SETPOS, TRUE, 300);
+            app.NeuralWndProc(dialog, WM_HSCROLL, 0, 0);
+            CHECK(std::abs(app.m_mochizuki.maxRatio - 3.0f) < 0.001f);
+            // The highlight guard is the runtime's own field, so the shared
+            // intensity beside it is untouched by that move.
+            CHECK(std::abs(app.m_neuralSettings.intensity - 1.0f) < 0.001f);
+            DestroyWindow(dialog);
+        }
+        app.m_opt.neuralBackend = backend;
+        app.m_amdNrRuntime = runtime;
+        app.m_neuralSettings = {}; app.m_mochizuki = MochizukiOptions{};
         app.m_lastNeuralPreset = neural_presets::kPresetCount;
     }
 
@@ -3036,6 +3095,7 @@ struct PlayerAppTestAccess {
         UI_CASE(export_stages_dialog_test),
         UI_CASE(neural_settings_dialog_test),
         UI_CASE(neural_settings_dialog_amd_ladder_test),
+        UI_CASE(neural_settings_dialog_mochizuki_test),
         UI_CASE(neural_preset_strip_and_apply_state_test),
         UI_CASE(settings_ahead_notice_test),
         UI_CASE(render_report_test),
