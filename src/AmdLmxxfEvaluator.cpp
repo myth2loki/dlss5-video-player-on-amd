@@ -1409,10 +1409,16 @@ bool AmdLmxxfEvaluator::BringUpRuntime()
     // reads dlssnr-amd/ from its assets directory and would only be confused by
     // a weight path pointing at the other backend's tiled assets.
     std::error_code weightsError;
-    if (!mochizuki && std::filesystem::exists(config_.weightsDirectory, weightsError)) {
+    if (mochizuki) {
+        // The variable is the lmxxf runtime's channel, and this process may have
+        // set it on an earlier bring-up - a runtime switch, or a test that drives
+        // both. A Mochizuki session that inherited the other backend's tiled
+        // assets would be reading a tree it was never pointed at.
+        ::SetEnvironmentVariableW(L"LMXXF_WEIGHTS_DIR", nullptr);
+    } else if (std::filesystem::exists(config_.weightsDirectory, weightsError)) {
         ::SetEnvironmentVariableW(L"LMXXF_WEIGHTS_DIR", config_.weightsDirectory.wstring().c_str());
         Log("LMXXF_WEIGHTS_DIR = " + NarrowPath(config_.weightsDirectory));
-    } else if (!mochizuki) {
+    } else {
         Log("LMXXF_WEIGHTS_DIR not set: " + NarrowPath(config_.weightsDirectory) + " is absent");
     }
 
@@ -1467,10 +1473,11 @@ bool AmdLmxxfEvaluator::BringUpRuntime()
     // for history without it is what makes the status line answer
     // "unsupported-lifecycle" before a single guide check runs.
     // The lease lifecycle is optional on lmxxf (it is what turns the temporal
-    // model on) and mandatory on Mochizuki: its Create accepts
-    // RECORDING_LEASES, or RECORDING_LEASES|INLINE_QUEUE, and answers
-    // "current package recording ABI required" for anything else - including the
-    // no-flags session the lmxxf path may create.
+    // model on) and mandatory on Mochizuki. Its Create accepts exactly that one
+    // flag and answers "current package recording ABI required" for anything
+    // else - including the no-flags session the lmxxf path may create, and
+    // including INLINE_QUEUE or DIRECT_RECORDING, which belong to the adopted
+    // vkd3d path this host does not take.
     leases_ = config_.temporalHistory || mochizuki;
     const uint32_t createFlags =
         config_.createFlags | (leases_ ? LMXXF_NR_CREATE_FLAG_RECORDING_LEASES : 0u);
@@ -1508,10 +1515,13 @@ bool AmdLmxxfEvaluator::BringUpRuntime()
     Log("PrepareSession OK" + (runtimeStatus_.empty() ? std::string() : " | status: " + runtimeStatus_));
 
     session_.emplace(runtime_.Api(), runtime_.Context(), leases_, runtime_.MochizukiPrepare());
-    prepared_ = true;
     // The network is built lazily on this runtime; wait it out here so no job
-    // frame is ever the one that discovers it.
+    // frame is ever the one that discovers it. Before `prepared_`, not after: a
+    // build that never finishes leaves a session that cannot render, and a flag
+    // saying otherwise is exactly what would let a caller submit the first frame
+    // anyway.
     if (!WaitForMochizukiNetwork()) return false;
+    prepared_ = true;
     return true;
 }
 
@@ -1529,6 +1539,26 @@ bool AmdLmxxfEvaluator::PrepareFrameForBackend(amd_lmxxf::Session& session,
         return session.PrepareFrame(amd_mochizuki::ConvertFrame(info, config_.modelPasses));
     return session.PrepareFrame(info);
 }
+
+namespace {
+
+// ACO is the documented default and the difference between a first build that
+// takes about a minute and one that takes about six seconds: each of the
+// network's 25 pipelines becomes an AMD Pipeline Library import instead of a
+// driver compile. It is also fixed when the Vulkan device is created, so a
+// machine whose driver refuses the imported pipelines cannot be talked out of
+// that from the menu - the session has to come up with it off. One run with
+// DLSS5_MZ_ACO=0 is what tells that machine apart from a slow disk.
+uint32_t AcoModeFromEnvironment()
+{
+    wchar_t buffer[8]{};
+    const DWORD length = ::GetEnvironmentVariableW(L"DLSS5_MZ_ACO", buffer,
+                                                   static_cast<DWORD>(std::size(buffer)));
+    if (length == 0 || length >= std::size(buffer)) return 1u;
+    return buffer[0] == L'0' ? 0u : 1u;
+}
+
+} // namespace
 
 bool AmdLmxxfEvaluator::ApplyMochizukiControls()
 {
@@ -1570,7 +1600,7 @@ bool AmdLmxxfEvaluator::ApplyMochizukiControls()
     // itself (measured 66 s). On, each pipeline is an AMD Pipeline Library import
     // from dlssnr-amd/aco. Fixed when the Vulkan device is created, which is why
     // this has to be handed over before PrepareSession.
-    controls.aco_mode = 1;
+    controls.aco_mode = AcoModeFromEnvironment();
 
     std::wstring error;
     if (!runtime_.SetControls(controls, &error)) {

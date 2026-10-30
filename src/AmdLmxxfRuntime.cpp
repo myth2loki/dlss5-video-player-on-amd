@@ -108,6 +108,13 @@ bool IsRegularFileNoReparse(const std::filesystem::path& path)
            (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
 }
 
+// The buffer the exact-size probes run against. It is sized for the largest
+// struct either package revision has rather than for the size being tried: the
+// probe is the one place where we do not yet know whether the runtime reads
+// struct_size, and a runtime that ignores it would write its whole struct
+// through the pointer.
+constexpr uint32_t kProbeCapacity = 8192;
+
 std::wstring WideAscii(std::string_view text)
 {
     std::wstring wide;
@@ -434,14 +441,29 @@ uint32_t Runtime::MochizukiControlsSize()
     // size IS the package's - found once per load and stamped on every payload.
     if (mochizukiControlsSize_ != 0) return mochizukiControlsSize_;
     if (mochizukiGetControlDefaults_ == nullptr) return 0;
-    for (uint32_t size = 8; size <= 8192; size += 4) {
-        std::vector<uint8_t> probe(size, 0);
+    // The buffer is sized for the largest struct the header knows, not for the
+    // value being tried: a runtime that never reads struct_size would write its
+    // whole struct through a pointer into a tiny buffer, and this is exactly the
+    // place where we do not yet know that it does read it.
+    std::vector<uint8_t> probe(kProbeCapacity, 0);
+    for (uint32_t size = 8; size + 4 <= kProbeCapacity; size += 4) {
+        std::memset(probe.data(), 0, probe.size());
         std::memcpy(probe.data(), &size, sizeof(size));
+        if (mochizukiGetControlDefaults_(reinterpret_cast<MochizukiNrControls*>(probe.data())) !=
+            static_cast<int32_t>(LMXXF_NR_OK))
+            continue;
+        // A package that answers OK for every size would hand back its truth on
+        // the first probe, and every control this host sets would then be
+        // written into a struct shorter than the head of the real one. The next
+        // size up is the cheap test: a runtime that validates refuses it.
+        const uint32_t nextSize = size + 4;
+        std::memset(probe.data(), 0, probe.size());
+        std::memcpy(probe.data(), &nextSize, sizeof(nextSize));
         if (mochizukiGetControlDefaults_(reinterpret_cast<MochizukiNrControls*>(probe.data())) ==
-            static_cast<int32_t>(LMXXF_NR_OK)) {
-            mochizukiControlsSize_ = size;
-            return size;
-        }
+            static_cast<int32_t>(LMXXF_NR_OK))
+            return 0;
+        mochizukiControlsSize_ = size;
+        return size;
     }
     return 0;
 }
@@ -461,19 +483,28 @@ bool Runtime::Info(MochizukiNrInfo& out) const
     if (mochizukiInfoSize_ == 0) {
         // Exact-size contract, and the packages disagree on the size: probe once
         // rather than send a shape this binary refuses with the same sentence it
-        // uses for a null argument.
-        for (uint32_t size = 8; size <= 4096; size += 4) {
-            std::vector<uint8_t> probe(size, 0);
+        // uses for a null argument. The same strictness test as the controls
+        // apply: a size whose next one is also accepted came from a runtime that
+        // does not validate, and the number it hands back is meaningless.
+        std::vector<uint8_t> probe(kProbeCapacity, 0);
+        for (uint32_t size = 8; size + 4 <= kProbeCapacity; size += 4) {
+            std::memset(probe.data(), 0, probe.size());
             std::memcpy(probe.data(), &size, sizeof(size));
+            if (mochizukiGetInfo_(context_, reinterpret_cast<MochizukiNrInfo*>(probe.data())) !=
+                static_cast<int32_t>(LMXXF_NR_OK))
+                continue;
+            const uint32_t nextSize = size + 4;
+            std::memset(probe.data(), 0, probe.size());
+            std::memcpy(probe.data(), &nextSize, sizeof(nextSize));
             if (mochizukiGetInfo_(context_, reinterpret_cast<MochizukiNrInfo*>(probe.data())) ==
-                static_cast<int32_t>(LMXXF_NR_OK)) {
-                mochizukiInfoSize_ = size;
+                static_cast<int32_t>(LMXXF_NR_OK))
                 break;
-            }
+            mochizukiInfoSize_ = size;
+            break;
         }
         if (mochizukiInfoSize_ == 0) return false;
     }
-    std::vector<uint8_t> payload(mochizukiInfoSize_, 0);
+    std::vector<uint8_t> payload(kProbeCapacity, 0);
     const uint32_t size = mochizukiInfoSize_;
     std::memcpy(payload.data(), &size, sizeof(size));
     if (mochizukiGetInfo_(context_, reinterpret_cast<MochizukiNrInfo*>(payload.data())) !=

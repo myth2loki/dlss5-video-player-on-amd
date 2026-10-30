@@ -9,6 +9,7 @@
 
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -165,11 +166,24 @@ inline std::string FormatMochizukiOptions(const MochizukiOptions& options)
 // values and had them silently replaced by defaults would render a picture
 // nobody asked for and call it success. Every key must be present, because the
 // writer always writes all of them.
+//
+// Out of range is refused here as well, and for the same reason: this writer
+// never emits one, so a number outside the runtime's documented range means the
+// line did not come from it. The panel already clamps what it lets a reader
+// set - the saved document clamps it again on the way in - and the wire is the
+// one path left where a hand-assembled command line could hand the runtime a
+// negative pass count for an unsigned field.
 inline std::optional<MochizukiOptions> ParseMochizukiOptions(std::string_view text)
 {
     if (text.empty()) return std::nullopt;
     MochizukiOptions options;
     int seen = 0;
+    // The runtime's documented range, per field. `number()` has already rejected
+    // a string that is not a number; the range is the second half of the same
+    // question, and a NaN passes every comparison so it is named explicitly.
+    const auto inRange = [](const std::optional<double>& n, double low, double high) {
+        return n && std::isfinite(*n) && *n >= low && *n <= high;
+    };
     while (!text.empty()) {
         const size_t comma = text.find(',');
         const std::string_view field = text.substr(0, comma);
@@ -196,17 +210,23 @@ inline std::optional<MochizukiOptions> ParseMochizukiOptions(std::string_view te
             if (value == "0") return false;
             return std::nullopt;
         };
-        if (key == "intensity") { const auto n = number(); if (!n) return std::nullopt; options.intensity = float(*n); }
-        else if (key == "tone") { const auto n = number(); if (!n) return std::nullopt; options.localTone = float(*n); }
-        else if (key == "structure") { const auto n = number(); if (!n) return std::nullopt; options.localStructure = float(*n); }
-        else if (key == "skin") { const auto n = number(); if (!n) return std::nullopt; options.skinStructure = float(*n); }
+        if (key == "intensity") { const auto n = number(); if (!inRange(n, 0.0, 2.0)) return std::nullopt; options.intensity = float(*n); }
+        else if (key == "tone") { const auto n = number(); if (!inRange(n, 0.0, 2.0)) return std::nullopt; options.localTone = float(*n); }
+        else if (key == "structure") { const auto n = number(); if (!inRange(n, 0.0, 2.0)) return std::nullopt; options.localStructure = float(*n); }
+        else if (key == "skin") { const auto n = number(); if (!inRange(n, -1.0, 2.0)) return std::nullopt; options.skinStructure = float(*n); }
         else if (key == "mask") { const auto b = flag(); if (!b) return std::nullopt; options.autoMask = *b; }
-        else if (key == "maxratio") { const auto n = number(); if (!n) return std::nullopt; options.maxRatio = float(*n); }
-        else if (key == "history") { const auto n = number(); if (!n) return std::nullopt; options.historyStrength = float(*n); }
+        else if (key == "maxratio") { const auto n = number(); if (!inRange(n, 1.0, 8.0)) return std::nullopt; options.maxRatio = float(*n); }
+        else if (key == "history") { const auto n = number(); if (!inRange(n, 0.0, 1.0)) return std::nullopt; options.historyStrength = float(*n); }
         else if (key == "apply") { const auto b = flag(); if (!b) return std::nullopt; options.applyModel = *b; }
         else if (key == "pre") { const auto b = flag(); if (!b) return std::nullopt; options.preprocess = *b; }
         else if (key == "int4") { const auto b = flag(); if (!b) return std::nullopt; options.int4Mixed = *b; }
-        else if (key == "drs") { const auto n = number(); if (!n) return std::nullopt; options.drsMode = uint32_t(*n); }
+        else if (key == "drs") {
+            // An unsigned field, so a fractional or negative value is refused
+            // before the cast rather than converted to something arbitrary.
+            const auto n = number();
+            if (!inRange(n, 0.0, 2.0) || *n != std::floor(*n)) return std::nullopt;
+            options.drsMode = uint32_t(*n);
+        }
         else return std::nullopt;
         ++seen;
     }
@@ -230,13 +250,16 @@ inline std::optional<MochizukiOptions> ParseMochizukiOptions(std::string_view te
 //     0.44 Small network (31 blocks at 0.5x) against the Original 71-block one,
 //     the other spelling of the one DLSS5_MULTI_PASS key. The rung, the skin
 //     switch and the multi-pass switches travel outside this struct, so no
-//     other value of THIS struct reaches a pixel. The
-//     job's key carries the pair in AmdNeuralSettingsDocument(), and the
-//     retention key carries it through CanonicalNeuralSettingsForBackend();
-//     ApplyNeuralSettings restarts an AMD session when either moved, and a
-//     caller that wires a further panel value through to this backend must flip
-//     all three in the same change, or the picture moves and neither the keys
-//     nor the session follow it.
+//     other value of THIS struct reaches a pixel.
+//
+//     The runtime and the Mochizuki controls are the same kind of term as the
+//     count: the job's key carries both in AmdNeuralSettingsDocument(), and that
+//     document's digest is a term of NeuralCacheIdentity - which is the render
+//     key - so a job cannot be served frames built by the other runtime, or
+//     under a control that has since moved. ApplyNeuralSettings restarts an AMD
+//     session when the document moved. A caller that wires a further panel value
+//     through to this backend has to add it to the document in the same change,
+//     or the picture moves and the key does not follow it.
 //
 // The interesting case is the one this leaves out rather than the one it
 // covers. `NeuralSettings` is the add-on's struct: the same dialog also holds

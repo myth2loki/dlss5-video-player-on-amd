@@ -2287,20 +2287,35 @@ static start_screen::RuntimeState CheckAmdRuntime(const std::filesystem::path& r
         const std::filesystem::path settingsPath=
             (settingsDirectory?*settingsDirectory:std::filesystem::current_path())/L"DLSSVideoPlayer.ini";
         if(ReadSavedAmdNrRuntime(settingsPath)==AmdNrRuntime::Mochizuki){
-            const std::pair<const wchar_t*,const wchar_t*> required[]={
-                {L"MochizukiNrRuntime.dll",L"runtime"},
-                {L"dlssnr-amd\\dlssnr.bin",L"model"},
-                {L"dlssnr-amd\\shaders",L"shaders"}};
+            // The module and the model are files; the shader bundle is a
+            // directory, and `exists` would accept an empty file of that name
+            // and let the session fail seconds later with a message about the
+            // network instead of about the pack.
+            const auto missingFile=[&](const wchar_t* relative){
+                std::error_code error;
+                return !std::filesystem::is_regular_file(runtimeDirectory/relative,error);
+            };
             std::wstring missing;
-            for(const auto& [relative,label]:required){
-                std::error_code existsError;
-                if(!std::filesystem::exists(runtimeDirectory/relative,existsError)){
+            if(missingFile(L"MochizukiNrRuntime.dll"))missing+=L"runtime";
+            if(missingFile(L"dlssnr-amd\\dlssnr.bin")){
+                if(!missing.empty())missing+=L", ";
+                missing+=L"model";
+            }
+            {
+                std::error_code shadersError;
+                if(!std::filesystem::is_directory(runtimeDirectory/L"dlssnr-amd\\shaders",shadersError)){
                     if(!missing.empty())missing+=L", ";
-                    missing+=label;
+                    missing+=L"shaders";
                 }
             }
             if(!missing.empty()){
                 detail=L"mochizuki pack is missing "+missing;
+                // The other runtime can sit in the same pack, one menu choice
+                // away: a viewer who set this by hand should not read the line
+                // as "the neural runtime is gone".
+                std::error_code lmxxfError;
+                if(std::filesystem::is_regular_file(runtimeDirectory/L"LmxxfNrRuntime.dll",lmxxfError))
+                    detail+=L"; the lmxxf runtime beside it is complete";
                 return start_screen::RuntimeState::Absent;
             }
             // The start screen's job here is to say which runtime is armed, not

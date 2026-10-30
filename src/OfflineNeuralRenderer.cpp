@@ -2986,6 +2986,15 @@ struct AmdLmxxfEvaluatorAdapter {
     // for another style, the evaluator is rebuilt, the module reloads and the
     // file is read again before the network is built.
     uint32_t broughtUpStyle{1};
+    // Which of the pack's two runtimes the bring-up loaded, and the picture
+    // controls it was handed. Both are bring-up facts on Mochizuki: the DLL and
+    // the network behind it differ per kind, and the controls are repeated to
+    // the runtime once, before its network is built. Reading them from the
+    // config alone would let a reused evaluator serve a job that asked for the
+    // other runtime - or for a different highlight guard - with the frames it
+    // built for the first one.
+    amd_lmxxf::NrKind broughtUpKind{amd_lmxxf::NrKind::Lmxxf};
+    MochizukiOptions broughtUpMochizuki{};
     // The capture's depth and its dither, which are bring-up state in the
     // strongest sense: the format of three textures and the pixel shader of the
     // encode pass are decided from them, so an evaluator brought up for 8 bits
@@ -3066,6 +3075,7 @@ struct AmdLmxxfEvaluatorAdapter {
         reused=evaluator&&width==w&&height==h&&broughtUpTemporal==config.temporalHistory&&
                broughtUpStability==config.stability&&broughtUpPasses==jobPasses&&
                broughtUpSmallModel==jobSmallModel&&
+               broughtUpKind==config.kind&&broughtUpMochizuki==config.mochizuki&&
                broughtUpSkinProtect==jobSkinProtect&&broughtUpPredict==jobPredict&&
                broughtUpSkip==jobSkip&&broughtUpStyle==jobStyle&&broughtUpOutputW==jobOutputW&&
                broughtUpOutputH==jobOutputH&&broughtUpTenBit==config.tenBitCapture&&
@@ -3075,6 +3085,7 @@ struct AmdLmxxfEvaluatorAdapter {
         captured.clear();
         evaluator=std::make_unique<AmdLmxxfEvaluator>(config);
         width=w;height=h;broughtUpTemporal=config.temporalHistory;
+        broughtUpKind=config.kind;broughtUpMochizuki=config.mochizuki;
         broughtUpTenBit=config.tenBitCapture;
         broughtUpDither=config.captureDither;
         broughtUpSourceConversion=conversion;
