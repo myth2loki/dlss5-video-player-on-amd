@@ -114,8 +114,8 @@ struct NeuralRenderRequest {
     std::filesystem::path amdRuntimeDirectory;
     // Which runtime in that directory the job drives. Two DLLs can live in one
     // pack, so this is a choice the job carries rather than something inferred
-    // from the directory; absent means lmxxf, the backend every earlier job ran.
-    AmdNrRuntime amdNrRuntime{AmdNrRuntime::Lmxxf};
+    // from the directory; absent means Mochizuki, the default runtime.
+    AmdNrRuntime amdNrRuntime{AmdNrRuntime::Mochizuki};
     // What that runtime's own panel would set (MochizukiOptions). Ignored by
     // lmxxf, whose options are lines in the configuration file this job writes
     // before the runtime loads; on Mochizuki they are session state and are

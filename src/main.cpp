@@ -2488,7 +2488,7 @@ static MochizukiOptions ReadSavedMochizukiOptions(const std::filesystem::path& s
 static AmdNrRuntime ReadSavedAmdNrRuntime(const std::filesystem::path& settingsPath)
 {
     wchar_t buffer[32]{};
-    GetPrivateProfileStringW(L"AmdNeural",L"Runtime",L"lmxxf",buffer,
+    GetPrivateProfileStringW(L"AmdNeural",L"Runtime",L"mochizuki",buffer,
                              static_cast<DWORD>(std::size(buffer)),settingsPath.c_str());
     const amd_lmxxf::NrKind kind = _wcsicmp(buffer,L"mochizuki")==0
         ? amd_lmxxf::NrKind::Mochizuki : amd_lmxxf::NrKind::Lmxxf;
@@ -2590,7 +2590,7 @@ struct NeuralJobInputs {
     uint32_t amdPasses{1};
     // Which runtime inside the AMD pack (NeuralRenderRequest::amdNrRuntime), read
     // from the same saved value the style comes from.
-    AmdNrRuntime amdNrRuntime{AmdNrRuntime::Lmxxf};
+    AmdNrRuntime amdNrRuntime{AmdNrRuntime::Mochizuki};
     // The Mochizuki runtime's own controls, look knobs included (they are copied
     // in from `settings` where the job is built, so one panel value feeds both
     // backends).
@@ -7700,7 +7700,7 @@ private:
         // behind two different DLLs, so the same settings render two different
         // pictures and a cache that did not carry the choice would serve one for
         // the other.
-        AmdNrRuntime amdNrRuntime{AmdNrRuntime::Lmxxf};
+        AmdNrRuntime amdNrRuntime{AmdNrRuntime::Mochizuki};
         // The Mochizuki runtime's own knobs (MochizukiOptions). A key term like
         // the runtime above: they change the picture, so two settings that differ
         // only here are two renders and must not share a cache entry.
@@ -14287,7 +14287,7 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // a change reaches the next render and needs a restart for the session
     // already on screen.
     uint32_t m_amdTemporalMode{amd_lmxxf::kAmdTemporalModeDefault};
-    AmdNrRuntime m_amdNrRuntime{AmdNrRuntime::Lmxxf};
+    AmdNrRuntime m_amdNrRuntime{AmdNrRuntime::Mochizuki};
     // What the Mochizuki group in the neural settings panel edits. Only this
     // runtime reads it; the look knobs it shares with NVIDIA live in
     // m_neuralSettings and are copied in when a job is built.

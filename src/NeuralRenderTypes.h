@@ -55,8 +55,11 @@ constexpr std::optional<NeuralBackend> ParseNeuralBackend(std::string_view name)
 // same evaluator, same lease lifecycle, same capture - so the cache key, the
 // plan and the worker wire keep one backend value and carry this beside it.
 //
-// Lmxxf is the default, which keeps every existing caller and every verified
-// render byte-identical to before this choice existed.
+// Mochizuki is the default: it is the runtime that builds its network once and
+// then answers from that network, so a job that says nothing about the runtime
+// gets the one that does not rebuild its model per job. Lmxxf stays available
+// and unchanged for anyone who picks it - the choice is a menu radio, and the
+// name travels with the job either way.
 enum class AmdNrRuntime { Lmxxf, Mochizuki };
 
 inline const char* AmdNrRuntimeName(AmdNrRuntime runtime) noexcept
@@ -65,10 +68,10 @@ inline const char* AmdNrRuntimeName(AmdNrRuntime runtime) noexcept
         case AmdNrRuntime::Lmxxf: return "lmxxf";
         case AmdNrRuntime::Mochizuki: return "mochizuki";
     }
-    return "lmxxf";
+    return "mochizuki";
 }
 
-// Absent means lmxxf, which is what every job before this key ran.
+// Absent means Mochizuki, which is what a job that names no runtime runs.
 constexpr std::optional<AmdNrRuntime> ParseAmdNrRuntime(std::string_view name) noexcept
 {
     using namespace std::literals;

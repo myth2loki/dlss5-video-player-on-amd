@@ -210,6 +210,10 @@ inline constexpr UINT IDM_NEURAL_AMD_STYLE_COUNT = 3;
 // about the picture (which network) rather than about a file. Two items, which
 // is the smallest a radio block can be; greyed on NVIDIA in
 // SyncFeatureMenuState, where the value has no meaning.
+//
+// The order here is the radio block's, not the default's: Mochizuki is the
+// default runtime, and it is the second of the two. The order is kept because
+// the command ids are already in the saved settings and in the ini.
 inline constexpr UINT IDM_NEURAL_AMD_RUNTIME_FIRST = 498;
 inline constexpr UINT IDM_NEURAL_AMD_RUNTIME_COUNT = 2;
 // The processing-scale rungs, one contiguous radio block in the order of

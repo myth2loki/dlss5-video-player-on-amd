@@ -138,7 +138,7 @@ struct StageExportJob {
     // because it is a different network behind a different DLL: two exports that
     // differ here are two different pictures, and the runtime directory alone
     // cannot say which was asked for.
-    AmdNrRuntime amdNrRuntime{AmdNrRuntime::Lmxxf};
+    AmdNrRuntime amdNrRuntime{AmdNrRuntime::Mochizuki};
     // The Mochizuki runtime's own controls for this export. Carried by the plan
     // because they change the picture and therefore the cache entry: two exports
     // that differ only here are two different renders.

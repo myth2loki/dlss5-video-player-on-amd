@@ -16060,20 +16060,31 @@ void mochizuki_options_wire_and_key_test()
 
     // The cache key carries them only when the runtime is Mochizuki and only off
     // its defaults; a default panel on either runtime keys exactly as before.
+    // A job that names no runtime runs the default runtime, so the default
+    // document is Mochizuki's and says which one it is.
     const std::string plainDefault = AmdNeuralSettingsDocument(TemporalStability::Off);
+    CHECK(plainDefault.find("backend=amd-mochizuki\n") == 0);
     const std::string mochizukiDefault =
         AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, false, true, false, 1, 0,
                                   "mochizuki", FormatMochizukiOptions(MochizukiOptions{}));
+    CHECK(mochizukiDefault == plainDefault);
     CHECK(mochizukiDefault.find("mochizuki=") == std::string::npos);
     const std::string mochizukiMoved =
         AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, false, true, false, 1, 0,
                                   "mochizuki", FormatMochizukiOptions(asked));
     CHECK(mochizukiMoved.find("mochizuki=") != std::string::npos);
-    // And the lmxxf key is untouched by the new term whatever it holds.
+    // And the lmxxf key is untouched by the new term whatever it holds. It has to
+    // name its own runtime now: the default names the other one, so a key that
+    // leaned on the default would serve one backend's frames to the other.
     const std::string lmxxfKey =
         AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, false, true, false, 1, 0,
                                   "lmxxf", {});
-    CHECK(lmxxfKey == plainDefault);
+    const std::string lmxxfPlain =
+        AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, false, true, false, 1, 0,
+                                  "lmxxf", {});
+    CHECK(lmxxfKey == lmxxfPlain);
+    CHECK(lmxxfKey.find("backend=amd-lmxxf\n") == 0);
+    CHECK(lmxxfKey != plainDefault);
 }
 
 constexpr test_support::TestCase kCases[] = {

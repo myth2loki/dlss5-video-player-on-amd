@@ -265,14 +265,19 @@ RESULT: ok（95 条断言全绿，exit 0）
 ### 产品选择链路（A，已接完）
 
 - **类型**：`NeuralRenderTypes.h` 加 `AmdNrRuntime{Lmxxf,Mochizuki}` + `AmdNrRuntimeName/ParseAmdNrRuntime`；
-  `NeuralRenderRequest::amdNrRuntime`（默认 lmxxf）。
-- **协议**：worker 参数 `--amd-nr-runtime`（只在非默认时发），旧 helper 收到的命令行逐字节不变。
+  `NeuralRenderRequest::amdNrRuntime`（**默认 mochizuki** —— 它一次建网、之后从这张网出图；
+  lmxxf 仍在菜单里可选）。
+- **协议**：worker 参数 `--amd-nr-runtime`（只在非默认时发，即只有 lmxxf 才发），
+  旧 helper 收到的命令行逐字节不变。
 - **端到端**：`RenderSettings::amdNrRuntime`（聚合初值同步）→ `NeuralJobInputs` → `StageExport::Job`
   → `NeuralRenderRequest` → `AmdLmxxfEvaluatorConfig.kind`。
 - **持久化**：`[AmdNeural] Runtime=lmxxf|mochizuki`，读在 `ReadSavedAmdNrRuntime()`，
-  与 Style 同一节一起保存。
-- **缓存键**：`AmdNeuralSettingsDocument()` 首行改成 `backend=amd-<runtime>`（默认 lmxxf 生成的字符串
-  与旧键完全一致），所以两个后端不会互相命中缓存。
+  与 Style 同一节一起保存。**ini 里没有这一项时走默认（mochizuki）**；
+  已有的 `Runtime=lmxxf` 会继续生效，改默认不会覆盖别人机器上存下来的选择。
+- **缓存键**：`AmdNeuralSettingsDocument()` 首行是 `backend=amd-<runtime>`，**函数签名里的默认
+  runtime 跟产品默认一致（mochizuki）**，所以省略参数写出来的键不会描述另一个后端的画；
+  显式 lmxxf 的键仍逐字节是 `backend=amd-lmxxf`（`AmdLmxxfApiTests` 用显式 wrapper 钉住这一点）。
+  两个后端不会互相命中缓存。
 - **菜单风格/Passes 真的生效**：`MochizukiNrSetControls` 已接。控件结构的 **struct_size 由运行时决定**
   （`GetControlDefaults` 只接受包自己的尺寸，1.12.1 与我们 vendored 的 2026-10-28 头不同），
   所以 `Runtime::MochizukiControlsSize()` 探一次、把头部字段拷进该尺寸的零填充 payload。
@@ -345,7 +350,7 @@ WaitForMochizukiNetwork 早退）都是行为中性的，判断是本地包/时�
   缺件时明确说缺什么。
 - `StageExport` / `OfflineNeuralRenderer`：解析失败文案点名**缺哪个模块、在哪个目录找的**
   （旧句 "put amd-neural-runtime beside the module" 对已经这么做过的人只会误导）。
-- `StageExport` 的解析补上 `job.amdNrRuntime`（原来写死默认 lmxxf）。
+- `StageExport` 的解析补上 `job.amdNrRuntime`（原来写死 lmxxf）。
 - smoke 的 borrowed-device 臂新建 config 时漏了 `kind`，一直悄悄在测 lmxxf → 已补。
 
 部署：把 `MochizukiNrRuntime.dll` + `dlssnr-amd/` 放进**同一个** `amd-neural-runtime/`（与 lmxxf

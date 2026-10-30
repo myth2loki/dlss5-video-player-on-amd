@@ -65,13 +65,14 @@ inline std::string AmdNeuralSettingsDocument(TemporalStability accumulation, uin
                                              bool skinProtect = false, bool multiPassPredict = true,
                                              bool laterPassSkip = false, uint32_t style = 1,
                                              uint32_t temporalMode = 0,
-                                             std::string_view runtime = "lmxxf",
+                                             std::string_view runtime = "mochizuki",
                                              std::string_view mochizukiOptions = {})
 {
     // The runtime names the whole network: two runtimes in one pack are two
     // differently trained models behind two DLLs, so `backend=amd-<runtime>` is
     // the first key term rather than a detail of how it was loaded. The default
-    // reproduces the string every render before the choice existed keyed.
+    // is the runtime a job that names none runs, so a key written from the
+    // defaults cannot describe a render made by the other runtime.
     std::string document = "backend=amd-" + std::string(runtime) + "\n"
                            "temporal=off\n"
                            "motion=constant(0,0)\n"

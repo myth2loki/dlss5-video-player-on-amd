@@ -320,8 +320,8 @@ private:
             {L"menu.amd_style_1", L"Style 1 \u00b7 Stellar Blade (runtime default)"},
             {L"menu.amd_style_2", L"Style 2 \u00b7 third style"},
             {L"menu.amd_runtime_header", L"AMD runtime: which network draws the frame"},
-            {L"menu.amd_runtime_lmxxf", L"lmxxf \u00b7 HIP modules (default)"},
-            {L"menu.amd_runtime_mochizuki", L"mochizuki \u00b7 Vulkan, builds its network once"},
+            {L"menu.amd_runtime_lmxxf", L"lmxxf \u00b7 HIP modules"},
+            {L"menu.amd_runtime_mochizuki", L"mochizuki \u00b7 Vulkan, builds its network once (default)"},
             {L"menu.neural_settings", L"Neural settings\tCtrl+N"},
             // The measured rates are whole 8 s 3840x2160 renders on an RTX 4080
             // SUPER, helper start included, median of three; see UpscalingPolicy.h.

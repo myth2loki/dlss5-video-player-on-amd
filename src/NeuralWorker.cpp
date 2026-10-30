@@ -1458,9 +1458,11 @@ std::vector<std::wstring> neural_worker_detail::BuildWorkerArguments(
             arguments.emplace_back(L"--amd-style");
             arguments.emplace_back(std::to_wstring(request.amdStyle));
         }
-        // Which of the two runtimes in the pack the job drives. Absent means
-        // lmxxf, which is what the helper did before this key existed.
-        if (request.amdNrRuntime != AmdNrRuntime::Lmxxf) {
+        // Which of the two runtimes in the pack the job drives. Absent means the
+        // default runtime, so the parameter is written only for the other one:
+        // a job that names no runtime keeps the command line it had before the
+        // key existed, and the helper's own default reads it back the same way.
+        if (request.amdNrRuntime != AmdNrRuntime::Mochizuki) {
             arguments.emplace_back(L"--amd-nr-runtime");
             const std::string runtimeName = AmdNrRuntimeName(request.amdNrRuntime);
             arguments.emplace_back(runtimeName.begin(), runtimeName.end());
@@ -1674,7 +1676,8 @@ std::optional<neural_worker_detail::WorkerArguments> neural_worker_detail::Parse
         // The capture's CAS strength, forwarded whenever the caller named it.
         L"--upscale-sharpness",
         // Which runtime in the pack (lmxxf or mochizuki), sent only off the
-        // default so an lmxxf job's command line is unchanged.
+        // default so a job that names no runtime keeps the command line it had
+        // before this key existed.
         L"--amd-nr-runtime",
         // The Mochizuki runtime's own controls, as one key=value line. Omitted
         // when every value is the runtime's default, which is what keeps an

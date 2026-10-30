@@ -254,7 +254,9 @@ HMENU CreateMenuBar(const Localizer& localizer, bool youtubeAvailable)
     // Which runtime inside the AMD pack draws the picture. Two networks behind
     // two DLLs, so this is the one neural choice that changes what the model IS
     // rather than what it is asked for - hence its own header and its own radio
-    // block. Default lmxxf, which is what every render before the choice used.
+    // block. The default is Mochizuki, the runtime that builds its network once;
+    // the radio's order is lmxxf first because that is the order the command
+    // ids were laid out in.
     AppendMenuW(presets, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(presets, MF_STRING | MF_GRAYED, 0,
                 localizer.Get(L"menu.amd_runtime_header").c_str());

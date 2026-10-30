@@ -70,6 +70,20 @@ LmxxfNrApi CompleteApi()
     return api;
 }
 
+// The lmxxf backend's own key document. The function's own default runtime is
+// the product default (Mochizuki), so every call in this file names the runtime
+// it is about: without that, the expected text below would be describing the
+// other backend's key.
+inline std::string LmxxfDocument(TemporalStability accumulation, uint32_t passes = 1,
+                                 bool smallModel = false, bool skinProtect = false,
+                                 bool multiPassPredict = true, bool laterPassSkip = false,
+                                 uint32_t style = 1, uint32_t temporalMode = 0)
+{
+    return AmdNeuralSettingsDocument(accumulation, passes, smallModel, skinProtect,
+                                      multiPassPredict, laterPassSkip, style, temporalMode,
+                                      "lmxxf");
+}
+
 void complete_table_is_accepted_without_the_abi3_appendix_test()
 {
     LmxxfNrApi api = CompleteApi();
@@ -469,12 +483,12 @@ void amd_accumulation_rung_is_on_by_default_and_off_keeps_the_old_key_test()
 
     // The pre-pass document, spelled out. Any added or renamed line here is a
     // change to every AMD key on disk at the defaults, so the check is against
-    // the literal text and not against `AmdNeuralSettingsDocument(Off)`.
+    // the literal text and not against `LmxxfDocument(Off)`.
     const std::string before = "backend=amd-lmxxf\n"
                                "temporal=off\n"
                                "motion=constant(0,0)\n"
                                "depth=constant(1)\n";
-    CHECK_EQ(before, AmdNeuralSettingsDocument(TemporalStability::Off));
+    CHECK_EQ(before, LmxxfDocument(TemporalStability::Off));
 
     // Every other rung adds exactly its own line, and no two rungs share a
     // document: two rungs blend differently, so one key for both would serve a
@@ -483,7 +497,7 @@ void amd_accumulation_rung_is_on_by_default_and_off_keeps_the_old_key_test()
     size_t distinct = 0;
     for (const TemporalStability rung :
          {TemporalStability::Low, TemporalStability::Medium, TemporalStability::High}) {
-        const std::string document = AmdNeuralSettingsDocument(rung);
+        const std::string document = LmxxfDocument(rung);
         const std::string line = "accumulation=" + std::string(TemporalStabilityName(rung)) + "\n";
         CHECK_EQ(before.size() + line.size(), document.size());
         CHECK(document.compare(0, before.size(), before) == 0);
@@ -497,15 +511,15 @@ void amd_accumulation_rung_is_on_by_default_and_off_keeps_the_old_key_test()
     // as it keyed, and each non-default count is its own line because N passes
     // is N runs of the model and must never serve another count's entry. The
     // AMD ladder tops at 3 - 4 is not a count this runtime takes.
-    CHECK_EQ(before, AmdNeuralSettingsDocument(TemporalStability::Off, 1));
+    CHECK_EQ(before, LmxxfDocument(TemporalStability::Off, 1));
     for (const uint32_t passes : {2u, 3u}) {
-        const std::string document = AmdNeuralSettingsDocument(TemporalStability::Off, passes);
+        const std::string document = LmxxfDocument(TemporalStability::Off, passes);
         const std::string line = "passes=" + std::to_string(passes) + "\n";
         CHECK_EQ(before.size() + line.size(), document.size());
         CHECK(document.compare(before.size(), line.size(), line) == 0);
         // And the count composes with a rung rather than replacing it.
         const std::string both =
-            AmdNeuralSettingsDocument(TemporalStability::Low, passes);
+            LmxxfDocument(TemporalStability::Low, passes);
         CHECK(both.find("accumulation=low\n") != std::string::npos);
         CHECK(both.find(line) != std::string::npos);
     }
@@ -517,13 +531,13 @@ void amd_accumulation_rung_is_on_by_default_and_off_keeps_the_old_key_test()
     // count whatever the caller says and none of the stacking switches can
     // fire beside it - but the style still composes, because it is the
     // runtime's own key like the rest.
-    CHECK_EQ(before + "model=small\n", AmdNeuralSettingsDocument(TemporalStability::Off, 1, true));
-    CHECK_EQ(before + "model=small\n", AmdNeuralSettingsDocument(TemporalStability::Off, 3, true));
-    CHECK_EQ(before + "model=small\n", AmdNeuralSettingsDocument(TemporalStability::Off, 4, true));
+    CHECK_EQ(before + "model=small\n", LmxxfDocument(TemporalStability::Off, 1, true));
+    CHECK_EQ(before + "model=small\n", LmxxfDocument(TemporalStability::Off, 3, true));
+    CHECK_EQ(before + "model=small\n", LmxxfDocument(TemporalStability::Off, 4, true));
     CHECK_EQ(before + "model=small\n",
-             AmdNeuralSettingsDocument(TemporalStability::Off, 3, true, true, false, true));
+             LmxxfDocument(TemporalStability::Off, 3, true, true, false, true));
     const std::string smallBoth =
-        AmdNeuralSettingsDocument(TemporalStability::High, 1, true, false, true, false, 2);
+        LmxxfDocument(TemporalStability::High, 1, true, false, true, false, 2);
     CHECK(smallBoth.find("accumulation=high\n") != std::string::npos);
     CHECK(smallBoth.find("model=small\n") != std::string::npos);
     CHECK(smallBoth.find("style=2\n") != std::string::npos);
@@ -534,23 +548,23 @@ void amd_accumulation_rung_is_on_by_default_and_off_keeps_the_old_key_test()
     // And a Small document is never the document of an Original pass, whatever
     // the count beside it: one key for both would serve one network's frames
     // to the other's caller.
-    CHECK(AmdNeuralSettingsDocument(TemporalStability::Off, 1, true) !=
-          AmdNeuralSettingsDocument(TemporalStability::Off, 1));
+    CHECK(LmxxfDocument(TemporalStability::Off, 1, true) !=
+          LmxxfDocument(TemporalStability::Off, 1));
 
     // The style keys the same way and for the same reason: its default 1 writes
     // nothing - that is the runtime's built-in answer and what every render
     // before the menu existed produced - and 0 and 2 are each their own line,
     // because they are different pictures at the same cost.
-    CHECK_EQ(before, AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, false, true, false, 1));
+    CHECK_EQ(before, LmxxfDocument(TemporalStability::Off, 1, false, false, true, false, 1));
     for (const uint32_t style : {0u, 2u}) {
         const std::string document =
-            AmdNeuralSettingsDocument(TemporalStability::Off, 1, false, false, true, false, style);
+            LmxxfDocument(TemporalStability::Off, 1, false, false, true, false, style);
         const std::string line = "style=" + std::to_string(style) + "\n";
         CHECK_EQ(before.size() + line.size(), document.size());
         CHECK(document.compare(before.size(), line.size(), line) == 0);
         // Composes with the count rather than replacing it.
         const std::string stacked =
-            AmdNeuralSettingsDocument(TemporalStability::Off, 3, false, false, true, false, style);
+            LmxxfDocument(TemporalStability::Off, 3, false, false, true, false, style);
         CHECK(stacked.find("passes=3\n") != std::string::npos);
         CHECK(stacked.find(line) != std::string::npos);
     }}
