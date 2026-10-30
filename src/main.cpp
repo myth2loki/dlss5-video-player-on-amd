@@ -12237,12 +12237,26 @@ private:
         DrawActivitySpinner(dc,spinner,ResolveActivityVisual({},ActivityElapsedMs(),0,0,false,m_activityMotionEnabled).spinnerStep);
         SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(242,243,245));HGDIOBJ oldFont=SelectObject(dc,m_font);
         RECT title{c.left+Dip(50),c.top+Dip(14),c.right-Dip(16),c.top+Dip(38)};
-        const std::wstring heading=m_previewJob?T(L"neural.preview.title"):m_liveAttached?T(L"neural.live.buffering"):T(L"neural.live.title");
+        // The one step that is not "waiting for frames" but "there is no network
+        // yet". It is named here, on the panel the press put on screen, because
+        // this is where a viewer looks after pressing D - and the line below used
+        // to read "0.0 s buffered · 0 frames rendered" for the whole of a build,
+        // which is what a stall looks like.
+        const warm_up::Step step=WarmUpStep();
+        const std::wstring heading=m_previewJob?T(L"neural.preview.title")
+            :step==warm_up::Step::BuildingNetwork?T(L"warmup.building.title")
+            :step!=warm_up::Step::None?T(L"warmup.title")
+            :m_liveAttached?T(L"neural.live.buffering"):T(L"neural.live.title");
         DrawTextW(dc,heading.c_str(),-1,&title,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
         SelectObject(dc,m_fontSmall);SetTextColor(dc,ui_palette::SecondaryText);
         const double lead=LiveLeadSeconds(),target=m_liveAttached?LiveResumeLead():m_liveStartLead;
         wchar_t detail[128]={};
         if(m_previewJob)swprintf_s(detail,L"%s",T(L"neural.preview.detail").c_str());
+        else if(step==warm_up::Step::BuildingNetwork)swprintf_s(detail,L"%s",T(L"warmup.building.detail").c_str());
+        // Every other cold-start step has its own sentence, and all of them are
+        // truer than the counters below: nothing is buffered yet, so "0.0 s
+        // buffered · 0 frames rendered" is the shape of a stall.
+        else if(step!=warm_up::Step::None)swprintf_s(detail,L"%s",T(warm_up::TextKey(step)).c_str());
         // A session that is still acquiring its source has no frames to report,
         // and "0 frames rendered" is exactly what a stall looks like.
         else if(m_neuralProgress.phase==NeuralRenderPhase::Acquiring)swprintf_s(detail,L"%s",AcquisitionDetailText().c_str());
@@ -12252,7 +12266,20 @@ private:
         SelectObject(dc,oldFont);
         RECT track{c.left+Dip(16),c.bottom-Dip(30),c.right-Dip(16),c.bottom-Dip(22)};
         HBRUSH trackBrush=CreateSolidBrush(RGB(68,71,77));FillRect(dc,&track,trackBrush);DeleteObject(trackBrush);
-        RECT fill=track;fill.right=track.left+static_cast<LONG>(std::lround((track.right-track.left)*std::clamp(m_previewJob?0.0:(target>0.0?lead/target:0.0),0.0,1.0)));
+        RECT fill=track;
+        if(step!=warm_up::Step::None){
+            // There is no fraction to show here - the runtime compiles its
+            // pipelines and tells nobody outside its own log - so the bar shows
+            // motion rather than a share: a third of the track sweeping, which is
+            // the difference between "working" and "stuck".
+            const double sweep=double(ActivityElapsedMs()%1600)/1600.0;
+            const double origin=sweep<0.5?sweep*2.0:(1.0-sweep)*2.0;
+            const LONG span=static_cast<LONG>(double(track.right-track.left)*0.34);
+            fill.left=track.left+static_cast<LONG>(double(track.right-track.left-span)*origin);
+            fill.right=fill.left+span;
+        }else{
+            fill.right=track.left+static_cast<LONG>(std::lround((track.right-track.left)*std::clamp(m_previewJob?0.0:(target>0.0?lead/target:0.0),0.0,1.0)));
+        }
         if(fill.right>fill.left){HBRUSH fillBrush=CreateSolidBrush(ui_palette::PrimaryBlue);FillRect(dc,&fill,fillBrush);DeleteObject(fillBrush);}
     }
     void MarkersChanged(){UpdateCachedStatus();InvalidatePlaybackProgress();}
@@ -13082,13 +13109,10 @@ private:
         return warm_up::Resolve(m_liveSession,NeuralJobActive(),!LiveCoverage().empty(),m_neuralProgress.phase,m_neuralProgress.completedFrames);
     }
     std::wstring LiveSessionStatusText()const{
-        // The cold start names its step instead of "0.0 s buffered", which is
-        // true and says nothing for the 17-22 s it lasts.
-        if(const auto step=WarmUpStep();step!=warm_up::Step::None){
-            std::wstring text=T(L"warmup.title")+L" \u00b7 "+T(warm_up::TextKey(step));
-            if(m_liveBuffering)text+=L" \u00b7 "+T(LiveResumePending()?L"neural.live.will_play":L"neural.live.will_stay_paused");
-            return text;
-        }
+        // The cold start is named on the buffering panel, not here: that panel is
+        // what the press puts on screen and where a viewer looks for it, and this
+        // line already carries the file, the runtime, the range and the settings.
+        // It keeps saying "buffering" while the panel says which step that is.
         wchar_t lead[64]={};swprintf_s(lead,L"%.1f s",LiveLeadSeconds());
         std::wstring text=(m_liveBuffering?T(L"neural.live.buffering"):T(L"neural.live.title"))+L" \u00b7 "+lead+L" "+T(L"neural.live.lead");
         // How much of the video is rendered is the render chip's to say
