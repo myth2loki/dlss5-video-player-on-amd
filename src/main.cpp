@@ -7813,7 +7813,10 @@ private:
             // and on this backend that is a different question than on NVIDIA.
             // NVIDIA's render reads every value in this dialog
             // (BackendReadsNeuralSettings), so any change is a reason. AMD's
-            // reads the accumulation rung and the pass count, and nothing else:
+            // lmxxf reads the accumulation rung and the pass count, and nothing
+            // else; its Mochizuki sibling reads those two through its own
+            // controls and the five look values beside them, because they are
+            // handed over as knobs rather than read from a file:
             // no ReShade.ini is loaded or read and the guides are the
             // evaluator's two constants rather than `m_renderGuides`, while the
             // rung is this player's own pass over the runtime's output and the
@@ -7844,9 +7847,23 @@ private:
                                // highlight guard, the history, the bypass — a
                                // session rendering under the old ones shows
                                // nothing of a change to any of them.
-                               m_mochizuki!=m_liveRenderSettings.mochizuki;
+                               m_mochizuki!=m_liveRenderSettings.mochizuki||
+                               // The five look values are that runtime's too,
+                               // and they are NOT in `m_mochizuki`: they are
+                               // copied in from NeuralSettings when the job is
+                               // built (see where the job is assembled). A
+                               // comparison that stopped at the runtime's own
+                               // struct would leave a moved intensity on the
+                               // panel, applied, and unrendered - the worst of
+                               // the three answers.
+                               (m_amdNrRuntime==AmdNrRuntime::Mochizuki&&
+                                (m_neuralSettings.intensity!=m_liveRenderSettings.neural.intensity||
+                                 m_neuralSettings.localTone!=m_liveRenderSettings.neural.localTone||
+                                 m_neuralSettings.localStructure!=m_liveRenderSettings.neural.localStructure||
+                                 m_neuralSettings.skinStructure!=m_liveRenderSettings.neural.skinStructure||
+                                 m_neuralSettings.autoMask!=m_liveRenderSettings.neural.autoMask));
             if(!restart){
-                LOG("Neural settings applied at "<<Position()<<" s; this backend's render reads the accumulation rung and the pass count and nothing else in the dialog, and neither moved, so the active session is left running.");
+                LOG("Neural settings applied at "<<Position()<<" s; nothing this backend's render reads moved, so the active session is left running.");
                 return;
             }
             // The restart must not leave a queued seek behind: it would run
