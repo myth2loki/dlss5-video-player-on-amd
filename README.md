@@ -23,6 +23,23 @@ config keeps `DLSS5_MULTI_PASS=2`, because the package's own default is now the
 fast-history mode read. See
 [the runtime package](third_party/lmxxf/README.md).
 
+The pack holds **two** neural runtimes now, and the player picks which one draws
+the frame: `LmxxfNrRuntime.dll` — the HIP runtime the paragraph above is about —
+and `MochizukiNrRuntime.dll`, a Vulkan one from the `OptScaler-NR-1.12.1`
+package. They are not two backends: the second hands back lmxxf's own ABI 6
+table, entry for entry, and differs only in which export prepares a frame and in
+the struct that export takes. So the choice costs a pointer and a frame layout,
+not a second copy of the D3D12 plumbing.
+
+**Mochizuki is the default.** It builds its network once per package and then
+renders from it — 1.5 s warm, about 66 s the first time on a machine, which the
+buffering panel names while it happens — where lmxxf pays a 6.9–10.0 s cold
+start on every job. Switch with **DLSS > Neural presets > AMD runtime**, or
+`[AmdNeural] Runtime=lmxxf|mochizuki` in the ini; a machine that already saved a
+choice keeps it. [Two runtimes in one pack](#two-runtimes-in-one-pack) has the
+differences, the speed and picture measurements, and what the second one costs.
+
+
 ![The player on an AMD card, whole window: Bumblebee in Split, neural rendering and FSR 4 upscaling on, interpolation on at 48 of 24 fps, a subtitle under the picture, and the render filling in behind the playhead](docs/media/amd/overview.png)
 
 The whole window, on an AMD card: *Bumblebee* at 1280x720 in **Split**, source
@@ -36,12 +53,15 @@ what each is doing — `DLSS Upscaling on: 2560x1440 (auto) · FSR4`, `Source
 > with an AMD backend.** The player, the compare views, the render cache, the
 > export pipeline and the documentation are upstream's work. What this fork adds
 > is a backend for all three stages: the neural pass runs on an RDNA 4 Radeon
-> through `LmxxfNrRuntime`, and upscaling and frame generation on FidelityFX's
+> through an AMD neural runtime (`LmxxfNrRuntime` or `MochizukiNrRuntime`), and
+> upscaling and frame generation on FidelityFX's
 > engines, with no NVIDIA add-on, no NGX and no ReShade. **The NVIDIA backend is
 > upstream's and is not supported here** — see the note further down.
 > [What the AMD backend does, and does not do](#on-an-amd-card) ·
+> [Two runtimes in one pack](#two-runtimes-in-one-pack) ·
 > [AMD captures](#what-it-looks-like) ·
 > [integration plan and status, in Chinese](docs/AMD-LMXXF-INTEGRATION-PLAN-REV2-zh.md) ·
+> [Mochizuki integration and its measurements, in Chinese](docs/AMD-MOCHIZUKI-COEXIST-PLAN-zh.md) ·
 > [the runtime package](third_party/lmxxf/README.md)
 
 [Upstream project](https://github.com/2600th/dlss5-video-player) · [On an AMD card](#on-an-amd-card) · [Build it](#building-and-contributing) · [First run](#first-run) · [Usage guide](docs/USAGE.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
@@ -56,13 +76,15 @@ what each is doing — `DLSS Upscaling on: 2560x1440 (auto) · FSR4`, `Source
 
 ## On an AMD card
 
-This fork's addition. Neural rendering runs through `LmxxfNrRuntime.dll` — the
-AMD runtime — instead of the NVIDIA add-on, and upscaling and frame generation
-have engines of their own behind the same menu items. The player picks the
-backend itself at startup: if the NVIDIA layout is absent and the AMD runtime
-package is present and matches the manifests it ships, neural rendering is
-offered on it. It is not a menu choice, because a machine has one of the two.
-`--neural-backend amd` does the same from the command line.
+This fork's addition. Neural rendering runs through an AMD runtime in the pack —
+`LmxxfNrRuntime.dll` or `MochizukiNrRuntime.dll`, whichever is selected, see
+[Two runtimes in one pack](#two-runtimes-in-one-pack) — instead of the NVIDIA
+add-on, and upscaling and frame generation have engines of their own behind the
+same menu items. The player picks the *backend* itself at startup: if the NVIDIA
+layout is absent and the AMD runtime package is present and matches the
+manifests it ships, neural rendering is offered on it. That is not a menu
+choice, because a machine has one of the two backends. `--neural-backend amd`
+does the same from the command line.
 
 | | AMD backend |
 | --- | --- |
@@ -78,6 +100,7 @@ offered on it. It is not a menu choice, because a machine has one of the two.
 | Colour | SDR. The cache capture is 8-bit with ordered dither at Standard, and 10-bit at High and Lossless — P010 out of the FP16 history slot, written as HEVC Main10 at High and FFV1 at Lossless — which needs a Temporal stability rung on, because that is where the FP16 slot comes from. HDR is not wired on this path |
 | Speed | **≈10 ms a frame at 720p and ≈21 ms at 1080p** for the neural pass alone — one pass of the Original model with the guide pair on, submit p50 on an RX 9070 XT, of which the network itself is 4.6 and 8.5 ms. That is 4.0x and 1.9x a 24 fps frame's budget before a live session's own decode, present and encode. Every job pays a cold start of **6.9–10.0 s**. [Measured speeds](#render-speed-and-the-render-ahead-window) has the numbers, what they cost, and which of them are measured rather than derived. The upscale's and the interpolation's own cost is unmeasured, and so are 900 and 4K |
 | What it needs | The `amd-neural-runtime/` package — 325 MiB as a download, 844 MiB unpacked, from this fork's [`lmxxf-<line>` release](https://github.com/myth2loki/dlss5-video-player-on-amd/releases) — beside the module directory or at the root of the checkout, or named by `DLSS5_AMD_RUNTIME_DIR`. For the two newer stages, FidelityFX's `amd_fidelityfx_loader_dx12.dll` beside the exe, with `amd_fidelityfx_upscaler_dx12.dll` and `amd_fidelityfx_framegeneration_dx12.dll` — three files, in the packaged build, that [the notices](docs/THIRD-PARTY-NOTICES.md) list |
+| Runtime | Two share the pack and one renders: **lmxxf** (`LmxxfNrRuntime.dll`, HIP modules — the runtime this table describes) and **mochizuki** (`MochizukiNrRuntime.dll`, Vulkan, builds its network once — **the default**). Same ABI 6 table both ways; see [Two runtimes in one pack](#two-runtimes-in-one-pack) for what actually differs |
 | Add-on, ReShade, `dxgi.dll` | None. This backend loads no proxy and registers no add-on |
 
 Measured on an RX 9070 XT: the player resolves and logs the pack at startup, the
@@ -121,6 +144,69 @@ modules and weights now (the log and the shader cache are skipped), and two
 independent sessions on one source record the same identity. The
 [integration plan](docs/AMD-LMXXF-INTEGRATION-PLAN-REV2-zh.md) (Chinese) records
 what was measured, on what, and what was not.
+
+### Two runtimes in one pack
+
+`amd-neural-runtime/` can hold two DLLs, and the player drives one of them per
+session. This is not two implementations of the AMD backend: `MochizukiNrRuntime.dll`
+returns **lmxxf's own ABI 6 table**, all 21 entries, and the table's own
+`PrepareFrame` is a refusal stub that tells you to call `MochizukiNrPrepareFrame`
+instead. Everything else — the lease lifecycle, `LmxxfNrJob` at 32 bytes, the
+D3D12 device, uploads, guides, readback — is the code path that was already
+there.
+
+| | lmxxf | mochizuki |
+| --- | --- | --- |
+| DLL | `LmxxfNrRuntime.dll` | `MochizukiNrRuntime.dll` |
+| What runs the network | HIP modules | Vulkan, on the `dlssnr-amd/` blob |
+| ABI | `(6, 176)`, 21 of 21 entries | **the same table**, handed back unchanged |
+| Frame submit | `api.PrepareFrame` | `MochizukiNrPrepareFrame`, a separate export |
+| Frame struct | 112 bytes, with a depth block | **88 bytes, no depth block** |
+| `Create` flags | any | `RECORDING_LEASES` only — a plain session is refused |
+| Network build | per job: 6.9–10.0 s cold start each time | once per package: 1.5 s warm, ~66 s the first time |
+| Panel | the column this backend has always had | its own column: highlight guard, history strength, INT4, preprocess |
+| Default | | **yes** |
+
+**Speed**, 66 frames through the same clip, per-frame network time the runtime
+itself reports. Note the pass counts: lmxxf ran its package default of two
+passes, mochizuki its default of one, so this compares the two as a user gets
+them rather than as a controlled experiment.
+
+| | lmxxf | mochizuki |
+| --- | --- | --- |
+| 640×360, network per frame | 3.22 ms | **1.98 ms** |
+| 1280×720, network per frame | 8.79 ms | **3.48 ms** |
+| 66 frames, end to end | 2693 / 3225 ms | **2179 / 2540 ms** |
+
+**Picture**, on the same input with every frame dumped and measured against a
+clean reference — 640×360 and 1280×720, both run, because a single size proves
+nothing. The one difference that held at both sizes is temporal: mochizuki moves
+**11–12 %** more between frames than the content itself does, lmxxf **25–37 %**.
+Flicker is the defect a still frame cannot show, and it is the one a viewer
+notices on a pan. PSNR agrees (mochizuki ahead by 1.1–2.5 dB) — but read that
+column carefully: **both runtimes score several dB worse than the untouched
+compressed input**, because a network that rebuilds detail has to move pixels
+away from the reference. Sharpness is the one place lmxxf leads (1.7–3.8 % more
+high-frequency energy). Two other metrics — flat-area noise and colour shift —
+flipped sign between the two sizes and are recorded as unusable rather than
+quoted. The numbers, the method and the two discarded metrics are in
+[the integration document](docs/AMD-MOCHIZUKI-COEXIST-PLAN-zh.md) (Chinese, §13).
+
+**What it costs.** The first build compiles the network's pipelines: 66 s with
+the driver compiling them, 6.4 s once the runtime's ACO path is on and the
+Vulkan cache is cold, 1.5 s warm. The 66 s is paid once per driver version, not
+per launch, and the buffering panel says it is building rather than freezing.
+This package's frame struct has no depth block, so **only the motion vectors
+reach the network on mochizuki** — the depth guide is computed and simply has
+nowhere to go.
+
+**What it needs.** `MochizukiNrRuntime.dll` and `dlssnr-amd/` (the model, the
+shaders, and the ACO bundle) beside `LmxxfNrRuntime.dll`. A pack that ships only
+the lmxxf half will refuse to start on the default runtime and name the missing
+files in the preflight — either add the assets or set
+`[AmdNeural] Runtime=lmxxf`. The switch is **DLSS > Neural presets > AMD
+runtime**, it restarts the session rather than mid-flight, and the panel is
+rebuilt because the two columns do not share coordinates.
 
 ### Render speed and the render-ahead window
 
@@ -580,7 +666,7 @@ As of 2026-10-02, from each project's README, releases and issues (details in
 > upstream built and what this comparison was written against. The AMD backend
 > runs the same three stages on different engines: FSR 4, FSR 1 or CAS for
 > upscaling, FidelityFX frame generation at 2x live and 2x to 5x in a
-> conversion, and the neural pass through `LmxxfNrRuntime` — see
+> conversion, and the neural pass through an AMD neural runtime — see
 > [On an AMD card](#on-an-amd-card).
 
 Of the five, only this player keeps the render, so a seek lands on rendered
@@ -757,6 +843,12 @@ how the toggle works, not what every source will gain.
   from the player's CPU block matcher, at about 10–12 source pixels a cell.
   Expect some artifacts at occlusions, on small objects and past either end of
   its search range.
+- **The mochizuki runtime takes no depth.** Its frame struct in this package is
+  88 bytes with no depth block, so the depth guide the player computes has
+  nowhere to go — only the motion vectors reach the network, where lmxxf takes
+  both. A package built against the later 112-byte struct would carry depth; this
+  one does not, and the player settles which struct it is by watching what the
+  export accepts rather than by asking.
 - **Ghosting has three sources on this backend, and they are separable.** The
   player's own accumulation (now reprojected through the guide field; it is Low
   by default for exactly this reason), frame generation's interpolated
@@ -821,7 +913,8 @@ how the toggle works, not what every source will gain.
 ## Building and contributing
 
 C++20, Win32, Direct3D 12, FFmpeg, and on top of that one of two neural
-runtimes: NVIDIA NGX on the NVIDIA backend, or `LmxxfNrRuntime` on the AMD one —
+runtimes: NVIDIA NGX on the NVIDIA backend, or `LmxxfNrRuntime` /
+`MochizukiNrRuntime` on the AMD one —
 where FidelityFX's loader, upscaler and frame generation DLLs carry the other two
 stages.
 
@@ -837,8 +930,12 @@ stages.
 The AMD backend is two things that have to match. A **runtime pack** —
 `amd-neural-runtime/`: `LmxxfNrRuntime.dll`, 80 HSACO modules for
 `gfx1200`/`gfx1201`, the tiled network weights, the runtime's own shaders and
-`DLSS5-AMD/custom-config.txt` — which is data and never needs compiling. And the
-**code** that drives it: `DLSSVideoPlayer.exe`, `neural-runtime/NeuralWorker.exe`
+`DLSS5-AMD/custom-config.txt` — which is data and never needs compiling; plus,
+for the second runtime, `MochizukiNrRuntime.dll` with `dlssnr-amd/` — its model,
+its shaders and the ACO bundle. A pack carrying only the first half has to be
+told `[AmdNeural] Runtime=lmxxf`, because the default runtime is the second one.
+And the **code** that drives it: `DLSSVideoPlayer.exe`,
+`neural-runtime/NeuralWorker.exe`
 and the three FidelityFX DLLs beside it, which is what CMake builds. Both can come
 from outside this repository.
 
