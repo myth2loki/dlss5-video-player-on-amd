@@ -2517,6 +2517,20 @@ static uint32_t ReadSavedAmdStyle(const std::filesystem::path& settingsPath)
                               settingsPath.c_str())));
 }
 
+// The pass count a session starts at when nothing was saved, and the one Reset
+// returns to. Mochizuki takes one pass of its own: the three-pass AMD default is
+// lmxxf's, where the count is stacked with the later-pass skip that keeps its
+// ghosting down, and Mochizuki's column has neither that switch nor a Small rung -
+// so its three passes are three rebuilds with nothing holding them back. Measured
+// on the A/B bench at 640x360 over 66 frames, one pass is both the least ghosting
+// and the most detail of the three: 1.51 / 2.03 / 2.55 ghosting and 0.945 / 0.822
+// / 0.779 detail for one / two / three passes.
+static uint32_t DefaultPassesFor(NeuralBackend backend,AmdNrRuntime runtime) noexcept
+{
+    if(backend==NeuralBackend::Amd&&runtime==AmdNrRuntime::Mochizuki)return 1u;
+    return PassesSettingsDefault(backend);
+}
+
 // The 0.44 Small model (31 blocks at 0.5x) against the Original 71-block one,
 // as this machine has saved it.
 //
@@ -5616,8 +5630,9 @@ private:
         m_neuralSettings={};
         // The backend's own default before the file is read, so a machine that
         // never touched the count starts at that backend's measured combination
-        // rather than at one pass everywhere.
-        m_neuralSettings.passes=PassesSettingsDefault(m_opt.neuralBackend);
+        // rather than at one pass everywhere - and Mochizuki at its own count,
+        // which is not lmxxf's (see DefaultPassesFor).
+        m_neuralSettings.passes=DefaultPassesFor(m_opt.neuralBackend,m_amdNrRuntime);
         LoadNeuralSettings(SettingsPath(),m_neuralSettings);
         const int mode=static_cast<int>(GetPrivateProfileIntW(L"Comparison",L"Mode",0,SettingsPath().c_str()));
         m_comparison={};
@@ -7223,8 +7238,16 @@ private:
         // count - the runtime's own F9 ladder, 0.5/1/2/3 - so there the index
         // IS the rung: 0 is the model and the count sits AT its index, one
         // above the NVIDIA ladder's. NVIDIA keeps the add-on's 1..4 ladder.
+        //
+        // Mochizuki has neither the Small rung nor a fourth rung: its column
+        // lists three counts, so its index is one below the count like NVIDIA's
+        // is. Reading it through the lmxxf mapping put the count at an index that
+        // does not exist in a three-item list - a session at three passes showed
+        // an empty combo, and one at two showed "3 passes".
         if(m_opt.neuralBackend==NeuralBackend::Amd)
-            select(IDC_NS_PASSES,m_amdSmallModel?0:std::clamp(m_neuralSettings.passes,1,3));
+            select(IDC_NS_PASSES,m_amdNrRuntime==AmdNrRuntime::Mochizuki
+                                     ?std::clamp(m_neuralSettings.passes,1,3)-1
+                                     :(m_amdSmallModel?0:std::clamp(m_neuralSettings.passes,1,3)));
         else
             select(IDC_NS_PASSES,std::clamp(m_neuralSettings.passes,1,4)-1);
         // The combo lists the rungs in the enum's own order, so the index IS the rung.
@@ -7895,7 +7918,22 @@ private:
         case WM_SIZE:ResizeSettingsChildren(h,kNeuralDesignW,kNeuralDesignH);return 0;
         case WM_COMMAND:{
             const int id=LOWORD(w);const int code=HIWORD(w);
-            if(id==IDC_NS_RESET){m_neuralSettings={};m_neuralSettings.passes=PassesSettingsDefault(m_opt.neuralBackend);m_renderGuides={};m_temporalSettings={};m_amdSkinProtect=true;m_amdMultiPassPredict=true;m_amdMultiPassSkip=true;m_amdSmallModel=false;ApplyLiveGuideControls();SyncNeuralSettingControls(h);SaveVideoSettings();SchedulePausedSettingsPreview();return 0;}
+            if(id==IDC_NS_RESET){
+                m_neuralSettings={};m_neuralSettings.passes=DefaultPassesFor(m_opt.neuralBackend,m_amdNrRuntime);
+                m_renderGuides={};
+                m_temporalSettings={};
+                // The rung is the backend's default, not the struct's zero. Those
+                // agreed by accident: TemporalSettings{} says Off and the AMD
+                // default used to be Low, so Reset quietly chose a rung nobody
+                // had picked.
+                m_temporalSettings.stability=StabilitySettingsDefault(m_opt.neuralBackend);
+                m_amdSkinProtect=true;m_amdMultiPassPredict=true;m_amdMultiPassSkip=true;m_amdSmallModel=false;
+                // The Mochizuki column's own six values. Without this line Reset
+                // reset everything the dialog shows except that panel: the
+                // runtime's highlight guard and history strength kept whatever
+                // the last session left, while the dialog said it had reset.
+                m_mochizuki={};
+                ApplyLiveGuideControls();SyncNeuralSettingControls(h);SaveVideoSettings();SchedulePausedSettingsPreview();return 0;}
             if(id==IDC_NS_APPLY){ApplyNeuralSettings();return 0;}
             if(id==IDC_NS_CLOSE){DestroyWindow(h);return 0;}
             if(id==IDC_NS_OPEN_ADJUST&&code==BN_CLICKED){ShowAdjustments();return 0;}
