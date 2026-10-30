@@ -2518,16 +2518,20 @@ static uint32_t ReadSavedAmdStyle(const std::filesystem::path& settingsPath)
 }
 
 // The pass count a session starts at when nothing was saved, and the one Reset
-// returns to. Mochizuki takes one pass of its own: the three-pass AMD default is
+// returns to. Mochizuki takes two of its own: the three-pass AMD default is
 // lmxxf's, where the count is stacked with the later-pass skip that keeps its
 // ghosting down, and Mochizuki's column has neither that switch nor a Small rung -
-// so its three passes are three rebuilds with nothing holding them back. Measured
-// on the A/B bench at 640x360 over 66 frames, one pass is both the least ghosting
-// and the most detail of the three: 1.51 / 2.03 / 2.55 ghosting and 0.945 / 0.822
-// / 0.779 detail for one / two / three passes.
+// so three passes are three rebuilds with nothing holding them back, which the A/B
+// bench measures as both the most ghosting and the least detail of the three
+// (2.55 against 2.03 at two and 1.51 at one; detail 0.779 against 0.822 and 0.945).
+// Two is where this ends up rather than one: it is the rung the picture was judged
+// at, the extra rebuild buys the part of the look one pass leaves out, and the
+// ghosting it adds over one pass is the half the runtime's own controls can still
+// be moved to take back. One remains reachable in the panel for anyone who would
+// rather have the steadier picture.
 static uint32_t DefaultPassesFor(NeuralBackend backend,AmdNrRuntime runtime) noexcept
 {
-    if(backend==NeuralBackend::Amd&&runtime==AmdNrRuntime::Mochizuki)return 1u;
+    if(backend==NeuralBackend::Amd&&runtime==AmdNrRuntime::Mochizuki)return 2u;
     return PassesSettingsDefault(backend);
 }
 
