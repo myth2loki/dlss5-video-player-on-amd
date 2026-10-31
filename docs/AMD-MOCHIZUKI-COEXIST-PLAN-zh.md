@@ -637,3 +637,121 @@ DLSS5_MZ_ACO=0 ./build-mz/AmdMochizukiRuntimeProbe.exe 'F:\dlss5-video\dlss5-vid
 探针要传**绝对路径**的 runtime 目录：传相对路径 `amd-neural-runtime` 会在
 `LoadLibraryExW` 上失败（GetLastError=87），看着像包坏了其实是参数问题。
 
+## 15. 上游新版怎么处理：0.0.8.1 与 C ABI 是两条线（2026-10-31）
+
+**结论：`DLSSNR-AMD-Vulkan-Windows-0.0.8.1-preview` 不能直接集成，原因不是版本旧，
+而是它没有那套 C ABI。**
+
+### 15.1 证据：它导出什么
+
+| 模块 | 大小 | 导出函数 | 能否当 runtime 用 |
+|---|---|---|---|
+| `reshade/dlssnr_amd.addon64` | 6.12 MB | `AddonUninit`、`NAME`、`DESCRIPTION` | 否（ReShade addon，要 ReShade 宿主） |
+| `optiscaler/asi/dlssnr-amd.asi` | 8.15 MB | `InitializeASI` | 否（OptiScaler 插件入口） |
+| 我们的 `MochizukiNrRuntime.dll`（1.12.1） | 1.47 MB | `MochizukiNrGetApi`、`PrepareFrame`、`SetControls`… 共 11 个 | 是 |
+
+两个 0.0.8.1 模块里 `grep -a "MochizukiNr"` 命中 **0 次**：不只是没导出，
+那套命名在二进制里根本不存在。所以 `LoadLibraryExW` + `GetProcAddress` 全路径
+（`src/AmdLmxxfRuntime.h` 的握手）在它上面无法成立。
+
+**两条线是不同发行版**，版本号不可比：
+
+- **DLSSNR-AMD** 0.0.8.1（2026-10-31 编译）= 最新实现，游戏注入形态
+  （ReShade addon / OptiScaler 插件），带 4 个网络、Passes 1–30、wilsjo2 style。
+- **OptScaler-NR** 1.12.1 / 1.13.0-alpha8 = 同一套 Vulkan 实现的**可独立加载外壳**，
+  提供 `MochizukiNrRuntime.dll` 与那 11 个导出。我们集成的是这条线。
+
+### 15.2 资源层面：同源，且 0.0.8.1 是超集
+
+逐字节对比（我们 `amd-neural-runtime/dlssnr-amd` vs 0.0.8.1 的同名目录）：
+
+| 项 | 我们（1.12.1） | 0.0.8.1 | 对比结果 |
+|---|---|---|---|
+| `aco/records` | 58 | 101 | 我们 58 条**全部命中且逐字节相同**；多出 43 条属新网络 |
+| `shaders` | 61 项 | 63 项 | 61 项里 54 个逐字节相同，4 个 `.txt` 差几个字节（换行/常量），`.spv` 全同 |
+| `int4/` | 有 | 有（无 `pipeline-binaries`、`pipeline.cache`） | 同构 |
+| `dlssnr.bin` | 147,756,560 B | **不含** | 0.0.8.1 要安装时从 `nvngx_dlssnr.dll` 310.9.16/310.8.0 提取 |
+| `dlssnr-small.bin` | **不含** | 也不含（同需提取） | small 是 CC_SMALL_FP8 的权重 |
+
+所以：**我们跑的正是 0.0.8.1 里的 CC_SILVER_AARDWOLD（310.8.0）网络**，
+新包对这条网络没有任何字节级改进；它多出来的 43 条记录属于
+CC_SMALL_FP8 / EXPERIMENTAL / INT4_MIXED，缺了新 DLL 与模型都用不上。
+
+### 15.3 真能升级的那一半：`network_model`
+
+`MochizukiNrControls::network_model` 早就存在（`third_party/mochizuki/MochizukiNrControls.h:187`）：
+
+```
+/* 0: 310.8.0 original, 1: 310.9.16 small (default). Rebuilds; owns upstream model selection. */
+```
+
+**播放器从来没给它赋过值**（`ApplyMochizukiControls` 里只有零初始化 = 0 = original）。
+探针现在可以用 `DLSS5_MZ_NETWORK=1` 试 small。实测结论要分开说：
+
+- 对 **1.12.1** 的 DLL：`SetControls` 接受 `network_model=1`，建网成功（2.10 s）、
+  `ACO effective=1`，但**输出与 original 逐位相同**（129.567131 / 5.073529，
+  连 `persist:` 行数都一样 14 行）→ 这个字段在该版本上被接受但没有实现切换。
+  要真拿到 small，需要带 `dlssnr-small.bin` 且实现了该分支的 DLL。
+- 对 **1.13.0-alpha8** 的 DLL：ABI 协商 `6 / 176`（与本仓库头文件一致）、
+  `SetControls(532)` 通过、探针 `RESULT: ok`。它自带 `dlssnr-small.bin`
+  （113,917,248 B）与 62 条记录，是**目前唯一可用的、比 1.12.1 新的 C ABI 版本**。
+
+### 15.4 所以怎么办
+
+1. **等**：OptScaler-NR 发行版跟到 0.0.8.1 的实现（拿到 4 个网络 + 新 ACO）。
+   这是唯一能吃到 0.0.8.1 全部能力的路。
+2. **先升到 1.13.0-alpha8**：只换 DLL + `dlssnr-small.bin` + 新 `aco/shaders`，
+   ABI 已验证兼容；再在面板加 `network_model` 选项，做一次 A/B（照 §13 的量具）。
+   风险：alpha 版，且 small 网络的实际画质/速度还没测。
+3. **写 ReShade 宿主**：不推荐。addon 要 Present 钩子、纹理管理与 ImGui，
+   等于把播放器改成游戏宿主。
+4. 想要 0.0.8.1 的模型，必须自备 `nvngx_dlssnr.dll`（310.9.16 最好），
+   用它的 `model-tools\dlssnr_extract_model.exe` 提取 `dlssnr-small.bin` /
+   `dlssnr.bin`；本机目前没有这个 NVIDIA DLL。
+
+### 15.5 已落地：运行时升到 1.13.0-alpha8 + 面板可选网络（2026-10-31）
+
+按方案 2 执行完毕，改动分三块：
+
+**运行时包**（`amd-neural-runtime/`，不进 git）
+
+| 文件 | 之前（1.12.1） | 现在（1.13.0-alpha8） |
+|---|---|---|
+| `MochizukiNrRuntime.dll` | 1,465,632 | **1,697,568**（导出表不变，11 个） |
+| `dlssnr-amd/aco/records` | 58 | **62** |
+| `dlssnr-amd/shaders` | 61 项 | **62** |
+| `dlssnr-amd/dlssnr-small.bin` | 无 | **113,917,248**（新增） |
+| `dlssnr-amd/dlssnr.bin` | 147,756,560 | 保留不动（310.8.0） |
+| `dlssnr-amd/dlssnr-int4.bin` | 53,211,392 | 保留不动 |
+
+1.12.1 的 DLL / `aco` / `shaders` 备份在 `F:\dlss5-video\mz-backup-1.12.1\`
+（故意放在 runtime 目录外，否则打包脚本会把备份一起打进包）。
+
+**代码**
+
+- `MochizukiOptions::networkModel`（0 original / 1 small），进 `FormatMochizukiOptions`
+  的 wire（`network=%u`，`ParseMochizukiOptions` 要求 12 个键齐全，越界值直接拒）
+  与缓存键（`mochizuki=...` 整行进 settings 文档）。
+- `ApplyMochizukiControls` 写 `controls.network_model`；**文件缺失时回退到 0 并记日志**，
+  不让"面板说 small、渲染跑 original"这种情况静默发生。
+- 面板：Mochizuki 组第一行加 Network 下拉（Mochizuki 组整体下移 24 px，最低控件
+  312+top，仍在 486 设计高度内）；ini 键 `[AmdNeural] MochizukiNetwork`。
+- `runtimeDigest` 把 `dlssnr-small.bin` 也算进身份（存在才加）。
+
+**实测**
+
+| 项 | original（0） | small（1） |
+|---|---|---|
+| 探针（1920x1080 梯度帧）mean luminance | 129.567131 | 128.084412 |
+| 探针 mean \|输出−输入\| (RGB) | 5.073529 | 7.361313 |
+| 建网 | 2.32 s | **1.56 s** |
+| 模型 pack | `dlssnr.bin (599 entries)` | `dlssnr-small.bin (255 entries)` |
+| ACO | effective=1（28 条管线） | effective=1 |
+
+端到端（`--render` 同一段 2 秒、48 帧，`MochizukiNetwork` 0 vs 1）：
+SSIM **0.9896**（Y 0.9879），两版确实不同；同一网络重跑 SSIM **1.000000**，逐位一致。
+测试：PolicyTests 407 全过、AmdLmxxfApiTests PASS、RenderSettingsTests 静默通过、
+UI 回归 65 用例 22 失败（与基线同为 22，无新增）。
+
+
+

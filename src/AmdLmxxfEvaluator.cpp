@@ -1594,6 +1594,24 @@ bool AmdLmxxfEvaluator::ApplyMochizukiControls()
     }
     controls.int4_mixed = asked.int4Mixed ? 1u : 0u;
     controls.drs_mode = asked.drsMode > 2u ? 0u : asked.drsMode;
+    // Which network the runtime builds out of its own pack: 0 is the 310.8.0
+    // one (dlssnr.bin), 1 the 310.9.16 small one (dlssnr-small.bin). A value
+    // other than 0/1 would name a file this host cannot check for, so it falls
+    // back to the network that is always there rather than to nothing.
+    controls.network_model = asked.networkModel > 1u ? 0u : asked.networkModel;
+    if (controls.network_model != 0u) {
+        std::error_code smallError;
+        if (!std::filesystem::is_regular_file(
+                config_.runtimeDirectory / L"dlssnr-amd" / L"dlssnr-small.bin", smallError)) {
+            // Without this the switch would look like it worked: the runtime
+            // builds the network it does have, the panel keeps saying "small",
+            // and the only sign is a picture nobody can compare. Named, and
+            // taken back to the network that is present.
+            Log("  network_model=1 was asked for but dlssnr-amd/dlssnr-small.bin is missing; "
+                "building the 310.8.0 network instead");
+            controls.network_model = 0u;
+        }
+    }
     // ACO import, the documented default and the reason the pack ships 58 record
     // files next to 58 precompiled shaders. A zeroed struct means OFF, and off is
     // what a first frame pays for: the driver compiles the network's 25 pipelines
@@ -1623,6 +1641,7 @@ bool AmdLmxxfEvaluator::ApplyMochizukiControls()
         std::to_string(controls.apply_model) + ", preprocess=" +
         std::to_string(controls.preprocess) + ", int4=" + std::to_string(controls.int4_mixed) +
         ", drs=" + std::to_string(controls.drs_mode) +
+        ", network=" + std::to_string(controls.network_model) +
         (MochizukiOptionsAreDefault(asked) ? " (all defaults)" : " (from the panel)"));
     return true;
 }

@@ -35,7 +35,12 @@ lmxxf（HIP runtime）
 mochizuki（Vulkan/RDNA4 runtime）
   MochizukiNrRuntime.dll      runtime 本体。它读 <包>\dlssnr-amd\，找不到时
                               退回 DLL 所在目录，所以两套可以同放一棵树。
-  dlssnr-amd\dlssnr.bin       模型权重（约 141 MB）
+  dlssnr-amd\dlssnr.bin       310.8.0 网络的权重（约 141 MB）。面板 Network
+                              选 "original" 时用它。
+  dlssnr-amd\dlssnr-small.bin 310.9.16 small 网络的权重（约 109 MB），另一个
+                              训练出来的网络，不是同一个网络的省电档。面板
+                              Network 选 "small" 时用它；缺这个文件时那一条
+                              会选中却没效果（runtime 安静地退回 dlssnr.bin）。
   dlssnr-amd\dlssnr-int4.bin  INT4 权重（约 51 MB），面板勾 "INT4 mixed" 才用
   dlssnr-amd\shaders\         网络 shader 源
   dlssnr-amd\int4\            INT4 分支自己的 shader、swin 表与设置

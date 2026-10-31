@@ -967,6 +967,21 @@ int main(int argc, char** argv)
         controls.white_point = 1.0f;
         controls.apply_model = 1u;
         controls.aco_mode = acoMode;
+        // network_model: 0 is the 310.8.0 original, 1 the 310.9.16 small one
+        // (the runtime's own default). The player leaves this at 0 today, so a
+        // probe run with DLSS5_MZ_NETWORK=1 answers whether this DLL can build
+        // the small network at all - and, when it cannot, which file it wanted.
+        {
+            wchar_t networkBuffer[8]{};
+            const DWORD networkLength = ::GetEnvironmentVariableW(
+                L"DLSS5_MZ_NETWORK", networkBuffer,
+                static_cast<DWORD>(sizeof(networkBuffer) / sizeof(networkBuffer[0])));
+            if (networkLength > 0 &&
+                networkLength < sizeof(networkBuffer) / sizeof(networkBuffer[0]) &&
+                networkBuffer[0] == L'1') {
+                controls.network_model = 1u;
+            }
+        }
         std::wstring controlsError;
         if (!runtime.SetControls(controls, &controlsError)) {
             Line("  SetControls -> FAILED: " + Narrow(controlsError) + " | " +
@@ -979,6 +994,7 @@ int main(int argc, char** argv)
         }
         Line("  SetControls -> OK (struct_size " + std::to_string(controls.struct_size) +
              "), aco_mode requested=" + std::to_string(acoMode) +
+             ", network_model=" + std::to_string(controls.network_model) +
              " (DLSS5_MZ_ACO=0 turns it off)");
     }
 

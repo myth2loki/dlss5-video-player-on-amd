@@ -135,6 +135,14 @@ struct MochizukiOptions {
     // buckets trade a little wasted work for not rebuilding. A video's rect is
     // fixed per job, which is why 0 is the default this host sends.
     uint32_t drsMode{0};
+    // Which of the two networks this runtime carries. 0 is the 310.8.0 network
+    // (599 entries here, the picture every earlier render was made with); 1 is
+    // the 310.9.16 small one (255 entries), a differently trained network, not
+    // a cheaper setting of the same one: shipped as `dlssnr-small.bin` beside
+    // `dlssnr.bin` and selected by the runtime, so the two files must both be
+    // present for the switch to mean anything. Rebuilds the network, and it is
+    // a key term because the same settings make a different frame.
+    uint32_t networkModel{0};
 
     friend bool operator==(const MochizukiOptions&, const MochizukiOptions&) = default;
 };
@@ -157,12 +165,13 @@ inline std::string FormatMochizukiOptions(const MochizukiOptions& options)
     char line[256]{};
     std::snprintf(line, sizeof(line),
                   "intensity=%.2f,tone=%.2f,structure=%.2f,skin=%.2f,mask=%d,maxratio=%.2f,"
-                  "history=%.2f,apply=%d,pre=%d,int4=%d,drs=%u",
+                  "history=%.2f,apply=%d,pre=%d,int4=%d,drs=%u,network=%u",
                   double(options.intensity), double(options.localTone),
                   double(options.localStructure), double(options.skinStructure),
                   options.autoMask ? 1 : 0, double(options.maxRatio),
                   double(options.historyStrength), options.applyModel ? 1 : 0,
-                  options.preprocess ? 1 : 0, options.int4Mixed ? 1 : 0, options.drsMode);
+                  options.preprocess ? 1 : 0, options.int4Mixed ? 1 : 0, options.drsMode,
+                  options.networkModel);
     return line;
 }
 
@@ -231,10 +240,17 @@ inline std::optional<MochizukiOptions> ParseMochizukiOptions(std::string_view te
             if (!inRange(n, 0.0, 2.0) || *n != std::floor(*n)) return std::nullopt;
             options.drsMode = uint32_t(*n);
         }
+        else if (key == "network") {
+            // Two networks, not a range: anything else names a file the host
+            // cannot check for, so it is refused rather than clamped to 0.
+            const auto n = number();
+            if (!inRange(n, 0.0, 1.0) || *n != std::floor(*n)) return std::nullopt;
+            options.networkModel = uint32_t(*n);
+        }
         else return std::nullopt;
         ++seen;
     }
-    if (seen != 11) return std::nullopt;
+    if (seen != 12) return std::nullopt;
     return options;
 }
 

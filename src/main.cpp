@@ -413,6 +413,7 @@ static constexpr int IDC_NS_MZ_HISTORY = 7371;
 static constexpr int IDC_NS_MZ_APPLY = 7372;
 static constexpr int IDC_NS_MZ_PREPROCESS = 7373;
 static constexpr int IDC_NS_MZ_INT4 = 7374;
+static constexpr int IDC_NS_MZ_NETWORK = 7375;
 // The preset strip, the line that says what the preset does, the line that
 // says what Apply will do, and the way across to Image adjustments.
 static constexpr int IDC_NS_PRESET = 7342;
@@ -2497,6 +2498,10 @@ static MochizukiOptions ReadSavedMochizukiOptions(const std::filesystem::path& s
     options.int4Mixed=GetPrivateProfileIntW(L"AmdNeural",L"MochizukiInt4",defaults.int4Mixed?1:0,settingsPath.c_str())!=0;
     options.drsMode=std::min<uint32_t>(static_cast<uint32_t>(GetPrivateProfileIntW(L"AmdNeural",L"MochizukiDrs",
         static_cast<int>(defaults.drsMode),settingsPath.c_str())),2u);
+    // Two networks, so the saved value is clamped to the pair rather than to a
+    // range: a hand-edited 7 must not name a file the runtime will not find.
+    options.networkModel=std::min<uint32_t>(static_cast<uint32_t>(GetPrivateProfileIntW(L"AmdNeural",L"MochizukiNetwork",
+        static_cast<int>(defaults.networkModel),settingsPath.c_str())),1u);
     return options;
 }
 
@@ -2869,6 +2874,13 @@ private:
         if(mochizuki){
             identity.emplace_back(L"MochizukiNrRuntime.dll");
             identity.emplace_back(L"dlssnr-amd/dlssnr.bin");
+            // The small network is a second model file, and a tree that carries
+            // it is a different tree: without it here, swapping the file in
+            // would leave the digest - and every cache entry keyed beside it -
+            // claiming the pack had not changed.
+            if(std::filesystem::exists(runtimeDirectory_/L"dlssnr-amd"/L"dlssnr-small.bin")){
+                identity.emplace_back(L"dlssnr-amd/dlssnr-small.bin");
+            }
             std::error_code iterateError;
             const std::filesystem::path shaderRoot=runtimeDirectory_/L"dlssnr-amd"/L"shaders";
             for(std::filesystem::recursive_directory_iterator it(shaderRoot,iterateError),end;
@@ -5809,6 +5821,7 @@ private:
             WritePrivateProfileStringW(L"AmdNeural",L"MochizukiInt4",m_mochizuki.int4Mixed?L"1":L"0",SettingsPath().c_str());
             swprintf_s(number,L"%u",m_mochizuki.drsMode);
             WritePrivateProfileStringW(L"AmdNeural",L"MochizukiDrs",number,SettingsPath().c_str());
+            WritePrivateProfileStringW(L"AmdNeural",L"MochizukiNetwork",m_mochizuki.networkModel?L"1":L"0",SettingsPath().c_str());
         }
         // The temporal mode, in the same section: it is not a multi-pass
         // switch, and it is the one set of rungs whose value decides whether
@@ -7236,6 +7249,9 @@ private:
         SetCheckBoxState(GetDlgItem(h,IDC_NS_MZ_INT4),m_mochizuki.int4Mixed);
         const auto select=[&](int id,int index){if(HWND combo=GetDlgItem(h,id))SendMessageW(combo,CB_SETCURSEL,static_cast<WPARAM>(index),0);};
         select(IDC_NS_STYLE,std::clamp(m_neuralSettings.style,0,2));
+        // Two items, index = value: 0 is the 310.8.0 network and 1 the small
+        // one, so unlike the pass ladder above there is no offset to get wrong.
+        select(IDC_NS_MZ_NETWORK,m_mochizuki.networkModel>1?0:int(m_mochizuki.networkModel));
         // The combo lists 1..4 and the setting IS the pass count, so the
         // index is one below it.
         // The AMD combo's first rung is the Small model rather than a pass
@@ -7289,6 +7305,12 @@ private:
         if(HWND box=GetDlgItem(h,IDC_NS_MZ_APPLY))m_mochizuki.applyModel=CheckBoxState(box);
         if(HWND box=GetDlgItem(h,IDC_NS_MZ_PREPROCESS))m_mochizuki.preprocess=CheckBoxState(box);
         if(HWND box=GetDlgItem(h,IDC_NS_MZ_INT4))m_mochizuki.int4Mixed=CheckBoxState(box);
+        // CB_ERR must not become a network: (WPARAM)-1 would clamp to 1 and
+        // silently switch a panel that could not read its own combo.
+        if(HWND combo=GetDlgItem(h,IDC_NS_MZ_NETWORK)){
+            const int index=int(SendMessageW(combo,CB_GETCURSEL,0,0));
+            if(index!=CB_ERR)m_mochizuki.networkModel=index==1?1u:0u;
+        }
         m_neuralSettings.style=sel(IDC_NS_STYLE,m_neuralSettings.style);
         m_neuralSettings.autoMask=checked(IDC_NS_AUTOMASK);
         // The AMD ladder's first rung is the Small model: it reads as a single
@@ -7443,15 +7465,24 @@ private:
         CreateNeuralCombo(h,IDC_NS_PASSES,L"neural.settings.passes",40+top,
                           {L"1 (single pass)",L"2 passes",L"3 passes"},L"neural.tip.passes",right);
         CreateSettingsGroupHeading(h,L"neural.settings.group_mochizuki",74+top,right,400);
+        // Which of the two networks the runtime builds. Its own row above the
+        // runtime's sliders because it is the wider question: the two are
+        // differently trained models, not two settings of one, and every value
+        // below it means something different on each. A combo rather than a
+        // check box so the row already reads which release each file comes from.
+        CreateNeuralCombo(h,IDC_NS_MZ_NETWORK,L"neural.settings.mz_network",96+top,
+                          {L"310.8.0 \u00b7 original (599 weights, dlssnr.bin)",
+                           L"310.9.16 \u00b7 small (255 weights, dlssnr-small.bin)"},
+                          L"neural.tip.mz_network",right,240);
         // The two sliders the runtime has and the add-on does not.
-        CreateAdjustmentRow(h,IDC_NS_MZ_MAXRATIO,L"neural.settings.mz_maxratio",96+top,L"neural.tip.mz_maxratio",0,right,true);
-        CreateAdjustmentRow(h,IDC_NS_MZ_HISTORY,L"neural.settings.mz_history",138+top,L"neural.tip.mz_history",0,right,true);
-        CreateNeuralCheck(h,IDC_NS_MZ_APPLY,L"neural.settings.mz_apply",12+right,182+top,300,L"neural.tip.mz_apply");
-        CreateNeuralCheck(h,IDC_NS_MZ_PREPROCESS,L"neural.settings.mz_preprocess",12+right,206+top,330,L"neural.tip.mz_preprocess");
-        CreateNeuralCheck(h,IDC_NS_MZ_INT4,L"neural.settings.mz_int4",12+right,230+top,330,L"neural.tip.mz_int4");
-        CreateSettingsGroupHeading(h,L"neural.settings.group_guides",256+top,right,400);
-        CreateNeuralCheck(h,IDC_NS_GUIDE_MV,L"neural.settings.guide_mv",132+right,282+top,116,L"neural.tip.guide_mv");
-        CreateNeuralCheck(h,IDC_NS_GUIDE_DEPTH,L"neural.settings.guide_depth",252+right,282+top,80,L"neural.tip.guide_depth");
+        CreateAdjustmentRow(h,IDC_NS_MZ_MAXRATIO,L"neural.settings.mz_maxratio",126+top,L"neural.tip.mz_maxratio",0,right,true);
+        CreateAdjustmentRow(h,IDC_NS_MZ_HISTORY,L"neural.settings.mz_history",168+top,L"neural.tip.mz_history",0,right,true);
+        CreateNeuralCheck(h,IDC_NS_MZ_APPLY,L"neural.settings.mz_apply",12+right,212+top,300,L"neural.tip.mz_apply");
+        CreateNeuralCheck(h,IDC_NS_MZ_PREPROCESS,L"neural.settings.mz_preprocess",12+right,236+top,330,L"neural.tip.mz_preprocess");
+        CreateNeuralCheck(h,IDC_NS_MZ_INT4,L"neural.settings.mz_int4",12+right,260+top,330,L"neural.tip.mz_int4");
+        CreateSettingsGroupHeading(h,L"neural.settings.group_guides",286+top,right,400);
+        CreateNeuralCheck(h,IDC_NS_GUIDE_MV,L"neural.settings.guide_mv",132+right,312+top,116,L"neural.tip.guide_mv");
+        CreateNeuralCheck(h,IDC_NS_GUIDE_DEPTH,L"neural.settings.guide_depth",252+right,312+top,80,L"neural.tip.guide_depth");
     }
 
     void BuildNeuralSettingControls(HWND h){
@@ -7953,7 +7984,7 @@ private:
             // it back, and the setting the user thinks they picked never
             // reaches the render. Adding a control without adding it to this
             // line is the one mistake this dialog invites, and it is silent.
-            if(((id==IDC_NS_STYLE||id==IDC_NS_PASSES||id==IDC_NS_SCENE_CUTS||id==IDC_NS_STABILITY||id==IDC_NS_MP_SKIP)&&code==CBN_SELCHANGE)||
+            if(((id==IDC_NS_STYLE||id==IDC_NS_PASSES||id==IDC_NS_SCENE_CUTS||id==IDC_NS_STABILITY||id==IDC_NS_MP_SKIP||id==IDC_NS_MZ_NETWORK)&&code==CBN_SELCHANGE)||
                ((id==IDC_NS_AUTOMASK||id==IDC_NS_GUIDE_MV||id==IDC_NS_GUIDE_DEPTH||id==IDC_NS_CHAINED||id==IDC_NS_SKIN_PROTECT||id==IDC_NS_MP_PREDICT||
                  id==IDC_NS_MZ_APPLY||id==IDC_NS_MZ_PREPROCESS||id==IDC_NS_MZ_INT4)&&code==BN_CLICKED)){
                 // The owner-drawn check boxes do not flip their own check: the
