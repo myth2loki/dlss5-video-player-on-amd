@@ -1,16 +1,23 @@
-DLSS 5 Video Player - AMD 包说明（自带 lmxxf 神经渲染 runtime）
+DLSS 5 Video Player - AMD 包说明（自带 lmxxf / mochizuki 神经渲染 runtime）
 ================================================================
 
-本包带上了 amd-neural-runtime/ 整棵树。它必须在 DLSSVideoPlayer.exe 的
-同级目录里，目录名不能改 —— 播放器按下面这个顺序找它：
+本包带上了 amd-neural-runtime/ 整棵树，里面可能有一套运行时，也可能两套
+（LmxxfNrRuntime.dll 与 MochizukiNrRuntime.dll 可以并存在同一个目录）。
+它必须在 DLSSVideoPlayer.exe 的同级目录里，目录名不能改 —— 播放器按下面
+这个顺序找它：
 
   1. 显式目录（命令行/内部调用传入）
   2. 环境变量 DLSS5_AMD_RUNTIME_DIR
   3. 模块目录、其父目录、祖父目录下的 amd-neural-runtime
      （neural-runtime\NeuralWorker.exe 多一层，也认）
 
+选哪一套：DLSS ▸ Neural render ▸ Backend（AMD 时出现）里选 lmxxf 或
+mochizuki，默认是 mochizuki；也可以用命令行 --amd-nr-runtime=mochizuki
+或 ini 里的 [AmdNeural] Runtime=。两套的参数互不相同，面板会一起换掉。
+
 目录与各部分的用途
 ------------------
+lmxxf（HIP runtime）
   LmxxfNrRuntime.dll          HIP 神经渲染 runtime 本体（ABI 6 / 3 自适配）
   lmxxf-modules\              gfx1200\ 与 gfx1201\，每架构 40 个 .hsaco +
                               SHA256SUMS。Create 只认这个 40-per-arch 布局；
@@ -25,17 +32,42 @@ DLSS 5 Video Player - AMD 包说明（自带 lmxxf 神经渲染 runtime）
                               _SKIP_BLOCKS / STYLE 五行，手写的其它键
                               （如 DLSS5_NETWORK_FREE_RES）会保留。
 
+mochizuki（Vulkan/RDNA4 runtime）
+  MochizukiNrRuntime.dll      runtime 本体。它读 <包>\dlssnr-amd\，找不到时
+                              退回 DLL 所在目录，所以两套可以同放一棵树。
+  dlssnr-amd\dlssnr.bin       模型权重（约 141 MB）
+  dlssnr-amd\dlssnr-int4.bin  INT4 权重（约 51 MB），面板勾 "INT4 mixed" 才用
+  dlssnr-amd\shaders\         网络 shader 源
+  dlssnr-amd\int4\            INT4 分支自己的 shader、swin 表与设置
+  dlssnr-amd\aco\records\     ACO 记录，58 条
+  dlssnr-amd\aco\shaders\     对应的预编译 shell，58 个（shell-aliases.txt
+                              说明哪几条记录共用同一个 shell，所以条数不是
+                              协议要求，配对关系才是）
+  dlssnr-amd\aco\int4\        INT4 的 ACO 记录与 shell（71 条记录 / 88 个
+                              shell，全部经 shell-aliases.txt 映射）
+  dlssnr-amd\pipeline.cache   本机驱动生成的 VkPipelineCache。**不打进包**
+                              （与驱动、GPU 绑定，别的机器用不上）；缺失
+                              不影响运行，ACO 生效时首帧导入约 1.5 秒。
+
 启动时的一致性校验
 ------------------
-播放器启动时会用 runtime 包自带的 SHA256SUMS 逐条重算 lmxxf-modules 下的
-模块（80 条），LmxxfNrRuntime.dll 只做存在性检查（它没有已发布的摘要）。
-启动界面显示 "matches the pack's own SHA256SUMS" 即表示这棵树没有被改动。
-换 runtime 包请整棵替换，不要只替换 DLL 或单个 hsaco。
+lmxxf：播放器用包自带的 SHA256SUMS 逐条重算 lmxxf-modules 下的模块（80 条），
+LmxxfNrRuntime.dll 只做存在性检查（它没有已发布的摘要）。启动界面显示
+"matches the pack's own SHA256SUMS" 即表示这棵树没有被改动。
+
+mochizuki：没有 SHA256SUMS，改为对 115 个文件（DLL、dlssnr.bin、shaders、
+aco\ 全部记录与 shell、int4）算一个摘要，启动界面显示
+"lock=unverified(mochizuki · model and shaders present)"。它证明的是这套文件
+没换过，不是一个已发布的哈希。
+
+换 runtime 包请整棵替换，不要只替换 DLL 或其中某一个文件。
 
 硬件要求
 --------
   - RDNA4 独显：RX 9060（gfx1200）、RX 9070 / Radeon AI PRO R9700（gfx1201）
-  - 系统里有 AMD 驱动的 amdhip64_7.dll（runtime 日志会打印它的来源与版本）
+  - lmxxf 额外要 AMD 驱动里的 amdhip64_7.dll（runtime 日志会打印它的来源
+    与版本）；mochizuki 不用 HIP，它要 Vulkan 1.3 与驱动的 Vulkan 组件
+    （本机验证：Adrenalin 26.10.1 / LLPC）
   - Windows 10/11 x64
 
 关于超分与插帧的运行时（FidelityFX）
@@ -86,7 +118,9 @@ FSR4 → FSR1 → CAS 降级链），状态栏的 "DLSS Upscaling · On · FSR1"
 
 许可证
 ------
-本仓库自己的代码是 MIT（见 LICENSE）。LmxxfNrRuntime.dll、模型权重与
-third-party 二进制不属于本仓库的许可范围：上游为 OptiScaler /
-TheAutomatic dlss-5-amd-project 系（GPL-3.0 谱系）与第三方分发的运行时包。
-自用/研究不受影响；公开分发前请自行确认这些二进制的许可条件。
+本仓库自己的代码是 MIT（见 LICENSE）。LmxxfNrRuntime.dll、
+MochizukiNrRuntime.dll、模型权重与其它 third-party 二进制不属于本仓库的
+许可范围：上游分别是 OptiScaler / TheAutomatic dlss-5-amd-project 系
+（GPL-3.0 谱系）与 OptScaler-NR 1.12.1 的 dlssnr 运行时包，两者都按第三方
+分发的原始形态带上、未作修改。自用/研究不受影响；公开分发前请自行确认
+这些二进制的许可条件。

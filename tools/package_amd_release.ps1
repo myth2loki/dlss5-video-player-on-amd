@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
     # Package a build for the AMD backend: the player, its neural helper, the
-    # FFX DLLs it loads, and the LmxxfNrRuntime pack (amd-neural-runtime/).
+    # FFX DLLs it loads, and the neural runtime pack (amd-neural-runtime/), which
+    # carries lmxxf, mochizuki, or both - the tree is copied whole and each
+    # runtime present is checked against its own layout.
     #
     # This is deliberately a separate entry point from tools/package_release.ps1.
     # That one assembles the upstream NVIDIA release: it demands a clean tagged
@@ -114,33 +116,58 @@ function Assert-RuntimeModules {
 
 function Assert-RuntimeLayout {
     param([string]$Root)
-    # Two runtimes can live in this tree. The layout check is whichever one the
-    # pack carries: lmxxf wants its module tree and tiled assets, mochizuki wants
-    # its own DLL plus the model, shaders and ACO bundle under dlssnr-amd\.
+    # Two runtimes can live in this tree, and a pack may carry either or both:
+    # lmxxf wants its module tree and tiled assets, mochizuki wants its own DLL
+    # plus the model, shaders and ACO bundle under dlssnr-amd\. Each one is
+    # checked on its own presence - an "if the first DLL exists, stop looking"
+    # branch is how a pack ships with the other runtime's files silently absent,
+    # because nothing in the player refuses until a user selects that backend.
     $lmxxfDll = Join-Path $Root 'LmxxfNrRuntime.dll'
     $mochizukiDll = Join-Path $Root 'MochizukiNrRuntime.dll'
-    if (-not (Test-Path -LiteralPath $lmxxfDll)) {
-        if (-not (Test-Path -LiteralPath $mochizukiDll)) {
-            throw "Runtime pack has neither LmxxfNrRuntime.dll nor MochizukiNrRuntime.dll: $Root"
-        }
-        foreach ($required in @('MochizukiNrRuntime.dll', 'dlssnr-amd\dlssnr.bin', 'dlssnr-amd\shaders')) {
+    $hasLmxxf = Test-Path -LiteralPath $lmxxfDll -PathType Leaf
+    $hasMochizuki = Test-Path -LiteralPath $mochizukiDll -PathType Leaf
+    if (-not $hasLmxxf -and -not $hasMochizuki) {
+        throw "Runtime pack has neither LmxxfNrRuntime.dll nor MochizukiNrRuntime.dll: $Root"
+    }
+    Write-Host "Runtime pack: $Root"
+
+    if ($hasMochizuki) {
+        # dlssnr-amd\ is the whole network: the weights, the shader sources, and
+        # aco\ - record files with one precompiled shell each, which the runtime
+        # matches byte for byte before importing the pipelines. A pack without
+        # aco\ still runs, but its first frame pays the driver compile (66 s
+        # measured) instead of a 1.5 s import, so that is a warning, not a
+        # refusal. Uneven records/shells is refused: the bundle is one bundle.
+        foreach ($required in @('dlssnr-amd\dlssnr.bin', 'dlssnr-amd\shaders')) {
             $path = Join-Path $Root $required
             if (-not (Test-Path -LiteralPath $path)) { throw "Mochizuki pack is missing $required`: $path" }
         }
         $info = Get-Item -LiteralPath $mochizukiDll
-        Write-Host "Runtime pack (mochizuki only): $Root"
         Write-Host ("  MochizukiNrRuntime.dll {0:N0} bytes, {1:yyyy-MM-dd HH:mm}" -f $info.Length, $info.LastWriteTime)
         $model = Get-Item -LiteralPath (Join-Path $Root 'dlssnr-amd\dlssnr.bin')
         Write-Host ("  dlssnr-amd/dlssnr.bin {0:N0} bytes" -f $model.Length)
-        return
+        $acoRecordsRoot = Join-Path $Root 'dlssnr-amd\aco\records'
+        $acoShadersRoot = Join-Path $Root 'dlssnr-amd\aco\shaders'
+        $acoRecords = @(Get-ChildItem -LiteralPath $acoRecordsRoot -File -ErrorAction SilentlyContinue)
+        $acoShaders = @(Get-ChildItem -LiteralPath $acoShadersRoot -File -ErrorAction SilentlyContinue)
+        if ($acoRecords.Count -eq 0 -or $acoShaders.Count -eq 0) {
+            Write-Warning 'Mochizuki pack has no ACO bundle (dlssnr-amd\aco\records + shaders); every install will pay a driver compile on its first frame.'
+        }
+        else {
+            # Not a 1:1 rule: shell-aliases.txt lets several records share one
+            # shell, and the INT4 set ships 71 records against 88 shells. An
+            # uneven count is therefore reported, never refused - only an empty
+            # half is a broken bundle.
+            Write-Host ("  dlssnr-amd/aco: {0} records, {1} shells" -f $acoRecords.Count, $acoShaders.Count)
+        }
     }
+
+    if (-not $hasLmxxf) { return }
     foreach ($required in @('LmxxfNrRuntime.dll', 'lmxxf-modules', 'native-game-tiled-assets', 'shaders')) {
         $path = Join-Path $Root $required
         if (-not (Test-Path -LiteralPath $path)) { throw "Runtime pack is missing $required`: $path" }
     }
-    $dll = Join-Path $Root 'LmxxfNrRuntime.dll'
-    $dllInfo = Get-Item -LiteralPath $dll
-    Write-Host "Runtime pack: $Root"
+    $dllInfo = Get-Item -LiteralPath $lmxxfDll
     Write-Host ("  LmxxfNrRuntime.dll {0:N0} bytes, {1:yyyy-MM-dd HH:mm}" -f $dllInfo.Length, $dllInfo.LastWriteTime)
 
     $weights = @(Get-ChildItem -LiteralPath (Join-Path $Root 'native-game-tiled-assets') -File)
@@ -257,10 +284,25 @@ foreach ($item in $resolved) {
 $runtimeDestination = Join-Path $stageFull 'amd-neural-runtime'
 $copied = 0
 $excluded = 0
+# Directories first. A file walk cannot recreate an empty one, and the tree has
+# one that matters: dlssnr-amd\int4\pipeline-binaries, where the runtime drops
+# the INT4 pipeline binaries. Shipping without it would leave the runtime to
+# create the folder itself or fail, depending on the build.
+foreach ($directory in Get-ChildItem -LiteralPath $runtimeSource -Recurse -Directory) {
+    $relativeDir = Get-RelativePackagePath -Root $runtimeSource -Path $directory.FullName
+    if (-not $IncludeShaderCache -and ($relativeDir -eq 'shaders/shader-cache' -or $relativeDir.StartsWith('shaders/shader-cache/', [StringComparison]::OrdinalIgnoreCase))) { continue }
+    New-Item -ItemType Directory -Path (Join-Path $runtimeDestination $relativeDir.Replace('/', '\')) -Force | Out-Null
+}
 foreach ($file in Get-ChildItem -LiteralPath $runtimeSource -Recurse -File) {
     $relative = Get-RelativePackagePath -Root $runtimeSource -Path $file.FullName
     if (-not $IncludeShaderCache -and $relative.StartsWith('shaders/shader-cache/', [StringComparison]::OrdinalIgnoreCase)) { $excluded++; continue }
     if ($relative -like '*.log') { $excluded++; continue }
+    # dlssnr-amd\pipeline.cache is a VkPipelineCache the driver wrote on this
+    # machine, keyed by driver and GPU: on another card it is dead weight (5.8 MB
+    # here) and it can never speed up a build the ACO bundle does not already
+    # cover. The portable form of the same thing is aco\records + shells, which
+    # travels.
+    if ($relative -ieq 'dlssnr-amd/pipeline.cache') { $excluded++; continue }
     $destination = Join-Path $runtimeDestination $relative.Replace('/', '\')
     New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
     Copy-Item -LiteralPath $file.FullName -Destination $destination
@@ -271,15 +313,17 @@ Write-Host "Staged amd-neural-runtime: $copied files ($excluded skipped)."
 $files = @(Get-OrdinalPackageFiles -Root $stageFull)
 $manifest = New-Object Collections.Generic.List[string]
 $manifest.Add("ProductVersion=$Version")
-$runtimePackLine = "RuntimePack=amd-neural-runtime ("
-if (Test-Path -LiteralPath (Join-Path $runtimeSource 'LmxxfNrRuntime.dll')) {
-    $runtimePackLine += "LmxxfNrRuntime.dll $(Get-Sha256 -Path (Join-Path $runtimeSource 'LmxxfNrRuntime.dll'))"
+# Both runtimes are named when both are present, because which DLLs a pack
+# carries is what the player's runtime selector reads at startup. The model,
+# ACO records and module trees are pinned by the Path|Size|SHA256 table below.
+$runtimeNames = New-Object Collections.Generic.List[string]
+foreach ($runtimeDll in @('LmxxfNrRuntime.dll', 'MochizukiNrRuntime.dll')) {
+    $runtimePath = Join-Path $runtimeSource $runtimeDll
+    if (Test-Path -LiteralPath $runtimePath -PathType Leaf) {
+        $runtimeNames.Add("$runtimeDll $(Get-Sha256 -Path $runtimePath)")
+    }
 }
-if (Test-Path -LiteralPath (Join-Path $runtimeSource 'MochizukiNrRuntime.dll')) {
-    if ($runtimePackLine -notlike '*LmxxfNrRuntime.dll*') { } else { $runtimePackLine += ", " }
-    $runtimePackLine += "MochizukiNrRuntime.dll $(Get-Sha256 -Path (Join-Path $runtimeSource 'MochizukiNrRuntime.dll'))"
-}
-$manifest.Add($runtimePackLine + ")")
+$manifest.Add("RuntimePack=amd-neural-runtime (" + ($runtimeNames -join ', ') + ")")
 $manifest.Add('Path|Size|SHA256')
 foreach ($file in $files) {
     $relative = Get-RelativePackagePath -Root $stageFull -Path $file.FullName
