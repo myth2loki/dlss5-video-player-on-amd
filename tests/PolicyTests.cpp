@@ -16710,6 +16710,7 @@ void mochizuki_options_wire_and_key_test()
     asked.preprocess = true;
     asked.int4Mixed = true;
     asked.drsMode = 2;
+    asked.networkModel = 1;
     const std::string line = FormatMochizukiOptions(asked);
     CHECK(!line.empty());
     const auto parsed = ParseMochizukiOptions(line);
@@ -16726,9 +16727,22 @@ void mochizuki_options_wire_and_key_test()
         CHECK_EQ(asked.preprocess, parsed->preprocess);
         CHECK_EQ(asked.int4Mixed, parsed->int4Mixed);
         CHECK_EQ(asked.drsMode, parsed->drsMode);
+        CHECK_EQ(asked.networkModel, parsed->networkModel);
+    }
+    // Two networks is a pair, not a range: a third value names a file the host
+    // never checked for, so it is refused rather than clamped to the one that
+    // happens to be first.
+    {
+        std::string third = line;
+        const size_t at = third.find("network=1");
+        CHECK(at != std::string::npos);
+        if (at != std::string::npos) {
+            third[at + 8] = '2';
+            CHECK(ParseMochizukiOptions(third) == std::nullopt);
+        }
     }
     // A default value formats as nothing, so a round trip of "the defaults" is
-    // the empty string rather than a line of eleven default values.
+    // the empty string rather than a line of twelve default values.
     MochizukiOptions defaults;
     CHECK(ParseMochizukiOptions(FormatMochizukiOptions(defaults)) == std::nullopt);
 
