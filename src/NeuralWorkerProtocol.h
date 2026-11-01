@@ -224,7 +224,9 @@ static_assert(sizeof(WireMetrics) == 72);
 
 inline bool IsKnownPhase(uint32_t phase) noexcept
 {
-    return phase <= static_cast<uint32_t>(NeuralRenderPhase::Recovering);
+    // BuildingNetwork is the last value; the order above it is the wire's, so
+    // appending is what keeps an older helper's phases all <= this bound.
+    return phase <= static_cast<uint32_t>(NeuralRenderPhase::BuildingNetwork);
 }
 
 inline bool IsKnownFailure(uint32_t failure) noexcept

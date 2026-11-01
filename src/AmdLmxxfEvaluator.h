@@ -67,6 +67,30 @@
 struct AmdLmxxfEvaluatorConfig {
     // Holds LmxxfNrRuntime.dll. Required.
     std::filesystem::path runtimeDirectory;
+    // Which runtime in that directory this evaluator talks to. The two share one
+    // API table and one call order (see src/AmdLmxxfRuntime.h), so this is a
+    // pointer to the module's prepare export and a different frame struct rather
+    // than a second evaluator. Mochizuki additionally rewrites three things at
+    // bring-up: the assets directory, the mandatory recording-lease create flag,
+    // and a network build that the first frame has to wait out.
+    amd_lmxxf::NrKind kind{amd_lmxxf::NrKind::Lmxxf};
+    // The pass count a Mochizuki frame asks for (1..3; up to 30 with the
+    // capacity allowance). lmxxf carries its count in the runtime's own
+    // configuration file and builds the network around it, so this is read only
+    // on the Mochizuki path - a moved count there rebuilds the network, which is
+    // the same cost the lmxxf file was paying.
+    uint32_t modelPasses{1};
+    // The model's style (0 standard, 1 natural, 2 cinematic), which is the same
+    // 0..2 the player's DLSS5_STYLE menu writes. On lmxxf it goes into the
+    // runtime's configuration file before the module loads; on Mochizuki it is
+    // session state, handed over with MochizukiNrSetControls before the network
+    // is built.
+    uint32_t style{1};
+    // The rest of the runtime's own panel, handed over with the style (see
+    // MochizukiNrControls in third_party/mochizuki). The five values that share
+    // a name with NeuralSettings are filled from it by the caller, so a preset
+    // moves both backends' look controls at once.
+    MochizukiOptions mochizuki{};
     // The directory Create is handed as assets_directory. Empty means
     // runtimeDirectory/lmxxf-modules, which is the only layout the runtime
     // accepts: native-game-tiled-assets/HIP carries a stale 24-per-arch subset
@@ -346,6 +370,23 @@ private:
     bool CreateFrameResources();
     // Loads the module, negotiates the ABI, creates and prepares the session.
     bool BringUpRuntime();
+    // Mochizuki compiles its network on first use: PrepareFrame answers
+    // UNAVAILABLE until it is done (70 s cold, 2.6 s with a warm pipeline
+    // cache), and the host is supposed to pass frames through meanwhile. This
+    // evaluator cannot pass a frame through - one Submit is one frame, and a
+    // half-rendered one is not something the job's receipt can describe - so the
+    // wait happens once, here, before the first frame: the build is reported
+    // through config.log as it advances and the job starts with a ready network.
+    // Returns true immediately on the lmxxf path.
+    bool WaitForMochizukiNetwork();
+    // Hands this job's picture controls to a Mochizuki session. Called once per
+    // bring-up, before the network build, because the style is baked into the
+    // compiled network: setting it afterwards would describe a picture this
+    // session did not produce.
+    bool ApplyMochizukiControls();
+    // One prepare call, two contracts: the frame struct and the entry point
+    // differ, the phase machine does not.
+    bool PrepareFrameForBackend(amd_lmxxf::Session& session, const LmxxfNrFrameInfo& info);
     void TearDown();
 
     void Log(std::string_view text) const;

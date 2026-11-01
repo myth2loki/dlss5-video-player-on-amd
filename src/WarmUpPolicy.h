@@ -18,6 +18,7 @@ enum class Step {
     CheckingCache,   // the render key: mostly waiting out NGX rewriting its model files
     CheckingRuntime, // the preflight probe of the neural runtime
     PreparingModel,  // helper up, feature being armed, no frame out yet
+    BuildingNetwork, // the AMD Mochizuki runtime is compiling its network
     FirstSecond,     // frames are coming out; the first segment is not published
 };
 
@@ -28,6 +29,7 @@ inline Step Resolve(bool liveSession, bool jobActive, bool anyCoverage, NeuralRe
     switch (phase) {
     case NeuralRenderPhase::CheckingCache: return Step::CheckingCache;
     case NeuralRenderPhase::Preflight: return Step::CheckingRuntime;
+    case NeuralRenderPhase::BuildingNetwork: return Step::BuildingNetwork;
     default: break;
     }
     return completedFrames == 0 ? Step::PreparingModel : Step::FirstSecond;
@@ -39,6 +41,7 @@ inline const wchar_t* TextKey(Step step)
     case Step::CheckingCache: return L"warmup.cache";
     case Step::CheckingRuntime: return L"warmup.runtime";
     case Step::PreparingModel: return L"warmup.model";
+    case Step::BuildingNetwork: return L"warmup.building";
     case Step::FirstSecond: return L"warmup.first";
     case Step::None: break;
     }

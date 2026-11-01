@@ -1869,6 +1869,13 @@ private:
             return Fail(NeuralRenderFailure::Source, L"The source video could not be opened.");
         }
         Emit(NeuralRenderPhase::Decoding, 0, 0, false);
+        // The Mochizuki runtime compiles its network inside this call and answers
+        // "building" until it is done, so the phase is announced before it: a job
+        // whose first 70 s are one blocking call has nothing else to tell the
+        // player what it is waiting for.
+        if (request_.backend == NeuralBackend::Amd &&
+            request_.amdNrRuntime == AmdNrRuntime::Mochizuki)
+            Emit(NeuralRenderPhase::BuildingNetwork, 0, 0, false);
         if (!evaluator_.Initialize(request.renderWindow, modelInput_.width, modelInput_.height,
                                    outputWidth_, outputHeight_, request.fps,
                                    request.guides, source_.Layout(), source_.ColorDescription())) {
@@ -2979,6 +2986,15 @@ struct AmdLmxxfEvaluatorAdapter {
     // for another style, the evaluator is rebuilt, the module reloads and the
     // file is read again before the network is built.
     uint32_t broughtUpStyle{1};
+    // Which of the pack's two runtimes the bring-up loaded, and the picture
+    // controls it was handed. Both are bring-up facts on Mochizuki: the DLL and
+    // the network behind it differ per kind, and the controls are repeated to
+    // the runtime once, before its network is built. Reading them from the
+    // config alone would let a reused evaluator serve a job that asked for the
+    // other runtime - or for a different highlight guard - with the frames it
+    // built for the first one.
+    amd_lmxxf::NrKind broughtUpKind{amd_lmxxf::NrKind::Lmxxf};
+    MochizukiOptions broughtUpMochizuki{};
     // The capture's depth and its dither, which are bring-up state in the
     // strongest sense: the format of three textures and the pixel shader of the
     // encode pass are decided from them, so an evaluator brought up for 8 bits
@@ -3059,6 +3075,7 @@ struct AmdLmxxfEvaluatorAdapter {
         reused=evaluator&&width==w&&height==h&&broughtUpTemporal==config.temporalHistory&&
                broughtUpStability==config.stability&&broughtUpPasses==jobPasses&&
                broughtUpSmallModel==jobSmallModel&&
+               broughtUpKind==config.kind&&broughtUpMochizuki==config.mochizuki&&
                broughtUpSkinProtect==jobSkinProtect&&broughtUpPredict==jobPredict&&
                broughtUpSkip==jobSkip&&broughtUpStyle==jobStyle&&broughtUpOutputW==jobOutputW&&
                broughtUpOutputH==jobOutputH&&broughtUpTenBit==config.tenBitCapture&&
@@ -3068,6 +3085,7 @@ struct AmdLmxxfEvaluatorAdapter {
         captured.clear();
         evaluator=std::make_unique<AmdLmxxfEvaluator>(config);
         width=w;height=h;broughtUpTemporal=config.temporalHistory;
+        broughtUpKind=config.kind;broughtUpMochizuki=config.mochizuki;
         broughtUpTenBit=config.tenBitCapture;
         broughtUpDither=config.captureDither;
         broughtUpSourceConversion=conversion;
@@ -3967,8 +3985,21 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
     // question it had not asked. The backend, not the claim, is what decides
     // which evidence a job is held to; see NvidiaEvidenceRequired in
     // NeuralRenderJob.
+    // The kind travels with the job: two DLLs can sit in one pack and the
+    // directory lookups below must ask for the module this job chose.
+    const amd_lmxxf::NrKind nrKind = request.amdNrRuntime == AmdNrRuntime::Mochizuki
+        ? amd_lmxxf::NrKind::Mochizuki : amd_lmxxf::NrKind::Lmxxf;
+    state.amdEvaluator.config.kind = nrKind;
+    // The picture controls this job asked for. On lmxxf the style reaches the
+    // runtime through the configuration file written below and the pass count
+    // through the same file; on Mochizuki both are session state, so they travel
+    // in the config and are handed over before its network is built.
+    state.amdEvaluator.config.style = amd_lmxxf::NormalizedAmdStyle(request.amdStyle);
+    state.amdEvaluator.config.modelPasses =
+        request.amdPasses < 1u ? 1u : (request.amdPasses > 3u ? 3u : request.amdPasses);
+    state.amdEvaluator.config.mochizuki = request.mochizuki;
     state.amdEvaluator.config.runtimeDirectory=
-        amd_lmxxf::ResolveRuntimeDirectory(request.amdRuntimeDirectory);
+        amd_lmxxf::ResolveRuntimeDirectory(request.amdRuntimeDirectory, nrKind);
     // The capture size and the CAS strength the export asked for. The runtime
     // still renders 1:1; the evaluator stretches its output and reads the
     // capture back, so the encoder and the metrics see exactly the size the
@@ -4096,9 +4127,18 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
     if(request.guideFiles.zeroMotionTest)
         return NeuralRenderResult{.failure=NeuralRenderFailure::Protocol,
             .detail=L"The zero-motion test tunes the neural motion policy, which the AMD backend does not run."};
-    if(state.amdEvaluator.config.runtimeDirectory.empty())
-        return NeuralRenderResult{.failure=NeuralRenderFailure::Preflight,
-            .detail=L"The AMD neural runtime directory could not be resolved; set DLSS5_AMD_RUNTIME_DIR or put amd-neural-runtime beside the module."};
+    if(state.amdEvaluator.config.runtimeDirectory.empty()){
+        // Name the module that was looked for: with two runtimes in one pack the
+        // old sentence ("put amd-neural-runtime beside the module") sends a user
+        // who already did exactly that looking in the wrong place.
+        std::wstring detail=L"The AMD neural runtime directory could not be resolved: ";
+        detail+=amd_lmxxf::NrKindModuleName(nrKind);
+        detail+=L" is not in ";
+        detail+=request.amdRuntimeDirectory.empty()
+            ?std::wstring(L"amd-neural-runtime beside the module"):request.amdRuntimeDirectory.wstring();
+        detail+=L". Stage the pack there or set DLSS5_AMD_RUNTIME_DIR.";
+        return NeuralRenderResult{.failure=NeuralRenderFailure::Preflight,.detail=std::move(detail)};
+    }
     // One line per job, for the reason production writes one: two renders that
     // differ only here are different pictures, and a log that does not say which
     // one it made cannot tell them apart. The temporal mode is on this line

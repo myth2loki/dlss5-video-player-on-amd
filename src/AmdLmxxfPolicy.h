@@ -42,10 +42,17 @@ inline constexpr std::wstring_view kLockFileName = L"amd-runtime-lock.json";
 // steadiness for detail monotonically, and a job that wants a different rung
 // says so.
 //
-// Low rather than Medium or High because this is a default and not a choice:
-// the rungs trade steadiness for detail monotonically, Low is the one that moves
-// the picture least, and a viewer who wants more can ask for it.
-inline constexpr TemporalStability kAmdDefaultStability = TemporalStability::Low;
+// Off rather than Low/Medium/High, and the reason is the frame contract rather
+// than a taste for detail. Every rung blends the previous output through the
+// motion field, and the runtime this fork defaults to (mochizuki) carries no
+// depth in its 88-byte frame struct - so at an occlusion edge a wrong vector
+// puts one frame's content where the next frame's should be, and no trust band
+// on this side can undo what the runtime already fused. Off is the only rung
+// that cannot do that. The cost is the steadiness the pass existed for: measured
+// 8.44 -> 9.45 low-frequency jitter on the A/B bench, so a viewer who prefers a
+// calmer picture raises this in Neural settings, and lmxxf - which does carry
+// depth - is unaffected by the reason above.
+inline constexpr TemporalStability kAmdDefaultStability = TemporalStability::Off;
 
 enum class GpuFamily
 {

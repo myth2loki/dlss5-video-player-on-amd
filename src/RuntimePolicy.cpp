@@ -417,7 +417,11 @@ NeuralPlaybackState StateForProgressPhase(NeuralRenderPhase phase, NeuralPlaybac
 {
     switch (phase) {
     case NeuralRenderPhase::Acquiring:
-    case NeuralRenderPhase::Preflight: return NeuralPlaybackState::Acquiring;
+    case NeuralRenderPhase::Preflight:
+    // A network being built is still the session coming up, not a render: the
+    // same state as arming, so the player keeps waiting instead of showing a
+    // stalled render.
+    case NeuralRenderPhase::BuildingNetwork: return NeuralPlaybackState::Acquiring;
     case NeuralRenderPhase::Decoding:
     case NeuralRenderPhase::NeuralRendering:
     case NeuralRenderPhase::Encoding: return NeuralPlaybackState::Rendering;

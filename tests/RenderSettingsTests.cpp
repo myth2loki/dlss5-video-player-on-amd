@@ -673,7 +673,7 @@ void neural_settings_round_trip_and_format_renodx_overrides()
 {
     const auto defaults = NeuralAddonOverridesFor(NeuralSettings{});
     const std::vector<NeuralAddonOverride> expected{
-        {"NRIntensity", "1.000000"}, {"NRLocalTone", "1.000000"},
+        {"NRIntensity", "1.000000"}, {"NRLocalTone", "2.000000"},
         {"NRLocalStructure", "1.000000"}, {"NRSkinStructure", "-1.000000"},
         {"NRColorStrength", "1.000000"}, {"NRPreset", "0"}, {"NRStyle", "0"},
         {"NRAutoMask", "1"}, {"NRPasses", "1"}, {"NRChainedHistory", "1"},
@@ -710,7 +710,7 @@ void neural_settings_round_trip_and_format_renodx_overrides()
     // The canonical form is the neural cache key, so every field belongs in it:
     // a render at two stack passes is a different render, and one that keyed the
     // same as a single-pass render would be served from the wrong cache entry.
-    CHECK_EQ(std::string("intensity=1.000000 localTone=1.000000 localStructure=1.000000 "
+    CHECK_EQ(std::string("intensity=1.000000 localTone=2.000000 localStructure=1.000000 "
                          "skinStructure=-1.000000 colorStrength=1.000000 preset=0 style=0 "
                          "autoMask=1 passes=1 chainedHistory=1"),
              CanonicalNeuralSettings(NeuralSettings{}));
@@ -760,7 +760,7 @@ void neural_settings_round_trip_and_format_renodx_overrides()
     CHECK_EQ(-1.0f, clamped.skinStructure);
     CHECK_EQ(3, clamped.preset);
     CHECK(clamped.autoMask);
-    CHECK_EQ(1.0f, clamped.localTone);
+    CHECK_EQ(2.0f, clamped.localTone);
     CHECK_EQ(0, clamped.style);
 }
 

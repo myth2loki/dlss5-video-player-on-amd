@@ -313,10 +313,18 @@ MRT**，而是把这段边界拆成三个独立 pass（第 9.1 节），历史�
 - 用户明确要求：本文所属分支的闪烁修复目标就是"去掉抖动、不删风格"，而 Low 是三档里
   离源最近、鬼影风险最低的一档。
 
-因此：AMD 的默认档位是 `amd_lmxxf::kAmdDefaultStability = TemporalStability::Low`，
+因此：AMD 的默认档位当时定为 `amd_lmxxf::kAmdDefaultStability = TemporalStability::Low`，
 存在 `[Temporal] AmdStability`（**不是** NVIDIA 的 `[Temporal] Stability`）；用户在同一个
 组合框里仍然可以选 Off。**切换档位会影响正在播放的直播会话**：这是这份决定带来的、
 必须一起改的一处——见第 9.4 节。
+
+> **后续变更（2026-10-30）**：默认档位已改为 **Off**。上面的推理是在"场可用、
+> 且后端帧契约带 depth"的前提下成立的；把 Mochizuki 设为默认运行时之后这个前提变了——
+> 它的 88 字节帧结构**没有 depth 块**，遮挡边界上错误矢量无法被剔除，而这个 pass
+> 的 trust band 只能判断"源在这个位置像不像"，挽回不了运行时已经融合进去的内容。
+> 实测（`tools/ab-metrics`，66 帧）Off 与 Low 的低频抖动是 9.45 对 8.44，即关掉
+> 要闪 12%；用户侧的观感取舍是「更闪」对「更拖影」，当前默认选前者。
+> 想要稳定性的用户在同一组合框里选 `low` 即可，lmxxf 带 depth、不受这个理由约束。
 
 ### 8.2 是否要暴露 UI——已按既有控件沿用
 
@@ -498,7 +506,7 @@ off` 与 `high`），再离线复算一个"同位置 EMA"作为旧行为的对�
 
 ### 10.4 与配置的关系
 
-`kAmdDefaultStability` 已经是 `Low`（`AmdLmxxfPolicy.h`），本次不改默认值；改之前
+`kAmdDefaultStability` 那次是 `Low`（`AmdLmxxfPolicy.h`）、没有改默认值（**2026-10-30 已改为 `Off`**，理由见第 9.3 节末尾的后续变更：Mochizuki 的帧契约没有 depth）；改之前
 用户在 ini 里手选的是 `high`，那正是把零运动 EMA 放到最重的一档。现在 High 有真实
 重投影支撑，可以正常使用。仍未处理的是场本身的精度（§6 / 任务 §7 的第 2、3 项）：
 160×68 的 CPU 块匹配在遮挡边界与小物体上仍会拿错矢量，深度遮挡剔除也还没接进这个 pass。

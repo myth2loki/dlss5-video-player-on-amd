@@ -9,6 +9,10 @@
 
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -44,6 +48,196 @@ constexpr std::optional<NeuralBackend> ParseNeuralBackend(std::string_view name)
     return std::nullopt;
 }
 
+// Which of the two runtimes inside an AMD pack an AMD job drives. Both speak the
+// same API table (src/AmdLmxxfApi.h, ABI 6) and differ in the module, the frame
+// struct and one create flag - see docs/AMD-MOCHIZUKI-COEXIST-PLAN-zh.md.
+//
+// A name rather than a second `NeuralBackend`: an AMD job is still an AMD job -
+// same evaluator, same lease lifecycle, same capture - so the cache key, the
+// plan and the worker wire keep one backend value and carry this beside it.
+//
+// Mochizuki is the default: it is the runtime that builds its network once and
+// then answers from that network, so a job that says nothing about the runtime
+// gets the one that does not rebuild its model per job. Lmxxf stays available
+// and unchanged for anyone who picks it - the choice is a menu radio, and the
+// name travels with the job either way.
+enum class AmdNrRuntime { Lmxxf, Mochizuki };
+
+inline const char* AmdNrRuntimeName(AmdNrRuntime runtime) noexcept
+{
+    switch (runtime) {
+        case AmdNrRuntime::Lmxxf: return "lmxxf";
+        case AmdNrRuntime::Mochizuki: return "mochizuki";
+    }
+    return "mochizuki";
+}
+
+// Absent means Mochizuki, which is what a job that names no runtime runs.
+constexpr std::optional<AmdNrRuntime> ParseAmdNrRuntime(std::string_view name) noexcept
+{
+    using namespace std::literals;
+    if (name == "lmxxf"sv) return AmdNrRuntime::Lmxxf;
+    if (name == "mochizuki"sv) return AmdNrRuntime::Mochizuki;
+    return std::nullopt;
+}
+
+// The Mochizuki runtime's own controls, as its menu would show them. A separate
+// struct from `NeuralSettings` for two reasons: they are not the same knobs
+// (DLSS-NR's are read by NVIDIA's add-on, these by the AMD runtime), and they
+// travel a different road - a Mochizuki job hands them to MochizukiNrSetControls
+// before its network is built, while lmxxf's options are lines in a file the
+// runtime reads once per process.
+//
+// Every default is the runtime's own documented default, so a default-constructed
+// value is a no-op: a job that changes nothing renders exactly what the runtime
+// renders on its own, and the wire carries nothing (see FormatMochizukiOptions).
+//
+// The five values that are also `NeuralSettings` names - Intensity, Local tone,
+// Local structure, Skin structure, Automatic mask - are filled from it when the
+// job is built, so a preset moves them and the panel keeps one place per knob.
+struct MochizukiOptions {
+    // 0..2, default 1: above 1 raises the luminance ratio rather than "more NR".
+    float intensity{1.0f};
+    // 0..2, default 2: tone re-applied per frame. It matches
+    // NeuralSettings::localTone, which is where the value actually comes from
+    // (main.cpp copies it into this struct when a job is built) - the two are the
+    // same knob, and a default that disagreed would make MochizukiOptionsAreDefault
+    // say "not default" about the product's own default.
+    float localTone{2.0f};
+    // 0..2, default 1.
+    float localStructure{1.0f};
+    // -1..2, default -1: negative follows local structure. Needs automatic mask.
+    float skinStructure{-1.0f};
+    // Default on: skin structure is inert without it.
+    bool autoMask{true};
+    // 1..8, default 2: the highlight guard. Higher lets the model brighten more
+    // before it is held back - the one control that decides how a blown window or
+    // a lamp behaves, and the reason a film with practicals looks either
+    // protected or clipped.
+    float maxRatio{2.0f};
+    // 0..1, default 1: how much of the previous frame's answer is kept. With
+    // motion vectors only, so on this package it is the one temporal knob that
+    // reaches the network at all.
+    float historyStrength{1.0f};
+    // Default on. Off runs the whole network and shows the original frame - the
+    // only honest A/B a viewer can make without changing any other setting.
+    bool applyModel{true};
+    // Default off: the picture the network is shown is normalised and every change
+    // is taken back out of its answer. A game hands over HDR that already suits
+    // the model; a film's grade may not, and this is what re-fits it. Costs one
+    // network rebuild the first time it is on.
+    bool preprocess{false};
+    // Default off: the INT4 mixed network, which is smaller in memory and not the
+    // same picture. Rebuilds; kept off unless a card is short of VRAM.
+    bool int4Mixed{false};
+    // 0 exact (default here), 1 auto bucket, 2 always bucket. Exact builds the
+    // network for the frame's own render rect, so a changed rect rebuilds; the
+    // buckets trade a little wasted work for not rebuilding. A video's rect is
+    // fixed per job, which is why 0 is the default this host sends.
+    uint32_t drsMode{0};
+
+    friend bool operator==(const MochizukiOptions&, const MochizukiOptions&) = default;
+};
+
+// Whether every value is the runtime's own default.
+inline bool MochizukiOptionsAreDefault(const MochizukiOptions& options) noexcept
+{
+    return options == MochizukiOptions{};
+}
+
+// One line, so the helper's command line stays one argument: `key=value` pairs
+// separated by commas, floats at two decimals (the runtime's own precision).
+//
+// An empty string is the runtime's defaults, which is what a job that changed
+// nothing sends: the helper then takes no argument at all and an older helper -
+// one that has never heard of this key - renders the same picture.
+inline std::string FormatMochizukiOptions(const MochizukiOptions& options)
+{
+    if (MochizukiOptionsAreDefault(options)) return {};
+    char line[256]{};
+    std::snprintf(line, sizeof(line),
+                  "intensity=%.2f,tone=%.2f,structure=%.2f,skin=%.2f,mask=%d,maxratio=%.2f,"
+                  "history=%.2f,apply=%d,pre=%d,int4=%d,drs=%u",
+                  double(options.intensity), double(options.localTone),
+                  double(options.localStructure), double(options.skinStructure),
+                  options.autoMask ? 1 : 0, double(options.maxRatio),
+                  double(options.historyStrength), options.applyModel ? 1 : 0,
+                  options.preprocess ? 1 : 0, options.int4Mixed ? 1 : 0, options.drsMode);
+    return line;
+}
+
+// Absent or malformed returns nullopt rather than a default: a job that named
+// values and had them silently replaced by defaults would render a picture
+// nobody asked for and call it success. Every key must be present, because the
+// writer always writes all of them.
+//
+// Out of range is refused here as well, and for the same reason: this writer
+// never emits one, so a number outside the runtime's documented range means the
+// line did not come from it. The panel already clamps what it lets a reader
+// set - the saved document clamps it again on the way in - and the wire is the
+// one path left where a hand-assembled command line could hand the runtime a
+// negative pass count for an unsigned field.
+inline std::optional<MochizukiOptions> ParseMochizukiOptions(std::string_view text)
+{
+    if (text.empty()) return std::nullopt;
+    MochizukiOptions options;
+    int seen = 0;
+    // The runtime's documented range, per field. `number()` has already rejected
+    // a string that is not a number; the range is the second half of the same
+    // question, and a NaN passes every comparison so it is named explicitly.
+    const auto inRange = [](const std::optional<double>& n, double low, double high) {
+        return n && std::isfinite(*n) && *n >= low && *n <= high;
+    };
+    while (!text.empty()) {
+        const size_t comma = text.find(',');
+        const std::string_view field = text.substr(0, comma);
+        text = comma == std::string_view::npos ? std::string_view{} : text.substr(comma + 1);
+        const size_t equals = field.find('=');
+        if (equals == std::string_view::npos) return std::nullopt;
+        const std::string_view key = field.substr(0, equals);
+        const std::string_view value = field.substr(equals + 1);
+        if (key.empty() || value.empty()) return std::nullopt;
+        // std::from_chars for integers, strtof for the floats: the writer emits a
+        // plain decimal point and no exponent, and strtof is what reads that
+        // without a locale in the way.
+        char buffer[64]{};
+        if (value.size() >= sizeof(buffer)) return std::nullopt;
+        std::memcpy(buffer, value.data(), value.size());
+        const auto number = [&]() -> std::optional<double> {
+            char* end = nullptr;
+            const double parsed = std::strtod(buffer, &end);
+            if (end == buffer || *end != '\0') return std::nullopt;
+            return parsed;
+        };
+        const auto flag = [&]() -> std::optional<bool> {
+            if (value == "1") return true;
+            if (value == "0") return false;
+            return std::nullopt;
+        };
+        if (key == "intensity") { const auto n = number(); if (!inRange(n, 0.0, 2.0)) return std::nullopt; options.intensity = float(*n); }
+        else if (key == "tone") { const auto n = number(); if (!inRange(n, 0.0, 2.0)) return std::nullopt; options.localTone = float(*n); }
+        else if (key == "structure") { const auto n = number(); if (!inRange(n, 0.0, 2.0)) return std::nullopt; options.localStructure = float(*n); }
+        else if (key == "skin") { const auto n = number(); if (!inRange(n, -1.0, 2.0)) return std::nullopt; options.skinStructure = float(*n); }
+        else if (key == "mask") { const auto b = flag(); if (!b) return std::nullopt; options.autoMask = *b; }
+        else if (key == "maxratio") { const auto n = number(); if (!inRange(n, 1.0, 8.0)) return std::nullopt; options.maxRatio = float(*n); }
+        else if (key == "history") { const auto n = number(); if (!inRange(n, 0.0, 1.0)) return std::nullopt; options.historyStrength = float(*n); }
+        else if (key == "apply") { const auto b = flag(); if (!b) return std::nullopt; options.applyModel = *b; }
+        else if (key == "pre") { const auto b = flag(); if (!b) return std::nullopt; options.preprocess = *b; }
+        else if (key == "int4") { const auto b = flag(); if (!b) return std::nullopt; options.int4Mixed = *b; }
+        else if (key == "drs") {
+            // An unsigned field, so a fractional or negative value is refused
+            // before the cast rather than converted to something arbitrary.
+            const auto n = number();
+            if (!inRange(n, 0.0, 2.0) || *n != std::floor(*n)) return std::nullopt;
+            options.drsMode = uint32_t(*n);
+        }
+        else return std::nullopt;
+        ++seen;
+    }
+    if (seen != 11) return std::nullopt;
+    return options;
+}
+
 // Whether this backend's render reads `NeuralSettings` - the add-on's own panel
 // - at all.
 //
@@ -60,13 +254,16 @@ constexpr std::optional<NeuralBackend> ParseNeuralBackend(std::string_view name)
 //     0.44 Small network (31 blocks at 0.5x) against the Original 71-block one,
 //     the other spelling of the one DLSS5_MULTI_PASS key. The rung, the skin
 //     switch and the multi-pass switches travel outside this struct, so no
-//     other value of THIS struct reaches a pixel. The
-//     job's key carries the pair in AmdNeuralSettingsDocument(), and the
-//     retention key carries it through CanonicalNeuralSettingsForBackend();
-//     ApplyNeuralSettings restarts an AMD session when either moved, and a
-//     caller that wires a further panel value through to this backend must flip
-//     all three in the same change, or the picture moves and neither the keys
-//     nor the session follow it.
+//     other value of THIS struct reaches a pixel.
+//
+//     The runtime and the Mochizuki controls are the same kind of term as the
+//     count: the job's key carries both in AmdNeuralSettingsDocument(), and that
+//     document's digest is a term of NeuralCacheIdentity - which is the render
+//     key - so a job cannot be served frames built by the other runtime, or
+//     under a control that has since moved. ApplyNeuralSettings restarts an AMD
+//     session when the document moved. A caller that wires a further panel value
+//     through to this backend has to add it to the document in the same change,
+//     or the picture moves and the key does not follow it.
 //
 // The interesting case is the one this leaves out rather than the one it
 // covers. `NeuralSettings` is the add-on's struct: the same dialog also holds
@@ -96,6 +293,12 @@ enum class NeuralRenderPhase {
     Preflight,
     Paused,
     Recovering,
+    // The AMD Mochizuki runtime compiles its network on first use and answers
+    // UNAVAILABLE until it is done: 66-73 s the first time this driver ever sees
+    // the model, 1.5-1.8 s afterwards. Nothing is being decoded, rendered or
+    // encoded while that runs, so it is its own phase rather than a shade of
+    // "preparing" - the wait is the whole story of it.
+    BuildingNetwork,
 };
 
 // Explicit failure classification. Every failed job names exactly one kind so

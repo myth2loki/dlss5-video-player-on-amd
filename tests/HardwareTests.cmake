@@ -379,3 +379,13 @@ target_compile_definitions(AmdLmxxfEvaluatorSmoke PRIVATE
 add_test(NAME AmdLmxxfEvaluatorSmoke COMMAND AmdLmxxfEvaluatorSmoke)
 set_tests_properties(AmdLmxxfEvaluatorSmoke PROPERTIES
     LABELS gpu SKIP_RETURN_CODE 125 TIMEOUT 1800)
+
+# A measuring instrument, not a test: it renders one raw BGRA sequence through
+# both runtimes and dumps every frame of each, so the two pictures can be scored
+# against each other and against a clean reference. It asserts nothing and its
+# exit code only reports whether both arms produced their frames, which is why
+# it is built but not registered with ctest - there is no pass or fail here, only
+# a measurement someone has to read.
+dlss_video_player_test(AmdNrAbCompare tests/AmdNrAbCompare.cpp)
+target_compile_definitions(AmdNrAbCompare PRIVATE
+    "DLSS5_AMD_RUNTIME_DIR=\"${CMAKE_SOURCE_DIR}/amd-neural-runtime\"")

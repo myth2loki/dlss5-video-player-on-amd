@@ -410,6 +410,14 @@ static constexpr int IDC_NS_SKIN_PROTECT = 7351;
 static constexpr int IDC_NS_MP_PREDICT = 7352;
 static constexpr int IDC_NS_MP_SKIP = 7353;
 static constexpr int IDC_NS_TEMPORAL_MODE = 7354;
+// The Mochizuki group. Its own block of ids so nothing can be read or written by
+// a dialog that did not build it: on lmxxf and on NVIDIA these controls do not
+// exist, and every reader here guards on the handle.
+static constexpr int IDC_NS_MZ_MAXRATIO = 7370;
+static constexpr int IDC_NS_MZ_HISTORY = 7371;
+static constexpr int IDC_NS_MZ_APPLY = 7372;
+static constexpr int IDC_NS_MZ_PREPROCESS = 7373;
+static constexpr int IDC_NS_MZ_INT4 = 7374;
 // The preset strip, the line that says what the preset does, the line that
 // says what Apply will do, and the way across to Image adjustments.
 static constexpr int IDC_NS_PRESET = 7342;
@@ -2235,6 +2243,7 @@ struct StartScreenAnswers {
     uint64_t generation{};
     start_screen::RuntimeState runtime{start_screen::RuntimeState::Checking};
     std::wstring runtimeVersion;
+    bool runtimeDigestsPinned{true};
     struct Render{std::wstring badge;std::optional<TimelineMediaWorker::Thumbnail> thumbnail;};
     std::map<std::string,Render> renders;   // by render key
 };
@@ -2264,16 +2273,72 @@ static start_screen::RuntimeState CheckNeuralRuntime(const std::filesystem::path
 // after it. The check runs on the caller's own thread, where the lock check for
 // the other backend already runs, and costs a re-hash only of what changed:
 // Sha256FileCached holds every file the startup probe read.
+// Defined below with the other saved-setting readers; the start screen asks for
+// it before they appear in this file.
+static AmdNrRuntime ReadSavedAmdNrRuntime(const std::filesystem::path& settingsPath);
+
 static start_screen::RuntimeState CheckAmdRuntime(const std::filesystem::path& runtimeDirectory, std::stop_token stop,
-                                                  std::wstring& detail)
+                                                  std::wstring& detail, bool* digestsPinned = nullptr)
 {
     if(runtimeDirectory.empty())return start_screen::RuntimeState::Absent;
+    // A mochizuki tree is not the tree the digest lock was written for: it ships
+    // its own model, shaders and ACO bundle and no SHA256SUMS this player pins,
+    // so VerifyAmdRuntimeLock can only answer "drifted" for it. Presence of the
+    // three files the runtime cannot start without is what can be honestly
+    // checked here; the model's own per-entry verification happens inside the
+    // runtime when it loads dlssnr.bin.
+    {
+        const auto settingsDirectory=platform_paths::ModuleDirectory();
+        const std::filesystem::path settingsPath=
+            (settingsDirectory?*settingsDirectory:std::filesystem::current_path())/L"DLSSVideoPlayer.ini";
+        if(ReadSavedAmdNrRuntime(settingsPath)==AmdNrRuntime::Mochizuki){
+            // The module and the model are files; the shader bundle is a
+            // directory, and `exists` would accept an empty file of that name
+            // and let the session fail seconds later with a message about the
+            // network instead of about the pack.
+            const auto missingFile=[&](const wchar_t* relative){
+                std::error_code error;
+                return !std::filesystem::is_regular_file(runtimeDirectory/relative,error);
+            };
+            std::wstring missing;
+            if(missingFile(L"MochizukiNrRuntime.dll"))missing+=L"runtime";
+            if(missingFile(L"dlssnr-amd\\dlssnr.bin")){
+                if(!missing.empty())missing+=L", ";
+                missing+=L"model";
+            }
+            {
+                std::error_code shadersError;
+                if(!std::filesystem::is_directory(runtimeDirectory/L"dlssnr-amd\\shaders",shadersError)){
+                    if(!missing.empty())missing+=L", ";
+                    missing+=L"shaders";
+                }
+            }
+            if(!missing.empty()){
+                detail=L"mochizuki pack is missing "+missing;
+                // The other runtime can sit in the same pack, one menu choice
+                // away: a viewer who set this by hand should not read the line
+                // as "the neural runtime is gone".
+                std::error_code lmxxfError;
+                if(std::filesystem::is_regular_file(runtimeDirectory/L"LmxxfNrRuntime.dll",lmxxfError))
+                    detail+=L"; the lmxxf runtime beside it is complete";
+                return start_screen::RuntimeState::Absent;
+            }
+            // The start screen's job here is to say which runtime is armed, not
+            // just that one is: the two are different networks, and a viewer who
+            // set the INI by hand has no other place to confirm it took.
+            // No digest claim for this tree, and no repeat of its name inside
+            // the parentheses: the line already says which runtime it is.
+            detail=L"mochizuki \u00b7 model, shaders and ACO bundle";
+            if(digestsPinned)*digestsPinned=false;
+            return start_screen::RuntimeState::Verified;
+        }
+    }
     const std::vector<AmdRuntimeCheck> checks=VerifyAmdRuntimeLock(runtimeDirectory,stop);
     if(stop.stop_requested())return start_screen::RuntimeState::Checking;
     if(!AmdRuntimeLockSatisfied(checks))return start_screen::RuntimeState::Drifted;
     size_t published=0;
     for(const AmdRuntimeCheck& check:checks)if(check.digestPublished)++published;
-    detail=std::to_wstring(published)+L" files";
+    detail=L"lmxxf \u00b7 "+std::to_wstring(published)+L" files";
     return start_screen::RuntimeState::Verified;
 }
 
@@ -2286,13 +2351,14 @@ static void GatherStartScreen(StartScreenRequest request,std::shared_ptr<StartSc
     };
     std::wstring runtimeDetail;
     start_screen::RuntimeState runtime=start_screen::RuntimeState::Checking;
-    if(request.backend==NeuralBackend::Amd)runtime=CheckAmdRuntime(request.amdRuntimeDirectory,stop,runtimeDetail);
+    bool digestsPinned=true;
+    if(request.backend==NeuralBackend::Amd)runtime=CheckAmdRuntime(request.amdRuntimeDirectory,stop,runtimeDetail,&digestsPinned);
     else{
         runtime=CheckNeuralRuntime(request.moduleDirectory,stop);
         runtimeDetail=Utf8ToWide(EmbeddedRuntimeLock().runtimeVersion);
     }
     if(stop.stop_requested())return;
-    if(!publish([&](StartScreenAnswers& a){a.runtime=runtime;a.runtimeVersion=runtimeDetail;}))return;
+    if(!publish([&](StartScreenAnswers& a){a.runtime=runtime;a.runtimeVersion=runtimeDetail;a.runtimeDigestsPinned=digestsPinned;}))return;
     const std::filesystem::path ffmpeg=request.moduleDirectory/L"ffmpeg.exe";
     std::error_code toolError;const bool haveFfmpeg=std::filesystem::is_regular_file(ffmpeg,toolError);
     for(const auto& recent:request.recent){
@@ -2402,11 +2468,76 @@ static bool ReadSavedAmdMultiPassSkip(const std::filesystem::path& settingsPath)
 // section rather than beside the add-on's keys. Anything unreadable or out of
 // range falls back to 1 - the runtime's own answer for a value that is not
 // exactly 0, 1 or 2.
+// Which runtime inside the AMD pack this machine renders with. Stored by name
+// rather than by index so a hand-edited INI says what it means, and absent means
+// lmxxf - the runtime every render before this key existed used.
+// The Mochizuki runtime's own knobs, one key each in [AmdNeural] so the file
+// stays readable and hand-editable. The five look values that share a name with
+// NeuralSettings are NOT here: those live in [NeuralSettings] already, and a
+// second copy would be a second answer to "what is Intensity".
+static float ReadSavedFloat(const wchar_t* section, const wchar_t* key, float fallback,
+                            const std::filesystem::path& settingsPath)
+{
+    wchar_t text[32]{};
+    const DWORD length=GetPrivateProfileStringW(section,key,L"",text,
+        static_cast<DWORD>(std::size(text)),settingsPath.c_str());
+    if(length==0)return fallback;
+    wchar_t* end=nullptr;
+    const double value=std::wcstod(text,&end);
+    if(end==text||!std::isfinite(value))return fallback;
+    return static_cast<float>(value);
+}
+
+static MochizukiOptions ReadSavedMochizukiOptions(const std::filesystem::path& settingsPath)
+{
+    const MochizukiOptions defaults{};
+    MochizukiOptions options;
+    // Clamped where the runtime would clamp them: a hand-edited 12 for MaxRatio
+    // must not reach the network, and the panel would then show a value the
+    // render did not use.
+    options.maxRatio=std::clamp(ReadSavedFloat(L"AmdNeural",L"MochizukiMaxRatio",defaults.maxRatio,settingsPath),1.0f,8.0f);
+    options.historyStrength=std::clamp(ReadSavedFloat(L"AmdNeural",L"MochizukiHistory",defaults.historyStrength,settingsPath),0.0f,1.0f);
+    options.applyModel=GetPrivateProfileIntW(L"AmdNeural",L"MochizukiApply",defaults.applyModel?1:0,settingsPath.c_str())!=0;
+    options.preprocess=GetPrivateProfileIntW(L"AmdNeural",L"MochizukiPreprocess",defaults.preprocess?1:0,settingsPath.c_str())!=0;
+    options.int4Mixed=GetPrivateProfileIntW(L"AmdNeural",L"MochizukiInt4",defaults.int4Mixed?1:0,settingsPath.c_str())!=0;
+    options.drsMode=std::min<uint32_t>(static_cast<uint32_t>(GetPrivateProfileIntW(L"AmdNeural",L"MochizukiDrs",
+        static_cast<int>(defaults.drsMode),settingsPath.c_str())),2u);
+    return options;
+}
+
+static AmdNrRuntime ReadSavedAmdNrRuntime(const std::filesystem::path& settingsPath)
+{
+    wchar_t buffer[32]{};
+    GetPrivateProfileStringW(L"AmdNeural",L"Runtime",L"mochizuki",buffer,
+                             static_cast<DWORD>(std::size(buffer)),settingsPath.c_str());
+    const amd_lmxxf::NrKind kind = _wcsicmp(buffer,L"mochizuki")==0
+        ? amd_lmxxf::NrKind::Mochizuki : amd_lmxxf::NrKind::Lmxxf;
+    return kind==amd_lmxxf::NrKind::Mochizuki?AmdNrRuntime::Mochizuki:AmdNrRuntime::Lmxxf;
+}
+
 static uint32_t ReadSavedAmdStyle(const std::filesystem::path& settingsPath)
 {
     return amd_lmxxf::NormalizedAmdStyle(static_cast<uint32_t>(
         GetPrivateProfileIntW(L"AmdNeural",L"Style",int(amd_lmxxf::kAmdStyleDefault),
                               settingsPath.c_str())));
+}
+
+// The pass count a session starts at when nothing was saved, and the one Reset
+// returns to. Mochizuki takes two of its own: the three-pass AMD default is
+// lmxxf's, where the count is stacked with the later-pass skip that keeps its
+// ghosting down, and Mochizuki's column has neither that switch nor a Small rung -
+// so three passes are three rebuilds with nothing holding them back, which the A/B
+// bench measures as both the most ghosting and the least detail of the three
+// (2.55 against 2.03 at two and 1.51 at one; detail 0.779 against 0.822 and 0.945).
+// Two is where this ends up rather than one: it is the rung the picture was judged
+// at, the extra rebuild buys the part of the look one pass leaves out, and the
+// ghosting it adds over one pass is the half the runtime's own controls can still
+// be moved to take back. One remains reachable in the panel for anyone who would
+// rather have the steadier picture.
+static uint32_t DefaultPassesFor(NeuralBackend backend,AmdNrRuntime runtime) noexcept
+{
+    if(backend==NeuralBackend::Amd&&runtime==AmdNrRuntime::Mochizuki)return 2u;
+    return PassesSettingsDefault(backend);
 }
 
 // The 0.44 Small model (31 blocks at 0.5x) against the Original 71-block one,
@@ -2495,6 +2626,13 @@ struct NeuralJobInputs {
     // is restarted for a moved count (ApplyNeuralSettings) and would otherwise
     // relaunch under the number it was started with.
     uint32_t amdPasses{1};
+    // Which runtime inside the AMD pack (NeuralRenderRequest::amdNrRuntime), read
+    // from the same saved value the style comes from.
+    AmdNrRuntime amdNrRuntime{AmdNrRuntime::Mochizuki};
+    // The Mochizuki runtime's own controls, look knobs included (they are copied
+    // in from `settings` where the job is built, so one panel value feeds both
+    // backends).
+    MochizukiOptions mochizuki{};
     // The runtime's multi-pass skin switch, same road as the count (see
     // RenderSettings::amdSkinProtect).
     bool amdSkinProtect{false};
@@ -2717,6 +2855,7 @@ private:
     // feature-18 probe is paid for.
     bool PrepareAmdRuntime(){
         runtimeDirectory_=in_.amdRuntimeDirectory;
+        const bool mochizuki=in_.amdNrRuntime==AmdNrRuntime::Mochizuki;
         const auto runtimeStarted=std::chrono::steady_clock::now();
         // Discovered rather than declared: this backend's runtime is a tree of
         // modules and weights, and the manifests inside it name their own
@@ -2724,9 +2863,39 @@ private:
         // shader cache, so a warmed cache cannot change a render's identity.
         // 565 MiB of weights are hashed here on the first job of a session;
         // Sha256FileCached makes every later job in it free.
-        const std::vector<std::wstring> identity=AmdRuntimeIdentityFiles(runtimeDirectory_);
+        //
+        // A Mochizuki tree has none of that: its identity is one DLL, one 147 MiB
+        // model and a shader corpus, and its model carries a 599-entry verifier
+        // inside that the runtime runs when it loads the file. So the identity is
+        // built from what this tree actually is, and the lmxxf manifest lock is
+        // not consulted at all - it would answer "drifted" for every file it
+        // never expected to see.
+        std::vector<std::wstring> identity;
+        if(mochizuki){
+            identity.emplace_back(L"MochizukiNrRuntime.dll");
+            identity.emplace_back(L"dlssnr-amd/dlssnr.bin");
+            std::error_code iterateError;
+            const std::filesystem::path shaderRoot=runtimeDirectory_/L"dlssnr-amd"/L"shaders";
+            for(std::filesystem::recursive_directory_iterator it(shaderRoot,iterateError),end;
+                !iterateError&&it!=end;it.increment(iterateError)){
+                if(!it->is_regular_file())continue;
+                identity.push_back(std::filesystem::relative(it->path(),runtimeDirectory_).generic_wstring());
+            }
+            if(identity.size()<3){
+                completion_->result.failure=NeuralRenderFailure::Preflight;
+                completion_->result.detail=L"The Mochizuki pack is incomplete: "+runtimeDirectory_.wstring()+
+                                            L" needs MochizukiNrRuntime.dll, dlssnr-amd/dlssnr.bin and dlssnr-amd/shaders.";
+                return false;
+            }
+        }else{
+            identity=AmdRuntimeIdentityFiles(runtimeDirectory_);
+        }
         runtimeDigest_=BuildRuntimeDigest(runtimeDirectory_,identity,stop_);
         if(!runtimeDigest_){completion_->result.cancelled=stop_.stop_requested();completion_->result.detail=L"The configured AMD neural runtime is incomplete.";return false;}
+        if(mochizuki){
+            LOG("Mochizuki neural runtime identified: digest over "<<identity.size()<<" files (model, shaders and the DLL; the lmxxf manifest lock does not apply).");
+            runtimeLockNote_=L"mochizuki \u00b7 model and shaders present";
+        }else{
         const auto lockStarted=std::chrono::steady_clock::now();
         const std::vector<AmdRuntimeCheck> checks=VerifyAmdRuntimeLock(runtimeDirectory_,stop_);
         if(stop_.stop_requested())return Cancelled();
@@ -2742,6 +2911,7 @@ private:
             return false;
         }
         runtimeLockNote_=DescribeAmdRuntimeVerified(checks);
+        }
         // One writer at a time, for a smaller reason than on NVIDIA and the same
         // one in kind: nothing in this tree is rewritten per job, but the runtime
         // compiles into shaders/ on first use, and two players sharing one pack
@@ -2749,7 +2919,10 @@ private:
         // named mutex derived from the directory, so it costs the tree nothing.
         lease_.emplace(runtimeDirectory_);
         if(!lease_->Held()){completion_->result.failure=NeuralRenderFailure::Preflight;completion_->result.detail=L"Another neural render is using the experimental runtime. Wait for it to finish, then try again.";LOG("AMD neural runtime is in use by another render; refusing to share it.");return false;}
-        settingsSnapshot_=AmdNeuralSettingsDocument(in_.temporal.stability,in_.amdPasses,in_.amdSmallModel,in_.amdSkinProtect,in_.amdMultiPassPredict,in_.amdMultiPassSkip,in_.amdStyle,in_.amdTemporalMode);
+        // The Mochizuki controls are part of the key only when they are not the
+        // runtime's defaults: the empty string leaves every earlier key as it was.
+        settingsSnapshot_=AmdNeuralSettingsDocument(in_.temporal.stability,in_.amdPasses,in_.amdSmallModel,in_.amdSkinProtect,in_.amdMultiPassPredict,in_.amdMultiPassSkip,in_.amdStyle,in_.amdTemporalMode,AmdNrRuntimeName(in_.amdNrRuntime),
+            in_.amdNrRuntime==AmdNrRuntime::Mochizuki?FormatMochizukiOptions(in_.mochizuki):std::string{});
         settingsDigest_=Sha256Bytes(*settingsSnapshot_);
         if(!settingsDigest_){completion_->result.detail=L"The neural settings digest could not be computed.";return false;}
         return true;
@@ -2939,7 +3112,7 @@ private:
         staging_=cache_.BeginRenderStaging(renderKey_);if(!staging_){completion_->result.detail=in_.cacheFailureText.Describe(cache_);return false;}
         {std::ofstream settingsFile(*staging_/L"neural-settings.ini",std::ios::binary|std::ios::trunc);settingsFile.write(settingsSnapshot_->data(),static_cast<std::streamsize>(settingsSnapshot_->size()));if(!settingsFile){cache_.MarkInvalid(*staging_);completion_->result.detail=L"The neural settings snapshot could not be staged.";return false;}}
         const auto& range=in_.range;
-        NeuralRenderRequest request{nullptr,sourcePath_,liveIndex?liveDirectory/L"neural.mkv":*staging_/L"neural.mkv",width_,height_,fps_,duration_};request.jobId=in_.generation;request.range=range;request.prerollFrames=PrerollFramesFor(range,fps_);request.guides=in_.guides;request.temporal=in_.temporal;request.amdPasses=in_.amdPasses;request.amdSmallModel=in_.amdSmallModel;request.amdSkinProtect=in_.amdSkinProtect;request.amdMultiPassPredict=in_.amdMultiPassPredict;request.amdMultiPassSkip=in_.amdMultiPassSkip;request.amdStyle=in_.amdStyle;request.pauseEvent=in_.pauseEvent;request.segmentFrames=liveIndex?in_.segmentFrames:0u;request.firstSegmentFrames=liveIndex?in_.firstSegmentFrames:0u;request.gpuColorConversion=in_.gpuColorConversion;request.nvencPreset=in_.nvencPreset;request.gpuSourceConversion=in_.gpuSourceConversion;request.processingScale=in_.processingScale;request.captureDither=in_.captureDither;request.quality=in_.cacheQuality;request.sourceDeband=in_.sourceDeband;request.suppliedExposure=in_.suppliedExposure;
+        NeuralRenderRequest request{nullptr,sourcePath_,liveIndex?liveDirectory/L"neural.mkv":*staging_/L"neural.mkv",width_,height_,fps_,duration_};request.jobId=in_.generation;request.range=range;request.prerollFrames=PrerollFramesFor(range,fps_);request.guides=in_.guides;request.temporal=in_.temporal;request.amdPasses=in_.amdPasses;request.amdSmallModel=in_.amdSmallModel;request.amdSkinProtect=in_.amdSkinProtect;request.amdMultiPassPredict=in_.amdMultiPassPredict;request.amdMultiPassSkip=in_.amdMultiPassSkip;request.amdStyle=in_.amdStyle;request.amdNrRuntime=in_.amdNrRuntime;request.mochizuki=in_.mochizuki;request.pauseEvent=in_.pauseEvent;request.segmentFrames=liveIndex?in_.segmentFrames:0u;request.firstSegmentFrames=liveIndex?in_.firstSegmentFrames:0u;request.gpuColorConversion=in_.gpuColorConversion;request.nvencPreset=in_.nvencPreset;request.gpuSourceConversion=in_.gpuSourceConversion;request.processingScale=in_.processingScale;request.captureDither=in_.captureDither;request.quality=in_.cacheQuality;request.sourceDeband=in_.sourceDeband;request.suppliedExposure=in_.suppliedExposure;
         // Which backend runs the pass, and - on the AMD one - the tree it loads
         // its module from. The worker executable is not on this line for the
         // reason the export gives: one binary serves both backends and always
@@ -6213,6 +6386,8 @@ private:
         m_amdMultiPassPredict=ReadSavedAmdMultiPassPredict(SettingsPath());
         m_amdMultiPassSkip=ReadSavedAmdMultiPassSkip(SettingsPath());
         m_amdStyle=ReadSavedAmdStyle(SettingsPath());
+        m_amdNrRuntime=ReadSavedAmdNrRuntime(SettingsPath());
+        m_mochizuki=ReadSavedMochizukiOptions(SettingsPath());
         m_amdSmallModel=ReadSavedAmdSmallModel(SettingsPath());
         m_amdTemporalMode=ReadSavedAmdTemporalMode(SettingsPath(),m_opt.amdRuntimeDirectory);
         }
@@ -6242,8 +6417,9 @@ private:
         m_neuralSettings={};
         // The backend's own default before the file is read, so a machine that
         // never touched the count starts at that backend's measured combination
-        // rather than at one pass everywhere.
-        m_neuralSettings.passes=PassesSettingsDefault(m_opt.neuralBackend);
+        // rather than at one pass everywhere - and Mochizuki at its own count,
+        // which is not lmxxf's (see DefaultPassesFor).
+        m_neuralSettings.passes=DefaultPassesFor(m_opt.neuralBackend,m_amdNrRuntime);
         LoadNeuralSettings(SettingsPath(),m_neuralSettings);
         const int mode=static_cast<int>(GetPrivateProfileIntW(L"Comparison",L"Mode",0,SettingsPath().c_str()));
         m_comparison={};
@@ -6394,6 +6570,29 @@ private:
         // (which LoadNeuralSettings reads from [NeuralSettings] Style).
         WritePrivateProfileStringW(L"AmdNeural",L"Style",
             std::to_wstring(amd_lmxxf::NormalizedAmdStyle(m_amdStyle)).c_str(),SettingsPath().c_str());
+        // Which runtime inside the pack, in the same section: it decides which
+        // module and which frame contract the render uses, so a machine that
+        // pressed "mochizuki" must find the same answer on the next start.
+        WritePrivateProfileStringW(L"AmdNeural",L"Runtime",
+            AmdNrRuntimeName(m_amdNrRuntime)==std::string_view("mochizuki")?L"mochizuki":L"lmxxf",
+            SettingsPath().c_str());
+        // The Mochizuki panel's own values (see ReadSavedMochizukiOptions): the
+        // look knobs it shares with NVIDIA are in [NeuralSettings], these are the
+        // ones only this runtime has.
+        {
+            wchar_t number[32]{};
+            auto writeFloat=[&](const wchar_t* key,float value){
+                swprintf_s(number,L"%.2f",double(value));
+                WritePrivateProfileStringW(L"AmdNeural",key,number,SettingsPath().c_str());
+            };
+            writeFloat(L"MochizukiMaxRatio",m_mochizuki.maxRatio);
+            writeFloat(L"MochizukiHistory",m_mochizuki.historyStrength);
+            WritePrivateProfileStringW(L"AmdNeural",L"MochizukiApply",m_mochizuki.applyModel?L"1":L"0",SettingsPath().c_str());
+            WritePrivateProfileStringW(L"AmdNeural",L"MochizukiPreprocess",m_mochizuki.preprocess?L"1":L"0",SettingsPath().c_str());
+            WritePrivateProfileStringW(L"AmdNeural",L"MochizukiInt4",m_mochizuki.int4Mixed?L"1":L"0",SettingsPath().c_str());
+            swprintf_s(number,L"%u",m_mochizuki.drsMode);
+            WritePrivateProfileStringW(L"AmdNeural",L"MochizukiDrs",number,SettingsPath().c_str());
+        }
         // The temporal mode, in the same section: it is not a multi-pass
         // switch, and it is the one set of rungs whose value decides whether
         // the model above is the one that runs.
@@ -7102,6 +7301,20 @@ private:
                 for(UINT style=0;style<IDM_NEURAL_AMD_STYLE_COUNT;++style)
                     EnableMenuItem(owner,IDM_NEURAL_AMD_STYLE_FIRST+style,styleState);
             }
+            // Which runtime, the style block's neighbour and the same rule: a
+            // row that cannot change a pixel on this backend is greyed rather
+            // than clickable.
+            if(const HMENU owner=app_menu::FindMenuContainingCommand(menu,IDM_NEURAL_AMD_RUNTIME_FIRST)){
+                CheckMenuRadioItem(owner,IDM_NEURAL_AMD_RUNTIME_FIRST,
+                                   IDM_NEURAL_AMD_RUNTIME_FIRST+IDM_NEURAL_AMD_RUNTIME_COUNT-1,
+                                   UINT(IDM_NEURAL_AMD_RUNTIME_FIRST+
+                                        (m_amdNrRuntime==AmdNrRuntime::Mochizuki?1u:0u)),
+                                   MF_BYCOMMAND);
+                const UINT runtimeState=MF_BYCOMMAND|
+                    (m_opt.neuralBackend==NeuralBackend::Amd?MF_ENABLED:MF_GRAYED);
+                for(UINT which=0;which<IDM_NEURAL_AMD_RUNTIME_COUNT;++which)
+                    EnableMenuItem(owner,IDM_NEURAL_AMD_RUNTIME_FIRST+which,runtimeState);
+            }
             CheckMenuRadioItem(menu,IDM_PROCESSING_SCALE_FIRST,IDM_PROCESSING_SCALE_LAST,
                                app_menu::CommandForProcessingScale(m_processingScale),MF_BYCOMMAND);
             CheckMenuRadioItem(menu,IDM_UPSCALE_HISTORY_TEMPORAL,IDM_UPSCALE_HISTORY_PER_FRAME,
@@ -7355,6 +7568,25 @@ private:
         info.lpszText=m_callbackTip.data();info.szText[0]=L'\0';info.hinst=nullptr;
         return 0;
     }
+    // The neural pill's tip names the runtime that will render. The pill itself
+    // cannot: it is 270 dip and its longest arm ("Queued for the seek") already
+    // uses the width, which is the same measurement that ruled out a longer
+    // label for the upscaling pill. A hover has no such budget, and this is the
+    // question the pill otherwise leaves open - the same toggle runs one of two
+    // networks that look nothing alike.
+    std::wstring NeuralPillTip(const wchar_t* key){
+        // The static sentence is NVIDIA's ("through NVIDIA's neural model"), and
+        // on this backend that is simply false: the pill starts one of the AMD
+        // runtimes, each with its own model. The AMD sentence says "the AMD
+        // runtime on this machine" and the line below names which one.
+        std::wstring tip=T(m_opt.neuralBackend==NeuralBackend::Amd?L"toolbar.tip.neural.amd":key);
+        if(m_opt.neuralBackend!=NeuralBackend::Amd)return tip;
+        tip+=L"\n";
+        tip+=T(m_amdNrRuntime==AmdNrRuntime::Mochizuki?L"neural.tip.runtime.mochizuki"
+                                                     :L"neural.tip.runtime.lmxxf");
+        return tip;
+    }
+
     void RefreshToolbarTips(){
         if(!m_hwnd||!IsWindow(m_hwnd))return;
         const auto items=FocusableItems();
@@ -7372,6 +7604,23 @@ private:
             const UINT_PTR id=static_cast<UINT_PTR>(action);
             TTTOOLINFOW info{};info.cbSize=TTTOOLINFOW_V2_SIZE;info.uFlags=TTF_SUBCLASS;
             info.hwnd=m_hwnd;info.uId=id;
+            // The neural pill's sentence has one variable in it - which runtime
+            // is selected - so it is rebuilt here and pushed onto a tool that is
+            // already registered. Every other tool's text is fixed.
+            if(action==ToolbarAction::ToggleNeuralRendering){
+                m_neuralPillTip=NeuralPillTip(key);
+                if(SendMessageW(host,TTM_GETTOOLINFOW,0,reinterpret_cast<LPARAM>(&info))){
+                    info.lpszText=m_neuralPillTip.data();
+                    info.rect=bounds;
+                    SendMessageW(host,TTM_UPDATETIPTEXTW,0,reinterpret_cast<LPARAM>(&info));
+                    SendMessageW(host,TTM_NEWTOOLRECTW,0,reinterpret_cast<LPARAM>(&info));
+                    continue;
+                }
+                info.lpszText=m_neuralPillTip.data();
+                info.rect=bounds;
+                SendMessageW(host,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&info));
+                continue;
+            }
             // Present already: move it. The control moved, the sentence did not.
             if(SendMessageW(host,TTM_GETTOOLINFOW,0,reinterpret_cast<LPARAM>(&info))){
                 info.rect=bounds;
@@ -7765,6 +8014,15 @@ private:
         SetTrack(h,IDC_NS_TONE,0,200,int(std::lround(m_neuralSettings.localTone*100.0f)));
         SetTrack(h,IDC_NS_SKIN,0,skin_structure::kSliderMax,skin_structure::SliderPosition(m_neuralSettings.skinStructure));
         SetTrack(h,IDC_NS_COLOR,0,100,int(std::lround(m_neuralSettings.colorStrength*100.0f)));
+        // The Mochizuki group: absent unless that runtime is the one rendering,
+        // so each one is written only when its handle exists.
+        SetTrack(h,IDC_NS_MZ_MAXRATIO,100,800,int(std::lround(m_mochizuki.maxRatio*100.0f)));
+        SetTrack(h,IDC_NS_MZ_HISTORY,0,100,int(std::lround(m_mochizuki.historyStrength*100.0f)));
+        SetAdjustmentValue(h,IDC_NS_MZ_MAXRATIO,PlainValue(m_mochizuki.maxRatio));
+        SetAdjustmentValue(h,IDC_NS_MZ_HISTORY,PlainValue(m_mochizuki.historyStrength));
+        SetCheckBoxState(GetDlgItem(h,IDC_NS_MZ_APPLY),m_mochizuki.applyModel);
+        SetCheckBoxState(GetDlgItem(h,IDC_NS_MZ_PREPROCESS),m_mochizuki.preprocess);
+        SetCheckBoxState(GetDlgItem(h,IDC_NS_MZ_INT4),m_mochizuki.int4Mixed);
         const auto select=[&](int id,int index){if(HWND combo=GetDlgItem(h,id))SendMessageW(combo,CB_SETCURSEL,static_cast<WPARAM>(index),0);};
         select(IDC_NS_STYLE,std::clamp(m_neuralSettings.style,0,2));
         // The combo lists 1..4 and the setting IS the pass count, so the
@@ -7773,8 +8031,16 @@ private:
         // count - the runtime's own F9 ladder, 0.5/1/2/3 - so there the index
         // IS the rung: 0 is the model and the count sits AT its index, one
         // above the NVIDIA ladder's. NVIDIA keeps the add-on's 1..4 ladder.
+        //
+        // Mochizuki has neither the Small rung nor a fourth rung: its column
+        // lists three counts, so its index is one below the count like NVIDIA's
+        // is. Reading it through the lmxxf mapping put the count at an index that
+        // does not exist in a three-item list - a session at three passes showed
+        // an empty combo, and one at two showed "3 passes".
         if(m_opt.neuralBackend==NeuralBackend::Amd)
-            select(IDC_NS_PASSES,m_amdSmallModel?0:std::clamp(m_neuralSettings.passes,1,3));
+            select(IDC_NS_PASSES,m_amdNrRuntime==AmdNrRuntime::Mochizuki
+                                     ?std::clamp(m_neuralSettings.passes,1,3)-1
+                                     :(m_amdSmallModel?0:std::clamp(m_neuralSettings.passes,1,3)));
         else
             select(IDC_NS_PASSES,std::clamp(m_neuralSettings.passes,1,4)-1);
         // The combo lists the rungs in the enum's own order, so the index IS the rung.
@@ -7803,6 +8069,15 @@ private:
         m_neuralSettings.localTone=float(pos(IDC_NS_TONE))/100.0f;
         m_neuralSettings.skinStructure=skin_structure::FromSliderPosition(pos(IDC_NS_SKIN));
         m_neuralSettings.colorStrength=float(pos(IDC_NS_COLOR))/100.0f;
+        // Only when this dialog built them: on the other backends these ids do
+        // not exist and reading them would write the fallback over a saved value.
+        if(HWND ratio=GetDlgItem(h,IDC_NS_MZ_MAXRATIO))
+            m_mochizuki.maxRatio=std::clamp(float(int(SendMessageW(ratio,TBM_GETPOS,0,0)))/100.0f,1.0f,8.0f);
+        if(HWND history=GetDlgItem(h,IDC_NS_MZ_HISTORY))
+            m_mochizuki.historyStrength=std::clamp(float(int(SendMessageW(history,TBM_GETPOS,0,0)))/100.0f,0.0f,1.0f);
+        if(HWND box=GetDlgItem(h,IDC_NS_MZ_APPLY))m_mochizuki.applyModel=CheckBoxState(box);
+        if(HWND box=GetDlgItem(h,IDC_NS_MZ_PREPROCESS))m_mochizuki.preprocess=CheckBoxState(box);
+        if(HWND box=GetDlgItem(h,IDC_NS_MZ_INT4))m_mochizuki.int4Mixed=CheckBoxState(box);
         m_neuralSettings.style=sel(IDC_NS_STYLE,m_neuralSettings.style);
         m_neuralSettings.autoMask=checked(IDC_NS_AUTOMASK);
         // The AMD ladder's first rung is the Small model: it reads as a single
@@ -7943,6 +8218,31 @@ private:
     // The preset strip sits above both columns: a preset is the first choice
     // and the one most people make, so it is the first thing the dialog asks.
     static constexpr int kNeuralPresetBand=46;
+    // The right column when the Mochizuki runtime is the one rendering: the same
+    // space, the other network's questions. Nothing from the lmxxf column is here
+    // - the multi-pass skin switch, the stacking prediction, the temporal modes
+    // and the stability ladder are that runtime's answers to its own model, and
+    // four controls that render nothing beside a session is worse than absent
+    // ones.
+    void BuildMochizukiCostGroup(HWND h,int top,int right){
+        CreateSettingsGroupHeading(h,L"neural.settings.group_cost",12+top,right,400);
+        // No Small rung: the 0.44 Small network belongs to lmxxf, and a Mochizuki
+        // session handed that rung would run the Original at one pass while the
+        // panel said otherwise.
+        CreateNeuralCombo(h,IDC_NS_PASSES,L"neural.settings.passes",40+top,
+                          {L"1 (single pass)",L"2 passes",L"3 passes"},L"neural.tip.passes",right);
+        CreateSettingsGroupHeading(h,L"neural.settings.group_mochizuki",74+top,right,400);
+        // The two sliders the runtime has and the add-on does not.
+        CreateAdjustmentRow(h,IDC_NS_MZ_MAXRATIO,L"neural.settings.mz_maxratio",96+top,L"neural.tip.mz_maxratio",0,right,true);
+        CreateAdjustmentRow(h,IDC_NS_MZ_HISTORY,L"neural.settings.mz_history",138+top,L"neural.tip.mz_history",0,right,true);
+        CreateNeuralCheck(h,IDC_NS_MZ_APPLY,L"neural.settings.mz_apply",12+right,182+top,300,L"neural.tip.mz_apply");
+        CreateNeuralCheck(h,IDC_NS_MZ_PREPROCESS,L"neural.settings.mz_preprocess",12+right,206+top,330,L"neural.tip.mz_preprocess");
+        CreateNeuralCheck(h,IDC_NS_MZ_INT4,L"neural.settings.mz_int4",12+right,230+top,330,L"neural.tip.mz_int4");
+        CreateSettingsGroupHeading(h,L"neural.settings.group_guides",256+top,right,400);
+        CreateNeuralCheck(h,IDC_NS_GUIDE_MV,L"neural.settings.guide_mv",132+right,282+top,116,L"neural.tip.guide_mv");
+        CreateNeuralCheck(h,IDC_NS_GUIDE_DEPTH,L"neural.settings.guide_depth",252+right,282+top,80,L"neural.tip.guide_depth");
+    }
+
     void BuildNeuralSettingControls(HWND h){
         constexpr int right=kNeuralColumn,top=kNeuralPresetBand;
         CreateNeuralCombo(h,IDC_NS_PRESET,L"neural.settings.preset",14,{},L"neural.tip.preset",0,230);
@@ -7961,6 +8261,15 @@ private:
         CreateAdjustmentRow(h,IDC_NS_INTENSITY,L"neural.settings.intensity",208+top,L"neural.tip.intensity",100,0,true);
         CreateAdjustmentRow(h,IDC_NS_SKIN,L"neural.settings.skin",250+top,L"neural.tip.skin",0,0,true);
         CreateNeuralCheck(h,IDC_NS_AUTOMASK,L"neural.settings.automask",132,286+top,236,L"neural.tip.automask");
+        // The right column is the one place the two AMD runtimes disagree about
+        // what the panel should ask, so it is built from the selection rather
+        // than shared: lmxxf's stacking and temporal switches have no meaning on
+        // Mochizuki, and its highlight guard and bypass have none on lmxxf.
+        const bool mochizukiColumns = m_opt.neuralBackend==NeuralBackend::Amd&&
+                                      m_amdNrRuntime==AmdNrRuntime::Mochizuki;
+        if(mochizukiColumns){
+            BuildMochizukiCostGroup(h,top,right);
+        }else{
         // Stacking, which arrived with RenoDX 6.x. Its own group because it
         // costs render time rather than changing the model's look: a second
         // pass adds 89 % model GPU time per frame (knobs-upper-20261003).
@@ -8026,6 +8335,7 @@ private:
             CreateNeuralCombo(h,IDC_NS_STABILITY,L"neural.settings.stability",264+top,
                               {stability[0].c_str(),stability[1].c_str(),stability[2].c_str(),stability[3].c_str()},
                               amdStability?L"neural.tip.stability.amd":L"neural.tip.stability",right);
+        }
         }
         // What Apply will do to the picture on screen right now (issue #15:
         // "the settings do not apply" was partly a picture nobody said was the
@@ -8121,6 +8431,47 @@ private:
         SyncFeatureMenuState();
     }
 
+    // Which runtime inside the AMD pack renders. A switch like the style above
+    // and not a preference: the two are separate DLLs with separate networks, so
+    // an armed session cannot be talked into the other one - it is torn down and
+    // started again, exactly as a moved style is. The first frame on mochizuki
+    // then pays its network build (measured 66 s cold, 1.3 s warm), which the
+    // worker logs as it goes.
+    void SetAmdNrRuntime(AmdNrRuntime runtime){
+        if(runtime==m_amdNrRuntime){SyncFeatureMenuState();return;}
+        const AmdNrRuntime previous=m_amdNrRuntime;
+        // The panel's right column is built from the runtime (see
+        // BuildNeuralSettingControls), so an open one describes whatever was
+        // selected when it opened. Torn down and rebuilt rather than edited in
+        // place: the two column sets share coordinates and nothing else.
+        RECT panelRect{};
+        const bool hadPanel=m_neuralWnd&&IsWindow(m_neuralWnd)&&
+                            GetWindowRect(m_neuralWnd,&panelRect)!=FALSE;
+        if(m_neuralWnd&&IsWindow(m_neuralWnd))DestroyWindow(m_neuralWnd);
+        m_amdNrRuntime=runtime;
+        LOG("AMD neural runtime set to "<<AmdNrRuntimeName(runtime)<<" (was "<<AmdNrRuntimeName(previous)<<").");
+        SaveVideoSettings();
+        if(m_liveSession){
+            const double at=Position();const bool wasPlaying=m_playing||m_liveResumePlaying;
+            LOG("AMD runtime applied; restarting the active session at "<<at<<" s (playing="<<wasPlaying<<").");
+            DetachLivePlayback();
+            StopLiveNeuralSession(false);
+            PerformSeek(at,false);
+            StartLiveNeuralSession();
+            m_liveResumePlaying=wasPlaying;
+        }else{
+            SchedulePausedSettingsPreview();
+        }
+        if(hadPanel){
+            ShowNeuralSettings();
+            if(m_neuralWnd)
+                SetWindowPos(m_neuralWnd,nullptr,panelRect.left,panelRect.top,
+                             panelRect.right-panelRect.left,panelRect.bottom-panelRect.top,
+                             SWP_NOZORDER|SWP_NOACTIVATE);
+        }
+        SyncFeatureMenuState();
+    }
+
     void ShowNeuralSettings(){
         if(m_neuralWnd&&IsWindow(m_neuralWnd)){ShowWindow(m_neuralWnd,SW_SHOWNORMAL);SetForegroundWindow(m_neuralWnd);return;}
         static constexpr const wchar_t* kClassName=L"DLSSVideoNeuralSettingsClassV14";
@@ -8130,7 +8481,12 @@ private:
         const RECT wr=SettingsWindowRect(kNeuralDesignW,kNeuralDesignH,style,WS_EX_TOOLWINDOW,ActiveWindowDpi(m_hwnd));
         const int w=int(wr.right-wr.left),h=int(wr.bottom-wr.top);
         RECT pr{};GetWindowRect(m_hwnd,&pr);const int pw=int(pr.right-pr.left),ph=int(pr.bottom-pr.top);int x=int(pr.left)+std::max(0,(pw-w)/2),y=int(pr.top)+std::max(0,(ph-h)/2);
-        m_neuralWnd=CreateWindowExW(WS_EX_TOOLWINDOW,kClassName,T(L"neural.settings.title").c_str(),
+        // The title names the runtime when it is not the default one: the two
+        // panels show different controls, and a window that only says "Neural
+        // settings" leaves the reader to guess which network it describes.
+        const std::wstring panelTitle=T(L"neural.settings.title")+
+            (m_amdNrRuntime==AmdNrRuntime::Mochizuki?L" \u00b7 mochizuki":L"");
+        m_neuralWnd=CreateWindowExW(WS_EX_TOOLWINDOW,kClassName,panelTitle.c_str(),
             style,x,y,w,h,m_hwnd,nullptr,GetModuleHandleW(nullptr),this);
     }
 
@@ -8170,9 +8526,19 @@ private:
         // is also the reason the Small rung above can be taken away, so the
         // two are read together everywhere they matter.
         uint32_t amdTemporalMode{amd_lmxxf::kAmdTemporalModeDefault};
+        // Which runtime inside the AMD pack (RenderSettings::amdNrRuntime in the
+        // player). A key term: lmxxf and mochizuki are two different networks
+        // behind two different DLLs, so the same settings render two different
+        // pictures and a cache that did not carry the choice would serve one for
+        // the other.
+        AmdNrRuntime amdNrRuntime{AmdNrRuntime::Mochizuki};
+        // The Mochizuki runtime's own knobs (MochizukiOptions). A key term like
+        // the runtime above: they change the picture, so two settings that differ
+        // only here are two renders and must not share a cache entry.
+        MochizukiOptions mochizuki{};
         friend bool operator==(const RenderSettings&,const RenderSettings&)=default;
     };
-    RenderSettings CurrentRenderSettings()const{return {m_neuralSettings,m_renderGuides,m_temporalSettings,m_amdSkinProtect,m_amdMultiPassPredict,m_amdMultiPassSkip,m_amdStyle,m_amdSmallModel,EffectiveAmdTemporalMode()};}
+    RenderSettings CurrentRenderSettings()const{return {m_neuralSettings,m_renderGuides,m_temporalSettings,m_amdSkinProtect,m_amdMultiPassPredict,m_amdMultiPassSkip,m_amdStyle,m_amdSmallModel,EffectiveAmdTemporalMode(),m_amdNrRuntime,m_mochizuki};}
 
     // The render the picture came from is not what the dialog now holds. Only the
     // export path noticed this before, so a settings change made during playback
@@ -8263,7 +8629,10 @@ private:
             // and on this backend that is a different question than on NVIDIA.
             // NVIDIA's render reads every value in this dialog
             // (BackendReadsNeuralSettings), so any change is a reason. AMD's
-            // reads the accumulation rung and the pass count, and nothing else:
+            // lmxxf reads the accumulation rung and the pass count, and nothing
+            // else; its Mochizuki sibling reads those two through its own
+            // controls and the five look values beside them, because they are
+            // handed over as knobs rather than read from a file:
             // no ReShade.ini is loaded or read and the guides are the
             // evaluator's two constants rather than `m_renderGuides`, while the
             // rung is this player's own pass over the runtime's output and the
@@ -8289,9 +8658,28 @@ private:
                                m_amdMultiPassSkip!=m_liveRenderSettings.amdMultiPassSkip||
                                m_amdStyle!=m_liveRenderSettings.amdStyle||
                                m_amdSmallModel!=m_liveRenderSettings.amdSmallModel||
-                               EffectiveAmdTemporalMode()!=m_liveRenderSettings.amdTemporalMode;
+                               EffectiveAmdTemporalMode()!=m_liveRenderSettings.amdTemporalMode||
+                               // The Mochizuki controls are the picture: the
+                               // highlight guard, the history, the bypass — a
+                               // session rendering under the old ones shows
+                               // nothing of a change to any of them.
+                               m_mochizuki!=m_liveRenderSettings.mochizuki||
+                               // The five look values are that runtime's too,
+                               // and they are NOT in `m_mochizuki`: they are
+                               // copied in from NeuralSettings when the job is
+                               // built (see where the job is assembled). A
+                               // comparison that stopped at the runtime's own
+                               // struct would leave a moved intensity on the
+                               // panel, applied, and unrendered - the worst of
+                               // the three answers.
+                               (m_amdNrRuntime==AmdNrRuntime::Mochizuki&&
+                                (m_neuralSettings.intensity!=m_liveRenderSettings.neural.intensity||
+                                 m_neuralSettings.localTone!=m_liveRenderSettings.neural.localTone||
+                                 m_neuralSettings.localStructure!=m_liveRenderSettings.neural.localStructure||
+                                 m_neuralSettings.skinStructure!=m_liveRenderSettings.neural.skinStructure||
+                                 m_neuralSettings.autoMask!=m_liveRenderSettings.neural.autoMask));
             if(!restart){
-                LOG("Neural settings applied at "<<Position()<<" s; this backend's render reads the accumulation rung and the pass count and nothing else in the dialog, and neither moved, so the active session is left running.");
+                LOG("Neural settings applied at "<<Position()<<" s; nothing this backend's render reads moved, so the active session is left running.");
                 return;
             }
             // The restart must not leave a queued seek behind: it would run
@@ -8313,7 +8701,9 @@ private:
         if(LRESULT result=0;SettingsDialogChrome(h,m,w,l,result))return result;
         switch(m){
         case WM_CREATE:ApplyDarkTitleBar(h);BuildNeuralSettingControls(h);return 0;
-        case WM_HSCROLL:ReadNeuralSettingControls(h);return 0;
+        // Read, then re-label: the value beside a slider is written from the
+        // setting, and the setting only moves when the control is read back.
+        case WM_HSCROLL:ReadNeuralSettingControls(h);UpdateNeuralSettingValueLabels(h);return 0;
         case WM_GETMINMAXINFO:{
             const RECT wr=SettingsWindowRect(kNeuralDesignW,kNeuralDesignH,DWORD(GetWindowLongPtrW(h,GWL_STYLE)),DWORD(GetWindowLongPtrW(h,GWL_EXSTYLE)),ActiveWindowDpi(h));
             auto* mmi=reinterpret_cast<MINMAXINFO*>(l);mmi->ptMinTrackSize={wr.right-wr.left,wr.bottom-wr.top};return 0;
@@ -8321,7 +8711,22 @@ private:
         case WM_SIZE:ResizeSettingsChildren(h,kNeuralDesignW,kNeuralDesignH);return 0;
         case WM_COMMAND:{
             const int id=LOWORD(w);const int code=HIWORD(w);
-            if(id==IDC_NS_RESET){m_neuralSettings={};m_neuralSettings.passes=PassesSettingsDefault(m_opt.neuralBackend);m_renderGuides={};m_temporalSettings={};m_amdSkinProtect=true;m_amdMultiPassPredict=true;m_amdMultiPassSkip=true;m_amdSmallModel=false;ApplyLiveGuideControls();SyncNeuralSettingControls(h);SaveVideoSettings();SchedulePausedSettingsPreview();return 0;}
+            if(id==IDC_NS_RESET){
+                m_neuralSettings={};m_neuralSettings.passes=DefaultPassesFor(m_opt.neuralBackend,m_amdNrRuntime);
+                m_renderGuides={};
+                m_temporalSettings={};
+                // The rung is the backend's default, not the struct's zero. Those
+                // agreed by accident: TemporalSettings{} says Off and the AMD
+                // default used to be Low, so Reset quietly chose a rung nobody
+                // had picked.
+                m_temporalSettings.stability=StabilitySettingsDefault(m_opt.neuralBackend);
+                m_amdSkinProtect=true;m_amdMultiPassPredict=true;m_amdMultiPassSkip=true;m_amdSmallModel=false;
+                // The Mochizuki column's own six values. Without this line Reset
+                // reset everything the dialog shows except that panel: the
+                // runtime's highlight guard and history strength kept whatever
+                // the last session left, while the dialog said it had reset.
+                m_mochizuki={};
+                ApplyLiveGuideControls();SyncNeuralSettingControls(h);SaveVideoSettings();SchedulePausedSettingsPreview();return 0;}
             if(id==IDC_NS_APPLY){ApplyNeuralSettings();return 0;}
             if(id==IDC_NS_CLOSE){DestroyWindow(h);return 0;}
             if(id==IDC_NS_OPEN_ADJUST&&code==BN_CLICKED){ShowAdjustments();return 0;}
@@ -8338,7 +8743,8 @@ private:
             // reaches the render. Adding a control without adding it to this
             // line is the one mistake this dialog invites, and it is silent.
             if(((id==IDC_NS_STYLE||id==IDC_NS_PASSES||id==IDC_NS_SCENE_CUTS||id==IDC_NS_STABILITY||id==IDC_NS_MP_SKIP)&&code==CBN_SELCHANGE)||
-               ((id==IDC_NS_AUTOMASK||id==IDC_NS_GUIDE_MV||id==IDC_NS_GUIDE_DEPTH||id==IDC_NS_CHAINED||id==IDC_NS_SKIN_PROTECT||id==IDC_NS_MP_PREDICT)&&code==BN_CLICKED)){
+               ((id==IDC_NS_AUTOMASK||id==IDC_NS_GUIDE_MV||id==IDC_NS_GUIDE_DEPTH||id==IDC_NS_CHAINED||id==IDC_NS_SKIN_PROTECT||id==IDC_NS_MP_PREDICT||
+                 id==IDC_NS_MZ_APPLY||id==IDC_NS_MZ_PREPROCESS||id==IDC_NS_MZ_INT4)&&code==BN_CLICKED)){
                 // The owner-drawn check boxes do not flip their own check: the
                 // click is only a click until this turns the state over, and
                 // the read below is what carries it into the settings.
@@ -9677,7 +10083,7 @@ private:
                         :!framegen_addon::RegularFile(ExecutableDirectory()/L"nvngx_vsr.dll")?start_screen::VsrState::MissingRuntime
                         :m_playbackVsr?start_screen::VsrState::On:start_screen::VsrState::Off;
         }
-        {std::scoped_lock lock(m_startAnswers->mutex);facts.runtime=m_startAnswers->runtime;facts.runtimeVersion=m_startAnswers->runtimeVersion;}
+        {std::scoped_lock lock(m_startAnswers->mutex);facts.runtime=m_startAnswers->runtime;facts.runtimeVersion=m_startAnswers->runtimeVersion;facts.runtimeDigestsPinned=m_startAnswers->runtimeDigestsPinned;}
         // The live-session forecast, which is measured on this machine once a
         // session has run and otherwise a measured prior for the generation;
         // with neither it says nothing and neither does this. The prior is
@@ -10652,7 +11058,18 @@ private:
         case ToolbarAction::PlayPause:{const bool playing=m_playing||LiveResumePending();return{playing?UiIcon::Pause:UiIcon::Play,playing?L"Pause":L"Play",enabled,playing};}
         // A toggle pressed during a seek is queued rather than dropped, and the
         // label says so: a dead-looking key is how it read before.
-        case ToolbarAction::ToggleNeuralRendering:{const bool active=(m_cachedPlayback&&m_comparisonView==ComparisonView::Neural)||m_previewShown;const bool cachedPair=m_cachedPlayback&&m_havePresentedPair&&rendererReady;const std::wstring label=m_neuralToggleDeferred?L"Neural Rendering · Queued for the seek":WarmUpStep()!=warm_up::Step::None?L"Neural Rendering · Starting":m_previewJob?L"Neural Rendering · Previewing settings":m_previewShown?L"Neural Rendering · Settings preview":enabled?(active?L"Neural Rendering · On":L"Neural Rendering · Off"):(cachedPair?std::wstring(L"Neural Rendering · Seeking · ")+(active?L"On":L"Off"):(NeuralJobActive()?L"Neural Rendering · Preparing cache":L"Neural Rendering · No cache"));return{UiIcon::Sparkles,label,enabled,active,m_previewJob!=0||NeuralJobActive()};}
+        case ToolbarAction::ToggleNeuralRendering:{
+            const bool active=(m_cachedPlayback&&m_comparisonView==ComparisonView::Neural)||m_previewShown;
+            const bool cachedPair=m_cachedPlayback&&m_havePresentedPair&&rendererReady;
+            std::wstring label=m_neuralToggleDeferred?L"Neural Rendering · Queued for the seek":WarmUpStep()!=warm_up::Step::None?L"Neural Rendering · Starting":m_previewJob?L"Neural Rendering · Previewing settings":m_previewShown?L"Neural Rendering · Settings preview":enabled?(active?L"Neural Rendering · On":L"Neural Rendering · Off"):(cachedPair?std::wstring(L"Neural Rendering · Seeking · ")+(active?L"On":L"Off"):(NeuralJobActive()?L"Neural Rendering · Preparing cache":L"Neural Rendering · No cache"));
+            // Which of the two AMD runtimes the chip describes. On this backend
+            // the runtime is a picture decision - two networks behind two DLLs -
+            // so every state carries it, not only the on states: "Off · mochizuki"
+            // answers the question a viewer asks first (which network will this
+            // turn on). NVIDIA has one model, so its chip says nothing.
+            if(m_opt.neuralBackend==NeuralBackend::Amd)
+                label+=L" · "+Utf8ToWide(AmdNrRuntimeName(m_amdNrRuntime));
+            return{UiIcon::Sparkles,label,enabled,active,m_previewJob!=0||NeuralJobActive()};}
         case ToolbarAction::Stop:return{UiIcon::Stop,L"Stop",enabled,false};
         case ToolbarAction::Forward10:return{UiIcon::FastForward,L"10s",enabled,false};
         case ToolbarAction::Mute:return{m_muted?UiIcon::VolumeOff:UiIcon::Volume,m_muted?L"Sound":L"Mute",enabled,m_muted};
@@ -12801,12 +13218,26 @@ private:
         DrawActivitySpinner(dc,spinner,ResolveActivityVisual({},ActivityElapsedMs(),0,0,false,m_activityMotionEnabled).spinnerStep);
         SetBkMode(dc,TRANSPARENT);SetTextColor(dc,RGB(242,243,245));HGDIOBJ oldFont=SelectObject(dc,m_font);
         RECT title{c.left+Dip(50),c.top+Dip(14),c.right-Dip(16),c.top+Dip(38)};
-        const std::wstring heading=m_previewJob?T(L"neural.preview.title"):m_liveAttached?T(L"neural.live.buffering"):T(L"neural.live.title");
+        // The one step that is not "waiting for frames" but "there is no network
+        // yet". It is named here, on the panel the press put on screen, because
+        // this is where a viewer looks after pressing D - and the line below used
+        // to read "0.0 s buffered · 0 frames rendered" for the whole of a build,
+        // which is what a stall looks like.
+        const warm_up::Step step=WarmUpStep();
+        const std::wstring heading=m_previewJob?T(L"neural.preview.title")
+            :step==warm_up::Step::BuildingNetwork?T(L"warmup.building.title")
+            :step!=warm_up::Step::None?T(L"warmup.title")
+            :m_liveAttached?T(L"neural.live.buffering"):T(L"neural.live.title");
         DrawTextW(dc,heading.c_str(),-1,&title,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
         SelectObject(dc,m_fontSmall);SetTextColor(dc,ui_palette::SecondaryText);
         const double lead=LiveLeadSeconds(),target=m_liveAttached?LiveResumeLead():m_liveStartLead;
         wchar_t detail[128]={};
         if(m_previewJob)swprintf_s(detail,L"%s",T(L"neural.preview.detail").c_str());
+        else if(step==warm_up::Step::BuildingNetwork)swprintf_s(detail,L"%s",T(L"warmup.building.detail").c_str());
+        // Every other cold-start step has its own sentence, and all of them are
+        // truer than the counters below: nothing is buffered yet, so "0.0 s
+        // buffered · 0 frames rendered" is the shape of a stall.
+        else if(step!=warm_up::Step::None)swprintf_s(detail,L"%s",T(warm_up::TextKey(step)).c_str());
         // A session that is still acquiring its source has no frames to report,
         // and "0 frames rendered" is exactly what a stall looks like.
         else if(m_neuralProgress.phase==NeuralRenderPhase::Acquiring)swprintf_s(detail,L"%s",AcquisitionDetailText().c_str());
@@ -12816,7 +13247,20 @@ private:
         SelectObject(dc,oldFont);
         RECT track{c.left+Dip(16),c.bottom-Dip(30),c.right-Dip(16),c.bottom-Dip(22)};
         HBRUSH trackBrush=CreateSolidBrush(RGB(68,71,77));FillRect(dc,&track,trackBrush);DeleteObject(trackBrush);
-        RECT fill=track;fill.right=track.left+static_cast<LONG>(std::lround((track.right-track.left)*std::clamp(m_previewJob?0.0:(target>0.0?lead/target:0.0),0.0,1.0)));
+        RECT fill=track;
+        if(step!=warm_up::Step::None){
+            // There is no fraction to show here - the runtime compiles its
+            // pipelines and tells nobody outside its own log - so the bar shows
+            // motion rather than a share: a third of the track sweeping, which is
+            // the difference between "working" and "stuck".
+            const double sweep=double(ActivityElapsedMs()%1600)/1600.0;
+            const double origin=sweep<0.5?sweep*2.0:(1.0-sweep)*2.0;
+            const LONG span=static_cast<LONG>(double(track.right-track.left)*0.34);
+            fill.left=track.left+static_cast<LONG>(double(track.right-track.left-span)*origin);
+            fill.right=fill.left+span;
+        }else{
+            fill.right=track.left+static_cast<LONG>(std::lround((track.right-track.left)*std::clamp(m_previewJob?0.0:(target>0.0?lead/target:0.0),0.0,1.0)));
+        }
         if(fill.right>fill.left){HBRUSH fillBrush=CreateSolidBrush(ui_palette::PrimaryBlue);FillRect(dc,&fill,fillBrush);DeleteObject(fillBrush);}
     }
     void MarkersChanged(){UpdateCachedStatus();InvalidatePlaybackProgress();}
@@ -12939,7 +13383,7 @@ private:
     }
     static std::filesystem::path ExecutableDirectory(){std::filesystem::path executable;std::wstring error;return CurrentExecutablePath(executable,error)?executable.parent_path():std::filesystem::path{};}
     static std::string GpuPathName(GpuGeneration generation){return GpuGenerationPathName(generation);}
-    static const wchar_t* NeuralPhaseTextKey(NeuralRenderPhase phase){switch(phase){case NeuralRenderPhase::CheckingCache:return L"neural.phase.cache";case NeuralRenderPhase::Acquiring:return L"neural.phase.acquiring";case NeuralRenderPhase::Decoding:case NeuralRenderPhase::NeuralRendering:return L"neural.phase.rendering";case NeuralRenderPhase::Encoding:return L"neural.phase.encoding";case NeuralRenderPhase::Validating:return L"neural.phase.validating";case NeuralRenderPhase::Ready:return L"neural.phase.ready";case NeuralRenderPhase::Preflight:return L"neural.phase.preflight";case NeuralRenderPhase::Paused:return L"neural.phase.paused";case NeuralRenderPhase::Recovering:return L"neural.phase.recovering";}return L"neural.phase.acquiring";}
+    static const wchar_t* NeuralPhaseTextKey(NeuralRenderPhase phase){switch(phase){case NeuralRenderPhase::CheckingCache:return L"neural.phase.cache";case NeuralRenderPhase::Acquiring:return L"neural.phase.acquiring";case NeuralRenderPhase::Decoding:case NeuralRenderPhase::NeuralRendering:return L"neural.phase.rendering";case NeuralRenderPhase::Encoding:return L"neural.phase.encoding";case NeuralRenderPhase::Validating:return L"neural.phase.validating";case NeuralRenderPhase::Ready:return L"neural.phase.ready";case NeuralRenderPhase::Preflight:return L"neural.phase.preflight";case NeuralRenderPhase::BuildingNetwork:return L"neural.phase.building";case NeuralRenderPhase::Paused:return L"neural.phase.paused";case NeuralRenderPhase::Recovering:return L"neural.phase.recovering";}return L"neural.phase.acquiring";}
     std::wstring NeuralPhaseText(const NeuralRenderProgress& progress)const{std::wstring text=T(NeuralPhaseTextKey(progress.phase));if(progress.phase==NeuralRenderPhase::Recovering){const auto failure=NeuralRenderFailureName(progress.recovering);text+=L" (attempt "+std::to_wstring(progress.retries)+L" \u00b7 "+std::wstring(failure.begin(),failure.end())+L")";}return text;}
     static const wchar_t* NeuralFailureTextKey(NeuralRenderFailure failure){switch(failure){case NeuralRenderFailure::GpuStall:return L"neural.failure.gpu-stall";case NeuralRenderFailure::DeviceRemoved:return L"neural.failure.device-removed";case NeuralRenderFailure::WorkerCrashed:return L"neural.failure.worker-crashed";case NeuralRenderFailure::RetryExhausted:return L"neural.failure.retry-exhausted";case NeuralRenderFailure::Preflight:return L"neural.failure.preflight";case NeuralRenderFailure::Identity:return L"neural.failure.identity";case NeuralRenderFailure::Protocol:return L"neural.failure.protocol";default:return nullptr;}}
     // Lands the lifecycle in the failure's state. RetryExhausted is only
@@ -12961,7 +13405,12 @@ private:
     // Returns true when it put the notice on screen, so a caller that would show its
     // own dialog does not stack a second one on top.
     bool NoteNeuralFailure(const NeuralJobCompletion& completion){
-        const bool belowFloor=completion.result.failure==NeuralRenderFailure::Preflight&&
+        // Only the NVIDIA backend has a driver floor to be below. An AMD
+        // preflight failure - a missing pack, a drifted tree - used to be read
+        // against whatever driver was detected and reported as "needs a newer
+        // NVIDIA driver", which is the one message that cannot be acted on.
+        const bool belowFloor=m_opt.neuralBackend==NeuralBackend::Nvidia&&
+                              completion.result.failure==NeuralRenderFailure::Preflight&&
                               ClassifyNeuralDriver(m_opt.detectedGpu.driverVersion)==NeuralDriverSupport::BelowFloor;
         if(belowFloor)m_neuralNotice=T(L"driver.below_floor");
         else if(const wchar_t* kind=NeuralFailureTextKey(completion.result.failure))m_neuralNotice=T(kind);
@@ -13087,6 +13536,16 @@ private:
             // AMD, the add-on's 1..4 on NVIDIA. The model switch is AMD's own
             // and is dropped for the other backend.
             job.amdPasses=render.amdSmallModel?1u:std::clamp(render.neural.passes,1,job.backend==NeuralBackend::Amd?3:4);
+            job.amdNrRuntime=render.amdNrRuntime;
+            // The look knobs the two backends share are filled from the panel
+            // here rather than stored twice: a preset writes NeuralSettings, and
+            // the Mochizuki controls have to follow it.
+            job.mochizuki=render.mochizuki;
+            job.mochizuki.intensity=render.neural.intensity;
+            job.mochizuki.localTone=render.neural.localTone;
+            job.mochizuki.localStructure=render.neural.localStructure;
+            job.mochizuki.skinStructure=render.neural.skinStructure;
+            job.mochizuki.autoMask=render.neural.autoMask;
             job.amdSkinProtect=render.amdSkinProtect;job.amdMultiPassPredict=render.amdMultiPassPredict;job.amdMultiPassSkip=render.amdMultiPassSkip;job.amdStyle=render.amdStyle;job.amdTemporalMode=render.amdTemporalMode;
             job.amdSmallModel=job.backend==NeuralBackend::Amd&&render.amdSmallModel;
             // The mode the job will run under, which is the panel's rung unless
@@ -13634,13 +14093,10 @@ private:
         return warm_up::Resolve(m_liveSession,NeuralJobActive(),!LiveCoverage().empty(),m_neuralProgress.phase,m_neuralProgress.completedFrames);
     }
     std::wstring LiveSessionStatusText()const{
-        // The cold start names its step instead of "0.0 s buffered", which is
-        // true and says nothing for the 17-22 s it lasts.
-        if(const auto step=WarmUpStep();step!=warm_up::Step::None){
-            std::wstring text=T(L"warmup.title")+L" \u00b7 "+T(warm_up::TextKey(step));
-            if(m_liveBuffering)text+=L" \u00b7 "+T(LiveResumePending()?L"neural.live.will_play":L"neural.live.will_stay_paused");
-            return text;
-        }
+        // The cold start is named on the buffering panel, not here: that panel is
+        // what the press puts on screen and where a viewer looks for it, and this
+        // line already carries the file, the runtime, the range and the settings.
+        // It keeps saying "buffering" while the panel says which step that is.
         wchar_t lead[64]={};swprintf_s(lead,L"%.1f s",LiveLeadSeconds());
         std::wstring text=(m_liveBuffering?T(L"neural.live.buffering"):T(L"neural.live.title"))+L" \u00b7 "+lead+L" "+T(L"neural.live.lead");
         // How much of the video is rendered is the render chip's to say
@@ -14388,6 +14844,8 @@ private:
             ApplyNeuralPreset(size_t(id-IDM_NEURAL_PRESET_FIRST));return;}
         if(id>=IDM_NEURAL_AMD_STYLE_FIRST&&id<IDM_NEURAL_AMD_STYLE_FIRST+IDM_NEURAL_AMD_STYLE_COUNT){
             SetAmdStyle(uint32_t(id-IDM_NEURAL_AMD_STYLE_FIRST));return;}
+        if(id>=IDM_NEURAL_AMD_RUNTIME_FIRST&&id<IDM_NEURAL_AMD_RUNTIME_FIRST+IDM_NEURAL_AMD_RUNTIME_COUNT){
+            SetAmdNrRuntime(id==IDM_NEURAL_AMD_RUNTIME_FIRST?AmdNrRuntime::Lmxxf:AmdNrRuntime::Mochizuki);return;}
         if(app_menu::RoutesToRehook(app_menu::PlayerCommandRoute::NativeMenu,id)){Rehook();return;}
         if(app_menu::RoutesToOpenYouTube(app_menu::PlayerCommandRoute::NativeMenu,id,false)){ActivateYouTube();return;}
         if(const ExampleVideo* example=app_menu::ExampleVideoForCommand(id)){ActivateExampleVideo(*example);return;}
@@ -14918,6 +15376,9 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // these dialogs can be open at the same time.
     std::map<HWND,HWND> m_tipHosts;
     std::map<HWND,std::vector<std::unique_ptr<std::wstring>>> m_tipText;
+    // Backs the neural pill's tool text, which is rebuilt whenever the runtime
+    // selection moves: TTM_ADDTOOL stores the pointer, not a copy.
+    std::wstring m_neuralPillTip;
     // Design-time (unresized) child positions for each resizable settings
     // dialog, captured once when its controls are built so WM_SIZE can
     // recompute layout without drifting across repeated resizes.
@@ -15041,6 +15502,11 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // a change reaches the next render and needs a restart for the session
     // already on screen.
     uint32_t m_amdTemporalMode{amd_lmxxf::kAmdTemporalModeDefault};
+    AmdNrRuntime m_amdNrRuntime{AmdNrRuntime::Mochizuki};
+    // What the Mochizuki group in the neural settings panel edits. Only this
+    // runtime reads it; the look knobs it shares with NVIDIA live in
+    // m_neuralSettings and are copied in when a job is built.
+    MochizukiOptions m_mochizuki{};
     // The preset the Look settings were last taken from, so Custom can say
     // which one it departed from. kPresetCount when none is known yet.
     size_t m_lastNeuralPreset=neural_presets::kPresetCount;
@@ -15619,6 +16085,21 @@ static int RunRenderCommand(const render_command::Parsed& parsed,const std::vect
         // for it (the menu is the surface), so a scripted --render uses this
         // machine's value.
         job.amdStyle=ReadSavedAmdStyle(settings);
+        // Which runtime in the pack, from the same saved section: a batch export
+        // that wants mochizuki saves the setting rather than passing a flag,
+        // exactly as the style above works.
+        job.amdNrRuntime=ReadSavedAmdNrRuntime(settings);
+        // The same saved values the interactive path reads, so an export renders
+        // what the panel showed.
+        job.mochizuki=ReadSavedMochizukiOptions(settings);
+        // The look knobs come from the settings this export already resolved
+        // (the preset or the file, then any command-line override), so an export
+        // renders the look the panel would render.
+        job.mochizuki.intensity=neuralSettings.intensity;
+        job.mochizuki.localTone=neuralSettings.localTone;
+        job.mochizuki.localStructure=neuralSettings.localStructure;
+        job.mochizuki.skinStructure=neuralSettings.skinStructure;
+        job.mochizuki.autoMask=neuralSettings.autoMask;
         // The temporal mode, saved the same way and, like the style, with no
         // command-line key of its own. Read for the backend that has the key
         // and left at off for the one that does not.

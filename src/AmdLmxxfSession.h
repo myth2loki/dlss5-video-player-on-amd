@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AmdLmxxfApi.h"
+#include "../third_party/mochizuki/MochizukiNrApi.h"
 
 #include <cstdint>
 #include <string>
@@ -41,10 +42,17 @@ namespace amd_lmxxf {
 class Session
 {
 public:
-    Session(const LmxxfNrApi& api, void* context, bool leases = false) noexcept
-        : api_(api), context_(context), leases_(leases) {}
+    // `mochizukiPrepare` is the runtime's standalone prepare export. It is
+    // non-null only for a Mochizuki runtime, whose API table answers
+    // PrepareFrame with a rejection stub - everything else in this class is
+    // shared by both, which is why the kind is one pointer rather than a second
+    // state machine.
+    Session(const LmxxfNrApi& api, void* context, bool leases = false,
+            PFN_MochizukiNrPrepareFrame mochizukiPrepare = nullptr) noexcept
+        : api_(api), context_(context), leases_(leases), mochizukiPrepare_(mochizukiPrepare) {}
 
     bool Leases() const noexcept { return leases_; }
+    bool UsesMochizuki() const noexcept { return mochizukiPrepare_ != nullptr; }
     void* Context() const noexcept { return context_; }
     CallPhase Phase() const noexcept { return phase_; }
     const LmxxfNrJob& Job() const noexcept { return job_; }
@@ -69,6 +77,50 @@ public:
         job_ = MakeJob();
         StampJobForAbi(job_, api_.abi_version);
         const int32_t status = api_.PrepareFrame(context_, &info, &job_);
+        if (status != static_cast<int32_t>(LMXXF_NR_OK)) return Fail(status, "PrepareFrame");
+        if (job_.handle == nullptr) return Refuse("PrepareFrame returned a null job");
+        phase_ = CallPhase::Prepared;
+        return Succeed();
+    }
+
+    // Mochizuki's prepare step. Same phase machine, same job object (32 bytes on
+    // both runtimes), a different struct and a different entry point: the table's
+    // PrepareFrame is the stub whose whole body is "use the standalone export".
+    //
+    // There is no StampJobForAbi call here on purpose - Mochizuki only negotiates
+    // ABI 6, so the 24-byte legacy job cannot occur, and writing 32 is the whole
+    // contract.
+    // Which frame-struct size this runtime accepted. The two packages in the
+    // wild disagree (88 without a depth block, 112 with one) and both answer
+    // INVALID_ARGUMENT for the other, with the same sentence a null argument
+    // gets - so the size is learned from the runtime once per session and reused.
+    uint32_t MochizukiFrameInfoSize() const noexcept { return mochizukiFrameInfoSize_; }
+
+    bool PrepareFrame(MochizukiNrFrameInfo info)
+    {
+        if (mochizukiPrepare_ == nullptr)
+            return Refuse("PrepareFrame: this session has no Mochizuki prepare export");
+        if (!CanPrepare()) return Refuse("PrepareFrame is out of order");
+        // The size this session settled on, which is what the runtime validated
+        // last time. The caller's own struct_size is not trusted: it describes the
+        // header, not the binary on this machine.
+        info.struct_size = mochizukiFrameInfoSize_;
+        job_ = MakeJob();
+        int32_t status = mochizukiPrepare_(context_, &info, &job_);
+        if (status == static_cast<int32_t>(LMXXF_NR_INVALID_ARGUMENT) &&
+            mochizukiFrameInfoSize_ == MOCHIZUKI_NR_FRAME_INFO_SIZE_FULL) {
+            // Either this package predates the depth block or the frame is
+            // malformed. Retrying at the older size is the only way to tell them
+            // apart, and it costs one call on the first frame of a session.
+            job_ = MakeJob();
+            info.struct_size = MOCHIZUKI_NR_FRAME_INFO_SIZE_LEGACY;
+            status = mochizukiPrepare_(context_, &info, &job_);
+            // UNAVAILABLE ("building the network") proves the size as well as OK
+            // does: the runtime only looks at its own build state after it has
+            // accepted the struct. Only another rejection leaves the question open.
+            if (status != static_cast<int32_t>(LMXXF_NR_INVALID_ARGUMENT))
+                mochizukiFrameInfoSize_ = MOCHIZUKI_NR_FRAME_INFO_SIZE_LEGACY;
+        }
         if (status != static_cast<int32_t>(LMXXF_NR_OK)) return Fail(status, "PrepareFrame");
         if (job_.handle == nullptr) return Refuse("PrepareFrame returned a null job");
         phase_ = CallPhase::Prepared;
@@ -300,6 +352,10 @@ private:
     // Set from LMXXF_NR_CREATE_FLAG_RECORDING_LEASES at construction. It
     // changes two orderings and removes two calls, so it is not a hint.
     bool leases_{};
+    // Non-null for a Mochizuki runtime; see the constructor.
+    PFN_MochizukiNrPrepareFrame mochizukiPrepare_{};
+    // Learned on the first frame; 112 is what this header declares.
+    uint32_t mochizukiFrameInfoSize_{MOCHIZUKI_NR_FRAME_INFO_SIZE_FULL};
     CallPhase phase_{CallPhase::Idle};
     LmxxfNrJob job_{};
     std::string lastError_;
