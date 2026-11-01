@@ -1,0 +1,619 @@
+#pragma once
+
+#include <string>
+#include <unordered_map>
+
+class Localizer {
+public:
+    std::wstring Get(const wchar_t* key) const {
+        const auto& strings = EnglishDefaults();
+        const auto it = strings.find(key);
+        if (it != strings.end()) return it->second;
+        return key ? std::wstring(key) : std::wstring();
+    }
+
+    using Map = std::unordered_map<std::wstring, std::wstring>;
+    // Every English string, for the tests that check what the strings claim
+    // (a menu path they name has to exist).
+    static const Map& All() { return EnglishDefaults(); }
+
+private:
+
+    // A tip a tool shows (the "*.tip.*" keys) is read back by the UI
+    // regression's tip readers into a 512-wchar buffer with TTM_GETTEXTW,
+    // which copies the whole string and honours no size - not the wParam,
+    // not cbSize - so a tip of 512 characters or more overflows that buffer
+    // and the suite dies with __fastfail at the next return, with nothing
+    // said about why. Every tip a reader touches stays at 511 or fewer -
+    // the readers check the key's length before the read that would smash
+    // the frame's /GS cookie - and the detail that does not fit belongs in
+    // docs/USAGE.md. A tip no reader touches is unbounded by this.
+    static const Map& EnglishDefaults() {
+        static const Map strings = {
+            {L"app.title", L"DLSS 5 Video Player"},
+            {L"menu.file", L"File"}, {L"menu.open", L"Open file\tCtrl+O"}, {L"menu.open_youtube", L"Open YouTube URL\u2026\tCtrl+L"}, {L"menu.exit", L"Exit"}, {L"menu.save_comparison", L"Save comparison image\u2026\tCtrl+Shift+S"},
+            {L"compare.save.dialog", L"Save the comparison as shown"}, {L"compare.save.saved", L"Comparison saved: "}, {L"compare.save.failed", L"The comparison image could not be saved"},
+            {L"compare.save.no_render", L"no neural render"},
+            {L"menu.playback", L"Playback"}, {L"menu.playpause", L"Play / Pause\tSpace   (Overlay: Ctrl+Alt+Space)"}, {L"menu.stop", L"Stop\tS"},
+            {L"menu.back10", L"Back 10 s\tLeft"}, {L"menu.forward10", L"Forward 10 s\tRight"}, {L"menu.mute", L"Mute\tM"}, {L"menu.audio", L"Audio"}, {L"menu.audio_passthrough", L"Passthrough to receiver (AC-3/E-AC-3/DTS)"},
+            {L"audio.passthrough.active", L"Passthrough: %s to the receiver"},
+            {L"audio.passthrough.refused", L"Passthrough: the audio device does not take %s; playing PCM"},
+            {L"audio.passthrough.unavailable", L"Passthrough: the audio device is in use or refuses exclusive mode, so %s cannot go out; playing PCM"},
+            {L"audio.passthrough.not_applicable", L"Passthrough: this track is %s, not AC-3, E-AC-3 or DTS; playing PCM"},
+            {L"audio.passthrough.unknown_track", L"of an unknown format"},
+            {L"audio.passthrough.unsupported_rate", L"Passthrough: %s at this sample rate has no IEC 61937 carriage; playing PCM"},
+            {L"menu.subtitles", L"Subtitles"}, {L"menu.subtitles_off", L"Off"}, {L"menu.subtitles_file", L"File: "},
+            {L"menu.subtitles_next", L"Next subtitles\tV"}, {L"menu.subtitles_load", L"Load subtitle file\u2026"},
+            {L"menu.subtitles_earlier", L"Subtitles earlier (\u22120.1 s)\tH"}, {L"menu.subtitles_later", L"Subtitles later (+0.1 s)\tJ"},
+            {L"menu.subtitles_delay_reset", L"Reset subtitle delay"},
+            {L"menu.subtitles_mode_original", L"Original"},
+            {L"menu.subtitles_mode_chinese", L"Chinese"},
+            {L"menu.subtitles_mode_dual", L"Chinese and original"},
+            {L"menu.subtitles_speech", L"Subtitles from speech"},
+            {L"menu.subtitles_speech_stop", L"Stop listening"},
+            {L"menu.subtitles_speech_gpu", L"Transcribe on the graphics card"},
+            {L"menu.subtitles_speech_cpu", L"Transcribe on the processor"},
+            {L"subtitles.translating", L"Translating subtitles"}, {L"subtitles.translated", L"Subtitles translated"},
+            {L"subtitles.translate_failed", L"Subtitles could not be translated: "},
+            {L"subtitles.translate_bitmap", L"Only text subtitles can be translated"},
+            {L"subtitles.speech_starting", L"Listening to the film"},
+            {L"subtitles.speech_generating", L"Subtitles"},
+            {L"subtitles.speech_done", L"Subtitles written from speech"},
+            {L"subtitles.speech_stopped", L"Stopped listening"},
+            {L"subtitles.speech_gpu", L"Transcribing on the graphics card"},
+            {L"subtitles.speech_cpu", L"Transcribing on the processor"},
+            {L"subtitles.speech_failed", L"Subtitles could not be made: "},
+            {L"subtitles.starting", L"Preparing subtitles"},
+            {L"subtitles.stopped", L"Subtitles off"},
+            {L"subtitles.speech_seconds_behind", L" s behind"},
+            {L"subtitles.speech_minutes_behind", L" min behind"},
+            {L"subtitles.dialog", L"Load a subtitle file"}, {L"subtitles.filter", L"Subtitles"},
+            {L"subtitles.failed", L"The subtitle file could not be read"}, {L"subtitles.delay", L"Subtitle delay "},
+            {L"menu.mark_in", L"Mark In\tI"}, {L"menu.mark_out", L"Mark Out\tO"}, {L"menu.clear_marks", L"Clear Marks\tShift+I / Shift+O"},
+            {L"menu.goto_timecode", L"Go to timecode...\tCtrl+G"}, {L"menu.pause_neural_render", L"Pause conversion\tSpace"},
+            {L"menu.video", L"Video"}, {L"menu.aspectfit", L"Original aspect ratio (Fit)\tA"}, {L"menu.aspectfill", L"Fill without stretching (Crop)"}, {L"menu.aspect_pixels", L"1:1 pixels"},
+            {L"menu.youtube_quality", L"YouTube source quality"}, {L"menu.youtube_quality_auto", L"Auto (up to 1440p, highest bitrate)"},
+            {L"menu.youtube_quality_2160", L"2160p"}, {L"menu.youtube_quality_1440", L"1440p"}, {L"menu.youtube_quality_1080", L"1080p"},
+            {L"menu.adjustments", L"Image adjustments...\tCtrl+E   (Overlay: Ctrl+Alt+C)"},
+            {L"menu.compare", L"Compare"}, {L"menu.compare_neural", L"DLSS 5"}, {L"menu.compare_original", L"Original"}, {L"menu.compare_split", L"Split"}, {L"menu.compare_wipe", L"Wipe"}, {L"menu.compare_difference", L"Difference"}, {L"menu.compare_side_by_side", L"Side by side"}, {L"menu.compare_quad", L"2 \u00d7 2"},
+            {L"menu.compare_second_mix", L"2 \u00d7 2 fourth pane Mix"}, {L"menu.compare_second_mix_0", L"25%"}, {L"menu.compare_second_mix_1", L"50%"},
+            {L"menu.compare_second_mix_2", L"75%"}, {L"menu.compare_second_mix_3", L"150%"}, {L"menu.compare_second_mix_4", L"200%"},
+            {L"menu.compare_difference_less", L"Less difference gain\tShift+["}, {L"menu.compare_difference_more", L"More difference gain\tShift+]"}, {L"menu.compare_difference_luma", L"Difference as brightness only"},
+            {L"menu.compare_mask_load", L"Load mask image\u2026"}, {L"menu.compare_mask_feather", L"Mask feather"}, {L"menu.compare_mask_invert", L"Invert mask"}, {L"menu.compare_mask_clear", L"Clear mask"},
+            {L"menu.compare_mask_feather_0", L"Off"}, {L"menu.compare_mask_feather_1", L"4 px"}, {L"menu.compare_mask_feather_2", L"8 px"},
+            {L"menu.compare_mask_feather_3", L"16 px"}, {L"menu.compare_mask_feather_4", L"32 px"}, {L"menu.compare_mask_feather_5", L"64 px"},
+            {L"compare.mask.dialog", L"Load a mask image (white keeps DLSS 5, black shows the original)"}, {L"compare.mask.filter", L"Images"},
+            {L"compare.hint.mask", L"Mask: "}, {L"compare.mask.failed", L"The mask image could not be read"},
+            {L"menu.compare_blend_less", L"Mix less\t["}, {L"menu.compare_blend_more", L"Mix more\t]"}, {L"menu.compare_swap", L"Swap sides\tX"}, {L"menu.compare_next_mode", L"Next mode\tC"}, {L"menu.compare_previous_mode", L"Previous mode\tShift+C"}, {L"menu.compare_zoom", L"Zoom in (Fit, 1:1, 2x, 4x, 8x)\tZ"}, {L"menu.compare_zoom_out", L"Zoom out\tShift+Z"}, {L"menu.compare_zoom_fit", L"Zoom to fit"}, {L"menu.compare_loupe", L"Loupe\tL"},
+            // The compare bar over the control strip, and the tags drawn on the picture.
+            {L"compare.mode.neural", L"DLSS 5"}, {L"compare.mode.original", L"Original"}, {L"compare.mode.split", L"Split"}, {L"compare.mode.wipe", L"Wipe"}, {L"compare.mode.difference", L"Difference"}, {L"compare.mode.side_by_side", L"Side by side"}, {L"compare.mode.quad", L"2 \u00d7 2"},
+            {L"compare.mix", L"Mix"}, {L"compare.swap", L"Swap"}, {L"compare.zoom.fit", L"Fit"}, {L"compare.loupe", L"Loupe"},
+            // What a narrow window shows instead: the bar steps down to these before it folds the modes into a menu.
+            {L"compare.mode.neural.short", L"DLSS 5"}, {L"compare.mode.original.short", L"Orig."}, {L"compare.mode.split.short", L"Split"}, {L"compare.mode.wipe.short", L"Wipe"}, {L"compare.mode.difference.short", L"Diff."}, {L"compare.mode.side_by_side.short", L"Side"}, {L"compare.mode.quad.short", L"2 \u00d7 2"},
+            {L"compare.tip.mode", L"Compare mode (C)"}, {L"compare.tip.swap", L"Swap sides (X)"}, {L"compare.tip.loupe", L"Loupe (L)"}, {L"compare.tip.zoom_in", L"Zoom in (Z)"}, {L"compare.tip.zoom_out", L"Zoom out (Shift+Z)"},
+            {L"compare.hint.hold", L"Hold on the picture to see the original"},
+            {L"compare.hint.unavailable", L"Turn on Neural Rendering (D) to compare"}, {L"compare.tip.mode_cycle", L" (C and Shift+C step through the modes)"},
+            {L"compare.tag.original", L"ORIGINAL"}, {L"compare.tag.dlss", L"DLSS 5"},
+            {L"compare.tag.difference", L"DIFFERENCE"}, {L"compare.tag.mix", L"MIX"}, {L"compare.tag.luma", L"LUMA"}, {L"compare.tag.color", L"COLOR"},
+            {L"menu.final", L"Final image\t1"}, {L"menu.input", L"DLSS input\t2"}, {L"menu.mv", L"Motion vectors\t3"},
+            {L"menu.depth", L"Depth\t4"}, {L"menu.fullscreen", L"Fullscreen\tF11"},
+            {L"menu.generated", L"Generated frame\t5"},
+            {L"menu.dlss", L"DLSS"}, {L"menu.neural_rendering", L"Neural Rendering\tD"},
+        // How far ahead of the playhead the live session renders. "Off" is the
+        // whole of what the session set out to render - for a film, all of it.
+        {L"menu.neural_window", L"Render ahead"},
+        {L"menu.neural_window_off", L"Off \u2014 render the whole video"},
+        {L"menu.neural_window_60", L"1:00 ahead"},
+        {L"menu.neural_window_90", L"1:30 ahead"},
+        {L"menu.neural_window_120", L"2:00 ahead"},
+        {L"menu.neural_window_180", L"3:00 ahead"},
+        {L"menu.neural_window_300", L"5:00 ahead (default)"},
+        {L"menu.dlss_upscaling", L"DLSS Upscaling"},
+        {L"menu.rtx_vsr_upscaling", L"RTX VSR Upscaling (recommended)"},
+        // The keep-up guard (VsrPolicy.h). %s is the quality's menu name.
+        {L"vsr.keep_up.lowered", L"Playback fell behind: RTX VSR quality lowered to %s for this video"},
+        {L"vsr.keep_up.off", L"Playback fell behind: RTX VSR Upscaling paused for this video"},
+        {L"vsr.quality.low", L"Low"}, {L"vsr.quality.medium", L"Medium"}, {L"vsr.quality.high", L"High"}, {L"vsr.quality.ultra", L"Ultra"},
+        // Appended to the greyed menu item; %s is the reason RTX VSR cannot run.
+        {L"menu.rtx_vsr_unavailable", L" \u2014 %s"},
+            {L"menu.upscale_output", L"Upscaling output"},
+            {L"menu.upscale_auto", L"Auto (match display)"},
+            {L"menu.upscale_1080", L"1080p"}, {L"menu.upscale_1440", L"1440p"}, {L"menu.upscale_2160", L"2160p (4K)"},
+            // Measured 960x540 -> 1080p on an RTX 4080 SUPER, six clips, VMAF against the
+            // 1080p original (docs/measurements/sr-history-20260924/REPORT.md).
+            {L"menu.upscale_history", L"Upscaling history"},
+            {L"menu.upscale_history_measured", L"VMAF against the original, 6 clips on an RTX 4080 SUPER - bicubic scored 70-96"},
+            {L"menu.upscale_history_temporal", L"Temporal (smooths grain, trails motion)\t49-80"},
+            {L"menu.upscale_history_per_frame", L"Per-frame (recommended)\t63-94"},
+            {L"menu.frame_generation", L"Generate frames (higher frame rate)..."},
+            {L"menu.cancel_frame_generation", L"Cancel frame generation"},
+            // The live, on-screen toggle, distinct from the offline conversion
+            // above. Default off; the player remembers the choice in the ini.
+            {L"menu.playback_frame_generation", L"Frame Generation during playback\tCtrl+Alt+G"},
+            // Which upscaler serves the picture - one setting for the whole
+            // chain, the source frames and the generated half of the playback
+            // cadence alike. Auto is the cascade; the rest force an entry point
+            // into it. The FSR 4 row carries the tier's known property on the
+            // generated half: the second context measured darker than the
+            // source frame, a brightness strobe at the cadence rate.
+            {L"menu.upscale_engine", L"Upscaled by"},
+            {L"menu.upscale_engine_auto", L"Auto (FSR 4, else FSR1, else CAS)"},
+            {L"menu.upscale_engine_fsr4", L"FSR 4 (generated frames measure darker)"},
+            {L"menu.upscale_engine_fsr1", L"FSR1"},
+            {L"menu.upscale_engine_cas", L"CAS"},
+            {L"playback_framegen.pill.on", L"Interpolate \u00b7 On"},
+            {L"playback_framegen.pill.off", L"Interpolate \u00b7 Off"},
+            {L"playback_framegen.pill.unavailable", L"Interpolate \u00b7 Unavailable"},
+            {L"menu.cancel_export_running", L"Cancel export"},
+            {L"menu.show_framegen_output", L"Show last generated file"},
+            // 2x is the default because a conversion costs minutes of GPU work
+            // and a large file; the rest are opt-in, and "as many as the
+            // display allows" is what the first version did automatically.
+            {L"menu.framegen_multiple", L"Generated frames"},
+            {L"menu.framegen_2x", L"2\u00d7 the frame rate (default)"},
+            {L"menu.framegen_3x", L"3\u00d7 the frame rate"},
+            {L"menu.framegen_4x", L"4\u00d7 the frame rate"},
+            {L"menu.framegen_5x", L"5\u00d7 the frame rate"},
+            {L"menu.framegen_max", L"As many as the display allows"},
+            // Appended to a multiple the measured runtime does not admit; %u is its highest.
+            {L"menu.framegen_beyond_gpu", L" \u2014 this GPU allows up to %u\u00d7"},
+            // A checkbox under the multiples. Off by default; FrameRatePolicy.h
+            // carries the measurement that made it a setting instead of a rule.
+            {L"menu.framegen_even_only", L"Even cadence only"},
+            {L"menu.framegen_hold_duplicates", L"Hold repeated frames (animation on twos)"},
+            {L"framegen.refusal.preference", L"This display cannot show %u\u00d7 this video's frame rate evenly, but it can show %u\u00d7.\n\nRaise DLSS > Generated frames to convert it."},
+            {L"framegen.refusal.preference.short", L"set to %u\u00d7, needs %u\u00d7"},
+            // Frame generation names ONE feature on every surface. Before this
+            // block the menu called it "Generate frames", the toolbar pill
+            // called it "Frame Generation" and the status line called it "FG" -
+            // three names for one feature in a single screenshot, four while it
+            // ran. The control is "Frame Generation"; "Generate frames" is only
+            // the verb on the action item.
+            {L"framegen.title", L"Frame Generation"},
+            {L"framegen.pill.generate", L"Frame Generation \u00b7 Generate"},
+            {L"framegen.pill.cancel", L"Frame Generation \u00b7 Cancel"},
+            {L"framegen.pill.busy", L"Frame Generation \u00b7 Busy"},
+            {L"framegen.pill.unavailable", L"Frame Generation \u00b7 Unavailable"},
+            {L"framegen.status.ready", L"Frame Generation ready "},
+            // Ready in every way the player can check without the GPU; the
+            // runtime's own admission is measured inside the first conversion,
+            // because a second NGX feature create beside the renderer's own
+            // froze presentation when it was tried in the background. No
+            // multiple is promised here, because the cap could still narrow it.
+            {L"framegen.status.ready_unchecked", L"Frame Generation ready"},
+            {L"framegen.status.busy", L"Frame Generation waits for the current job"},
+            // Printed with the refusal's short form in brackets, so the line
+            // reads "Frame Generation off (already lands evenly)".
+            {L"framegen.status.off", L"Frame Generation off"},
+            {L"framegen.status.generating", L"Generating frames"},
+            {L"framegen.status.stopping", L"Stopping frame generation"},
+            // The streaming case. It is an OFFER, not a refusal: the pass
+            // converts a file, the player can keep one with the same
+            // acquisition a render of a stream uses, and playback continues
+            // while it downloads.
+            {L"framegen.pill.get_copy", L"Frame Generation \u00b7 Get a copy"},
+            {L"framegen.pill.copying", L"Frame Generation \u00b7 Copying"},
+            {L"framegen.status.needs_copy", L"Frame Generation needs a local copy of this stream"},
+            {L"framegen.status.copying", L"Frame Generation is keeping a local copy of this stream"},
+            {L"framegen.needs_copy", L"This video is streaming, and frame generation converts a file.\n\nKeep a local copy of it now? It goes into the player's cache, playback carries on while it downloads, and Generate frames becomes available as soon as it finishes."},
+            {L"framegen.copy_started", L"Keeping a local copy of this video. The status line shows it while it runs; Generate frames becomes available when it finishes."},
+            {L"framegen.copy_failed", L"A local copy of this video could not be started. Try again once playback is running, or open a local file."},
+            {L"framegen.status.cancel_hint", L"Cancel: DLSS > Cancel frame generation"},
+            // Refusals. The long form is what a dialog shows; the short form is
+            // what fits the status line. The status line used to print the log
+            // slug ("no-even-multiple"), which is a developer identifier in a
+            // user's face while a written sentence sat unused beside it.
+            {L"framegen.refusal.unknown_rate", L"This video does not report a frame rate, so there is no interval to generate inside."},
+            {L"framegen.refusal.unknown_rate.short", L"no frame rate"},
+            {L"framegen.refusal.still_image", L"A still image has no second frame to generate between."},
+            {L"framegen.refusal.still_image.short", L"still image"},
+            {L"framegen.refusal.variable_rate", L"This video's frame rate varies, and generated frames need a constant one."},
+            {L"framegen.refusal.variable_rate.short", L"variable frame rate"},
+            {L"framegen.refusal.unknown_refresh", L"Windows did not report a refresh rate for this display."},
+            {L"framegen.refusal.unknown_refresh.short", L"no display refresh"},
+            {L"framegen.refusal.meets_refresh", L"This video already runs at or above what this display can show, so generated frames would never be presented."},
+            {L"framegen.refusal.meets_refresh.short", L"already matches the display"},
+            {L"framegen.refusal.below_double", L"This display cannot show even twice this video's frame rate, so there is no multiple to generate."},
+            {L"framegen.refusal.below_double.short", L"display cannot double it"},
+            // The one cadence trade this player refuses: the video is already
+            // scanned out the same number of times per frame, and no multiple
+            // that fits divides this refresh, so generating would land the
+            // frames unevenly where the video does not.
+            {L"framegen.refusal.source_even", L"This video already lands evenly on this display - every frame is scanned out the same number of times - and no higher multiple divides this refresh, so generated frames would land unevenly where this video does not."},
+            {L"framegen.refusal.source_even.short", L"already lands evenly"},
+            // Uneven, admissible, and withheld by the setting: the generated
+            // frames would land in the grid the video is already playing in,
+            // which is why this is an offer rather than a rule.
+            {L"framegen.refusal.even_only", L"No whole multiple of this video's frame rate divides this display's refresh, and Even cadence only is on.\n\nTurning it off in DLSS > Generated frames converts it anyway: the generated frames land in the same uneven grid this video already plays in, and arrive twice as often."},
+            {L"framegen.refusal.even_only.short", L"even cadence only"},
+            // The display-side answer, offered as the refusal dialog's Yes.
+            // %s Hz, %u the multiple, %s the rate it reaches, %s Hz again.
+            {L"framegen.mode_switch", L"\n\nThis monitor also has a %s Hz mode, where %u\u00d7 this video's frame rate lands on the refresh exactly: %s fps.\n\nSwitch this display to %s Hz? Nothing is converted yet - ask for Generate frames again once the display has changed. Windows keeps the new mode until you change it back."},
+            {L"framegen.mode_switch_failed", L"Windows refused the display mode change. Nothing was changed and your video is still playing."},
+            {L"framegen.refusal.runtime", L"This GPU and driver admit no generated frames."},
+            {L"framegen.refusal.runtime.short", L"refused by the driver"},
+            {L"framegen.refusal.no_local_copy.short", L"needs a local copy"},
+            {L"framegen.refusal.unchanged", L"\n\nNothing was changed and your video is still playing."},
+            {L"framegen.driver_next_step", L"\n\nUpdate the NVIDIA driver and try again."},
+            // FrameGenAddon.h: an RTX 20/30 refusal is the hardware, and with
+            // the dlssg_sm86 add-on loaded it is the add-on's to explain.
+            {L"framegen.gpu_next_step", L"\n\nNVIDIA Frame Generation needs an RTX 40 or 50 series GPU."},
+            {L"framegen.refusal.gpu.short", L"needs an RTX 40 or 50 GPU"},
+            {L"framegen.addon_next_step", L"\n\nThe dlssg_sm86 add-on is loaded but could not enable it. Its log is in the dlssg_sm86 folder beside the player."},
+            {L"framegen.refusal.addon.short", L"refused with the dlssg_sm86 add-on"},
+            // The offer and its outcomes (FrameGenAddon.h). %u is megabytes; %s a file name or a transport error.
+            {L"framegen.addon.offer", L"\n\nA community add-on, dlssg_sm86, can enable it on this GPU. It is unofficial and not made or supported by NVIDIA or by this player.\n\nDownload it from its author (%u MB) and install it beside the player?"},
+            {L"framegen.addon.downloading", L"Downloading the dlssg_sm86 add-on"},
+            {L"framegen.addon.installed", L"The dlssg_sm86 add-on is installed. It loads when the player starts.\n\nRestart the player now?"},
+            {L"framegen.addon.restart_failed", L"The player could not restart itself. Close it and open it again to use the add-on."},
+            {L"framegen.addon.failed.download", L"The add-on could not be downloaded (%s). Check the connection and try again. Nothing was installed."},
+            {L"framegen.addon.failed.verify", L"The downloaded %s did not match the version this player expects, so nothing was installed."},
+            {L"framegen.addon.failed.conflict", L"A different %s is already beside the player, probably from another mod. Nothing was changed."},
+            {L"framegen.addon.failed.write", L"%s could not be written beside the player. Move the player to a folder you can write to and try again."},
+            // %u is the multiplier, then the source and target rates as text so
+            // one formatter renders every rate the user sees.
+            {L"framegen.confirm", L"Generate %u\u00d7 the frames of this video: %s fps \u2192 %s fps.\n\nThe converted file is kept with the player's converted videos; DLSS > Convert & export > Show last generated file opens it. Playback switches to it when the conversion finishes.\n\nStart the conversion?"},
+            // Appended when the generated rate does not divide the refresh. The
+            // two holds are one scan-out apart, which is the same unevenness
+            // the source is already being shown with - see FrameRatePolicy.h.
+            {L"framegen.confirm.uneven", L"\n\nEach frame is shown for %u or %u refreshes of this display, which is the unevenness this video already plays with."},
+            // %u is the setting's multiple, then the highest the runtime admits.
+            {L"framegen.confirm.lowered", L"\n\nGenerated frames is set to %u\u00d7, but this GPU's Frame Generation allows up to %u\u00d7."},
+            {L"framegen.confirm.lowered.addon", L" The dlssg_sm86 add-on sets that limit: MaxGeneratedFrames=4 in dlssg_sm86.ini beside the player allows 5\u00d7, after a restart."},
+            {L"framegen.confirm.neural", L"\n\nThe neural render on screen is what will be converted, not the original - upscale first, generate frames on the result, which is the order NVIDIA’s own pipeline uses. Turn Neural Rendering off first to generate frames from the original instead."},
+            {L"framegen.exists", L"This video has already been converted:\n%s\n\nPlay that file instead of converting again?\n\nYes plays it. No converts again and replaces it."},
+            {L"framegen.worker_failed", L"The conversion could not start. Try again."},
+            {L"export.worker_failed", L"Saving could not start. Try again."},
+            {L"framegen.cache_failed", L"The converted file could not be created where the player keeps its converted videos. Check that the cache folder is writable."},
+            {L"framegen.failed", L"The conversion did not finish, so nothing was written and your video is unchanged.\n\nSee DLSSVideoPlayer.log for what the runtime reported."},
+            {L"framegen.finished_elsewhere", L"The conversion finished for a video you have since left, so playback was left alone.\n\nDLSS > Convert & export > Show last generated file opens the new file."},
+            {L"framegen.reveal_failed", L"The converted file could not be shown. It may have been moved or deleted."},
+            {L"export.title.failed", L"Save failed"},
+            {L"export.title.complete", L"Save complete"},
+            {L"menu.rehook", L"Recreate NGX / re-hook DLSS 5\tF6"},
+            {L"menu.preview_frame", L"Preview this frame (neural)\tF"}, {L"menu.preview_clip", L"Preview 4 s clip (neural)\tShift+F"},
+            {L"menu.convert", L"Convert && export"},
+            {L"menu.render_range", L"Convert marked clip to neural video\tCtrl+R"}, {L"menu.render_whole", L"Convert whole video to neural video"},
+            {L"menu.export_cached", L"Save converted video..."},
+            {L"menu.export_stages", L"Export with DLSS stages...\tCtrl+S"},
+            {L"export.stages.title", L"Export with DLSS stages"},
+            {L"export.stages.upscale", L"Super Resolution"},
+            {L"export.stages.engine", L"Upscaler"},
+            {L"export.stages.engine_vsr", L"RTX VSR (recommended)"},
+            {L"export.stages.engine_dlss", L"DLSS Super Resolution"},
+            {L"export.tip.engine", L"Which upscaler writes the file when the neural model does not run. RTX VSR, the default and the playback upscaler, measured 87.5 VMAF against bicubic's 80.5 and DLSS Super Resolution's 74.9, 960x540 to 1080p over six clips on an RTX 5090 (docs/measurements/vsr-quality-20261002), at the quality chosen under Video > Compare > RTX VSR quality. DLSS Super Resolution is built for rendered games and scored below bicubic on every clip. With Neural rendering ticked the upscale is the model's carrier, DLSS's, whatever this says."},
+            {L"export.stages.neural", L"Neural rendering"},
+            {L"export.stages.framegen", L"Frame generation"},
+            {L"export.stages.resolution", L"Output height"},
+            {L"export.stages.multiplier", L"Frame rate"},
+            {L"export.stages.run", L"Export..."},
+            {L"export.stages.close", L"Close"},
+            {L"export.stages.note", L"Stages run in NVIDIA's order: Super Resolution, then neural rendering on the upscaled frame, then frame generation on the result. Image adjustments and Mix are not included: they change only what the screen shows."},
+            {L"export.stages.group_stages", L"Stages, in the order they run"},
+            {L"export.stages.group_result", L"Result"},
+            {L"export.progress.title", L"Exporting with DLSS stages"},
+            {L"export.progress.pass_sr_neural", L"Super Resolution and neural rendering"},
+            {L"export.progress.pass_sr", L"Super Resolution"},
+            {L"export.progress.pass_vsr", L"RTX VSR"},
+            {L"export.progress.pass_neural", L"Neural rendering"},
+            {L"export.progress.pass_framegen", L"Frame generation"},
+            {L"export.progress.writing", L"Writing the finished file"},
+            {L"export.stages.refusal.nothing", L"Choose at least one stage."},
+            {L"export.stages.refusal.geometry", L"This source reports no usable geometry."},
+            {L"export.stages.refusal.target", L"This source is already at or above that height, so there is nothing to upscale."},
+            {L"export.stages.refusal.multiplier", L"This GPU's runtime does not admit that frame rate."},
+            {L"export.stages.refusal.vsr", L"RTX VSR is not available here (it needs an RTX GPU and the complete download). Choose DLSS Super Resolution as the upscaler."},
+            {L"export.stages.refusal.still", L"A still image has no successor frame to generate toward."},
+            {L"export.stages.busy", L"Another conversion is running."},
+            {L"export.stages.no_source", L"Open a local video first. A stream has to finish copying before it can be exported."},
+            {L"export.tip.upscale", L"Upscales the file to the resolution below, with the Upscaler under it - RTX VSR unless DLSS Super Resolution is chosen. Off, the render stays at the source resolution. Without Neural rendering the neural model does not run at all."},
+            {L"export.stages.history", L"History"},
+            {L"export.stages.history_temporal", L"Temporal (smooths grain, trails motion)"},
+            {L"export.stages.history_per_frame", L"Per-frame (recommended)"},
+            {L"export.tip.history", L"DLSS Super Resolution only: how it uses earlier frames. Per-frame, the default, upscales every frame on its own; Temporal accumulates them. Measured 960x540 to 1080p on an RTX 4080 SUPER, VMAF against the 1080p original: Per-frame scored higher on 5 of 6 clips (+19 on a slow pan, +18 on lossy near-still footage) and 1.3 lower on a held frame. Temporal changes less from frame to frame than the source (up to 1.2 luma levels less), which calms grain and trails motion; Per-frame changes as much as the source does. Bicubic scored above both on every clip (70-96, against 63-94 for Per-frame and 49-80 for Temporal). The same choice is DLSS > Upscaling history for playback. With Neural rendering ticked the pass keeps Temporal, because the model runs on the same frames."},
+            {L"neural.tip.runtime.mochizuki", L"Runtime: mochizuki - the Vulkan network built from dlssnr-amd. Its own options are in Neural settings, under the Mochizuki heading. The first build of its network takes about a minute; later runs reuse the driver's pipeline cache."}, {L"neural.tip.runtime.lmxxf", L"Runtime: lmxxf - the HIP module tree. Its own options are in Neural settings, in the multi-pass and temporal rows."}, {L"toolbar.tip.neural.amd", L"Neural Rendering (D)\nReplays the video through the AMD runtime on this machine, which has to render the frames before you can watch them. Off plays the original."}, {L"toolbar.tip.neural", L"Neural Rendering (D)\nReplays the video through NVIDIA's neural model, which has to render the frames before you can watch them. Off plays the original."},
+            {L"toolbar.tip.upscaling", L"DLSS Super Resolution\nRenders the picture larger than the source. On video it measured below a plain bicubic upscale; it is built for rendered games. Unavailable when the source already fills the panel - there is nothing to upscale then.\n\nRTX VSR, the default upscaler, works while this is off: DLSS > RTX VSR Upscaling."},
+            {L"toolbar.tip.framegen", L"Frame Generation\nWrites a new file with generated frames between the real ones. This is a conversion that takes minutes, not a switch."},
+            {L"toolbar.tip.playback_framegen", L"Frame Generation during playback (Ctrl+Alt+G)\nInterpolates new frames between the real ones live, on screen, so motion looks smoother (the frame rate chip shows the higher rate). Off by default; the choice is remembered. This is the on-screen effect, not the file conversion started by Generate frames under DLSS."},
+            {L"toolbar.tip.open", L"Open a file (Ctrl+O)\nA video, a photo or a GIF. Dropping a file on the window does the same."},
+            {L"toolbar.tip.youtube", L"Open a YouTube link (Ctrl+L)\nPaste the address of a public video."},
+            {L"toolbar.tip.back10", L"Back 10 seconds (Left)"},
+            {L"toolbar.tip.forward10", L"Forward 10 seconds (Right)"},
+            {L"toolbar.tip.stop", L"Stop (S)\nStops live rendering or a running job; otherwise returns to the start."},
+            {L"toolbar.tip.playpause", L"Play or pause (Space)"},
+            {L"toolbar.tip.mute", L"Mute (M)\nThe slider beside it sets the level."},
+            {L"toolbar.tip.subtitles", L"Subtitles\nListens to the audio when the film has no subtitle track, translates what it finds, and shows the two together. The bar along the bottom of the button is how far along it is; press again to stop."},
+            {L"toolbar.tip.aspect", L"Fit or fill (A)\nFit the whole picture in the window, or fill the window and crop."},
+            {L"toolbar.tip.color", L"Image adjustments (Ctrl+E)\nBrightness, contrast, saturation and white balance. Applied after rendering, so they are instant."},
+            {L"toolbar.tip.debug", L"Debug views (1-4)\nShow the motion vectors and depth the model is given, instead of the picture. 1 returns to the picture."},
+            {L"toolbar.tip.fullscreen", L"Fullscreen (F11)\nEsc or F11 leaves. A render keeps going; Esc again in the window stops it."},
+            {L"export.tip.neural", L"Runs the neural model with the settings from Neural settings. On an upscaled export it runs on the upscaled frame, which is NVIDIA's own DLSS 5 order."},
+            {L"export.tip.framegen", L"Generates frames between the rendered ones. Always last, because DLSS-G consumes the finished picture."},
+            {L"menu.neural_presets", L"Neural presets"},
+            {L"menu.neural_preset_custom", L"Custom (a control was changed)"},
+            // The AMD runtime's DLSS5_STYLE, the model's own style feature. 0 is
+            // NVIDIA's default and the setting its reference images use; 1 is
+            // the style the original runtime ran in Stellar Blade and the value
+            // every package before the switch existed had built in; 2 is the
+            // third style. Each costs no render time - it changes what the
+            // network is asked for, not how much of it runs.
+            {L"menu.amd_style_header", L"AMD style: what the model is asked for"},
+            {L"menu.amd_style_0", L"Style 0 \u00b7 NVIDIA default (closest to reference)"},
+            {L"menu.amd_style_1", L"Style 1 \u00b7 Stellar Blade (runtime default)"},
+            {L"menu.amd_style_2", L"Style 2 \u00b7 third style"},
+            {L"menu.amd_runtime_header", L"AMD runtime: which network draws the frame"},
+            {L"menu.amd_runtime_lmxxf", L"lmxxf \u00b7 HIP modules"},
+            {L"menu.amd_runtime_mochizuki", L"mochizuki \u00b7 Vulkan, builds its network once (default)"},
+            {L"menu.neural_settings", L"Neural settings\tCtrl+N"},
+            // The measured rates are whole 8 s 3840x2160 renders on an RTX 4080
+            // SUPER, helper start included, median of three; see UpscalingPolicy.h.
+            {L"menu.processing_scale", L"Processing scale"},
+            {L"menu.processing_scale_measured", L"Render rate of a 4K clip, measured on an RTX 4080 SUPER"},
+            {L"menu.processing_scale_100", L"Source, 100% (recommended)\t14.8 fps"},
+            {L"menu.processing_scale_75", L"75% - the model sees a smaller picture\t17.3 fps, 1.2x"},
+            {L"menu.processing_scale_50", L"50% - the model sees a smaller picture\t22.0 fps, 1.5x"},
+            {L"menu.encoder_settings", L"Encoder settings"},
+            {L"menu.advanced", L"Advanced"}, {L"menu.safe_mode", L"Restart in DLSS SR safe mode"},
+            {L"menu.clear_neural_cache", L"Clear Neural Cache"}, {L"menu.open_receipt", L"Open render receipt"},
+            {L"menu.render_report", L"Render report..."},
+            {L"report.title", L"Render report"},
+            {L"report.unavailable", L"This render's receipt could not be read, so there is nothing to report."},
+            {L"report.unmeasured", L"This render was made before the player measured its renders, or measured no frame, so its receipt carries no temporal metrics.\nRender it again to measure it."},
+            {L"report.body", L"%s\n\nMeasured on %s output frames against their source (%s consecutive pairs, %s shots), in 8-bit codes.\n\nFlicker added: %s\n    change after following the video's own motion - source %s, render %s\nTemporal sigma added: %s\n    per-pixel spread inside a shot - source %s, render %s\nColour: %s from the source on average, brightness %s\n\nScene cuts %s, temporal stability %s.\nNegative flicker and sigma mean the render is steadier than its source."},
+            {L"menu.check_updates", L"Check for updates"},
+            // The badge sits right-justified in the menu bar; the arrow reads as
+            // "newer than this build" without needing colour, which a native
+            // menu bar does not give us.
+            {L"update.badge", L"\u2191 Update "},
+            {L"update.available", L"A newer release is available: "},
+            {L"update.open_question", L"\n\nOpen the GitHub releases page?"},
+            {L"update.up_to_date", L"This is the latest release: "},
+            {L"update.unreachable", L"The update check could not reach GitHub. Check the connection and try again."},
+            {L"driver.below_floor", L"Neural rendering needs a newer NVIDIA driver."},
+            {L"driver.detected", L"Detected driver: "},
+            {L"driver.minimum", L"Minimum for neural rendering: "},
+            {L"driver.verified", L"Verified for this build: "},
+            {L"neural.phase.cache", L"Checking saved video"},
+            {L"neural.cache.checking", L"Verifying cache; no re-encoding"},
+            // The cause is appended to the staging sentence, and the
+            // filesystem error number with it when there was one; the log line
+            // beside it names the exact directory that was refused.
+            {L"cache.staging_failed", L"Neural cache staging could not be created in %s: %s"},
+            {L"cache.not_writable", L"The neural cache is not writable at %s. Move the player to a folder you can write to, or free space in LocalAppData."},
+            {L"cache.cause.unwritable", L"the folder cannot be written to"},
+            {L"cache.cause.invalid_key", L"the cache key was rejected"},
+            {L"cache.cause.create_failed", L"the folder could not be created"},
+            {L"cache.cause.exists", L"a staging folder of that name is already there"},
+            {L"cache.cause.outside_root", L"the folder resolved outside the cache"},
+            {L"neural.phase.acquiring", L"Acquiring"}, {L"neural.phase.rendering", L"Neural rendering"},
+            {L"neural.phase.encoding", L"Encoding"}, {L"neural.phase.validating", L"Validating"},
+            {L"neural.phase.ready", L"Ready"}, {L"neural.cancel", L"Cancel"},
+            {L"neural.phase.preflight", L"Probing neural runtime"}, {L"neural.phase.paused", L"Paused"},
+            {L"neural.phase.recovering", L"Recovering"},
+            {L"neural.live.title", L"Neural rendering from here"},
+            {L"neural.live.buffering", L"Buffering neural frames"}, {L"warmup.title", L"Starting the neural render"}, {L"toast.rendered", L"Whole video rendered \u00b7 "}, {L"toast.rendered_in", L" of video in "}, {L"warmup.cache", L"waiting for NVIDIA's model files to settle"}, {L"warmup.runtime", L"checking the neural runtime"}, {L"warmup.model", L"preparing the model on the GPU"}, {L"neural.settings.group_mochizuki", L"Mochizuki \u00b7 this runtime's own controls"}, {L"neural.settings.mz_maxratio", L"Highlight guard"}, {L"neural.tip.mz_maxratio", L"1.00-8.00, default 2.00. How far the network may brighten a highlight before it is held back: higher keeps more of a window or a lamp, lower keeps the rest of the frame from following it. Off its default it writes its own cache entry."}, {L"neural.settings.mz_history", L"History strength"}, {L"neural.tip.mz_history", L"0-100 %, default 100 %. How much of the previous frame's answer is kept. Needs motion vectors, and it is the one temporal control this package's network actually reads."}, {L"neural.settings.mz_apply", L"Render the network (off shows the original)"}, {L"neural.tip.mz_apply", L"Runs the model at full cost and shows the source frame instead: the A/B that changes nothing else. The session restarts when it moves."}, {L"neural.settings.mz_preprocess", L"Preprocess \u00b7 auto exposure, filmic"}, {L"neural.tip.mz_preprocess", L"Normalises the picture the network is shown and takes the change back out of its answer - what a graded film needs and a game\u0027s HDR does not. Rebuilds the network once when it moves."}, {L"neural.settings.mz_int4", L"INT4 mixed network (smaller, not the same picture)"}, {L"neural.tip.mz_int4", L"Loads the INT4 mixed model: less VRAM, a measurably different render. Rebuilds the network when it moves."}, {L"neural.settings.mz_network", L"Network"}, {L"neural.tip.mz_network", L"310.8.0 is the network every earlier render was made with (599 weights). 310.9.16 small is a differently trained one (255 weights) shipped as dlssnr-small.bin: same settings, a different picture. A key term, and the session restarts when it moves."}, {L"warmup.building", L"building the network"}, {L"warmup.building.title", L"Building the neural network"}, {L"warmup.building.detail", L"a first build takes about a minute"}, {L"neural.phase.building", L"building the network"}, {L"warmup.first", L"rendering the first second"},
+            {L"neural.live.lead", L"buffered"},
+            // Which way the play press that arrived during buffering points: the
+            // button state alone was invisible, so a second press cancelled it.
+            {L"neural.live.stalled", L"Live rendering stopped: the render never reached this frame. Playing the original."},
+            {L"neural.cadence.cannot_follow", L"This video plays faster than the neural view can be assembled on this machine, so playback kept falling behind. Showing the rendered file on its own instead."},
+            {L"neural.order.generated_source", L"This video is a frame-generation conversion, so this render upscales generated frames and costs as many times the work as the conversion multiplied. Rendering first and converting the result is the faster order."},
+            {L"neural.live.will_play", L"starts when the buffer fills"},
+            {L"neural.live.will_stay_paused", L"stays paused when the buffer fills"},
+            {L"neural.live.slow", L"This video is %ux%u at %.6g fps. On this GPU neural rendering runs at about %.3g frames per second, which is %.2gx real time, so watching it live would pause to buffer almost continuously.\n\nConvert the clip instead (DLSS > Convert & export) to watch it smoothly afterwards.\n\nStart the live session anyway?"},
+            {L"neural.live.declined", L"Live neural rendering declined for this video; convert it instead (DLSS > Convert & export)"},
+            {L"neural.live.directory_failed", L"The neural segment folder could not be created; check the cache location"},
+            {L"neural.preview.title", L"Previewing neural settings"},
+            {L"neural.preview.detail", L"Rendering this frame with the new settings"},
+            {L"neural.failure.gpu-stall", L"The GPU stalled during neural rendering."},
+            {L"neural.failure.device-removed", L"The graphics device was removed or reset during neural rendering."},
+            {L"neural.failure.worker-crashed", L"The neural render helper crashed."},
+            {L"neural.failure.retry-exhausted", L"Neural rendering gave up after retrying the same frame."},
+            {L"neural.failure.preflight", L"The neural runtime preflight failed."},
+            {L"neural.failure.identity", L"A frame identity mismatch stopped the neural render."},
+            {L"neural.failure.protocol", L"The neural render helper stopped responding correctly."},
+            {L"compare.refused.no_video", L"Open a video or photo to compare it"},
+            {L"compare.refused.no_render", L"Compare views need a neural render: mark I/O, then Ctrl+R"},
+            {L"compare.refused.render_starting", L"Compare views open once the neural render is playing"},
+            {L"neural.view.original", L"Showing the original"},
+            {L"neural.sync.warning", L"The original and neural-rendered streams are out of sync."},
+            // A renderer that latched itself unusable is rebuilt once with the
+            // frame that was on screen; only a rebuild that fails unloads.
+            {L"renderer.removed.rebuilt", L"The graphics device was removed or reset; playback stopped and the renderer was rebuilt"},
+            {L"renderer.removed.lost", L"The graphics device was removed or reset, and the renderer could not be rebuilt. Open the video again."},
+            {L"renderer.stalled.rebuilt", L"The GPU stopped responding; playback stopped and the renderer was rebuilt"},
+            {L"renderer.stalled.lost", L"The GPU stopped responding, and the renderer could not be rebuilt. Open the video again."},
+            {L"safe_mode.confirm", L"Restart the player in DLSS SR safe mode?\n\nThis disables the experimental neural add-on for this launch."},
+            {L"safe_mode.launch_failed", L"The player could not restart in DLSS SR safe mode.\n\nSee DLSSVideoPlayer.log for details."},
+            {L"rehook.title", L"Recreate DLSS"}, {L"rehook.confirm", L"Recreate DLSS now?\n\nRenderer recreation can reset playback or hang while the experimental neural add-on is active."},
+            // The toolbar builds its own labels from state (Play/Pause, Mute/Sound,
+            // Fit/Fill); only the idle surface's Open button reads a key.
+            {L"button.open", L"Open"},
+            {L"adjustments.title", L"Image adjustments"}, {L"adjustments.brightness", L"Brightness"}, {L"adjustments.contrast", L"Contrast"},
+            {L"adjustments.saturation", L"Saturation"}, {L"adjustments.gamma", L"Gamma"}, {L"adjustments.temperature", L"Temperature"},
+            {L"adjustments.tint", L"Tint"},
+            {L"adjustments.neural_strength", L"DLSS 5 mix"},
+            {L"adjustments.neural_strength.tip", L"How much of the neural result you see - the same Mix as the compare bar: below 100 percent mixes back toward the original, above 100 percent extends the model's own luminance change, and either way it only re-composes the frame already on screen, so it costs no re-render."},
+            {L"adjustments.note", L"Instant, and only on this screen: applied after DLSS to the picture you see, not written by conversions or exports. Debug views remain unmodified."},
+            {L"adjustments.open_neural", L"Neural settings…"},
+            {L"adjustments.tip.open_neural", L"How the neural render itself looks: those changes re-render, and conversions and exports write them."},
+            {L"adjustments.reset", L"Reset"}, {L"adjustments.close", L"Close"},
+            {L"neural.settings.title", L"Neural settings"}, {L"neural.settings.intensity", L"Intensity"}, {L"neural.settings.structure", L"Local structure"},
+            {L"neural.settings.tone", L"Local tone"}, {L"neural.settings.skin", L"Skin structure"}, {L"neural.settings.skin_off", L"As structure"}, {L"neural.settings.skin_needs_mask", L"Mask off"}, {L"neural.settings.color", L"Color strength"},
+            {L"neural.settings.style", L"Style"}, {L"neural.settings.automask", L"Automatic mask"},
+            {L"neural.settings.guides", L"Guides"}, {L"neural.settings.guide_mv", L"Motion vectors"}, {L"neural.settings.guide_depth", L"Depth"},
+            {L"neural.settings.passes", L"Neural passes"}, {L"neural.settings.skin_protect", L"Keep skin tones"}, {L"neural.tip.skin_protect", L"AMD backend, two passes or more. Later passes keep skin-coloured pixels as the first pass rendered them, so stacking cannot drift faces.\n\nA colour heuristic, not a segment: a warm background can be caught by it, and coloured light can let a face slip through. The network output is already in a working encoding with its highlights compressed, so no gamma is applied to the test."}, {L"neural.settings.mp_predict", L"Predict third pass"}, {L"neural.tip.mp_predict", L"AMD backend, three passes only. A third pass costs a full network run; with this on, the third pass is forecast locally from the source and the first two outputs instead.\n\nOn keeps the third pass cheap. Turning it off runs the network for real a third time, which costs about a third more and changes the stacked look slightly. Measured on moving content, both arm the same ghosting - that comes from stacking itself, not from the forecast."}, {L"neural.settings.mp_skip", L"Later passes"}, {L"neural.tip.mp_skip", L"AMD backend, two passes or more. The later passes run the ViT and C512-uplink block group by default; skipping it makes them much lighter.\n\nMeasured on moving content: with the skip off, three passes carry 135 % of the source's own frame-to-frame change; with it on, 106 % - the same as a single pass, which is where the stacking's ghosting goes. The cost is the look of the later passes: lighter and lower-contrast, about 37 dB further from a single-pass render. Two passes instead of three is the other way to spend this."}, {L"neural.settings.chained", L"Keep temporal history per pass"},
+            {L"neural.settings.group_look", L"Look"}, {L"adjustments.group_picture", L"Picture"}, {L"adjustments.group_compare", L"Comparison"}, {L"encoder.group_conversion", L"Color conversion"}, {L"encoder.group_cache", L"Cache encoding"}, {L"encoder.group_model", L"What the model is given"},
+            {L"neural.settings.group_cost", L"Quality and render time"},
+            {L"neural.settings.temporal_mode", L"Temporal mode"}, {L"neural.tip.temporal_mode", L"AMD backend, and only at one pass with the Original model: every active mode requires DLSS5_MULTI_PASS=1, so the Small rung and the stacked rungs suspend it.\n\nOff is the network's own output, Fast history TheAutomatic's approximation, and the low-frequency modes smooth the residual that changes slowly.\n\nRead once when the network is built: a change reaches the next render; a session already running needs a restart."},
+            {L"neural.settings.group_guides", L"Guides sent to the model"},
+            {L"neural.settings.group_temporal", L"Across frames"},
+            {L"neural.settings.scene_cuts", L"Scene cuts"},
+            {L"neural.scene_cuts.default", L"Default (recommended)"}, {L"neural.scene_cuts.more", L"More sensitive"},
+            {L"neural.scene_cuts.less", L"Less sensitive"}, {L"neural.scene_cuts.off", L"Off"},
+            {L"neural.settings.stability", L"Temporal stability"},
+            {L"neural.stability.off", L"Off (default)"}, {L"neural.stability.low", L"Low"},
+            {L"neural.stability.medium", L"Medium"}, {L"neural.stability.high", L"High"},
+            // The same rung on the AMD backend, where it is not the default: Off
+            // there is the model's own frame-to-frame jitter with nothing holding
+            // it, which is what a viewer sees as flicker.
+            {L"neural.stability.off.amd", L"Off"},
+            {L"neural.settings.note", L"These change the neural render itself: a change re-renders, and conversions and exports write it. Image adjustments and Mix change only what this screen shows, instantly."},
+            {L"neural.settings.preset", L"Look preset"},
+            {L"neural.tip.preset", L"A named starting point for the Look controls. Every preset renders in the same time; moving a control afterwards makes it Custom, and picking the preset again brings its values back."},
+            {L"neural.preset.custom", L"Custom"},
+            {L"neural.preset.custom_from", L"Custom · from "},
+            {L"neural.preset.custom_note", L"Your own settings. Pick a preset to start from one again."},
+            {L"neural.settings.open_adjustments", L"Image adjustments…"},
+            {L"neural.tip.open_adjustments", L"Brightness, contrast, colour and Mix: instant, on this screen only, not in conversions or exports."},
+            // What Apply will do to the picture on screen (RefreshNeuralApplyState).
+            {L"neural.state.unloaded", L"No video open: these settings are used by the next render."},
+            {L"neural.state.session_current", L"On screen: the neural render with these settings."},
+            {L"neural.state.session_changed", L"Changed: Apply restarts the neural render at %s with these settings."},
+            {L"neural.state.preview_soon", L"This paused frame re-renders with these settings once you stop changing them."},
+            {L"neural.state.preview_rendering", L"Rendering this paused frame with these settings…"},
+            {L"neural.state.preview_shown", L"This frame shows these settings; the rest of the video is still the previous render."},
+            {L"neural.state.cached_ahead", L"Changed: the picture is the previous render. Pause to preview this frame, or convert again."},
+            {L"neural.state.cached_current", L"On screen: a render made with these settings."},
+            {L"neural.state.original", L"Neural Rendering is off: turn it on (D) to render with these settings; a paused frame previews them."},
+            {L"neural.settings.ahead", L"Settings changed - this is the previous render; pause to preview them, or convert again"},
+            {L"encoder.settings.title", L"Encoder settings"},
+            {L"encoder.settings.gpu_convert", L"GPU color conversion"},
+            {L"encoder.settings.gpu_source", L"GPU source conversion"},
+            {L"encoder.settings.nvenc_preset", L"NVENC preset"},
+            {L"encoder.settings.capture_dither", L"Dither the cached frames"},
+            {L"encoder.settings.cache_quality", L"Cache quality"},
+            {L"encoder.settings.deband", L"Deband the source before the model"},
+            {L"encoder.settings.exposure", L"Supply a smoothed exposure"},
+            {L"encoder.quality.standard", L"Standard - HEVC 8-bit, CQ 16"},
+            {L"encoder.quality.high", L"High - HEVC 10-bit, CQ 14 (1-5x the size)"},
+            {L"encoder.quality.lossless", L"Lossless - FFV1 10-bit (20-40x the size)"},
+            {L"encoder.settings.note", L"These apply to the next neural render. Each one that changes the written pixels is part of the render's cache key, so a range rendered under other settings is rendered again rather than reused."},
+            {L"encoder.settings.reset", L"Reset"}, {L"encoder.settings.close", L"Close"},
+            // Tooltips. They describe the control and, where it was measured,
+            // what it demonstrably does; they never promise a direction that has
+            // not been verified on hardware.
+            {L"neural.tip.intensity", L"Fades the model's change back towards the source. 1.00 is the model default and the most the runtime applies: DLSS-NR 310.8 renders anything above 1.00 exactly as 1.00.\n0.00 is not the source - it keeps about half of the model's change. On this runtime it acts almost exactly like Color strength (at 0.00 the two are identical). For a stronger look use Style, Local tone, Neural passes or the Strong preset."},
+            {L"neural.tip.structure", L"Strength of the model's local-detail term (default 1.00).\nBelow 1.00 the picture moves towards the source; above it the detail changes without moving further from the source. NVIDIA documents 0.00-1.00, so judge 1.00-2.00 on the preview.\nSkin structure follows this value unless you give it its own."},
+            {L"neural.tip.tone", L"Strength of the model's local brightness and shading term (default 1.00).\nBelow 1.00 the picture moves towards the source; 2.00 pushes it about a fifth further from it than the default. NVIDIA documents 0.00-1.00, so judge 1.00-2.00 on the preview."},
+            {L"neural.tip.skin", L"Structure term for the skin of the characters Automatic mask finds. At the left end, As structure (the default), skin follows Local structure; after it, 0.00 to 0.99 gives skin its own value.\nMeasured on DLSS-NR 310.8: at Local structure 0.50, As structure renders exactly like skin 0.50. It needs Automatic mask, so it is greyed out while the mask is off, and it is not face protection: its change lands on faces barely more than Intensity's does."},
+            {L"neural.tip.color", L"How much of the model's colour change is kept (default 1.00, the maximum). Lower values fade the change back towards the source; 0.00 keeps about half of it.\nOn this runtime it acts almost exactly like Intensity below 1.00 (at 0.00 the two are identical)."},
+            {L"neural.tip.style", L"Which look the model is asked for - the largest change any control here makes. Measured over six clips against Default: Natural lands 68 % further from the source (17-129 %), Cinematic 34 % (0-75 %).\nChanging it costs no render time (within 1 % per frame, as every Look control and preset). It starts a fresh temporal history, like any change that re-renders."},
+            {L"neural.tip.automask", L"Lets the runtime find characters in the frame, so the Skin structure term applies to them.\nTurning it off changes the frame and switches Skin structure off with it."},
+            {L"encoder.tip.gpu_convert", L"Converts each rendered frame to NV12 on the GPU instead of letting the encoder convert on the CPU. Measured with the neural pass running, the GPU is the scarce resource and the CPU path was slightly faster, so this is off by default; turn it on for a GPU with headroom."},
+            {L"encoder.tip.gpu_source", L"Decodes the source to NV12 and converts it to BGRA on the GPU instead of letting ffmpeg convert on the CPU. Turn it off to compare when the GPU is the bottleneck. Applies to the next render."},
+            {L"encoder.tip.capture_dither", L"Adds a fixed ordered dither where each rendered frame is cut to 8 bits for the Standard cache, so a smooth gradient becomes a fine mix of two levels instead of a staircase of flat bands. Measured on five 1080p clips: 45-71 % less banding on the three that have any, about the same size, VMAF within 0.05. On by default; turn it off to write exactly what the model produced. High removes the banding at its source instead. The player window always dithers what it shows, which costs nothing."},
+            {L"encoder.tip.cache_quality", L"What the neural render is written as, in the cache and in an export made from it. Measured on five 1080p clips against the Lossless render, RTX 4080 SUPER:\nStandard - HEVC 8-bit at CQ 16, now truly constant quality: VMAF 96.9 on average and 93.9 at worst, about 17 Mbit/s on average and 43 on the most detailed clip. Before NVENC's own bitrate ceiling was lifted it held that clip near 11 Mbit/s and scored 80.3 there. The 8-bit encode still leaves some banding in smooth gradients.\nHigh - a 10-bit capture written as HEVC Main10 without that ceiling. VMAF 97.6 (94.9 at worst), about 19 Mbit/s on average and 54 on the most detailed clip; the banding is gone.\nLossless - the same 10-bit capture written exactly as FFV1 on the CPU, about 240 Mbit/s (1.8 GB a minute at 1080p30).\nRender time was the same for all three at 1080p: the neural pass is the long pole. Each rung is part of the cache key, so changing it renders again.\nOn an AMD render the two lossy rungs are written by AMD's own encoder instead of libx264 on the CPU. On the same 720p neural render, High came out 7 % smaller with 0.1 dB more PSNR and wrote 1.8x faster, and Standard 23 % smaller with 0.25 dB less PSNR and 1.6x faster. Lossless is still FFV1."},
+            {L"encoder.tip.deband", L"Smooths the flat steps a compressed source leaves in gradients before the neural model sees the frame (libplacebo's deband at its defaults, with a fixed pattern so it cannot flicker). Measured on seven clips, the model already removes almost all of a source's banding, so this changes little but fine texture and text; off by default. Banding in a render comes from the Standard cache encode, which High removes. Part of the cache key, so changing it renders again."},
+            {L"encoder.tip.exposure", L"Gives the neural pass a metered exposure, smoothed over about 20 frames and restarted at every scene cut, instead of letting it meter each frame itself. Measured on 13 clips with the current runtime: real footage rendered bit-identically either way, and the synthetic clips it changed got very slightly more flicker, so it is off by default. Part of the cache key, so changing it renders again."},
+            {L"encoder.tip.nvenc_preset", L"Speed/quality preset for the hevc_nvenc encoder that writes neural renders and frame-generation conversions. p5 is the default. Measured at 2560x1440 on an RTX 5090: p7 takes twice the encode time of p5 and buys 0.12 VMAF on ordinary content, 0.53 on noise-heavy content, at 95-98 VMAF. The encoder is the long pole on both paths, so whole conversions ran 8.8 s against 6.3 s. Applies to the next render."},
+            {L"neural.tip.guide_mv", L"Sends this player's estimated motion to the model so it can reuse the previous frame.\nVideo carries no real motion vectors, so these are estimated per frame and rejected where the estimate is not trustworthy."},
+            {L"neural.tip.guide_depth", L"Sends this player's estimated depth proxy.\nMeasured: it only changes the image while Motion vectors is on - with motion off, depth makes no difference."},
+            {L"neural.tip.scene_cuts", L"How readily a cut in the video starts the model's temporal history over.\nDefault found every one of 22 labelled cuts in real footage with no false alarm. More sensitive also catches cuts between similar-looking shots, at the price of an extra reset on flashes; Less sensitive resets less often and can miss a second cut that follows within 0.3 s. Off never resets on the picture - only seeks and dropped frames do.\nChanging it renders again."},
+            {L"neural.tip.stability", L"Steadies shimmer the model adds from frame to frame: the previous rendered frame is moved along the video's own motion and blended in, only where the source itself did not change after that move - so moving edges, occlusions and cuts take the new frame as it is.\nLow, Medium and High keep 30, 50 and 70 % of that history. Changing it renders again.\nOff is the render as the model produced it."},
+            // The same pass on the AMD backend, where it runs without a motion
+            // estimate: that backend has none, so the one it is given is zero and
+            // the source test above is what does the work - a pixel is blended
+            // only where the two source frames agree, which is still surfaces and
+            // not the things that moved. Written as what happens rather than as
+            // what the pass can do with a flow, because on this backend there is
+            // no flow to speak of.
+            {L"neural.tip.stability.amd", L"Steadies what the model changes from frame to frame on still surfaces, which is what shows up as flicker.\nThis backend has no motion estimate, so none is used: a pixel is blended only where this frame and the one before it agree, so still areas are steadied and anything that moved is taken as the model made it. Low, Medium and High keep 30, 50 and 70 % of that history; Low is the default here. Changing it renders again.\nOff is the model's own output, nothing holding it - the rung that flickers."},
+            {L"neural.tip.apply", L"Applies these settings to what is on screen: an active session restarts at the playhead, a paused frame is rendered again.\nEvery distinct combination is rendered from scratch - about 10 s for one 1080p frame - and repeats come back from cache."},
+            {L"neural.tip.passes", L"Runs the model over each frame more than once.\nEvery extra pass is another full neural evaluate; a conversion has no frame budget, so the cost lands on render time - two passes took 9.81 s against 8.01 s.\nOn the AMD backend the first rung is the 0.44 Small model (31 blocks at 0.5x) rather than a pass count: a differently trained network, single-pass by construction; 1, 2 and 3 stack the Original 71-block one, and four is the NVIDIA ladder only."},
+            {L"neural.tip.chained", L"Gives every stacked pass its own temporal history, reset only on a scene cut.\nTurning it off makes passes 2 and up stateless - NVIDIA documents a per-frame reset as a flicker and aliasing risk, so this is an A/B switch for suspected ghosting rather than a setting to leave off.\nNo effect at one pass."},
+            {L"neural.tip.reset", L"Returns every control to the model defaults and previews the paused frame again."},
+            {L"neural.settings.reset", L"Reset"}, {L"neural.settings.apply", L"Apply"}, {L"neural.settings.close", L"Close"},
+            {L"export.settings_changed", L"The converted video on disk was rendered with different neural settings.\n\nConvert this range again with the settings you selected?"},
+            {L"timecode.title", L"Go to timecode"}, {L"timecode.label", L"Timecode (hh:mm:ss:ff, h:mm:ss.mmm or f<frame>)"},
+            {L"timecode.go", L"Go"}, {L"timecode.set_in", L"Set In"}, {L"timecode.set_out", L"Set Out"}, {L"timecode.cancel", L"Cancel"},
+            {L"timecode.invalid", L"Enter a timecode such as 00:01:23:04, 1:23.500 or f2000."},
+            {L"range.invalid", L"Mark In (I) and Out (O) with In before Out, then render the marked range."},
+            {L"idle.title", L"DLSS 5"}, {L"idle.subtitle", L"Drop a video, photo or GIF here, or press Ctrl+O"}, {L"idle.open", L"Open file"},
+            {L"idle.youtube", L"Open YouTube URL"}, {L"idle.youtube_unavailable", L"Unavailable in this build; YouTube support is not installed yet."},
+            {L"idle.youtube_unavailable_compact", L"YouTube unavailable in this build."},
+            {L"dialog.title", L"Open photo, GIF or video"}, {L"dialog.all_ffmpeg", L"All files (FFmpeg auto-detect)"}, {L"dialog.supported", L"Photos, GIFs and videos"}, {L"dialog.all", L"All files"},
+            {L"youtube.dialog.title", L"Open YouTube video"}, {L"youtube.dialog.url", L"YouTube URL"},
+            {L"youtube.dialog.paste", L"Paste"}, {L"youtube.dialog.play", L"Play"}, {L"youtube.dialog.cancel", L"Cancel"},
+            {L"youtube.dialog.note", L"Public, non-DRM videos only."},
+            {L"youtube.dialog.invalid", L"Enter a supported youtube.com or youtu.be video URL."},
+            {L"youtube.error.invalid", L"That is not a supported YouTube video URL. Check the address and try again."},
+            {L"youtube.error.helper_missing", L"YouTube support files are missing beside the app. Reinstall the complete package and try again."},
+            {L"youtube.error.start_failed", L"The YouTube resolver could not start. Close other copies of the player and try again."},
+            {L"youtube.error.extraction", L"A playable stream could not be extracted. The video may be private, DRM-protected, or temporarily unavailable."},
+            {L"youtube.error.timeout", L"YouTube took too long to respond. Check your connection and try again."},
+            {L"youtube.error.cancelled", L"YouTube resolution was cancelled."},
+            {L"youtube.error.ffmpeg", L"FFmpeg could not open this YouTube stream. Try another public, non-DRM video."},
+            {L"youtube.error.media_timeout", L"The YouTube stream did not become ready within 20 seconds. Check your connection and try again."},
+            {L"youtube.error.media_stalled", L"The YouTube stream stopped delivering video for 15 seconds. Check your connection and try again."},
+            // What the resolver actually got, said out loud. A silent 360p
+            // fallback on an age-restricted video is indistinguishable from a
+            // bad render otherwise.
+            {L"youtube.source.low", L"Source is only %dp at %.1f Mbps"},
+            {L"youtube.source.low.signin", L"Source is only %dp at %.1f Mbps: this video is age-restricted, and YouTube serves higher quality only to a signed-in session"},
+            {L"youtube.source.low_height", L"Source is only %dp: this copy was acquired at that height, so pick a YouTube source quality to fetch it again"},
+            {L"error.decode", L"Could not open this media. Check the file and bundled FFmpeg files, then try again."},
+            {L"error.renderer", L"DLSS is unavailable. Update the NVIDIA driver or use safe mode, then try again."},
+            {L"error.frame", L"No video frame could be decoded. Try another file."},
+            {L"status.muted", L"Muted"}, {L"status.volume", L"Vol"}, {L"status.seeking", L"Seeking\u2026"},
+            {L"status.render_hint", L"Mark I/O, then Ctrl+R renders the marked range"},
+            {L"status.preparing_source", L"Downloading this source for rendering\u2026"},
+            {L"status.hdr_tonemapped", L"HDR tone-mapped to SDR (DLSS 5 renders SDR)"},
+            {L"status.hdr_original", L"HDR display: original in HDR, DLSS 5 in SDR"},
+            {L"status.hdr_at_sdr", L"HDR display: comparing at SDR, as DLSS 5 sees the source"},
+            {L"menu.compare_hdr_at_sdr", L"Compare HDR at SDR"},
+            // RTX Video Super Resolution (P2.8): a view of its own, what the other modes
+            // compare against, its quality ladder, and why it cannot run when it cannot.
+            {L"menu.compare_vsr", L"RTX VSR\tR"}, {L"menu.compare_against_vsr", L"Compare against RTX VSR\tShift+R"},
+            {L"menu.compare_vsr_quality", L"RTX VSR quality"}, {L"menu.compare_vsr_quality_0", L"Low"}, {L"menu.compare_vsr_quality_1", L"Medium"},
+            {L"menu.compare_vsr_quality_2", L"High (default)"}, {L"menu.compare_vsr_quality_3", L"Ultra"},
+            {L"compare.mode.vsr", L"RTX VSR"}, {L"compare.mode.vsr.short", L"VSR"},
+            {L"compare.tag.vsr", L"RTX VSR"}, {L"compare.tag.vsr_quality_0", L"LOW"}, {L"compare.tag.vsr_quality_1", L"MEDIUM"},
+            {L"compare.tag.vsr_quality_2", L"HIGH"}, {L"compare.tag.vsr_quality_3", L"ULTRA"},
+            {L"compare.tip.vsr", L"RTX VSR (R): NVIDIA's video super resolution of the original, made live at the quality set in Video > Compare. Shift+R compares the other modes against it."},
+            {L"vsr.reason.not_built", L"RTX VSR is not in this build: it was built without the NVIDIA RTX Video SDK"},
+            {L"vsr.reason.no_session", L"RTX VSR needs an NVIDIA RTX GPU: NGX did not start on this one"},
+            {L"vsr.reason.query_failed", L"RTX VSR is unavailable: the NVIDIA driver did not report its features"},
+            {L"vsr.reason.needs_driver", L"RTX VSR needs NVIDIA driver %u.%02u or newer"},
+            {L"vsr.reason.missing_runtime", L"RTX VSR is unavailable: nvngx_vsr.dll is missing beside the player"},
+            {L"vsr.reason.unsupported", L"RTX VSR is not supported on this GPU or driver"},
+            {L"vsr.reason.create_failed", L"RTX VSR could not start on this GPU (NGX %s)"},
+            {L"vsr.reason.ready", L"RTX VSR"},
+            {L"recent.missing", L"This local video has moved or is no longer available."},
+            {L"open.missing", L"This video could not be found:\n\n%s"},
+            // Keyboard discoverability (P2.23). The cheat sheet lists every
+            // menu command that names a key by reading the menus themselves;
+            // these are only the rows no menu command carries, and the sheet's
+            // own chrome.
+            {L"menu.help", L"Help"},
+            {L"menu.keyboard_shortcuts", L"Keyboard shortcuts\t? / F1"},
+            {L"shortcuts.title", L"Keyboard shortcuts"},
+            {L"shortcuts.close_hint", L"? , F1 or Esc closes this"},
+            {L"shortcuts.group.keyboard", L"Keyboard and mouse"},
+            {L"shortcuts.focus", L"Move between the bar's buttons"},
+            {L"shortcuts.activate", L"Press the focused button"},
+            {L"shortcuts.step", L"Step one cached frame"},
+            {L"shortcuts.escape", L"Leave fullscreen; in a window, stop live rendering or cancel a job"},
+            {L"shortcuts.reveal", L"Show the menu and bar in fullscreen"},
+            {L"shortcuts.volume", L"Volume"},
+            {L"shortcuts.overlay", L"Seek, mute and neural rendering over ReShade"},
+            {L"shortcuts.media_key", L"Play or pause from the keyboard's media key"},
+            // Taskbar thumbnail buttons (P2.24): each tip says what a press
+            // will do, as the toolbar's labels do.
+            {L"thumb.play", L"Play"},
+            {L"thumb.pause", L"Pause"},
+            {L"thumb.neural_on", L"Turn Neural Rendering on"},
+            {L"thumb.neural_off", L"Turn Neural Rendering off"},
+            {L"thumb.compare_on", L"Compare side by side"},
+            {L"thumb.compare_off", L"Back to the neural picture"},
+            // The start screen (P2.20).
+            {L"start.recent", L"Recent"},
+            {L"start.trailers", L"Game trailers"},
+            {L"start.tile.youtube", L"YouTube"},
+            {L"start.tile.local", L"Local file"},
+            {L"start.safe_mode", L"Restart in DLSS SR safe mode"},
+            {L"start.hint", L"Press D while a video plays to switch between the neural render and the original"}
+        };
+        return strings;
+    }
+};

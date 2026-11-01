@@ -1,0 +1,240 @@
+#pragma once
+
+#include "PlatformCompat.h"
+
+#include <array>
+#include <cstdint>
+#include <functional>
+#include <span>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+#include "MediaSource.h"
+
+enum class ToolbarAction {
+    Open, OpenYouTube, Back10, PlayPause, Stop, Forward10, Mute,
+    ToggleNeuralRendering, ToggleUpscaling, ToggleFrameGeneration,
+    TogglePlaybackFrameGeneration,
+    Aspect, Adjustments, DebugView, Fullscreen,
+    // The one press that gets subtitles out of a film: it listens to the audio
+    // when there is no track, translates whatever it finds, and shows the two
+    // together. Beside Mute, because Mute is the sound and this is the words.
+    ToggleSubtitles, None
+};
+
+struct ToolbarItem {
+    ToolbarAction action{ToolbarAction::None};
+    RECT bounds{};
+    bool compact{false};
+};
+
+struct ToolbarAvailability {
+    bool mediaLoaded{false};
+    bool seeking{false};
+    bool rendererReady{false};
+    bool youtubeAvailable{false};
+    bool resolvingYouTube{false};
+    bool neuralRenderingAvailable{false};
+    // A render can be started from the playhead even though nothing is cached.
+    bool neuralSessionAvailable{false};
+    bool upscalingAvailable{false};
+    bool frameGenerationAvailable{false};
+    // A conversion is running, which is a SECOND way the frame-generation pill
+    // is live: it reads "Cancel" then, and a control that says Cancel has to be
+    // clickable. Availability alone is false while a conversion runs - nothing
+    // can be started - so gating the pill on it alone made the Cancel label a
+    // lie.
+    bool frameGenerationConverting{false};
+    // The playback frame-generation toggle (the FidelityFX island that
+    // interpolates between source frames live, as against the offline
+    // conversion the ToggleFrameGeneration pill starts). Enabled whenever there
+    // is a loaded source and a renderer to hand the setting to.
+    bool playbackFrameGenerationAvailable{false};
+    // The AI subtitle switch. "Active" is the moment the TRANSLATED track is on
+    // screen, not the moment the first line of the original is: the button was
+    // pressed for Chinese, and going active on the English would make a second
+    // press cancel the translation that is still loading.
+    bool subtitlesAvailable{false};
+    bool subtitlesActive{false};
+    bool subtitlesWorking{false};
+};
+
+class YouTubeResolutionLifecycle {
+public:
+    uint64_t Begin();
+    bool Complete(uint64_t generation);
+    void Invalidate();
+    bool IsResolving() const { return resolving_; }
+    uint64_t Generation() const { return generation_; }
+
+private:
+    uint64_t generation_{0};
+    bool resolving_{false};
+};
+
+struct IdleSurfaceLayout {
+    RECT title{};
+    RECT subtitle{};
+    std::array<ToolbarItem, 2> actions{};
+    RECT youtubeReason{};
+    bool stacked{false};
+};
+
+enum class PlayerRuntimeConfiguration {
+    NeuralAddonExperimental,
+    // The same state on the other backend: neural rendering is on, and the
+    // runtime behind it is the AMD pack rather than the NVIDIA add-on. A
+    // separate value because the line names which one is running - "DLSS 5
+    // (experimental)" over an AMD pack would name a thing that is not there.
+    AmdNeuralExperimental,
+    DlssSrSafeMode,
+    NeuralAddonUnavailable,
+};
+
+enum class PlayerDlssState {
+    Active,
+    ScalerFallback,
+};
+
+struct PlayerRuntimeStatus {
+    PlayerRuntimeConfiguration configuration{PlayerRuntimeConfiguration::NeuralAddonUnavailable};
+    PlayerDlssState dlssState{PlayerDlssState::ScalerFallback};
+};
+
+enum class PlayerStatusActivity {
+    None,
+    ResolvingYouTube,
+};
+
+struct PlayerStatusSnapshot {
+    bool mediaLoaded{false};
+    PlayerStatusActivity activity{PlayerStatusActivity::None};
+    PlayerRuntimeConfiguration runtimeConfiguration{PlayerRuntimeConfiguration::NeuralAddonUnavailable};
+    PlayerDlssState dlssState{PlayerDlssState::ScalerFallback};
+    uint32_t sourceWidth{};
+    uint32_t sourceHeight{};
+    uint32_t inputWidth{};
+    uint32_t inputHeight{};
+    uint32_t outputWidth{};
+    uint32_t outputHeight{};
+    std::wstring quality;
+    std::wstring upscalingStatus;
+    // Frame generation's own state, for the same reason the upscaling status is
+    // a string rather than a flag: "unavailable" was hard-coded here while the
+    // control could only be unavailable, and it became a contradiction the
+    // moment the toolbar pill could read "Generate".
+    std::wstring frameGenerationStatus;
+    // No frame rate or dropped count: those are status chips now, built by
+    // StatusChipPolicy.h, so nothing here can push them past the ellipsis.
+};
+
+struct PaintBufferLayout {
+    RECT paintBounds{};
+    int width{};
+    int height{};
+    POINT viewportOrigin{};
+};
+
+inline constexpr int kButtonHorizontalInsetDip = 10;
+inline constexpr int kButtonVerticalInsetDip = 6;
+inline constexpr int kButtonIconLabelGapDip = 7;
+
+struct ButtonContentLayout {
+    RECT content{};
+    RECT icon{};
+    RECT text{};
+    bool stacked{};
+};
+
+struct PreRenderSurfaceLayout {
+    RECT spinner{};
+    RECT title{};
+    RECT phase{};
+    RECT resolution{};
+    RECT frameCount{};
+    RECT elapsedEta{};
+    RECT size{};
+    RECT progressTrack{};
+    RECT progressFill{};
+    RECT cancelButton{};
+};
+
+struct ActivityVisual {
+    RECT fill{};
+    unsigned spinnerStep{};
+    unsigned percent{};
+    bool indeterminate{};
+};
+
+ActivityVisual ResolveActivityVisual(RECT track, uint64_t elapsedMs,
+                                     uint64_t completed, uint64_t total,
+                                     bool measurable, bool motionEnabled);
+
+inline constexpr int kToolbarSpacingDip = 4;
+inline constexpr int kToolbarMinHitHeightDip = 36;
+inline constexpr int kToolbarCornerRadiusDip = 8;
+inline constexpr int kToolbarOuterGutterDip = 16;
+inline constexpr int kToolbarGroupGapDip = 12;
+// How narrow a feature pill may get before the bar goes compact. Only its
+// state, never its name, has to fit then: the longest state is "Queued for the
+// seek", 134 px in Segoe UI at the 14 px the pills draw with, plus the 17 dip
+// icon, the 7 dip gap and both 10 dip insets.
+inline constexpr int kFeaturePillNarrowWidthDip = 180;
+
+std::vector<ToolbarItem> LayoutToolbar(int clientWidth, int clientHeight, UINT dpi);
+IdleSurfaceLayout LayoutIdleSurface(int clientWidth, int clientHeight, UINT dpi);
+ToolbarAction HitTestToolbar(std::span<const ToolbarItem> items, POINT point);
+int MinimumToolbarClientWidth(UINT dpi);
+// The narrowest client at which the required set still has its feature pills
+// at full width. Between this and MinimumToolbarClientWidth they shrink.
+int FullPillToolbarClientWidth(UINT dpi);
+// A feature pill reads "<feature> · <state>". One too narrow for all of it
+// keeps the state, which is the part that changes; its icon and tooltip still
+// name the feature. A label without the separator comes back whole.
+std::wstring_view FeaturePillStateLabel(std::wstring_view label);
+int MinimumIdleClientHeight(UINT dpi);
+RECT ClampWindowRectToMinimumTrackSize(RECT suggested, POINT minimumTrackSize);
+std::optional<RECT> LayoutVolumeSlider(int clientWidth, int clientHeight, UINT dpi,
+                                      std::span<const ToolbarItem> toolbarItems);
+bool IsToolbarActionEnabled(ToolbarAction action, ToolbarAvailability availability);
+std::wstring_view OpenActionLabelKey(bool idleSurface);
+ToolbarAction ReconcileFocusedToolbarAction(std::span<const ToolbarItem> items,
+                                            ToolbarAction current,
+                                            ToolbarAvailability availability);
+ToolbarAction NextFocusableToolbarAction(std::span<const ToolbarItem> items,
+                                         ToolbarAction current, bool reverse,
+                                         ToolbarAvailability availability);
+std::vector<RECT> HoverDirtyRectangles(std::span<const ToolbarItem> items,
+                                       ToolbarAction oldAction,
+                                       ToolbarAction newAction);
+ToolbarAction ResolveToolbarHover(std::span<const ToolbarItem> items,
+                                  POINT point,
+                                  ToolbarAvailability availability);
+ToolbarAction ResolveToolbarHoverForCursor(std::span<const ToolbarItem> items,
+                                           std::optional<POINT> clientPoint,
+                                           ToolbarAvailability availability);
+std::optional<PaintBufferLayout> LayoutPaintBuffer(RECT clientBounds, RECT paintBounds);
+ButtonContentLayout LayoutButtonContent(RECT outer, SIZE icon, SIZE text,
+                                        bool stacked, UINT dpi);
+PreRenderSurfaceLayout LayoutPreRenderSurface(int clientWidth, int clientHeight, UINT dpi);
+std::wstring BuildPlayerStatusText(const PlayerStatusSnapshot& status);
+std::wstring BuildPlayerWindowTitle(std::wstring_view appTitle,
+                                    std::wstring_view mediaTitle,
+                                    size_t maxCharacters);
+// `amdNeuralBackend` is read only when `neuralAddonConfigured` is: it selects
+// which of the two experimental states the configured runtime is reported as.
+PlayerRuntimeStatus ResolvePlayerRuntimeStatus(bool safeMode,
+                                               bool neuralAddonConfigured,
+                                               bool amdNeuralBackend,
+                                               bool dlssEnabled,
+                                               bool dlssFeatureCreated);
+bool ExecuteGuardedRehook(int dialogResult, const std::function<void()>& requestRecreate);
+std::wstring DisplayTitleForSource(MediaSourceKind sourceKind,
+                                   std::wstring_view suppliedTitle);
+std::string_view SafeSourceLogLabel(MediaSourceKind sourceKind);
+void ExecuteYouTubeCancellationSequence(const std::function<void()>& requestStop,
+                                        const std::function<void()>& cancelResolver,
+                                        const std::function<void()>& joinWorker);
+bool YouTubePlaybackAvailable();

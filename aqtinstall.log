@@ -1,0 +1,52 @@
+2026-11-01 23:14:26,157 - aqt.main - INFO - installer 8345981696 aqtinstall(aqt) v3.3.0 on Python 3.14.6 [CPython Clang 17.0.0 (clang-1700.6.4.2)]
+2026-11-01 23:14:36,614 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6103/qt6_6103/Updates.xml.sha256
+2026-11-01 23:14:47,709 - aqt.main - INFO - installer 8345981696 aqtinstall(aqt) v3.3.0 on Python 3.14.6 [CPython Clang 17.0.0 (clang-1700.6.4.2)]
+2026-11-01 23:14:47,710 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/Updates.xml.sha256
+2026-11-01 23:14:49,913 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/extensions/qtwebengine/6120/clang_64/Updates.xml.sha256
+2026-11-01 23:14:52,045 - aqt.archives - INFO - archives 8345981696 Found extension qtwebengine
+2026-11-01 23:14:52,045 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/extensions/qtpdf/6120/clang_64/Updates.xml.sha256
+2026-11-01 23:14:54,637 - aqt.archives - INFO - archives 8345981696 Found extension qtpdf
+2026-11-01 23:14:54,643 - aqt.main - ERROR - installer 8345981696 The packages ['qtbase'] were not found while parsing XML of package information!
+==============================Suggested follow-up:==============================
+* Please use 'aqt list-qt mac desktop --modules 6.12.0 <arch>' to show modules available.
+2026-11-01 23:15:09,478 - aqt.main - INFO - installer 8345981696 aqtinstall(aqt) v3.3.0 on Python 3.14.6 [CPython Clang 17.0.0 (clang-1700.6.4.2)]
+2026-11-01 23:15:09,478 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/Updates.xml.sha256
+2026-11-01 23:15:11,537 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/extensions/qtwebengine/6120/clang_64/Updates.xml.sha256
+2026-11-01 23:15:13,235 - aqt.archives - INFO - archives 8345981696 Found extension qtwebengine
+2026-11-01 23:15:13,236 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/extensions/qtpdf/6120/clang_64/Updates.xml.sha256
+2026-11-01 23:15:15,187 - aqt.archives - INFO - archives 8345981696 Found extension qtpdf
+2026-11-01 23:15:16,791 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qtbase-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z.sha256
+2026-11-01 23:15:16,803 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qtdeclarative-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z.sha256
+2026-11-01 23:15:16,810 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qtsvg-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z.sha256
+2026-11-01 23:15:16,811 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qtdoc-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z.sha256
+2026-11-01 23:15:17,687 - aqt.helper - INFO - helper 8345981696 Downloading qtbase...
+2026-11-01 23:15:17,687 - aqt.installer - DEBUG - installer 8345981696 Download URL: https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qtbase-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z
+2026-11-01 23:15:17,935 - aqt.helper - INFO - helper 8345981696 Downloading qtdoc...
+2026-11-01 23:15:17,935 - aqt.installer - DEBUG - installer 8345981696 Download URL: https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qtdoc-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z
+2026-11-01 23:15:18,352 - aqt.helper - INFO - helper 8345981696 Downloading qtsvg...
+2026-11-01 23:15:18,353 - aqt.installer - DEBUG - installer 8345981696 Download URL: https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qtsvg-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z
+2026-11-01 23:15:18,359 - aqt.helper - INFO - helper 8345981696 Downloading qtdeclarative...
+2026-11-01 23:15:18,359 - aqt.installer - DEBUG - installer 8345981696 Download URL: https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qtdeclarative-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z
+2026-11-01 23:15:18,531 - aqt.helper - DEBUG - helper 8345981696 Asked to redirect(302) to: https://ftp.jaist.ac.jp/pub/qtproject/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qtbase-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z
+2026-11-01 23:15:18,531 - aqt.helper - INFO - helper 8345981696 Redirected: ftp.jaist.ac.jp
+2026-11-01 23:15:18,736 - aqt.helper - DEBUG - helper 8345981696 Asked to redirect(302) to: https://ftp.jaist.ac.jp/pub/qtproject/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qtdoc-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z
+2026-11-01 23:15:18,736 - aqt.helper - INFO - helper 8345981696 Redirected: ftp.jaist.ac.jp
+2026-11-01 23:15:19,177 - aqt.helper - DEBUG - helper 8345981696 Asked to redirect(302) to: https://ftp.jaist.ac.jp/pub/qtproject/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qtsvg-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z
+2026-11-01 23:15:19,177 - aqt.helper - INFO - helper 8345981696 Redirected: ftp.jaist.ac.jp
+2026-11-01 23:15:20,322 - aqt.helper - DEBUG - helper 8345981696 Asked to redirect(302) to: https://ftp.jaist.ac.jp/pub/qtproject/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qtdeclarative-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z
+2026-11-01 23:15:20,323 - aqt.helper - INFO - helper 8345981696 Redirected: ftp.jaist.ac.jp
+2026-11-01 23:15:31,561 - aqt.installer - INFO - installer 8345981696 Finished installation of qtdoc-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z in 14.78685671
+2026-11-01 23:15:31,608 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qttools-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z.sha256
+2026-11-01 23:15:32,371 - aqt.helper - INFO - helper 8345981696 Downloading qttools...
+2026-11-01 23:15:32,372 - aqt.installer - DEBUG - installer 8345981696 Download URL: https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qttools-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z
+2026-11-01 23:15:33,495 - aqt.helper - DEBUG - helper 8345981696 Asked to redirect(302) to: https://ftp.jaist.ac.jp/pub/qtproject/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qttools-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z
+2026-11-01 23:15:33,495 - aqt.helper - INFO - helper 8345981696 Redirected: ftp.jaist.ac.jp
+2026-11-01 23:16:04,357 - aqt.installer - INFO - installer 8345981696 Finished installation of qtsvg-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z in 47.58543433
+2026-11-01 23:16:04,386 - aqt.helper - DEBUG - helper 8345981696 Attempt to download checksum at https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qttranslations-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z.sha256
+2026-11-01 23:16:06,168 - aqt.helper - INFO - helper 8345981696 Downloading qttranslations...
+2026-11-01 23:16:06,168 - aqt.installer - DEBUG - installer 8345981696 Download URL: https://download.qt.io/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qttranslations-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z
+2026-11-01 23:16:07,265 - aqt.helper - DEBUG - helper 8345981696 Asked to redirect(302) to: https://ftp.jaist.ac.jp/pub/qtproject/online/qtsdkrepository/mac_x64/desktop/qt6_6120/qt6_6120/qt.qt6.6120.clang_64/6.12.0-0-202609280346qttranslations-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z
+2026-11-01 23:16:07,265 - aqt.helper - INFO - helper 8345981696 Redirected: ftp.jaist.ac.jp
+2026-11-01 23:20:42,821 - aqt.installer - INFO - installer 8345981696 Finished installation of qtbase-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z in 326.07154621
+2026-11-01 23:20:42,841 - aqt.installer - WARNING - installer 8345981696 Caught ArchiveDownloadError, terminating installer workers
+2026-11-01 23:20:42,871 - aqt.main - ERROR - installer 8345981696 Download of 6.12.0-0-202609280346qttools-MacOS-MacOS_26-Clang-MacOS-MacOS_26-X86_64-ARM64.7z has error: HTTPSConnectionPool(host='ftp.jaist.ac.jp', port=443): Read timed out.

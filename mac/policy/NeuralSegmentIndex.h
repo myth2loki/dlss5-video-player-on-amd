@@ -1,0 +1,415 @@
+#pragma once
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <vector>
+#include "NeuralCoverage.h"
+
+// One finalized neural output file produced by a running render job. Each file
+// starts at its own pts zero; firstTimestamp100ns places it on the source
+// timeline. end100ns is exclusive.
+struct NeuralSegment {
+    std::filesystem::path path;
+    uint64_t runId{};  // the render job that published it
+    uint64_t index{};  // the producer's own segment number inside that run
+    uint64_t firstFrameNumber{};
+    int64_t firstTimestamp100ns{};
+    int64_t end100ns{};
+    uint64_t frameCount{};
+};
+
+// Steady-state render pace observed from segment arrivals: wall time from the
+// first segment this run published to the latest, over the frames of every
+// segment after that first one. Excluding the first segment drops the job's
+// startup (helper launch, preroll) exactly the way the reference constants in
+// PlaybackTiming.h were measured.
+struct SegmentPace {
+    double wallMs{};
+    uint64_t frames{};
+    double MsPerFrame() const { return frames ? wallMs / double(frames) : 0.0; }
+};
+
+// Append-only, thread-safe. The render thread appends; the UI/playback threads read.
+class NeuralSegmentIndex {
+public:
+    // Segments arrive from one run in timeline order, but a session renders in
+    // several runs, and a user who seeks backwards makes the next run start
+    // behind the last one. Storage is sorted by timestamp for that reason, and a
+    // run's own index only orders that run.
+    void Append(NeuralSegment segment)
+    {
+        const std::lock_guard lock(mutex_);
+        if (segment.end100ns <= segment.firstTimestamp100ns) return;
+        const auto at = std::upper_bound(
+            segments_.begin(), segments_.end(), segment.firstTimestamp100ns,
+            [](int64_t value, const NeuralSegment& existing) {
+                return value < existing.firstTimestamp100ns;
+            });
+        // Measured from the span the producer declared, before either clamp
+        // below can move it: dividing a clamped end by the full frame count
+        // yields a duration too small to recognise the sub-frame seams these
+        // close.
+        const int64_t frameDuration =
+            segment.frameCount
+                ? (segment.end100ns - segment.firstTimestamp100ns) / int64_t(segment.frameCount)
+                : 0;
+        // Ground that is already playable is never published over: a retargeted
+        // run can overlap what an earlier one finished, and a republished file
+        // would move the timeline under a decoder that is reading it.
+        //
+        // A SUB-FRAME overlap is not that; it is arithmetic. The producer
+        // synthesizes a segment's exclusive end from one rounded frame duration
+        // - llround(1e7/fps) in NeuralWorkerMain.cpp - so at every rate whose
+        // duration rounds UP, that end overshoots the next file's own first pts:
+        // 60 fps rounds 166666.67 to 166667, and a 120-frame file ends 40 ticks
+        // past the file that follows it. Refusing the follower for those 40
+        // ticks dropped EVERY OTHER segment of a 60 fps render - 14 of 28
+        // measured on a 2560x1440 clip, the joined result carrying 1590 of 3267
+        // frames - and the publish gate then correctly refused a render that had
+        // just succeeded, so no 60 or 24 fps source could be neural rendered at
+        // all. 30 fps escaped it only because 333333.33 rounds down into the
+        // sub-frame hole that the code below already closes.
+        //
+        // The seam belongs to the arriving file: it owns its own first pts, and
+        // the file before it gives that tick back. An overlap of a whole frame
+        // or more is a real republish and is still refused.
+        if (at != segments_.begin() && segment.firstTimestamp100ns < std::prev(at)->end100ns) {
+            NeuralSegment& previous = *std::prev(at);
+            const int64_t previousFrame =
+                previous.frameCount
+                    ? (previous.end100ns - previous.firstTimestamp100ns) / int64_t(previous.frameCount)
+                    : 0;
+            const int64_t seam = std::max(frameDuration, previousFrame);
+            if (seam <= 0) return;
+            if (previous.end100ns - segment.firstTimestamp100ns >= seam) return;
+            // A file that starts at or before the one it overlaps replaces it
+            // rather than continuing it, whatever the arithmetic says.
+            if (segment.firstTimestamp100ns <= previous.firstTimestamp100ns) return;
+            previous.end100ns = segment.firstTimestamp100ns;
+        }
+        // A run filling a hole ends on a segment boundary rather than on the
+        // hole's edge, so its last file can reach into the region beyond. Clamp
+        // the declared end there: those frames are already served from the other
+        // file, and one owner per timestamp is what makes a seek land in one
+        // decoder.
+        if (at != segments_.end())
+            segment.end100ns = std::min(segment.end100ns, at->firstTimestamp100ns);
+        if (segment.end100ns <= segment.firstTimestamp100ns) return;
+        // A segment's exclusive end is rebuilt from an integer frame duration,
+        // so a fractional frame rate declares it a few ticks below the next
+        // segment's own first pts. Close that sub-frame hole: a playhead inside
+        // it belongs to the earlier file, and reporting it as uncovered reads
+        // as a producer contract break. A real gap - a run rebased further
+        // ahead - is a frame or more wide and stays uncovered.
+        if (frameDuration > 0 && at != segments_.begin()) {
+            NeuralSegment& previous = *std::prev(at);
+            const int64_t hole = segment.firstTimestamp100ns - previous.end100ns;
+            if (hole > 0 && hole < frameDuration) previous.end100ns = segment.firstTimestamp100ns;
+        }
+        if (frameDuration > 0 && at != segments_.end()) {
+            const int64_t hole = at->firstTimestamp100ns - segment.end100ns;
+            if (hole > 0 && hole < frameDuration) segment.end100ns = at->firstTimestamp100ns;
+        }
+        totalFrames_ += segment.frameCount;
+        segments_.insert(at, std::move(segment));
+        ++revision_;
+        const auto now = std::chrono::steady_clock::now();
+        if (!paceStart_) {
+            paceStart_ = now;
+            paceBaseFrames_ = totalFrames_;
+        }
+        paceLatest_ = now;
+    }
+
+    SegmentPace Pace() const
+    {
+        const std::lock_guard lock(mutex_);
+        return PaceLocked();
+    }
+
+    // A new job's pace is its own: the clock starts at its first segment. The
+    // adopted and chained cases were covered by `Unfinish` before coverage
+    // became a set; without an explicit reset the idle gap between two jobs -
+    // and every job startup while holes are being filled - counts as render
+    // time and teaches the forecast a pace no GPU achieves.
+    void ResetPace()
+    {
+        const std::lock_guard lock(mutex_);
+        const SegmentPace finished = PaceLocked();
+        if (finished.frames > longestPace_.frames) longestPace_ = finished;
+        paceStart_.reset();
+        paceBaseFrames_ = totalFrames_;
+    }
+
+    // What the session measured, for the forecast: the pace of whichever job
+    // counted the most frames, the current one included. `Pace` is the current
+    // job alone, which is what a status line wants while it runs. A session
+    // opened mid-video renders to the end and then fills the head behind the
+    // playhead, and that short last job must not replace the long one.
+    SegmentPace MeasuredPace() const
+    {
+        const std::lock_guard lock(mutex_);
+        const SegmentPace current = PaceLocked();
+        return current.frames >= longestPace_.frames ? current : longestPace_;
+    }
+
+    void Restart()
+    {
+        const std::lock_guard lock(mutex_);
+        segments_.clear();
+        totalFrames_ = 0;
+        paceStart_.reset();
+        longestPace_ = {};
+        ++revision_;
+    }
+
+    // Drops everything one run published, wherever those segments sit in the
+    // timeline. A worker that restarted republishes from its own index zero, so
+    // its earlier files are stale; coverage other runs left behind stays valid,
+    // which is what lets a session retarget without redoing finished work.
+    void DropRun(uint64_t runId)
+    {
+        const std::lock_guard lock(mutex_);
+        uint64_t frames = 0;
+        size_t matches = 0;
+        for (const NeuralSegment& segment : segments_)
+            if (segment.runId == runId) {
+                frames += segment.frameCount;
+                ++matches;
+            }
+        if (!matches) return;
+        segments_.erase(std::remove_if(segments_.begin(), segments_.end(),
+                                       [runId](const NeuralSegment& segment) {
+                                           return segment.runId == runId;
+                                       }),
+                        segments_.end());
+        totalFrames_ -= frames;
+        ++revision_;
+        paceStart_.reset();
+    }
+
+    // Serves one finished run from `joined` - its segments concatenated and
+    // published as a cache entry - instead of from the segments themselves.
+    // Every rendered byte of a live session used to sit on disk twice until the
+    // session was released, and a retained session kept both copies across
+    // toggles: the segments, because playback read them, and the joined entry.
+    // With the run served from the entry, its segments have no reader left and
+    // are handed to RetiredFiles() for the caller to delete.
+    //
+    // Coverage does not move: the joined record spans exactly the window the
+    // run's records spanned, seams and clamps included, and carries every
+    // frame they carried. Refused - nothing changes - unless the run's records
+    // are adjacent here and number their frames without a gap, which is the
+    // only shape of which a concatenation is the same frames at the same
+    // timestamps. The joined file restarts at its own zero, like any segment.
+    bool ReplaceRun(uint64_t runId, std::filesystem::path joined)
+    {
+        const std::lock_guard lock(mutex_);
+        if (joined.empty()) return false;
+        const auto first = std::find_if(segments_.begin(), segments_.end(),
+                                        [runId](const NeuralSegment& segment) { return segment.runId == runId; });
+        if (first == segments_.end()) return false;
+        auto last = first;
+        uint64_t frames = first->frameCount;
+        while (std::next(last) != segments_.end() && std::next(last)->runId == runId) {
+            const NeuralSegment& next = *std::next(last);
+            if (!last->frameCount || next.firstFrameNumber != last->firstFrameNumber + last->frameCount)
+                return false;
+            frames += next.frameCount;
+            ++last;
+        }
+        if (std::any_of(std::next(last), segments_.end(),
+                        [runId](const NeuralSegment& segment) { return segment.runId == runId; }))
+            return false;
+        NeuralSegment merged = *first;
+        merged.path = std::move(joined);
+        merged.end100ns = last->end100ns;
+        merged.frameCount = frames;
+        for (auto it = first; it != std::next(last); ++it)
+            if (it->path != merged.path) retired_.push_back(it->path);
+        const auto at = segments_.erase(first, std::next(last));
+        segments_.insert(at, std::move(merged));
+        ++revision_;
+        return true;
+    }
+
+    // Segment files ReplaceRun took out of service and nobody has deleted yet.
+    std::vector<std::filesystem::path> RetiredFiles() const
+    {
+        const std::lock_guard lock(mutex_);
+        return retired_;
+    }
+
+    // The caller deleted it, or found it already gone.
+    void ForgetRetired(const std::filesystem::path& path)
+    {
+        const std::lock_guard lock(mutex_);
+        retired_.erase(std::remove(retired_.begin(), retired_.end(), path), retired_.end());
+    }
+
+    // Every file coverage is currently served from, in timeline order.
+    std::vector<std::filesystem::path> Files() const
+    {
+        const std::lock_guard lock(mutex_);
+        std::vector<std::filesystem::path> files;
+        files.reserve(segments_.size());
+        for (const NeuralSegment& segment : segments_) files.push_back(segment.path);
+        return files;
+    }
+
+    // Bumped by every change to coverage. A repaint cannot be triggered off the
+    // newest rendered timestamp any more: a run filling an earlier hole leaves
+    // that unchanged while changing what the seek bar must show.
+    uint64_t Revision() const
+    {
+        const std::lock_guard lock(mutex_);
+        return revision_;
+    }
+
+    size_t Count() const
+    {
+        const std::lock_guard lock(mutex_);
+        return segments_.size();
+    }
+
+    bool Empty() const
+    {
+        const std::lock_guard lock(mutex_);
+        return segments_.empty();
+    }
+
+    std::optional<NeuralSegment> At(size_t index) const
+    {
+        const std::lock_guard lock(mutex_);
+        if (index >= segments_.size()) return std::nullopt;
+        return segments_[index];
+    }
+
+    std::optional<NeuralSegment> Containing(int64_t timestamp100ns) const
+    {
+        const std::lock_guard lock(mutex_);
+        // Segments are stored sorted by start timestamp and never overlap, so a
+        // playhead belongs to the last segment that starts at or before it.
+        const auto above = std::upper_bound(
+            segments_.begin(), segments_.end(), timestamp100ns,
+            [](int64_t value, const NeuralSegment& segment) { return value < segment.firstTimestamp100ns; });
+        if (above == segments_.begin()) return std::nullopt;
+        const NeuralSegment& candidate = *std::prev(above);
+        if (timestamp100ns >= candidate.end100ns) return std::nullopt;
+        return candidate;
+    }
+
+    // Frame numbers are exact where a seeked source's pts is not, so a numbered
+    // playhead picks its segment by number.
+    std::optional<NeuralSegment> ContainingFrame(uint64_t frameNumber) const
+    {
+        const std::lock_guard lock(mutex_);
+        const auto above = std::upper_bound(
+            segments_.begin(), segments_.end(), frameNumber,
+            [](uint64_t value, const NeuralSegment& segment) { return value < segment.firstFrameNumber; });
+        if (above == segments_.begin()) return std::nullopt;
+        const NeuralSegment& candidate = *std::prev(above);
+        if (!candidate.frameCount ||
+            frameNumber >= candidate.firstFrameNumber + candidate.frameCount) return std::nullopt;
+        return candidate;
+    }
+
+    // The next segment along the timeline, whatever run published it. Used to
+    // leave a file that ended inside its own declared window; the caller decides
+    // whether what follows continues the picture or begins a later region.
+    std::optional<NeuralSegment> After(int64_t timestamp100ns) const
+    {
+        const std::lock_guard lock(mutex_);
+        const auto above = std::upper_bound(
+            segments_.begin(), segments_.end(), timestamp100ns,
+            [](int64_t value, const NeuralSegment& segment) { return value < segment.firstTimestamp100ns; });
+        if (above == segments_.end()) return std::nullopt;
+        return *above;
+    }
+
+    bool Covered(int64_t timestamp100ns) const { return Containing(timestamp100ns).has_value(); }
+
+    // Every rendered region, sorted and joined where they touch. This is the
+    // whole answer to "what is rendered": a session that has been retargeted
+    // holds several, and the holes between them are what is left to do.
+    // Memoised against revision_, which every one of the three mutators bumps
+    // under this same mutex. This was rebuilt and re-sorted from all segments on
+    // every call, several times per tick, under the lock the metadata reader
+    // needs to append - and the input is already in order, so MergeSpans was
+    // sorting sorted data. A five-minute live session at 3 s/segment holds about
+    // 100 of them. The result is still returned by value: handing out a
+    // reference to storage this mutex guards would outlive the lock.
+    std::vector<CoverageSpan> CoveredRanges() const
+    {
+        const std::lock_guard lock(mutex_);
+        if (coverageRevision_ != revision_ || !coverageValid_) {
+            std::vector<CoverageSpan> spans;
+            spans.reserve(segments_.size());
+            for (const NeuralSegment& segment : segments_)
+                spans.push_back({segment.firstTimestamp100ns, segment.end100ns});
+            coverage_ = MergeSpans(std::move(spans));
+            coverageRevision_ = revision_;
+            coverageValid_ = true;
+        }
+        return coverage_;
+    }
+
+    // The coverage playback can reach from here without crossing a hole. A
+    // disjoint region further on is not buffer: measuring lead against the
+    // newest rendered timestamp would attach a session with nothing to show.
+    std::optional<CoverageSpan> PlayableSpan(int64_t timestamp100ns) const
+    {
+        return SpanContaining(CoveredRanges(), timestamp100ns);
+    }
+
+    // Span of the whole index, which is no longer one run: there can be holes
+    // between Start100ns() and Head100ns(). Ask `Covered` about a timestamp and
+    // `PlayableSpan` about a buffer; these two only bound the set.
+    int64_t Start100ns() const
+    {
+        const std::lock_guard lock(mutex_);
+        return segments_.empty() ? 0 : segments_.front().firstTimestamp100ns;
+    }
+
+    int64_t Head100ns() const
+    {
+        const std::lock_guard lock(mutex_);
+        return segments_.empty() ? 0 : segments_.back().end100ns;
+    }
+
+    uint64_t TotalFrames() const
+    {
+        const std::lock_guard lock(mutex_);
+        return totalFrames_;
+    }
+
+private:
+    // Callers hold mutex_.
+    SegmentPace PaceLocked() const
+    {
+        if (!paceStart_ || totalFrames_ <= paceBaseFrames_) return {};
+        return {std::chrono::duration<double, std::milli>(paceLatest_ - *paceStart_).count(),
+                totalFrames_ - paceBaseFrames_};
+    }
+
+    mutable std::mutex mutex_;
+    std::vector<NeuralSegment> segments_;
+    uint64_t totalFrames_{};
+    uint64_t revision_{};
+    // Guarded by mutex_ like everything else here; mutable because CoveredRanges
+    // is const and is where the memo is filled. coverageValid_ distinguishes
+    // "never computed" from "computed at revision 0", which an empty index is.
+    mutable std::vector<CoverageSpan> coverage_;
+    mutable uint64_t coverageRevision_{};
+    mutable bool coverageValid_{};
+    std::vector<std::filesystem::path> retired_;
+    std::optional<std::chrono::steady_clock::time_point> paceStart_;
+    std::chrono::steady_clock::time_point paceLatest_{};
+    uint64_t paceBaseFrames_{};
+    // The finished job that measured the most frames, kept across ResetPace.
+    SegmentPace longestPace_{};
+};

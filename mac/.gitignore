@@ -1,0 +1,6 @@
+# 构建产物
+build/
+
+# Qt 的安装位置。aqtinstall 把它放在项目里，211MB，不进版本库。
+# 重新取得它见 README.md 的「Qt6 是怎么装的」一节。
+.qt/

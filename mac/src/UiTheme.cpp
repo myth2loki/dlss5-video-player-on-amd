@@ -1,0 +1,107 @@
+#include "UiTheme.h"
+
+// The platform-free half of UiResources.cpp: the glyph table and the button
+// state rules. Copied rather than rewritten, because there is nothing in them
+// to change - the tabler code points are the same committed font, and the
+// precedence rule is the same four states.
+//
+// What is deliberately absent: Load() and CreateIconFont(). Those are the two
+// functions that ask Windows for a font, and their macOS counterpart is
+// CoreText, which belongs with the UI port rather than with this layer.
+
+std::wstring GlyphForIcon(UiIcon icon)
+{
+    // @tabler/icons-webfont 3.46.0. Keep these values aligned with the
+    // committed assets/tabler/tabler-icons.css source of truth.
+    switch (icon) {
+    case UiIcon::Open: return L"\xfaf7";             // folder-open
+    case UiIcon::Rewind: return L"\xfaba";           // rewind-backward-10
+    case UiIcon::Play: return L"\xed46";             // player-play
+    case UiIcon::Pause: return L"\xed45";            // player-pause
+    case UiIcon::Stop: return L"\xed4a";             // player-stop
+    case UiIcon::FastForward: return L"\xfac2";      // rewind-forward-10
+    case UiIcon::Volume: return L"\xeb51";           // volume
+    case UiIcon::VolumeOff: return L"\xf1c3";        // volume-off
+    case UiIcon::Sparkles: return L"\xf6d7";         // sparkles
+    // arrows-maximize: four arrows pushing outward from a centre, which is what
+    // Super Resolution does to a picture. Verified present in the committed
+    // tabler-icons.ttf cmap (U+EA28, glyph 341).
+    //
+    // It must not be sparkles. The comment on FrameGeneration below already
+    // established why - the feature pills collapse to icon-only at 44/36 dip -
+    // and then left Neural Rendering and DLSS Upscaling BOTH on sparkles, so
+    // two of the three were still indistinguishable at exactly the width the
+    // note was written about. Sparkles stays with the neural model, which is
+    // the one that earns it.
+    case UiIcon::Upscaling: return L"\xea28";        // arrows-maximize
+    // copy-plus: a duplicated frame with a plus, the one glyph in the embedded
+    // 3.46.0 set that reads as "more frames out of one frame". Verified present
+    // in the committed tabler-icons.ttf cmap (U+FDAE, 15 contours), so it needs
+    // no fallback. Picked over keyframes (U+F585, a timeline key row - an
+    // editing concept, not a frame count) and multiplier-2x (U+EF44, which
+    // states a fixed 2x while the planned multiple is measured per source).
+    // It must not be sparkles: the three feature pills collapse to icon-only
+    // at 44/36 dip, where three identical sparkles hid which one starts a
+    // minutes-long conversion.
+    case UiIcon::FrameGeneration: return L"\xfdae"; // copy-plus
+    // movie: a film frame, the one glyph that reads as "video being played"
+    // rather than "a file being written". Verified present in the committed
+    // tabler-icons.ttf cmap (U+EAFA). Distinct from copy-plus (the offline
+    // conversion pill) and from arrows-maximize / sparkles, the other two
+    // feature pills, so the four never collapse to the same icon at narrow
+    // widths.
+    case UiIcon::FrameInterpolation: return L"\xeafa"; // movie
+    case UiIcon::Crop: return L"\xea85";             // crop
+    case UiIcon::Adjustments: return L"\xea03";      // adjustments
+    case UiIcon::Debug: return L"\xea48";            // bug
+    case UiIcon::Maximize: return L"\xeaea";         // maximize
+    case UiIcon::YouTube: return L"\xec90";          // brand-youtube
+    case UiIcon::Warning: return L"\xea06";          // alert-triangle
+    // layout-columns: two panes side by side, which is what the compare
+    // button on the taskbar thumbnail turns on. Verified present in the
+    // committed tabler-icons.ttf cmap (U+EAD4, 9 contours).
+    case UiIcon::Compare: return L"\xead4";          // layout-columns
+    // Past the BMP, so these two are why the return type is a string.
+    case UiIcon::SubtitlesAi: return L"\U000101a4";   // subtitles-ai
+    case UiIcon::SubtitlesOff: return L"\U000101a2";  // subtitles-off
+    }
+    return L"";
+}
+
+ButtonVisual ResolveButtonVisual(ButtonState state)
+{
+    if (!state.enabled) {
+        return {ui_palette::ControlSurface, ui_palette::Inactive,
+                ui_palette::SecondaryText, state.focus};
+    }
+    if (state.pressed) {
+        return {ui_palette::ControlSurface, ui_palette::PrimaryBlue,
+                ui_palette::PrimaryText, state.focus};
+    }
+    // Teal rather than blue, and the same teal the timeline already uses for
+    // rendered coverage: the two places the player says "this is being made
+    // right now" should not say it in two different colours.
+    // A lit pill answers the cursor too, by lifting a step toward white in its
+    // own hue. It used to ignore hover entirely, so on the icon-only bar the
+    // one control that was on was the one that looked dead under the pointer.
+    // Lighter only: the dark label's contrast rises, never falls.
+    if (state.working) {
+        return state.hover ? ButtonVisual{RGB(104, 214, 198), RGB(156, 236, 222), ui_palette::Window, state.focus}
+                           : ButtonVisual{ui_palette::NeuralCoverage, RGB(120, 226, 208), ui_palette::Window, state.focus};
+    }
+    if (state.active) {
+        return state.hover ? ButtonVisual{RGB(84, 158, 236), RGB(136, 197, 250), ui_palette::Window, state.focus}
+                           : ButtonVisual{ui_palette::PrimaryBlue, RGB(103, 179, 245), ui_palette::Window, state.focus};
+    }
+    if (state.hover) {
+        return {ui_palette::Hover, RGB(93, 97, 104),
+                ui_palette::PrimaryText, state.focus};
+    }
+    return {ui_palette::Inactive, RGB(75, 78, 84),
+            ui_palette::PrimaryText, state.focus};
+}
+
+ButtonPresentation ResolveButtonPresentation(bool iconFontAvailable)
+{
+    return iconFontAvailable ? ButtonPresentation::IconAndLabel : ButtonPresentation::LabelOnly;
+}
