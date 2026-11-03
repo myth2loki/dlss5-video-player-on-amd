@@ -1612,6 +1612,22 @@ bool AmdLmxxfEvaluator::ApplyMochizukiControls()
             controls.network_model = 0u;
         }
     }
+    // Passes 2 and 3: each may carry its own look, or follow pass 1. A zeroed
+    // block IS "follow" (the runtime then inherits pass 1's look and drops that
+    // pass's tone to 0), so only a moved block is written field by field.
+    const auto fillPass = [](MochizukiNrPassControls& out, const MochizukiPassOptions& in) {
+        out = MochizukiNrPassControls{};
+        if (in.followPass1) return;
+        out.used = 1u;
+        out.style = in.style > 2u ? 2u : in.style;
+        out.intensity = in.intensity;
+        out.local_tone = in.localTone;
+        out.local_structure = in.localStructure;
+        out.skin_structure = in.skinStructure;
+        out.automatic_mask = in.autoMask ? 1u : 0u;
+    };
+    fillPass(controls.pass[0], asked.pass2);
+    fillPass(controls.pass[1], asked.pass3);
     // ACO import, the documented default and the reason the pack ships 58 record
     // files next to 58 precompiled shaders. A zeroed struct means OFF, and off is
     // what a first frame pays for: the driver compiles the network's 25 pipelines
@@ -1642,6 +1658,8 @@ bool AmdLmxxfEvaluator::ApplyMochizukiControls()
         std::to_string(controls.preprocess) + ", int4=" + std::to_string(controls.int4_mixed) +
         ", drs=" + std::to_string(controls.drs_mode) +
         ", network=" + std::to_string(controls.network_model) +
+        ", pass2=" + (asked.pass2.followPass1 ? "follow" : "own") +
+        ", pass3=" + (asked.pass3.followPass1 ? "follow" : "own") +
         (MochizukiOptionsAreDefault(asked) ? " (all defaults)" : " (from the panel)"));
     return true;
 }

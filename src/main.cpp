@@ -419,6 +419,30 @@ static constexpr int IDC_NS_MZ_APPLY = 7372;
 static constexpr int IDC_NS_MZ_PREPROCESS = 7373;
 static constexpr int IDC_NS_MZ_INT4 = 7374;
 static constexpr int IDC_NS_MZ_NETWORK = 7375;
+// Passes 2 and 3 have a dialog of their own: fourteen more controls do not fit
+// on a panel that is already full at its design height.
+static constexpr int IDC_NS_MZ_PASSES = 7376;
+// That dialog's block. 7401-7409 are the encoder's, 7501-7510 the export
+// dialog's and the timecode strip's, so this starts past both; the sliders take
+// their readout at id+100 (see CreateAdjustmentRow), which is why the block is
+// laid out with that +100 in mind.
+static constexpr int IDC_PP_P2_INTENSITY = 7600;
+static constexpr int IDC_PP_P2_TONE = 7601;
+static constexpr int IDC_PP_P2_STRUCTURE = 7602;
+static constexpr int IDC_PP_P2_SKIN = 7603;
+static constexpr int IDC_PP_P3_INTENSITY = 7604;
+static constexpr int IDC_PP_P3_TONE = 7605;
+static constexpr int IDC_PP_P3_STRUCTURE = 7606;
+static constexpr int IDC_PP_P3_SKIN = 7607;
+static constexpr int IDC_PP_P2_FOLLOW = 7610;
+static constexpr int IDC_PP_P2_STYLE = 7611;
+static constexpr int IDC_PP_P2_MASK = 7612;
+static constexpr int IDC_PP_P3_FOLLOW = 7613;
+static constexpr int IDC_PP_P3_STYLE = 7614;
+static constexpr int IDC_PP_P3_MASK = 7615;
+static constexpr int IDC_PP_RESET = 7616;
+static constexpr int IDC_PP_CLOSE = 7617;
+static constexpr int IDC_PP_APPLY = 7618;
 // The preset strip, the line that says what the preset does, the line that
 // says what Apply will do, and the way across to Image adjustments.
 static constexpr int IDC_NS_PRESET = 7342;
@@ -2507,6 +2531,23 @@ static MochizukiOptions ReadSavedMochizukiOptions(const std::filesystem::path& s
     // range: a hand-edited 7 must not name a file the runtime will not find.
     options.networkModel=std::min<uint32_t>(static_cast<uint32_t>(GetPrivateProfileIntW(L"AmdNeural",L"MochizukiNetwork",
         static_cast<int>(defaults.networkModel),settingsPath.c_str())),1u);
+    // Passes 2 and 3, each with its own seven values. A missing block reads as
+    // the runtime's own default - follow pass 1 - so a file written before this
+    // existed keeps rendering what it rendered.
+    const auto readPass=[&](const wchar_t* prefix,MochizukiPassOptions pass){
+        const std::wstring key(prefix);
+        pass.followPass1=GetPrivateProfileIntW(L"AmdNeural",(key+L"Follow").c_str(),pass.followPass1?1:0,settingsPath.c_str())!=0;
+        pass.style=std::min<uint32_t>(static_cast<uint32_t>(GetPrivateProfileIntW(L"AmdNeural",(key+L"Style").c_str(),
+            static_cast<int>(pass.style),settingsPath.c_str())),2u);
+        pass.intensity=std::clamp(ReadSavedFloat(L"AmdNeural",(key+L"Intensity").c_str(),pass.intensity,settingsPath),0.0f,2.0f);
+        pass.localTone=std::clamp(ReadSavedFloat(L"AmdNeural",(key+L"Tone").c_str(),pass.localTone,settingsPath),0.0f,2.0f);
+        pass.localStructure=std::clamp(ReadSavedFloat(L"AmdNeural",(key+L"Structure").c_str(),pass.localStructure,settingsPath),0.0f,2.0f);
+        pass.skinStructure=std::clamp(ReadSavedFloat(L"AmdNeural",(key+L"Skin").c_str(),pass.skinStructure,settingsPath),-1.0f,2.0f);
+        pass.autoMask=GetPrivateProfileIntW(L"AmdNeural",(key+L"Mask").c_str(),pass.autoMask?1:0,settingsPath.c_str())!=0;
+        return pass;
+    };
+    options.pass2=readPass(L"MochizukiPass2",defaults.pass2);
+    options.pass3=readPass(L"MochizukiPass3",defaults.pass3);
     return options;
 }
 
@@ -6605,6 +6646,26 @@ private:
             swprintf_s(number,L"%u",m_mochizuki.drsMode);
             WritePrivateProfileStringW(L"AmdNeural",L"MochizukiDrs",number,SettingsPath().c_str());
             WritePrivateProfileStringW(L"AmdNeural",L"MochizukiNetwork",m_mochizuki.networkModel?L"1":L"0",SettingsPath().c_str());
+            // Passes 2 and 3. Written even when they follow pass 1, so the file
+            // says what the render did rather than leaving it to a default that
+            // could move between versions.
+            auto writePass=[&](const wchar_t* prefix,const MochizukiPassOptions& pass){
+                const std::wstring key(prefix);
+                WritePrivateProfileStringW(L"AmdNeural",(key+L"Follow").c_str(),pass.followPass1?L"1":L"0",SettingsPath().c_str());
+                swprintf_s(number,L"%u",pass.style);
+                WritePrivateProfileStringW(L"AmdNeural",(key+L"Style").c_str(),number,SettingsPath().c_str());
+                const auto writeValue=[&](const wchar_t* suffix,float value){
+                    swprintf_s(number,L"%.2f",double(value));
+                    WritePrivateProfileStringW(L"AmdNeural",(key+suffix).c_str(),number,SettingsPath().c_str());
+                };
+                writeValue(L"Intensity",pass.intensity);
+                writeValue(L"Tone",pass.localTone);
+                writeValue(L"Structure",pass.localStructure);
+                writeValue(L"Skin",pass.skinStructure);
+                WritePrivateProfileStringW(L"AmdNeural",(key+L"Mask").c_str(),pass.autoMask?L"1":L"0",SettingsPath().c_str());
+            };
+            writePass(L"MochizukiPass2",m_mochizuki.pass2);
+            writePass(L"MochizukiPass3",m_mochizuki.pass3);
         }
         // The temporal mode, in the same section: it is not a multi-pass
         // switch, and it is the one set of rungs whose value decides whether
@@ -7741,11 +7802,16 @@ private:
     // runs from it (DrawDialogSlider) - and `x` shifts the row into a second
     // column. A row in a column layout (`columned`, or any shifted row) keeps
     // its size when the dialog is resized, so it never grows into its neighbour.
-    void CreateAdjustmentRow(HWND h,int id,const wchar_t* labelKey,int y,const wchar_t* tipKey=nullptr,int origin=-1,int x=0,bool columned=false){
+    // `origin` is the track position where the setting does nothing - the fill
+    // runs from it (DrawDialogSlider) - and `x` shifts the row into a second
+    // column. `trackWidth` is that columned track's width; 0 keeps the 218 every
+    // earlier caller laid out against, and a wider panel names its own.
+    void CreateAdjustmentRow(HWND h,int id,const wchar_t* labelKey,int y,const wchar_t* tipKey=nullptr,int origin=-1,int x=0,bool columned=false,int trackWidth=0){
         const bool column=columned||x!=0;
+        const int width=column?(trackWidth>0?trackWidth:218):236;
         HWND label=DialogControl(h,L"STATIC",T(labelKey).c_str(),SS_LEFT,16+x,y,116,20);
-        HWND track=DialogControl(h,TRACKBAR_CLASSW,L"",TBS_HORZ|TBS_NOTICKS,132+x,y-6,column?218:236,30,id,column?DialogAnchor::Fixed:DialogAnchor::StretchTrack);
-        HWND value=DialogControl(h,L"STATIC",L"",SS_RIGHT,(column?352:370)+x,y,64,20,id+100,column?DialogAnchor::Fixed:DialogAnchor::RightValue);
+        HWND track=DialogControl(h,TRACKBAR_CLASSW,L"",TBS_HORZ|TBS_NOTICKS,132+x,y-6,width,30,id,column?DialogAnchor::Fixed:DialogAnchor::StretchTrack);
+        HWND value=DialogControl(h,L"STATIC",L"",SS_RIGHT,(column?132+x+width+2:370+x),y,64,20,id+100,column?DialogAnchor::Fixed:DialogAnchor::RightValue);
         if(track&&origin>=0)SetPropW(track,kSliderOriginProperty,reinterpret_cast<HANDLE>(static_cast<INT_PTR>(origin+1)));
         AddTip(h,label,tipKey);AddTip(h,track,tipKey);AddTip(h,value,tipKey);
     }
@@ -8021,6 +8087,32 @@ private:
         if(HWND apply=GetDlgItem(dialog,IDC_NS_APPLY);apply&&(IsWindowEnabled(apply)!=FALSE)!=state.applyEnabled)EnableWindow(apply,state.applyEnabled);
     }
 
+    // The per-pass door follows the ladder it sits beside. One pass has no
+    // second pass to configure, so there is nothing to open and the button is
+    // hidden rather than disabled: a greyed door on a one-pass panel asks a
+    // question nobody can answer. A window already open is closed when the
+    // ladder drops below what it shows - its columns would edit values the
+    // render no longer reads.
+    void UpdatePerPassDoor(HWND h){
+        // Read the ladder the panel is showing rather than the stored value:
+        // the combo changes the moment it is picked, the setting is only read
+        // back on the same message, and a door that lags one step behind the
+        // dropdown is a door that opens the wrong number of columns.
+        int passes=m_neuralSettings.passes;
+        if(HWND ladder=GetDlgItem(h,IDC_NS_PASSES)){
+            const int index=int(SendMessageW(ladder,CB_GETCURSEL,0,0));
+            if(index!=CB_ERR)passes=std::clamp(index+1,1,4);
+        }
+        if(HWND button=GetDlgItem(h,IDC_NS_MZ_PASSES))
+            ShowWindow(button,passes>=2?SW_SHOW:SW_HIDE);
+        // Two passes show one column, three show two. A window built for the
+        // other count is closed whichever way the ladder moved: leaving it up
+        // would show a pass the render does not run, or hide one it does.
+        const int wanted=passes>=3?3:2;
+        if(m_passWnd&&IsWindow(m_passWnd)&&m_passColumns!=wanted)
+            DestroyWindow(m_passWnd);
+    }
+
     void SyncNeuralSettingControls(HWND h){
         SetTrack(h,IDC_NS_INTENSITY,0,int(std::lround(kIntensityMax*100.0f)),int(std::lround(m_neuralSettings.intensity*100.0f)));
         SetTrack(h,IDC_NS_STRUCTURE,0,200,int(std::lround(m_neuralSettings.localStructure*100.0f)));
@@ -8074,6 +8166,7 @@ private:
         if(HWND chained=GetDlgItem(h,IDC_NS_CHAINED))EnableWindow(chained,m_neuralSettings.passes>1);
         EnableDependentNeuralControls(h);
         UpdateNeuralSettingValueLabels(h);
+        UpdatePerPassDoor(h);
     }
 
     void ReadNeuralSettingControls(HWND h){
@@ -8102,11 +8195,22 @@ private:
         }
         m_neuralSettings.style=sel(IDC_NS_STYLE,m_neuralSettings.style);
         m_neuralSettings.autoMask=checked(IDC_NS_AUTOMASK);
-        // The AMD ladder's first rung is the Small model: it reads as a single
-        // Original pass everywhere below - the stacking switches grey out at
-        // one pass - while the model itself travels as its own switch. NVIDIA
-        // keeps the add-on's 1..4 ladder.
-        if(m_opt.neuralBackend==NeuralBackend::Amd){
+        // Three ladders, three mappings, and reading one with another's rule is
+        // silent: a combo three items long read as the four-item lmxxf ladder
+        // gives count-1, so picking "3 passes" stored 2, picking "2 passes"
+        // stored 1, and picking "1 (single pass)" was taken as the Small model -
+        // every Mochizuki session lost a pass on any change to the panel, and
+        // the per-pass dialog then opened for a count the dropdown did not show.
+        if(m_opt.neuralBackend==NeuralBackend::Amd&&m_amdNrRuntime==AmdNrRuntime::Mochizuki){
+            // No Small rung here, so the index is one below the count. The
+            // lmxxf model switch is left alone: it has nothing to do with this
+            // runtime and it is still set the way that panel left it.
+            m_neuralSettings.passes=std::clamp(sel(IDC_NS_PASSES,m_neuralSettings.passes-1)+1,1,3);
+        } else if(m_opt.neuralBackend==NeuralBackend::Amd){
+            // The AMD ladder's first rung is the Small model: it reads as a single
+            // Original pass everywhere below - the stacking switches grey out at
+            // one pass - while the model itself travels as its own switch. NVIDIA
+            // keeps the add-on's 1..4 ladder.
             const int rung=sel(IDC_NS_PASSES,m_amdSmallModel?0:m_neuralSettings.passes);
             m_amdSmallModel=rung<=0;
             m_neuralSettings.passes=m_amdSmallModel?1:std::clamp(rung,1,3);
@@ -8134,6 +8238,7 @@ private:
         temporal.stability=static_cast<TemporalStability>(std::clamp(sel(IDC_NS_STABILITY,static_cast<int>(temporal.stability)),0,3));
         if(guides!=m_renderGuides||temporal!=m_temporalSettings){m_renderGuides=guides;m_temporalSettings=temporal;ApplyLiveGuideControls();}
         UpdateNeuralSettingValueLabels(h);
+        UpdatePerPassDoor(h);
         // Sliders fire continuously; the preview waits for them to settle.
         SchedulePausedSettingsPreview();
     }
@@ -8236,7 +8341,7 @@ private:
     // Two columns: what the model does to the picture on the left, what it
     // costs and what it works from on the right. One column was 756 dip tall,
     // 1,323 px at 175%, taller than a 1080p screen's work area; this is 418.
-    static constexpr int kNeuralColumn=448;
+    static constexpr int kNeuralColumn=520;
     // The preset strip sits above both columns: a preset is the first choice
     // and the one most people make, so it is the first thing the dialog asks.
     static constexpr int kNeuralPresetBand=46;
@@ -8252,7 +8357,16 @@ private:
         // session handed that rung would run the Original at one pass while the
         // panel said otherwise.
         CreateNeuralCombo(h,IDC_NS_PASSES,L"neural.settings.passes",40+top,
-                          {L"1 (single pass)",L"2 passes",L"3 passes"},L"neural.tip.passes",right);
+                          {L"1 (single pass)",L"2 passes",L"3 passes"},L"neural.tip.passes",right,170);
+        // Right of the ladder, because it is the same question: the count picks
+        // how many passes run, this opens the look for the later ones. One door
+        // for both: the dialog it opens shows one column at two passes and two
+        // at three, so there is nothing to choose before opening it.
+        {
+            HWND passes=DialogControl(h,L"BUTTON",T(L"neural.settings.mz_passes").c_str(),WS_TABSTOP|BS_OWNERDRAW,
+                                      832,37+top,150,26,IDC_NS_MZ_PASSES);
+            AddTip(h,passes,L"neural.tip.mz_passes");
+        }
         CreateSettingsGroupHeading(h,L"neural.settings.group_mochizuki",74+top,right,400);
         // Which of the two networks the runtime builds. Its own row above the
         // runtime's sliders because it is the wider question: the two are
@@ -8262,10 +8376,10 @@ private:
         CreateNeuralCombo(h,IDC_NS_MZ_NETWORK,L"neural.settings.mz_network",96+top,
                           {L"310.8.0 \u00b7 original (599 weights, dlssnr.bin)",
                            L"310.9.16 \u00b7 small (255 weights, dlssnr-small.bin)"},
-                          L"neural.tip.mz_network",right,240);
+                          L"neural.tip.mz_network",right,360);
         // The two sliders the runtime has and the add-on does not.
-        CreateAdjustmentRow(h,IDC_NS_MZ_MAXRATIO,L"neural.settings.mz_maxratio",126+top,L"neural.tip.mz_maxratio",0,right,true);
-        CreateAdjustmentRow(h,IDC_NS_MZ_HISTORY,L"neural.settings.mz_history",168+top,L"neural.tip.mz_history",0,right,true);
+        CreateAdjustmentRow(h,IDC_NS_MZ_MAXRATIO,L"neural.settings.mz_maxratio",126+top,L"neural.tip.mz_maxratio",0,right,true,240);
+        CreateAdjustmentRow(h,IDC_NS_MZ_HISTORY,L"neural.settings.mz_history",168+top,L"neural.tip.mz_history",0,right,true,240);
         CreateNeuralCheck(h,IDC_NS_MZ_APPLY,L"neural.settings.mz_apply",12+right,212+top,300,L"neural.tip.mz_apply");
         CreateNeuralCheck(h,IDC_NS_MZ_PREPROCESS,L"neural.settings.mz_preprocess",12+right,236+top,330,L"neural.tip.mz_preprocess");
         CreateNeuralCheck(h,IDC_NS_MZ_INT4,L"neural.settings.mz_int4",12+right,260+top,330,L"neural.tip.mz_int4");
@@ -8276,8 +8390,8 @@ private:
 
     void BuildNeuralSettingControls(HWND h){
         constexpr int right=kNeuralColumn,top=kNeuralPresetBand;
-        CreateNeuralCombo(h,IDC_NS_PRESET,L"neural.settings.preset",14,{},L"neural.tip.preset",0,230);
-        DialogControl(h,L"STATIC",L"",SS_LEFT|SS_NOPREFIX,380,8,484,36,IDC_NS_PRESET_NOTE);
+        CreateNeuralCombo(h,IDC_NS_PRESET,L"neural.settings.preset",14,{},L"neural.tip.preset",0,300);
+        DialogControl(h,L"STATIC",L"",SS_LEFT|SS_NOPREFIX,380,8,644,36,IDC_NS_PRESET_NOTE);
         CreateSettingsGroupHeading(h,L"neural.settings.group_look",12+top,0,400);
         // Ordered by how far each control measurably moves the picture
         // (docs/measurements/knobs-upper-20261003): Style first, Intensity -
@@ -8285,12 +8399,12 @@ private:
         // do something of their own.
         // NVIDIA's names, with what each measurably does beside it: Natural
         // moves the picture furthest from the source.
-        CreateNeuralCombo(h,IDC_NS_STYLE,L"neural.settings.style",44+top,{L"Default",L"Natural \u00b7 strongest change",L"Cinematic \u00b7 strong change"},L"neural.tip.style",0,230);
-        CreateAdjustmentRow(h,IDC_NS_TONE,L"neural.settings.tone",82+top,L"neural.tip.tone",100,0,true);
-        CreateAdjustmentRow(h,IDC_NS_STRUCTURE,L"neural.settings.structure",124+top,L"neural.tip.structure",100,0,true);
-        CreateAdjustmentRow(h,IDC_NS_COLOR,L"neural.settings.color",166+top,L"neural.tip.color",100,0,true);
-        CreateAdjustmentRow(h,IDC_NS_INTENSITY,L"neural.settings.intensity",208+top,L"neural.tip.intensity",100,0,true);
-        CreateAdjustmentRow(h,IDC_NS_SKIN,L"neural.settings.skin",250+top,L"neural.tip.skin",0,0,true);
+        CreateNeuralCombo(h,IDC_NS_STYLE,L"neural.settings.style",44+top,{L"Default",L"Natural \u00b7 strongest change",L"Cinematic \u00b7 strong change"},L"neural.tip.style",0,300);
+        CreateAdjustmentRow(h,IDC_NS_TONE,L"neural.settings.tone",82+top,L"neural.tip.tone",100,0,true,240);
+        CreateAdjustmentRow(h,IDC_NS_STRUCTURE,L"neural.settings.structure",124+top,L"neural.tip.structure",100,0,true,240);
+        CreateAdjustmentRow(h,IDC_NS_COLOR,L"neural.settings.color",166+top,L"neural.tip.color",100,0,true,240);
+        CreateAdjustmentRow(h,IDC_NS_INTENSITY,L"neural.settings.intensity",208+top,L"neural.tip.intensity",100,0,true,240);
+        CreateAdjustmentRow(h,IDC_NS_SKIN,L"neural.settings.skin",250+top,L"neural.tip.skin",0,0,true,240);
         CreateNeuralCheck(h,IDC_NS_AUTOMASK,L"neural.settings.automask",132,286+top,236,L"neural.tip.automask");
         // The right column is the one place the two AMD runtimes disagree about
         // what the panel should ask, so it is built from the selection rather
@@ -8316,11 +8430,11 @@ private:
         if(m_opt.neuralBackend==NeuralBackend::Amd){
             CreateNeuralCombo(h,IDC_NS_PASSES,L"neural.settings.passes",40+top,
                               {L"Small \u00b7 0.5\u00d7 (31 blocks)",L"1 (single pass)",L"2 passes",L"3 passes"},
-                              L"neural.tip.passes",right);
+                              L"neural.tip.passes",right,300);
         } else {
             CreateNeuralCombo(h,IDC_NS_PASSES,L"neural.settings.passes",40+top,
                               {L"1 (single pass)",L"2 passes",L"3 passes",L"4 passes"},
-                              L"neural.tip.passes",right);
+                              L"neural.tip.passes",right,300);
         }
         CreateNeuralCheck(h,IDC_NS_SKIN_PROTECT,L"neural.settings.skin_protect",12+right,74+top,116,L"neural.tip.skin_protect");
         CreateNeuralCheck(h,IDC_NS_CHAINED,L"neural.settings.chained",132+right,74+top,224,L"neural.tip.chained");
@@ -8328,7 +8442,7 @@ private:
         // (skin 12+right..132+right+116, chained ..+224, ends 804 of the 880
         // the dialog is wide) and a third box on it was drawn off the window.
         CreateNeuralCheck(h,IDC_NS_MP_PREDICT,L"neural.settings.mp_predict",12+right,96+top,200,L"neural.tip.mp_predict");
-        CreateNeuralCombo(h,IDC_NS_MP_SKIP,L"neural.settings.mp_skip",96+top,{L"Off",L"Skip ViT + C512"},L"neural.tip.mp_skip",212+right,180);
+        CreateNeuralCombo(h,IDC_NS_MP_SKIP,L"neural.settings.mp_skip",96+top,{L"Off",L"Skip ViT + C512"},L"neural.tip.mp_skip",212+right,280);
         // The runtime's own temporal mode, in this group because it is the one
         // setting here that decides which network runs rather than how much the
         // run costs: an active mode requires the Original model, so the Small
@@ -8338,7 +8452,7 @@ private:
         if(m_opt.neuralBackend==NeuralBackend::Amd)
             CreateNeuralCombo(h,IDC_NS_TEMPORAL_MODE,L"neural.settings.temporal_mode",118+top,
                               {L"Off",L"Fast history",L"Low-frequency EMA",L"Low-frequency + detail"},
-                              L"neural.tip.temporal_mode",right);
+                              L"neural.tip.temporal_mode",right,300);
         CreateSettingsGroupHeading(h,L"neural.settings.group_guides",138+top,right,400);
         CreateNeuralCheck(h,IDC_NS_GUIDE_MV,L"neural.settings.guide_mv",132+right,164+top,116,L"neural.tip.guide_mv");
         CreateNeuralCheck(h,IDC_NS_GUIDE_DEPTH,L"neural.settings.guide_depth",252+right,164+top,80,L"neural.tip.guide_depth");
@@ -8350,7 +8464,7 @@ private:
             const std::wstring cuts[]={T(L"neural.scene_cuts.default"),T(L"neural.scene_cuts.more"),
                                        T(L"neural.scene_cuts.less"),T(L"neural.scene_cuts.off")};
             CreateNeuralCombo(h,IDC_NS_SCENE_CUTS,L"neural.settings.scene_cuts",230+top,
-                              {cuts[0].c_str(),cuts[1].c_str(),cuts[2].c_str(),cuts[3].c_str()},L"neural.tip.scene_cuts",right);
+                              {cuts[0].c_str(),cuts[1].c_str(),cuts[2].c_str(),cuts[3].c_str()},L"neural.tip.scene_cuts",right,300);
             // A ladder with Off first and the default, for the reason the policy
             // header gives: it trades detail in motion for steadiness, and a
             // default never moves down a ladder to buy something else.
@@ -8365,24 +8479,24 @@ private:
                 T(L"neural.stability.low"),T(L"neural.stability.medium"),T(L"neural.stability.high")};
             CreateNeuralCombo(h,IDC_NS_STABILITY,L"neural.settings.stability",264+top,
                               {stability[0].c_str(),stability[1].c_str(),stability[2].c_str(),stability[3].c_str()},
-                              amdStability?L"neural.tip.stability.amd":L"neural.tip.stability",right);
+                              amdStability?L"neural.tip.stability.amd":L"neural.tip.stability",right,300);
         }
         }
         // What Apply will do to the picture on screen right now (issue #15:
         // "the settings do not apply" was partly a picture nobody said was the
         // previous render), then what kind of setting these are.
-        DialogControl(h,L"STATIC",L"",SS_LEFT|SS_NOPREFIX,16,372,848,20,IDC_NS_STATE,DialogAnchor::StretchNote);
-        DialogControl(h,L"STATIC",T(L"neural.settings.note").c_str(),SS_LEFT,16,396,848,38,0,DialogAnchor::StretchNote);
+        DialogControl(h,L"STATIC",L"",SS_LEFT|SS_NOPREFIX,16,372,1008,20,IDC_NS_STATE,DialogAnchor::StretchNote);
+        DialogControl(h,L"STATIC",T(L"neural.settings.note").c_str(),SS_LEFT,16,396,1008,38,0,DialogAnchor::StretchNote);
         HWND adjust=DialogControl(h,L"BUTTON",T(L"neural.settings.open_adjustments").c_str(),WS_TABSTOP|BS_OWNERDRAW,16,442,170,30,IDC_NS_OPEN_ADJUST,DialogAnchor::BottomLeft);
-        HWND reset=DialogButton(h,L"neural.settings.reset",IDC_NS_RESET,550,442,86,30);
-        HWND apply=DialogButton(h,L"neural.settings.apply",IDC_NS_APPLY,646,442,122,30,true);
-        DialogButton(h,L"neural.settings.close",IDC_NS_CLOSE,778,442,86,30);
+        HWND reset=DialogButton(h,L"neural.settings.reset",IDC_NS_RESET,714,442,86,30);
+        HWND apply=DialogButton(h,L"neural.settings.apply",IDC_NS_APPLY,808,442,122,30,true);
+        DialogButton(h,L"neural.settings.close",IDC_NS_CLOSE,938,442,86,30);
         AddTip(h,reset,L"neural.tip.reset");AddTip(h,apply,L"neural.tip.apply");AddTip(h,adjust,L"neural.tip.open_adjustments");
         SyncNeuralSettingControls(h);
         CaptureSettingsDesignLayout(h);
     }
 
-    static constexpr int kNeuralDesignW=880,kNeuralDesignH=486;
+    static constexpr int kNeuralDesignW=1040,kNeuralDesignH=486;
 
     // Playback takes it on the next frame (the renderer reads it per frame, and a
     // paused frame is drawn again so the picture shows it); an export takes it when
@@ -8759,6 +8873,7 @@ private:
                 m_mochizuki={};
                 ApplyLiveGuideControls();SyncNeuralSettingControls(h);SaveVideoSettings();SchedulePausedSettingsPreview();return 0;}
             if(id==IDC_NS_APPLY){ApplyNeuralSettings();return 0;}
+            if(id==IDC_NS_MZ_PASSES&&code==BN_CLICKED){ShowMochizukiPassSettings();return 0;}
             if(id==IDC_NS_CLOSE){DestroyWindow(h);return 0;}
             if(id==IDC_NS_OPEN_ADJUST&&code==BN_CLICKED){ShowAdjustments();return 0;}
             // Picking a preset writes its values into the controls, as the menu
@@ -8851,6 +8966,200 @@ private:
         DialogButton(h,L"encoder.settings.close",IDC_ES_CLOSE,348,380,86,30,true);
         SyncEncoderSettingControls(h);
         CaptureSettingsDesignLayout(h);
+    }
+
+    // ---- Mochizuki passes 2 and 3 ---------------------------------------
+    //
+    // The runtime takes a look per pass (MochizukiNrPassControls, two blocks
+    // beside the global one), so a stack can carry a different one on each pass
+    // instead of repeating pass 1. Its own window because the neural panel is
+    // full: fourteen controls beside the eleven it already carries would run
+    // past its design height.
+    //
+    // `Follow pass 1` is the runtime's own default and means what the zeroed
+    // block says: the pass inherits pass 1's look and its tone drops to 0,
+    // because re-applying the same tone on every pass compounds.
+    // The dialog is as wide as the ladder is tall: one later pass needs one
+    // column, two need two. The width is chosen when the window opens.
+    static constexpr int kPassDesignH=430;
+
+    void ShowMochizukiPassSettings(){
+        const int wanted=m_neuralSettings.passes>=3?3:2;
+        if(m_passWnd&&IsWindow(m_passWnd)&&m_passColumns==wanted){
+            ShowWindow(m_passWnd,SW_SHOWNORMAL);SetForegroundWindow(m_passWnd);return;
+        }
+        // The ladder changed while the dialog was up: rebuild it rather than
+        // re-showing a window titled for a pass count the render no longer uses.
+        if(m_passWnd&&IsWindow(m_passWnd))DestroyWindow(m_passWnd);
+        static constexpr const wchar_t* kClassName=L"DLSSVideoMochizukiPassClassV1";
+        WNDCLASSW n{};n.lpfnWndProc=PassWndProcStatic;n.hInstance=GetModuleHandleW(nullptr);n.lpszClassName=kClassName;n.hCursor=LoadCursor(nullptr,IDC_ARROW);n.hbrBackground=DarkDialogBrush();
+        if(!RegisterClassW(&n)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return;
+        m_passColumns=m_neuralSettings.passes>=3?3:2;
+        m_passDesignW=m_passColumns>=3?1040:560;
+        constexpr DWORD style=(WS_OVERLAPPEDWINDOW&~WS_MAXIMIZEBOX)|WS_VISIBLE;
+        const RECT wr=SettingsWindowRect(m_passDesignW,kPassDesignH,style,WS_EX_TOOLWINDOW,ActiveWindowDpi(m_hwnd));
+        const int w=int(wr.right-wr.left),h=int(wr.bottom-wr.top);
+        RECT pr{};GetWindowRect(m_hwnd,&pr);const int pw=int(pr.right-pr.left),ph=int(pr.bottom-pr.top);int x=int(pr.left)+std::max(0,(pw-w)/2),y=int(pr.top)+std::max(0,(ph-h)/2);
+        // The title says which passes are inside: a window that reads "per-pass
+        // settings" over one column at two passes and two at three leaves the
+        // reader to count.
+        const std::wstring title=T(L"neural.pass.title")+L" \u00b7 "+T(L"neural.pass.pass2")+
+            (m_passColumns>=3?(std::wstring(L" + ")+T(L"neural.pass.pass3")):std::wstring());
+        m_passWnd=CreateWindowExW(WS_EX_TOOLWINDOW,kClassName,title.c_str(),
+            style,x,y,w,h,m_hwnd,nullptr,GetModuleHandleW(nullptr),this);
+    }
+
+    // One column per later pass, at the same 448-unit column the neural panel
+    // uses, so the two windows line up when they are open together.
+    void BuildPassColumn(HWND h,int x,bool third){
+        const int follow=third?IDC_PP_P3_FOLLOW:IDC_PP_P2_FOLLOW;
+        const int style=third?IDC_PP_P3_STYLE:IDC_PP_P2_STYLE;
+        const int intensity=third?IDC_PP_P3_INTENSITY:IDC_PP_P2_INTENSITY;
+        const int tone=third?IDC_PP_P3_TONE:IDC_PP_P2_TONE;
+        const int structure=third?IDC_PP_P3_STRUCTURE:IDC_PP_P2_STRUCTURE;
+        const int skin=third?IDC_PP_P3_SKIN:IDC_PP_P2_SKIN;
+        const int mask=third?IDC_PP_P3_MASK:IDC_PP_P2_MASK;
+        CreateSettingsGroupHeading(h,third?L"neural.pass.pass3":L"neural.pass.pass2",44,x,420);
+        CreateNeuralCheck(h,follow,L"neural.pass.follow",16+x,68,400,L"neural.pass.tip.follow");
+        CreateNeuralCombo(h,style,L"neural.pass.style",96,
+                          {L"Default",L"Natural \u00b7 strongest change",L"Cinematic \u00b7 strong change"},
+                          L"neural.pass.tip.style",x,360);
+        CreateAdjustmentRow(h,intensity,L"neural.pass.intensity",128,L"neural.pass.tip.intensity",0,x,true,240);
+        CreateAdjustmentRow(h,tone,L"neural.pass.tone",170,L"neural.pass.tip.tone",0,x,true,240);
+        CreateAdjustmentRow(h,structure,L"neural.pass.structure",212,L"neural.pass.tip.structure",0,x,true,240);
+        CreateAdjustmentRow(h,skin,L"neural.pass.skin",254,L"neural.pass.tip.skin",100,x,true,240);
+        CreateNeuralCheck(h,mask,L"neural.pass.mask",16+x,296,400,L"neural.pass.tip.mask");
+    }
+
+    void BuildMochizukiPassControls(HWND h){
+        // At two passes there is no pass 3, so the sentence explaining when it
+        // runs would describe a control that is not in this window.
+        DialogControl(h,L"STATIC",T(m_passColumns>=3?L"neural.pass.note":L"neural.pass.note.one").c_str(),
+                      SS_LEFT,16,8,m_passDesignW-32,32,0,DialogAnchor::StretchNote);
+        BuildPassColumn(h,0,false);
+        if(m_passColumns>=3)BuildPassColumn(h,520,true);
+        const int closeX=m_passDesignW-16-86,applyX=closeX-8-86,resetX=applyX-8-86;
+        DialogButton(h,L"neural.pass.reset",IDC_PP_RESET,resetX,384,86,30);
+        DialogButton(h,L"neural.pass.apply",IDC_PP_APPLY,applyX,384,86,30,true);
+        DialogButton(h,L"neural.pass.close",IDC_PP_CLOSE,closeX,384,86,30);
+        SyncPassSettingControls(h);
+        CaptureSettingsDesignLayout(h);
+    }
+
+    // A pass that follows pass 1 has nothing of its own to edit, so its block is
+    // greyed rather than left live: a value nobody reads is a value the panel
+    // should not offer.
+    void EnablePassColumn(HWND h,bool third){
+        const bool on=!(third?m_mochizuki.pass3.followPass1:m_mochizuki.pass2.followPass1);
+        const int ids[]={third?IDC_PP_P3_STYLE:IDC_PP_P2_STYLE,
+                         third?IDC_PP_P3_INTENSITY:IDC_PP_P2_INTENSITY,
+                         third?IDC_PP_P3_TONE:IDC_PP_P2_TONE,
+                         third?IDC_PP_P3_STRUCTURE:IDC_PP_P2_STRUCTURE,
+                         third?IDC_PP_P3_SKIN:IDC_PP_P2_SKIN,
+                         third?IDC_PP_P3_MASK:IDC_PP_P2_MASK};
+        for(const int id:ids){
+            if(HWND control=GetDlgItem(h,id))EnableWindow(control,on);
+            if(HWND value=GetDlgItem(h,id+100))EnableWindow(value,on);
+        }
+    }
+
+    void UpdatePassValueLabels(HWND h){
+        const auto labels=[&](bool third){
+            const MochizukiPassOptions& pass=third?m_mochizuki.pass3:m_mochizuki.pass2;
+            SetAdjustmentValue(h,third?IDC_PP_P3_INTENSITY:IDC_PP_P2_INTENSITY,PlainValue(pass.intensity));
+            SetAdjustmentValue(h,third?IDC_PP_P3_TONE:IDC_PP_P2_TONE,PlainValue(pass.localTone));
+            SetAdjustmentValue(h,third?IDC_PP_P3_STRUCTURE:IDC_PP_P2_STRUCTURE,PlainValue(pass.localStructure));
+            // Skin reads Off rather than a number the runtime ignores, the same
+            // reading the pass 1 row uses, and says why when the mask is off.
+            SetAdjustmentValue(h,third?IDC_PP_P3_SKIN:IDC_PP_P2_SKIN,
+                !pass.autoMask?T(L"neural.settings.skin_needs_mask")
+                :skin_structure::IsOff(pass.skinStructure)?T(L"neural.settings.skin_off")
+                :PlainValue(pass.skinStructure));
+        };
+        labels(false);
+        if(m_passColumns>=3)labels(true);
+    }
+
+    void SyncPassSettingControls(HWND h){
+        const auto sync=[&](bool third){
+            const MochizukiPassOptions& pass=third?m_mochizuki.pass3:m_mochizuki.pass2;
+            SetCheckBoxState(GetDlgItem(h,third?IDC_PP_P3_FOLLOW:IDC_PP_P2_FOLLOW),pass.followPass1);
+            SetCheckBoxState(GetDlgItem(h,third?IDC_PP_P3_MASK:IDC_PP_P2_MASK),pass.autoMask);
+            if(HWND combo=GetDlgItem(h,third?IDC_PP_P3_STYLE:IDC_PP_P2_STYLE))
+                SendMessageW(combo,CB_SETCURSEL,static_cast<WPARAM>(std::clamp(int(pass.style),0,2)),0);
+            SetTrack(h,third?IDC_PP_P3_INTENSITY:IDC_PP_P2_INTENSITY,0,200,int(std::lround(pass.intensity*100.0f)));
+            SetTrack(h,third?IDC_PP_P3_TONE:IDC_PP_P2_TONE,0,200,int(std::lround(pass.localTone*100.0f)));
+            SetTrack(h,third?IDC_PP_P3_STRUCTURE:IDC_PP_P2_STRUCTURE,0,200,int(std::lround(pass.localStructure*100.0f)));
+            SetTrack(h,third?IDC_PP_P3_SKIN:IDC_PP_P2_SKIN,-100,200,int(std::lround(pass.skinStructure*100.0f)));
+        };
+        sync(false);
+        if(m_passColumns>=3)sync(true);
+        UpdatePassValueLabels(h);
+        EnablePassColumn(h,false);
+        if(m_passColumns>=3)EnablePassColumn(h,true);
+    }
+
+    void ReadPassSettingControls(HWND h){
+        const auto read=[&](bool third){
+            MochizukiPassOptions& pass=third?m_mochizuki.pass3:m_mochizuki.pass2;
+            if(HWND box=GetDlgItem(h,third?IDC_PP_P3_FOLLOW:IDC_PP_P2_FOLLOW))pass.followPass1=CheckBoxState(box);
+            if(HWND box=GetDlgItem(h,third?IDC_PP_P3_MASK:IDC_PP_P2_MASK))pass.autoMask=CheckBoxState(box);
+            if(HWND combo=GetDlgItem(h,third?IDC_PP_P3_STYLE:IDC_PP_P2_STYLE)){
+                const int index=int(SendMessageW(combo,CB_GETCURSEL,0,0));
+                if(index!=CB_ERR)pass.style=uint32_t(std::clamp(index,0,2));
+            }
+            const auto slider=[&](int id,float& out,float low,float high){
+                if(HWND track=GetDlgItem(h,id))
+                    out=std::clamp(float(int(SendMessageW(track,TBM_GETPOS,0,0)))/100.0f,low,high);
+            };
+            slider(third?IDC_PP_P3_INTENSITY:IDC_PP_P2_INTENSITY,pass.intensity,0.0f,2.0f);
+            slider(third?IDC_PP_P3_TONE:IDC_PP_P2_TONE,pass.localTone,0.0f,2.0f);
+            slider(third?IDC_PP_P3_STRUCTURE:IDC_PP_P2_STRUCTURE,pass.localStructure,0.0f,2.0f);
+            slider(third?IDC_PP_P3_SKIN:IDC_PP_P2_SKIN,pass.skinStructure,-1.0f,2.0f);
+        };
+        read(false);
+        if(m_passColumns>=3)read(true);
+    }
+
+    LRESULT PassWndProc(HWND h,UINT m,WPARAM w,LPARAM l){
+        if(LRESULT result=0;SettingsDialogChrome(h,m,w,l,result))return result;
+        switch(m){
+        case WM_CREATE:ApplyDarkTitleBar(h);BuildMochizukiPassControls(h);return 0;
+        case WM_GETMINMAXINFO:{
+            const RECT wr=SettingsWindowRect(m_passDesignW,kPassDesignH,DWORD(GetWindowLongPtrW(h,GWL_STYLE)),DWORD(GetWindowLongPtrW(h,GWL_EXSTYLE)),ActiveWindowDpi(h));
+            auto* mmi=reinterpret_cast<MINMAXINFO*>(l);mmi->ptMinTrackSize={wr.right-wr.left,wr.bottom-wr.top};return 0;
+        }
+        case WM_SIZE:ResizeSettingsChildren(h,m_passDesignW,kPassDesignH);return 0;
+        // A slider reports through WM_HSCROLL, not WM_COMMAND: read the block,
+        // repaint the readouts, and leave saving to Apply or to the window
+        // closing - dragging a track fires this a hundred times.
+        case WM_HSCROLL:ReadPassSettingControls(h);UpdatePassValueLabels(h);return 0;
+        case WM_COMMAND:{
+            const int id=LOWORD(w);const int code=HIWORD(w);
+            if(id==IDC_PP_RESET){m_mochizuki.pass2={};m_mochizuki.pass3={};SyncPassSettingControls(h);SaveVideoSettings();return 0;}
+            if(id==IDC_PP_APPLY){ReadPassSettingControls(h);ApplyNeuralSettings();return 0;}
+            if(id==IDC_PP_CLOSE){DestroyWindow(h);return 0;}
+            const bool box=id==IDC_PP_P2_FOLLOW||id==IDC_PP_P2_MASK||id==IDC_PP_P3_FOLLOW||id==IDC_PP_P3_MASK;
+            if(box&&code==BN_CLICKED){
+                // The owner-drawn boxes do not flip themselves; the read below is
+                // what carries the click into the settings.
+                if(HWND control=GetDlgItem(h,id))SetCheckBoxState(control,!CheckBoxState(control));
+                ReadPassSettingControls(h);SyncPassSettingControls(h);return 0;
+            }
+            if((id==IDC_PP_P2_STYLE||id==IDC_PP_P3_STYLE)&&code==CBN_SELCHANGE){ReadPassSettingControls(h);return 0;}
+            break;
+        }
+        case WM_CLOSE:DestroyWindow(h);return 0;
+        case WM_DESTROY:SaveVideoSettings();m_settingsDesignLayout.erase(h);ReleaseDialogTips(h);if(h==m_passWnd)m_passWnd=nullptr;return 0;
+        }
+        return DefWindowProcW(h,m,w,l);
+    }
+
+    static LRESULT CALLBACK PassWndProcStatic(HWND h,UINT m,WPARAM w,LPARAM l){
+        PlayerApp* a=nullptr;
+        if(m==WM_NCCREATE){auto* cs=reinterpret_cast<CREATESTRUCTW*>(l);a=static_cast<PlayerApp*>(cs->lpCreateParams);SetWindowLongPtrW(h,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(a));}
+        else a=reinterpret_cast<PlayerApp*>(GetWindowLongPtrW(h,GWLP_USERDATA));
+        return a?a->PassWndProc(h,m,w,l):DefWindowProcW(h,m,w,l);
     }
 
     static constexpr int kEncoderDesignW=466,kEncoderDesignH=424;
@@ -15402,6 +15711,13 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     POINT m_panLast{};
     HWND m_neuralWnd=nullptr;
     HWND m_encoderWnd=nullptr;
+    // The per-pass dialog, opened from the neural panel's Mochizuki group, and
+    // how many later passes it shows. Two passes open one column, three open
+    // two; a change of the ladder while it is open closes it, because a column
+    // for a pass the panel no longer runs edits a value nothing reads.
+    HWND m_passWnd=nullptr;
+    int m_passColumns=3;
+    int m_passDesignW=1040;
     // Tooltip host per settings dialog, and the strings each host points at:
     // TTM_ADDTOOL keeps the pointer rather than copying the text, and two of
     // these dialogs can be open at the same time.

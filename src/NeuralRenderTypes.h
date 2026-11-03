@@ -92,6 +92,29 @@ constexpr std::optional<AmdNrRuntime> ParseAmdNrRuntime(std::string_view name) n
 // value is a no-op: a job that changes nothing renders exactly what the runtime
 // renders on its own, and the wire carries nothing (see FormatMochizukiOptions).
 //
+// One later pass's own controls. The runtime takes two of these beside the
+// global block (its pass[0] is pass 2, pass[1] is pass 3), which is what lets a
+// stack carry a different look per pass instead of repeating one. Follow keeps
+// the runtime's own default: that pass inherits pass 1's look and its tone drops
+// to 0, because re-applying the same tone on every pass compounds.
+struct MochizukiPassOptions {
+    bool followPass1{true};
+    // 0..2, as MochizukiOptions::style.
+    uint32_t style{1};
+    // 0..2, default 1.
+    float intensity{1.0f};
+    // 0..2, default 0 for a later pass: see above.
+    float localTone{0.0f};
+    // 0..2, default 1.
+    float localStructure{1.0f};
+    // -1..2, default -1: negative follows the structure value.
+    float skinStructure{-1.0f};
+    // Default on: skin structure is inert without it.
+    bool autoMask{true};
+
+    friend bool operator==(const MochizukiPassOptions&, const MochizukiPassOptions&) = default;
+};
+
 // The five values that are also `NeuralSettings` names - Intensity, Local tone,
 // Local structure, Skin structure, Automatic mask - are filled from it when the
 // job is built, so a preset moves them and the panel keeps one place per knob.
@@ -143,6 +166,11 @@ struct MochizukiOptions {
     // present for the switch to mean anything. Rebuilds the network, and it is
     // a key term because the same settings make a different frame.
     uint32_t networkModel{0};
+    // Passes 2 and 3, each optionally carrying its own look instead of
+    // inheriting pass 1. Only the ones the frame's pass count reaches run: at
+    // two passes pass3 is inert, at one neither is.
+    MochizukiPassOptions pass2;
+    MochizukiPassOptions pass3;
 
     friend bool operator==(const MochizukiOptions&, const MochizukiOptions&) = default;
 };
@@ -162,16 +190,27 @@ inline bool MochizukiOptionsAreDefault(const MochizukiOptions& options) noexcept
 inline std::string FormatMochizukiOptions(const MochizukiOptions& options)
 {
     if (MochizukiOptionsAreDefault(options)) return {};
-    char line[256]{};
+    // Two lines' worth of fields: a pass block is seven values and there are
+    // two of them, so 256 was no longer enough once they existed.
+    char line[512]{};
+    // `|` inside a pass block: the outer separator is the comma, and a nested
+    // comma would split a pass into two fields that parse as neither.
+    const auto pass = [](const MochizukiPassOptions& p) {
+        char block[96]{};
+        std::snprintf(block, sizeof(block), "%d|%u|%.2f|%.2f|%.2f|%.2f|%d",
+                      p.followPass1 ? 1 : 0, p.style, double(p.intensity), double(p.localTone),
+                      double(p.localStructure), double(p.skinStructure), p.autoMask ? 1 : 0);
+        return std::string(block);
+    };
     std::snprintf(line, sizeof(line),
                   "intensity=%.2f,tone=%.2f,structure=%.2f,skin=%.2f,mask=%d,maxratio=%.2f,"
-                  "history=%.2f,apply=%d,pre=%d,int4=%d,drs=%u,network=%u",
+                  "history=%.2f,apply=%d,pre=%d,int4=%d,drs=%u,network=%u,pass2=%s,pass3=%s",
                   double(options.intensity), double(options.localTone),
                   double(options.localStructure), double(options.skinStructure),
                   options.autoMask ? 1 : 0, double(options.maxRatio),
                   double(options.historyStrength), options.applyModel ? 1 : 0,
                   options.preprocess ? 1 : 0, options.int4Mixed ? 1 : 0, options.drsMode,
-                  options.networkModel);
+                  options.networkModel, pass(options.pass2).c_str(), pass(options.pass3).c_str());
     return line;
 }
 
@@ -196,6 +235,44 @@ inline std::optional<MochizukiOptions> ParseMochizukiOptions(std::string_view te
     // question, and a NaN passes every comparison so it is named explicitly.
     const auto inRange = [](const std::optional<double>& n, double low, double high) {
         return n && std::isfinite(*n) && *n >= low && *n <= high;
+    };
+    // A pass block: seven fields separated by `|` - follow, style, intensity,
+    // tone, structure, skin, mask - every one of them required, because the
+    // writer always emits all seven. Anything else (an eighth field, a missing
+    // one, a value outside the runtime's range) means the line did not come
+    // from this writer, and a half-read look is worse than no answer.
+    const auto passBlock = [&inRange](std::string_view block) -> std::optional<MochizukiPassOptions> {
+        std::array<double, 7> values{};
+        for (size_t index = 0; index < values.size(); ++index) {
+            const size_t bar = block.find('|');
+            const std::string_view field = block.substr(0, bar);
+            block = bar == std::string_view::npos ? std::string_view{} : block.substr(bar + 1);
+            if (field.empty() || field.size() >= 32) return std::nullopt;
+            char scratch[32]{};
+            std::memcpy(scratch, field.data(), field.size());
+            char* end = nullptr;
+            const double parsed = std::strtod(scratch, &end);
+            if (end == scratch || *end != '\0') return std::nullopt;
+            values[index] = parsed;
+        }
+        if (!block.empty()) return std::nullopt;   // an eighth field
+        const auto whole = [](double value, double low, double high) {
+            return std::isfinite(value) && value >= low && value <= high && value == std::floor(value);
+        };
+        if (!whole(values[0], 0.0, 1.0) || !whole(values[1], 0.0, 2.0)) return std::nullopt;
+        if (!inRange(values[2], 0.0, 2.0) || !inRange(values[3], 0.0, 2.0) ||
+            !inRange(values[4], 0.0, 2.0) || !inRange(values[5], -1.0, 2.0))
+            return std::nullopt;
+        if (!whole(values[6], 0.0, 1.0)) return std::nullopt;
+        MochizukiPassOptions out;
+        out.followPass1 = values[0] != 0.0;
+        out.style = uint32_t(values[1]);
+        out.intensity = float(values[2]);
+        out.localTone = float(values[3]);
+        out.localStructure = float(values[4]);
+        out.skinStructure = float(values[5]);
+        out.autoMask = values[6] != 0.0;
+        return out;
     };
     while (!text.empty()) {
         const size_t comma = text.find(',');
@@ -247,10 +324,15 @@ inline std::optional<MochizukiOptions> ParseMochizukiOptions(std::string_view te
             if (!inRange(n, 0.0, 1.0) || *n != std::floor(*n)) return std::nullopt;
             options.networkModel = uint32_t(*n);
         }
+        else if (key == "pass2" || key == "pass3") {
+            const auto block = passBlock(value);
+            if (!block) return std::nullopt;
+            (key == "pass2" ? options.pass2 : options.pass3) = *block;
+        }
         else return std::nullopt;
         ++seen;
     }
-    if (seen != 12) return std::nullopt;
+    if (seen != 14) return std::nullopt;
     return options;
 }
 

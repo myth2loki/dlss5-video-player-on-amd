@@ -753,5 +753,78 @@ SSIM **0.9896**（Y 0.9879），两版确实不同；同一网络重跑 SSIM **1
 测试：PolicyTests 407 全过、AmdLmxxfApiTests PASS、RenderSettingsTests 静默通过、
 UI 回归 65 用例 22 失败（与基线同为 22，无新增）。
 
+## 16. 每档独立设置：pass 2 / pass 3 各有一套 look（2026-11-03）
+
+**ABI 一直支持，host 一直没填。** `MochizukiNrControls` 里有个
+`MochizukiNrPassControls pass[2]`（`pass[0]` 是第 2 档、`pass[1]` 是第 3 档），
+每档自带 `style / intensity / local_tone / local_structure / skin_structure /
+automatic_mask` 六个值加一个 `used`。`used = 0` 是"跟随第 1 档"，且**该档 tone 归 0**
+（每档重复加 tone 会复合，这是上游刻意的默认）。
+
+之前的 `ApplyMochizukiControls` 只写全局那 11 个字段，`pass[]` 全零 → 等价于
+OptiScaler 里的 `FollowPass1 = 1`，三档画面完全一致。
+
+### 16.1 现在的做法
+
+| 层 | 改动 |
+|---|---|
+| 数据 | `MochizukiPassOptions`（`followPass1/style/intensity/localTone/localStructure/skinStructure/autoMask`），`MochizukiOptions::pass2/pass3` |
+| 应用 | `ApplyMochizukiControls` 逐档填 `controls.pass[0..1]`；`followPass1` 时留零，否则 `used=1` 并写六个字段 |
+| wire | `FormatMochizukiOptions` 追加 `pass2=…`、`pass3=…`，每档 7 个值用 **`|`** 分隔（外层逗号切分，嵌套逗号会把一档劈成两段）；`ParseMochizukiOptions` 要求 **14 个键**齐全，八段、缺段、越界一律拒 |
+| 缓存键 | 自动：`mochizuki=` 整行进 settings 文档 |
+| ini | `[AmdNeural] MochizukiPass2Follow/Style/Intensity/Tone/Structure/Skin/Mask`，Pass3 同 |
+| UI | 神经面板右列 **"Neural passes" 下拉右侧**加 **"Pass settings…"** 按钮（同一行的同一件事：档数 + 每档的 look）。**按钮随档数显隐**：1 档没有后档可设，按钮整个隐藏；2 档只开 **Pass 2 一列**（窗口 560 宽）；3 档开两列（1040 宽）。窗口里 follow 时整列灰化，底部 Reset / Apply / Close；两档窗口的标题是 `Mochizuki · per-pass settings · Pass 2`，且说明文字去掉了"Pass 3 只在三档运行"那句 |
+
+独立窗口而不是塞进主面板：主面板右列已经到 334 / 486 设计单位，十四个控件放不下。
+主面板同时加宽到 **1040×486**（两列 16..~500 与 520..1024），滑条行多了 `trackWidth` 参数，
+否则加宽后控件宽度不变、右侧留一条空白。
+
+> 档数联动写在 `UpdatePerPassDoor()`：它读**下拉框当前的选项**（不是
+> `m_neuralSettings.passes`，那个要等同一轮读取才回写），`ShowWindow(button, passes>=2)`，
+> 并在 `m_passColumns != wanted` 时 `DestroyWindow(m_passWnd)`。
+>
+> 🐞 最初只在 `passes < m_passColumns` 时关窗，于是 **2 档开着窗口 → 改成 3 档 → 再点按钮**
+> 会走到"窗口已存在就直接 Show"的早退分支：三档下打开的还是那个单列窗口，标题写着
+> per-pass settings 却只有 Pass 2 一列。现在改成"档数不等就关"，并且
+> `ShowMochizukiPassSettings()` 自己也校验 `m_passColumns == wanted`，不匹配就重建。
+> UI 回归补了这条路径（2→3 之后 `m_passWnd == nullptr`，再点开必须有 `IDC_PP_P3_*`），
+> 以及两档/三档窗口的宽高比（560×430 与 1040×430，按比例断言以适配缩放的显示器）。
+
+> 🐞 更根本的一条：`ReadNeuralSettingControls` 读档数时用的是 **lmxxf 的 4 项映射**
+> （索引 0 = Small 模型），而 Mochizuki 的下拉只有 **3 项**（索引 = 档数−1）。于是
+> 选 `3 passes`(索引 2) 存成 **2**、选 `2 passes`(索引 1) 存成 **1**、选 `1`(索引 0)
+> 被当成 Small 模型（顺手把 lmxxf 的 Small 开关打开）。这个读回路径在**任何控件变化**
+> 时都会跑，所以 Mochizuki 下每动一下面板档数就静默掉一档——面板显示 3、实际跑 2，
+> per-pass 窗口也就按 2 建列。现在 Mochizuki 单独一条分支读 `index+1` 并 clamp 到 1..3，
+> lmxxf / NVIDIA 的映射不动。UI 回归改成**走真实控件路径**（`CB_SETCURSEL` +
+> `WM_COMMAND/CBN_SELCHANGE`）断言 1/2/3 → 1/2/3，并在 3 档点开按钮断言两列都在。
+
+> ⚠️ 按钮最初放在 Mochizuki 列的 `y=340+top`（386），而面板底部有一条 **848 单位宽、
+> y=396..434** 的说明文字（`neural.settings.note`，横跨两列），按钮正好被它盖住——
+> 看得见"控件存在"的测试全绿，屏幕上却什么都没有。所以位置改到 passes 行，并在
+> UI 回归里加了"在右列上半区"的几何断言（`corners[0].x*2 >= client.right`、
+> `corners[1].y*3 <= client.bottom`）：掉进 note 那条带就等于看不见。
+
+### 16.2 实测（9070 XT，`darkfate` 2 秒 48 帧，passes=2）
+
+| 改动 | 与默认的 SSIM |
+|---|---|
+| `Pass2Follow=0`，intensity 2.00 / tone 0.50 / style 1 | **0.9783** |
+| 同上但 style 保持 0（与全局一致） | **0.9895** |
+
+第二条排除了"style 引起的差异"：只动第 2 档的 intensity 与 tone，画面就已经不同，
+说明 1.13 的 runtime 确实在按 `pass[0]` 渲染。回归：PolicyTests **423** 全过
+（含新增的 wire 往返与"follow=2 / 八段"两个拒绝用例）、UI 回归 66 用例 22 失败
+（与基线同为 22，无新增）。
+
+### 16.3 两个必须知道的边界
+
+- **第 3 档只在 `passes = 3` 时运行**，第 2 档要 `passes ≥ 2`。默认 2 passes，所以
+  Pass 3 那一列现在改了也不进画面——面板照实灰化做不到（它不知道 passes），
+  所以窗口里的说明行写了这句。
+- **`followPass1` 时该档 tone 恒为 0**，不是继承 pass 1 的 2.0。用户在 pass 1 面板上
+  把 tone 设成 2.0，第 2 档仍然是 0——这是上游防复合的设计，不是 bug。
+
+
 
 

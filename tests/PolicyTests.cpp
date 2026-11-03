@@ -16711,6 +16711,17 @@ void mochizuki_options_wire_and_key_test()
     asked.int4Mixed = true;
     asked.drsMode = 2;
     asked.networkModel = 1;
+    // Passes 2 and 3 travel as two `|`-separated blocks; both are moved here so
+    // the round trip proves seven fields per block survive, not five.
+    asked.pass2.followPass1 = false;
+    asked.pass2.style = 2;
+    asked.pass2.intensity = 1.75f;
+    asked.pass2.localTone = 0.5f;
+    asked.pass2.localStructure = 1.25f;
+    asked.pass2.skinStructure = 0.5f;
+    asked.pass2.autoMask = false;
+    asked.pass3.followPass1 = false;
+    asked.pass3.intensity = 0.5f;
     const std::string line = FormatMochizukiOptions(asked);
     CHECK(!line.empty());
     const auto parsed = ParseMochizukiOptions(line);
@@ -16728,6 +16739,30 @@ void mochizuki_options_wire_and_key_test()
         CHECK_EQ(asked.int4Mixed, parsed->int4Mixed);
         CHECK_EQ(asked.drsMode, parsed->drsMode);
         CHECK_EQ(asked.networkModel, parsed->networkModel);
+        CHECK(asked.pass2 == parsed->pass2);
+        CHECK(asked.pass3 == parsed->pass3);
+    }
+    // A pass block is seven fields, and the follow flag is the pair 0/1: an
+    // eighth field or a 2 is refused rather than read as something it is not.
+    {
+        std::string block = line;
+        const size_t at = block.find("pass2=");
+        CHECK(at != std::string::npos);
+        if (at != std::string::npos) {
+            block[at + 6] = '2';   // "pass2=0|..." -> "pass2=2|..."
+            CHECK(ParseMochizukiOptions(block) == std::nullopt);
+        }
+    }
+    {
+        std::string extra = line;
+        const size_t at = extra.find("pass3=");
+        CHECK(at != std::string::npos);
+        if (at != std::string::npos) {
+            const size_t end = extra.find('|', at + 6);
+            CHECK(end != std::string::npos);
+            if (end != std::string::npos) extra.insert(end, "|9");   // eight fields' worth
+            CHECK(ParseMochizukiOptions(extra) == std::nullopt);
+        }
     }
     // Two networks is a pair, not a range: a third value names a file the host
     // never checked for, so it is refused rather than clamped to the one that

@@ -6,8 +6,57 @@
 #include "TestSupport.h"
 #include "TestEnvironment.h"
 #include "GpuTestGate.h"
+#include "CompareImageIO.h"
 
 namespace {
+// A dialog's own pixels, for when a test can only prove that a control exists
+// and a person still has to see where it landed. Enabled by DLSS5_UI_SHOTS
+// (a directory) rather than always on: writing files from a test that is run
+// by ctest on every build would leave the tree dirty.
+void SaveWindowShot(HWND wnd, const std::filesystem::path& path)
+{
+    RECT client{};
+    if (!wnd || !GetClientRect(wnd, &client)) return;
+    const int width = client.right - client.left, height = client.bottom - client.top;
+    if (width <= 0 || height <= 0) return;
+    HDC screen = GetDC(nullptr);
+    HDC memory = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, width, height);
+    HGDIOBJ previous = SelectObject(memory, bitmap);
+    PrintWindow(wnd, memory, PW_CLIENTONLY);
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    std::vector<uint8_t> pixels(static_cast<size_t>(width) * height * 4u);
+    GetDIBits(memory, bitmap, 0, UINT(height), pixels.data(), &info, DIB_RGB_COLORS);
+    SelectObject(memory, previous);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(nullptr, screen);
+    std::vector<uint8_t> bgr(static_cast<size_t>(width) * height * 3u);
+    for (size_t i = 0, n = static_cast<size_t>(width) * height; i < n; ++i) {
+        bgr[i * 3 + 0] = pixels[i * 4 + 0];
+        bgr[i * 3 + 1] = pixels[i * 4 + 1];
+        bgr[i * 3 + 2] = pixels[i * 4 + 2];
+    }
+    std::filesystem::create_directories(path.parent_path());
+    compare_image::SavePngBgr(path, bgr.data(), UINT(width), UINT(height), UINT(width) * 3u);
+}
+
+// Where to drop those shots, or empty when the run should not write any.
+std::filesystem::path windowShotDirectory()
+{
+    wchar_t buffer[520]{};
+    const DWORD length = GetEnvironmentVariableW(L"DLSS5_UI_SHOTS", buffer,
+                                                 static_cast<DWORD>(std::size(buffer)));
+    if (length == 0 || length >= std::size(buffer)) return {};
+    return std::filesystem::path(buffer);
+}
+
 std::vector<std::wstring> drawnText;
 std::wstring lastMessageBox;
 int messageBoxes = 0;
@@ -712,6 +761,7 @@ struct PlayerAppTestAccess {
         app.m_mochizuki = MochizukiOptions{};
         app.ShowNeuralSettings();
         CHECK(app.m_neuralWnd != nullptr);
+        const std::filesystem::path shots = windowShotDirectory();
         if (app.m_neuralWnd) {
             const HWND dialog = app.m_neuralWnd;
             // The runtime's own controls are on the panel ...
@@ -720,6 +770,143 @@ struct PlayerAppTestAccess {
             CHECK(GetDlgItem(dialog, IDC_NS_MZ_APPLY) != nullptr);
             CHECK(GetDlgItem(dialog, IDC_NS_MZ_PREPROCESS) != nullptr);
             CHECK(GetDlgItem(dialog, IDC_NS_MZ_INT4) != nullptr);
+            // The per-pass button, and where it is. It was first placed under
+            // the panel's note - a 848-unit static at y=396 - so it was drawn
+            // beneath it: invisible, unclickable, and no test noticed. Inside
+            // the client rect, tall enough to read, and in the bottom row.
+            {
+                const HWND passes = GetDlgItem(dialog, IDC_NS_MZ_PASSES);
+                CHECK(passes != nullptr);
+                if (passes) {
+                    RECT body{};
+                    CHECK(GetWindowRect(passes, &body) != FALSE);
+                    POINT corners[2] = {{body.left, body.top}, {body.right, body.bottom}};
+                    MapWindowPoints(nullptr, dialog, corners, 2);
+                    RECT client{};
+                    CHECK(GetClientRect(dialog, &client) != FALSE);
+                    CHECK(corners[0].x >= 0);
+                    CHECK(corners[0].y >= 0);
+                    CHECK(corners[1].x <= client.right);
+                    CHECK(corners[1].y <= client.bottom);
+                    CHECK(corners[1].y - corners[0].y >= 20);
+                    // Beside the pass ladder, in the right column's upper half.
+                    // The panel's note is a full-width static at y=396, so a
+                    // control that drifts down there is drawn underneath it and
+                    // cannot be seen - which is exactly what happened when this
+                    // button was first built.
+                    CHECK(corners[0].x * 2 >= client.right);
+                    CHECK(corners[1].y * 3 <= client.bottom);
+                }
+            }
+            // The door follows the ladder: one pass has no later pass to
+            // configure, so it is hidden rather than disabled, and two passes
+            // bring it back. Three passes open the second column too.
+            {
+                app.m_neuralSettings.passes = 1;
+                app.SyncNeuralSettingControls(dialog);
+                CHECK(!IsWindowVisible(GetDlgItem(dialog, IDC_NS_MZ_PASSES)));
+                app.m_neuralSettings.passes = 2;
+                app.SyncNeuralSettingControls(dialog);
+                CHECK(IsWindowVisible(GetDlgItem(dialog, IDC_NS_MZ_PASSES)));
+                if (!shots.empty())
+                    SaveWindowShot(dialog, shots / L"neural-panel-two-passes.png");
+            }
+            // And the dialog itself is built for that ladder: two passes give
+            // one column, three give the second one. A column for a pass the
+            // render does not run is a control that edits nothing.
+            {
+                app.m_neuralSettings.passes = 2;
+                app.ShowMochizukiPassSettings();
+                CHECK(app.m_passWnd != nullptr);
+                if (app.m_passWnd) {
+                    CHECK(GetDlgItem(app.m_passWnd, IDC_PP_P2_INTENSITY) != nullptr);
+                    CHECK(GetDlgItem(app.m_passWnd, IDC_PP_P3_INTENSITY) == nullptr);
+                    // One column is a narrow dialog: 560x430 at 100%. The
+                    // ratio is checked rather than the pixels so a scaled
+                    // display does not fail the test.
+                    RECT client{};
+                    CHECK(GetClientRect(app.m_passWnd, &client) != FALSE);
+                    CHECK(client.right * 2 < client.bottom * 3);
+                    if (!shots.empty()) SaveWindowShot(app.m_passWnd, shots / L"pass-two.png");
+                    DestroyWindow(app.m_passWnd);
+                }
+                app.m_neuralSettings.passes = 3;
+                app.ShowMochizukiPassSettings();
+                CHECK(app.m_passWnd != nullptr);
+                if (app.m_passWnd) {
+                    CHECK(GetDlgItem(app.m_passWnd, IDC_PP_P2_INTENSITY) != nullptr);
+                    CHECK(GetDlgItem(app.m_passWnd, IDC_PP_P3_INTENSITY) != nullptr);
+                    RECT client{};
+                    CHECK(GetClientRect(app.m_passWnd, &client) != FALSE);
+                    CHECK(client.right > client.bottom * 2);
+                    if (!shots.empty()) SaveWindowShot(app.m_passWnd, shots / L"pass-three.png");
+                    DestroyWindow(app.m_passWnd);
+                }
+                // The ladder can move while the dialog is up. Whichever way it
+                // goes, the open window must not keep a column for a pass the
+                // render stopped running, nor hide one it started: it closes,
+                // and the next click rebuilds it for the new count. Leaving it
+                // up was a real bug - three passes opened a two-pass window and
+                // showed one setting where there were two.
+                app.m_neuralSettings.passes = 2;
+                app.ShowMochizukiPassSettings();
+                CHECK(app.m_passWnd != nullptr);
+                app.m_neuralSettings.passes = 3;
+                app.SyncNeuralSettingControls(dialog);
+                CHECK(app.m_passWnd == nullptr);
+                CHECK(IsWindowVisible(GetDlgItem(dialog, IDC_NS_MZ_PASSES)));
+                app.ShowMochizukiPassSettings();
+                CHECK(app.m_passWnd != nullptr);
+                if (app.m_passWnd) {
+                    CHECK(GetDlgItem(app.m_passWnd, IDC_PP_P3_INTENSITY) != nullptr);
+                    DestroyWindow(app.m_passWnd);
+                }
+                // And back down: three columns close, two stay hidden at one.
+                app.m_neuralSettings.passes = 1;
+                app.SyncNeuralSettingControls(dialog);
+                CHECK(!IsWindowVisible(GetDlgItem(dialog, IDC_NS_MZ_PASSES)));
+                app.m_neuralSettings.passes = 2;
+                app.SyncNeuralSettingControls(dialog);
+            }
+            // The panel's own path, not a value set behind its back: pick each
+            // rung in the combo and let the dialog read it back. A three-item
+            // list read as the four-item lmxxf ladder stores count-1, which is
+            // how "3 passes" opened a one-column dialog: the dropdown said
+            // three, the setting said two, and the door believed the setting.
+            {
+                const HWND ladder = GetDlgItem(dialog, IDC_NS_PASSES);
+                CHECK(ladder != nullptr);
+                if (ladder) {
+                    const auto pick = [&](int index) {
+                        SendMessageW(ladder, CB_SETCURSEL, WPARAM(index), 0);
+                        SendMessageW(dialog, WM_COMMAND,
+                                     MAKEWPARAM(IDC_NS_PASSES, CBN_SELCHANGE),
+                                     reinterpret_cast<LPARAM>(ladder));
+                    };
+                    pick(0);
+                    CHECK(app.m_neuralSettings.passes == 1);
+                    CHECK(!IsWindowVisible(GetDlgItem(dialog, IDC_NS_MZ_PASSES)));
+                    pick(1);
+                    CHECK(app.m_neuralSettings.passes == 2);
+                    CHECK(IsWindowVisible(GetDlgItem(dialog, IDC_NS_MZ_PASSES)));
+                    pick(2);
+                    CHECK(app.m_neuralSettings.passes == 3);
+                    CHECK(IsWindowVisible(GetDlgItem(dialog, IDC_NS_MZ_PASSES)));
+                    // And the door opened from the panel, at that count, has
+                    // both columns - the end of the path a person takes.
+                    SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_NS_MZ_PASSES, BN_CLICKED),
+                                 reinterpret_cast<LPARAM>(GetDlgItem(dialog, IDC_NS_MZ_PASSES)));
+                    CHECK(app.m_passWnd != nullptr);
+                    if (app.m_passWnd) {
+                        CHECK(GetDlgItem(app.m_passWnd, IDC_PP_P3_INTENSITY) != nullptr);
+                        if (!shots.empty())
+                            SaveWindowShot(app.m_passWnd, shots / L"pass-three-from-panel.png");
+                        DestroyWindow(app.m_passWnd);
+                    }
+                    pick(1);
+                    CHECK(app.m_neuralSettings.passes == 2);
+                }
+            }
             // ... and lmxxf's own are not.
             CHECK(GetDlgItem(dialog, IDC_NS_SKIN_PROTECT) == nullptr);
             CHECK(GetDlgItem(dialog, IDC_NS_CHAINED) == nullptr);
