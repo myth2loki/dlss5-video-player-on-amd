@@ -211,7 +211,10 @@ inline bool IsAmdPassesConfigLine(std::string_view line) noexcept
 // value that is not exactly 0, 1 or 2 is read by the runtime as 1, so the
 // writer normalises instead of handing over something the reader would quietly
 // reinterpret.
-inline constexpr uint32_t kAmdStyleDefault = 1;
+// Standard, not the runtime's Natural: Natural and Cinematic apply a
+// post-network grade (docs/mochizuki.md in the runtime pack), which is a look
+// the viewer should opt into rather than the picture every session starts at.
+inline constexpr uint32_t kAmdStyleDefault = 0;
 inline constexpr uint32_t kAmdStyleCount = 3;
 
 inline uint32_t NormalizedAmdStyle(uint32_t style) noexcept

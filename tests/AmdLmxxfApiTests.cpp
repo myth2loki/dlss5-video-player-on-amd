@@ -654,7 +654,10 @@ void amd_pass_count_reaches_the_runtime_through_its_own_config_file_test()
     CHECK_EQ(std::string("DLSS5_STYLE=0"), amd_lmxxf::AmdStyleConfigLine(0));
     CHECK_EQ(std::string("DLSS5_STYLE=1"), amd_lmxxf::AmdStyleConfigLine(1));
     CHECK_EQ(std::string("DLSS5_STYLE=2"), amd_lmxxf::AmdStyleConfigLine(2));
-    CHECK_EQ(std::string("DLSS5_STYLE=1"), amd_lmxxf::AmdStyleConfigLine(3));
+    // Out of range falls back to the style every session starts at, which is
+    // Standard now: Natural and Cinematic are a post-network grade the viewer
+    // opts into (docs/mochizuki.md), not a default.
+    CHECK_EQ(std::string("DLSS5_STYLE=0"), amd_lmxxf::AmdStyleConfigLine(3));
 
     std::string error;
     // The parameter is not called `small`: the Windows SDK's rpcndr.h

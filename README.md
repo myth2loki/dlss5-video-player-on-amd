@@ -15,7 +15,7 @@ backend would not exist without their work. See the porting project at
 [github.com/lmxxf/dlss5-on-amd-9070xt-porting](https://github.com/lmxxf/dlss5-on-amd-9070xt-porting).
 
 The AMD backend's neural runtime payload currently ships **`OptiScaler-DLSS5-AMD-0.44`**
-(host DLL `OptScaler-NR-1.13.0-alpha8`, ABI `(6, 176)`). Its neural pass is
+(host DLL `OptScaler-NR-1.13.4`, ABI `(6, 176)`). Its neural pass is
 bit-exact against 0.43's — ffmpeg reads `psnr = inf` — as long as the custom
 config keeps `DLSS5_MULTI_PASS=2`, because the package's own default is now the
 31-block **Small** model at 0.5x. The two things 0.44 adds to the weights

@@ -99,8 +99,10 @@ constexpr std::optional<AmdNrRuntime> ParseAmdNrRuntime(std::string_view name) n
 // to 0, because re-applying the same tone on every pass compounds.
 struct MochizukiPassOptions {
     bool followPass1{true};
-    // 0..2, as MochizukiOptions::style.
-    uint32_t style{1};
+    // 0..2, as MochizukiOptions::style. Standard, which is what the dialog's
+    // first entry says: a later pass that is given its own look should start
+    // from the ungraded one, not from Natural.
+    uint32_t style{0};
     // 0..2, default 1.
     float intensity{1.0f};
     // 0..2, default 0 for a later pass: see above.
@@ -121,12 +123,12 @@ struct MochizukiPassOptions {
 struct MochizukiOptions {
     // 0..2, default 1: above 1 raises the luminance ratio rather than "more NR".
     float intensity{1.0f};
-    // 0..2, default 2: tone re-applied per frame. It matches
+    // 0..2, default 1: tone re-applied per frame. It matches
     // NeuralSettings::localTone, which is where the value actually comes from
     // (main.cpp copies it into this struct when a job is built) - the two are the
     // same knob, and a default that disagreed would make MochizukiOptionsAreDefault
     // say "not default" about the product's own default.
-    float localTone{2.0f};
+    float localTone{1.0f};
     // 0..2, default 1.
     float localStructure{1.0f};
     // -1..2, default -1: negative follows local structure. Needs automatic mask.
@@ -138,10 +140,13 @@ struct MochizukiOptions {
     // a lamp behaves, and the reason a film with practicals looks either
     // protected or clipped.
     float maxRatio{2.0f};
-    // 0..1, default 1: how much of the previous frame's answer is kept. With
+    // 0..1, default 0.70: how much of the previous frame's answer is kept. With
     // motion vectors only, so on this package it is the one temporal knob that
-    // reaches the network at all.
-    float historyStrength{1.0f};
+    // reaches the network at all. Measured: 1.00 -> 0.70 moves the trailing
+    // residue by about 1% (0.590 -> 0.584 on the ghosting score) while leaving
+    // the frame's texture alone, so it is a small trim rather than the lever
+    // the pass count and the per-pass look are.
+    float historyStrength{0.70f};
     // Default on. Off runs the whole network and shows the original frame - the
     // only honest A/B a viewer can make without changing any other setting.
     bool applyModel{true};

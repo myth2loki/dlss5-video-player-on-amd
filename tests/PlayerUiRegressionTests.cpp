@@ -907,6 +907,51 @@ struct PlayerAppTestAccess {
                     CHECK(app.m_neuralSettings.passes == 2);
                 }
             }
+            // Two one-click presets for the later passes: each writes the whole
+            // look and moves the ladder, so the pass it configures actually runs.
+            {
+                const HWND pass2 = GetDlgItem(dialog, IDC_NS_MZ_PASS2_PRESET);
+                const HWND pass3 = GetDlgItem(dialog, IDC_NS_MZ_PASS3_PRESET);
+                CHECK(pass2 != nullptr);
+                CHECK(pass3 != nullptr);
+                RECT client{};
+                CHECK(GetClientRect(dialog, &client) != FALSE);
+                for (HWND button : {pass2, pass3}) {
+                    if (!button) continue;
+                    RECT body{};
+                    CHECK(GetWindowRect(button, &body) != FALSE);
+                    POINT corners[2] = {{body.left, body.top}, {body.right, body.bottom}};
+                    MapWindowPoints(nullptr, dialog, corners, 2);
+                    CHECK(corners[1].x <= client.right);
+                    CHECK(corners[1].y <= client.bottom);
+                    CHECK(corners[1].y - corners[0].y >= 20);
+                }
+                app.m_neuralSettings.passes = 2;
+                SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_NS_MZ_PASS3_PRESET, BN_CLICKED),
+                             reinterpret_cast<LPARAM>(pass3));
+                CHECK(app.m_neuralSettings.passes == 3);
+                CHECK(!app.m_mochizuki.pass3.followPass1);
+                CHECK(std::abs(app.m_mochizuki.pass3.intensity - 0.50f) < 0.001f);
+                CHECK(app.m_mochizuki.pass3.style == 0);
+                CHECK(std::abs(app.m_mochizuki.pass3.localTone) < 0.001f);
+                SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_NS_MZ_PASS2_PRESET, BN_CLICKED),
+                             reinterpret_cast<LPARAM>(pass2));
+                CHECK(!app.m_mochizuki.pass2.followPass1);
+                CHECK(std::abs(app.m_mochizuki.pass2.intensity - 1.00f) < 0.001f);
+                CHECK(app.m_mochizuki.pass2.style == 0);
+                // Reset puts both later passes back to "follow pass 1" and takes
+                // the ladder with it: a reset that leaves a pass look behind is a
+                // reset the panel contradicts.
+                SendMessageW(dialog, WM_COMMAND, MAKEWPARAM(IDC_NS_RESET, BN_CLICKED),
+                             reinterpret_cast<LPARAM>(GetDlgItem(dialog, IDC_NS_RESET)));
+                CHECK(app.m_mochizuki.pass2.followPass1);
+                // Plain reset: both later passes back to "follow pass 1", and the
+                // ladder back to the runtime's default of two.
+                CHECK(app.m_mochizuki.pass3.followPass1);
+                CHECK(std::abs(app.m_mochizuki.pass3.intensity - 1.00f) < 0.001f);
+                CHECK(app.m_neuralSettings.passes == 2);
+                app.m_neuralSettings.passes = 2;
+            }
             // ... and lmxxf's own are not.
             CHECK(GetDlgItem(dialog, IDC_NS_SKIN_PROTECT) == nullptr);
             CHECK(GetDlgItem(dialog, IDC_NS_CHAINED) == nullptr);
@@ -918,7 +963,7 @@ struct PlayerAppTestAccess {
             // The runtime's own defaults are what the panel shows, and moving
             // one of its controls moves that runtime's own value.
             CHECK(std::abs(app.m_mochizuki.maxRatio - 2.0f) < 0.001f);
-            CHECK(std::abs(app.m_mochizuki.historyStrength - 1.0f) < 0.001f);
+            CHECK(std::abs(app.m_mochizuki.historyStrength - 0.70f) < 0.001f);
             CHECK(app.m_mochizuki.applyModel);
             CHECK(!app.m_mochizuki.preprocess);
             CHECK(!app.m_mochizuki.int4Mixed);

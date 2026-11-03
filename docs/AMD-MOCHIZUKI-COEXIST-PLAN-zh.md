@@ -753,6 +753,140 @@ SSIM **0.9896**（Y 0.9879），两版确实不同；同一网络重跑 SSIM **1
 测试：PolicyTests 407 全过、AmdLmxxfApiTests PASS、RenderSettingsTests 静默通过、
 UI 回归 65 用例 22 失败（与基线同为 22，无新增）。
 
+### 15.6 运行时再升一版：1.13.4（2026-11-03）
+
+上游 OptScaler-NR 出到 **1.13.4**（`G://补帧//OptiScaler-AMD-PreSR//OptScaler-NR-1.13.4`，
+DLL 2026-10-31）。只换了 `MochizukiNrRuntime.dll`：`1,697,568 -> 1,797,920` 字节，
+`sha256` 前 12 位 `f76252d1df1f`；`dlssnr-amd/` 下 452 个 `aco` + `shaders` 文件
+**逐字节相同**，`dlssnr.bin` / `dlssnr-small.bin` 的 md5 也与旧包一致，所以这次升级
+不动资源、不动模型。旧的 1.13.0-alpha8 DLL 备份在
+`F://dlss5-video//mz-backup-1.13.0//`（runtime 目录外，免得被打进包）。
+
+验证（9070 XT / 26.10.1）：
+
+| 项 | 1.13.4 |
+|---|---|
+| ABI 协商 | `6 / 176`（与仓库头文件一致，未改代码） |
+| `SetControls` | `OK (struct_size 532)` —— 控制块尺寸没变，**不需要同步头文件** |
+| ACO | `requested=1 effective=1` |
+| 建网 | original **2.01 s** / small **1.64 s** |
+| 探针输出 | original 129.567131 / 5.073529；small 128.084412 / 7.361313（与 1.13.0-alpha8 **数值相同**） |
+| 端到端 | 同一段、同一 ini：两版 SSIM **1.000000**（Y/U/V 全 1.0），逐位一致 |
+
+结论：1.13.4 是**行为中性**的稳定性升级。官方 README 说明它做的是生命周期重构
+（跨 API 无关队列的等待、**显存泄漏**、**着色器取消**、26.9.2+ 驱动修复）——对离线
+整片渲染有意义的是后三项。`runtimeDigest` 里含 DLL 哈希，所以换 DLL 会让**所有神经
+缓存失效**，首帧要重算一遍，这是唯一可感知的代价。
+
+> ⚠️ 比对这个升级时的坑：第一次拿 `rep-a.mkv` 当基准得到 SSIM 0.9849，差点判成
+> "新版改了画面"。实际是那份基准是在 `[AmdNeural] Style=2, Pass2Follow=1` 下渲的，
+> 而当前 ini 是 `Style=0, Pass2Follow=0` —— 换回旧 DLL 重渲得到的是**同一个** 0.9849，
+> 才确认差异来自 ini 不是 DLL。**A/B 的基准必须和被测配置同源，否则数字会骗人。**
+
+### 15.7 RenoDX 那一段：为什么"OptiScaler 里 style 很不一样"
+
+`MochizukiNrControls` 共 532 字节，偏移 180 起是整整一段 **RenoDX** 字段
+（`renodx_enabled`、`reno_style`、`reno_intensity`、`reno_pass_*`、`reno_look_*`…）。
+本仓库一直零初始化发过去，等于 RenoDX 关。OptiScaler 的 ini 把它们分成两组：
+
+- `MochizukiStyle`（Pass 1 的模型风格，0/1/2）← 本仓库用的就是这个（`controls.style`）
+- `MochizukiRenoDX` / `MochizukiRenoStyle` / Reno 的 tone、structure、transfer、color、look
+  ← **本仓库没接**
+
+包内 `docs/mochizuki.md` 还有一句关键说明：
+
+> Natural and Cinematic retain the vendored core's enabled **post-network style grade**;
+> Standard is not graded. There is no product menu, INI or controls-ABI switch for this grade.
+
+也就是说 style 1/2 = 出网之后一道**调色级**，Standard 不调色。这解释了实测的观感差异
+为什么强依赖内容：
+
+| 素材 | Style 0 ↔ 2（SSIM） |
+|---|---|
+| `darkfate` 暗场 | 0.9701（几乎看不出） |
+| `tos` 明亮霓虹场景 | **0.9467**（抬亮、偏暖、对比降低，一眼可见） |
+
+另外面板左上那个 **Style 下拉是死控件**：把 `[AmdNeural] Style` 固定住只翻它，
+SSIM **1.000000** —— 它只写 `m_neuralSettings.style`，唯一效果是让缓存键失效、
+白重渲一遍。真正生效的是 `[AmdNeural] Style`（菜单那条路）→ `request.amdStyle`。
+
+> 临时探针（已删除）把 RenoDX 按 OptiScaler 默认值点亮后：开 vs 关 SSIM 0.9722，
+> `reno_style` 0 vs 2 = 0.9839（暗场）。可见 RenoDX 本身就会改画面，想复现 OptiScaler
+> 那种明显观感，需要把这一段接进面板，而不是继续调 `controls.style`。
+
+### 15.8 默认画质的重定：去掉第二档的独立调色（2026-11-03）
+
+用户反馈"科技感（塑料/发灰）+ 鬼影"都在。用 `F://dlss5-video//tmp//qmetric.py`
+在同一段运动最剧烈的地方（`darkfate` 43–46 s，72 帧，1920×800）量了八组：
+
+| 组 | 配置 | 鬼影↓ | 细节 | 闪烁↓ | 亮度差 | 彩度 | 局部对比 |
+|---|---|---|---|---|---|---|---|
+| 00 | 旧默认（2 档，第 2 档独立 Cinematic 1.02，tone 2.0） | **0.955** | 0.869 | **25.72** | −1.68 | **0.782** | 0.903 |
+| 01 | passes = 1 | 0.554 | 0.885 | 26.51 | −1.20 | 0.919 | 0.962 |
+| 02 | 2 档跟随（tone 2.0） | 0.736 | 0.932 | 26.44 | −1.26 | 0.923 | 0.981 |
+| 05 | 2 档跟随 + tone 1.0 | 0.590 | 0.932 | 26.29 | −1.49 | 0.932 | 0.976 |
+| 06 | 2 档跟随 + tone 1.5 | 0.702 | 0.929 | 26.34 | −1.49 | 0.926 | 0.976 |
+| 07 | 1 档 + tone 1.0 | **0.399** | 0.879 | 26.28 | −1.46 | 0.931 | 0.953 |
+| **08** | **2 档跟随 + tone 1.0 + History 0.70** | 0.584 | **0.935** | 26.32 | −1.49 | **0.933** | **0.978** |
+| 09 | 2 档独立但 style = Standard | 0.590 | 0.932 | 26.29 | −1.49 | 0.932 | 0.976 |
+
+指标（`qmetric.py`）：**鬼影** = 运动像素上 `max(0, |输出−当前真值| − |输出−上一帧真值|)` 的均值，
+即"残留了多少上一帧"，越低越好；**细节 / 彩度 / 局部对比** = 相对源片的比值，1.0 为与源一致；
+**闪烁** = 4× 池化亮度的二阶时间差分，越低越稳。
+
+结论：
+
+1. **鬼影的主因是第二档，不是 History。** 0.955 →（跟随）0.590 →（1 档）0.554；
+   History 1.0→0.5/0.7 只挪动约 1%（04 的 0.943、08 的 0.584）。
+2. **"科技感"是第二档的调色级把画面压平了**：彩度 0.782、局部对比 0.903、细节 0.869，
+   换成跟随或 Standard 后回到 0.93 / 0.98 / 0.93。`LocalTone` 2.0→1.0 本身不改变彩度
+   （03 的 0.792），只是把局部对比再抬一档，让塑料感更明显。
+
+因此默认值改为（`NeuralSettings.h` / `NeuralRenderTypes.h` / `AmdLmxxfPolicy.h`）：
+
+| 值 | 旧 | 新 |
+|---|---|---|
+| `NeuralSettings::localTone` | 2.0 | **1.0** |
+| `MochizukiOptions::localTone` | 2.0 | **1.0**（两处必须一致，否则 `MochizukiOptionsAreDefault` 会把产品默认判成"非默认"） |
+| `MochizukiOptions::historyStrength` | 1.0 | **0.70** |
+| `MochizukiPassOptions::style` | 1（Natural） | **0**（Standard，和 dialog 第一项一致） |
+| `kAmdStyleDefault` | 1 | **0**（Natural/Cinematic 是要主动选的调色，不是每个会话的起点） |
+| `Mochizuki` 默认档数 | 2 | 2（不变，`DefaultPassesFor`） |
+
+验证：部署后的 `run-fg`（ini 也写成这套）重渲同一段，与第 08 组 **SSIM 1.000000**，
+说明面板/ini/代码三处是同一套值。
+
+顺手试了 `AmdStability=low`：闪烁 26.32→26.19（−0.5%），细节 0.935→0.896（−4%）、
+局部对比 0.978→0.952 —— 拿纹理换 0.5% 的稳定性不划算，**保持 Off**。
+
+### 15.9 两个一键按钮（2026-11-03）
+
+面板右列、`Neural passes` 下面多了一组 **`Later passes · one click`**，两个按钮各自把一整档写全
+（不是下拉，没有选项要挑）：
+
+| 按钮 | 写入 | 同时把档数抬到 |
+|---|---|---|
+| **Pass 2 · full look** | `Follow=0, Style=Standard, Intensity=1.00, Tone=0, Structure=1.00, Skin=-1, Mask=1` | 2 |
+| **Pass 3 · subtle look** | 同上，`Intensity=0.50` | 3 |
+
+点一下立刻生效（走 `ApplyNeuralSettings()`，会按需重启会话）。设计上三点：
+
+1. **写全七个字段**，所以对话框里残留的值不会在点击后活着——否则"一键"只是"部分一键"。
+2. **档数跟着抬**：给一个不运行的档配 look 是看不见的设置，按钮顺手把 ladder 移过去。
+3. 第三个档用 **0.50** 而不是 1.0：满强度的三档鬼影 0.833，半强度 0.616（§15.8 的表）。
+
+**Reset 仍然是纯复位**：`m_mochizuki={}` 之后 pass 2 / pass 3 都回到 `follow pass 1`，档数回到
+运行时的默认 2，不额外应用任何 preset。一键预设是它自己的两个按钮，Reset 不是第三个按钮——
+试过让 Reset 等于点 `Pass 3`（档数抬到 3、写 0.50），结论是它会悄悄改变每帧成本（+14%）与鬼影，
+不符合"复位"的含义，已回退。
+
+面板因此比 lmxxf 的面板高 **56 design units（486 → 542）**，说明行与底部按钮整体下移；
+`NeuralPanelHeight()` 统一回答"这个面板多高"，`WM_SIZE` / `WM_GETMINMAXINFO` / 创建窗口都走它。
+
+> 想更狠地去鬼影就走 1 档（第 07 组：0.399，比旧默认低 58%），代价是细节略平（0.879）。
+> 想保留 Cinematic 的调色，放在**全局** `[AmdNeural] Style=2`，不要叠在第二档上——
+> 叠两遍就是 00 组那个"发灰 + 拖影"的效果。
+
 ## 16. 每档独立设置：pass 2 / pass 3 各有一套 look（2026-11-03）
 
 **ABI 一直支持，host 一直没填。** `MochizukiNrControls` 里有个
