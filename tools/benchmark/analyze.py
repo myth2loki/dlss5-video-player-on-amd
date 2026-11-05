@@ -26,6 +26,10 @@ Per run (all frames decoded to rgb24 through FFmpeg, streamed, never cached in R
                 moving/static verdict flips between consecutive pairs
   cuts          precision/recall/F1 of the generator's own cut test against the
                 manifest hard-cut indices at +/-1 frame, on both streams
+  band          (--bands only) residual PSNR below sigma 4 / between 1 and 4 / above 1,
+                and the output's high-band energy against the source's. The low band holds
+                97% of the squared error, so the head-line PSNR above is mostly a measure
+                of how much the pass relit the frame; see docs/BENCHMARK-METRIC-VALIDITY-zh.md
   two-pass      metric deltas of pass-2 profiles versus their single-pass
                 counterpart on the same clip
 
@@ -53,6 +57,7 @@ import numpy as np
 
 from common import (ANALYSIS, CORPUS, FrameReader, RUNS, framemd5, load_manifest, run_dirs, sequence_digest,
                     write_json)
+from bands import BandFidelity
 from cutmirror import CUT_MATCH_FRAMES, CutRun, GuideGrid, cut_scores
 
 SAMPLE_EVERY = 15
@@ -256,7 +261,8 @@ def active_text(clip: dict, seconds: float) -> list[str]:
     return [t["text"] for t in clip["text"] if t["start_s"] <= seconds < t["end_s"]]
 
 
-def analyze_run(run: Path, clip: dict, ocr: Ocr | None, faces: FaceEmbedder | None, sample_every: int) -> dict:
+def analyze_run(run: Path, clip: dict, ocr: Ocr | None, faces: FaceEmbedder | None, sample_every: int,
+                bands_enabled: bool = False) -> dict:
     result = json.loads((run / "result.json").read_text(encoding="utf-8"))
     metrics = dict(run=run.name, clip=result["clip"], category=result["category"], profile=result["profile"],
                    repeat=result["repeat"], passes=result["passes"], ok=bool(result["result"].get("ok")),
@@ -287,6 +293,10 @@ def analyze_run(run: Path, clip: dict, ocr: Ocr | None, faces: FaceEmbedder | No
     # clip's worth of motion under the same name. Sampling stays inside the block below.
     field = MotionField(w, h, clip["fps"], cuts)
     sigma_src, sigma_out = ShotSigma(), ShotSigma()
+    # The band split is off by default: four extra full-resolution blurs per frame cost
+    # more than every other metric in this loop combined, and it answers a question the
+    # head-line PSNR quietly gets wrong rather than a question nobody asked.
+    band = BandFidelity(bands_enabled)
     prev_src_y = prev_out_y = None
     prev_src_emb = prev_out_emb = None
     index = -1
@@ -297,6 +307,7 @@ def analyze_run(run: Path, clip: dict, ocr: Ocr | None, faces: FaceEmbedder | No
             sigma_out.cut()
         sigma_src.add(sy)
         sigma_out.add(oy)
+        band.add(sy, oy)
         field.add(index, s, o)
         if prev_src_y is not None and index not in cuts:
             flick_src.append(float(np.abs(sy - prev_src_y).mean()))
@@ -344,6 +355,8 @@ def analyze_run(run: Path, clip: dict, ocr: Ocr | None, faces: FaceEmbedder | No
         ssim_mean=statistics.fmean(ssims) if ssims else None, ssim_min=min(ssims) if ssims else None,
         sampled_frames=len(psnrs))
     sigma_source, sigma_output = sigma_src.result(), sigma_out.result()
+    if band.enabled:
+        metrics["band"] = band.result()
     if not metrics["frame_count_matches_source"]:
         metrics.update(temporal_sigma_source=None, temporal_sigma_output=None, temporal_sigma_added=None,
                        temporal_sigma_p99_source=None, temporal_sigma_p99_output=None, temporal_sigma_shots=0,
@@ -427,6 +440,12 @@ def summarize(rows: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
             nvml_total_used_peak_mib=statistics.median(r["nvml"].get("nvml_total_used_peak_mib") or 0 for r in runs),
             flicker_added=med("flicker_added"), delta_e_mean=med("delta_e_mean"), psnr_mean=med("psnr_mean"),
             ssim_mean=med("ssim_mean"),
+            band_psnr_low=med("band", "bands", "low", "psnr"),
+            band_psnr_mid=med("band", "bands", "mid", "psnr"),
+            band_psnr_high=med("band", "bands", "high", "psnr"),
+            band_detail_high=med("band", "detail_ratio_high"),
+            band_kstar_high=med("band", "bands", "high", "kstar"),
+            band_share_low=med("band", "error_share", "low"),
             temporal_sigma_source=med("temporal_sigma_source"),
             temporal_sigma_output=med("temporal_sigma_output"), temporal_sigma_added=med("temporal_sigma_added"),
             temporal_sigma_p99_output=med("temporal_sigma_p99_output"),
@@ -461,6 +480,8 @@ def summarize(rows: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
 
 
 def report(summary: list[dict], two_pass: list[dict], guide_ab: list[dict], rows: list[dict]) -> str:
+    has_bands = any(s.get("band_psnr_high") is not None for s in summary)
+    band_head = "| band PSNR lo/mid/hi | detail | k* hi " if has_bands else ""
     lines = ["# Neural benchmark report", "",
              "Per clip/profile medians over repeats. `flicker+` = output minus source mean |dY| "
              "(cut frames excluded); `sigma+` = output minus source per-pixel temporal standard deviation "
@@ -471,13 +492,19 @@ def report(summary: list[dict], two_pass: list[dict], guide_ab: list[dict], rows
              "source; PSNR/SSIM vs the lossless source "
              "(low values on a strong relight are expected, not failures); OCR = char-level ratio vs manifest "
              "strings (output | source); VRAM = worker peak local budget (receipt) | NVML whole-GPU peak; "
-             "wall s = all passes, e2e fps = final pass only.", "",
+             "wall s = all passes, e2e fps = final pass only."
+             + (" `band PSNR` = residual PSNR below sigma 4 / between 1 and 4 / above 1 in 8-bit luma; "
+                "`detail` = the output's high-band energy against the source's, so 1 keeps the texture and "
+                "0.95 gave away 5% of it; `k* hi` = the high-band scale that minimises this run's own "
+                "high-band error, so texture aimed at k* rather than 1 is not a loss." if has_bands else ""), "",
              "| clip | profile | n | det | wall s | e2e fps | proc fps | gpu ms p50/p95/max | guide ms | capture ms "
              "| VRAM MiB local|total | flicker+ | sigma+ | false mv | flips+ | cut F1 | dE | PSNR | SSIM "
+             + band_head +
              "| OCR out|src | face cos | resets |",
-             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+             "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"
+             + ("---|---|---|" if has_bands else "")]
     for s in summary:
-        lines.append("| " + " | ".join([
+        cells = [
             s["clip"], s["profile"], str(s["repeats"]), fmt(s["deterministic"]), fmt(s["wall_seconds"], 1),
             fmt(s["end_to_end_fps"], 2),
             fmt(s["processing_fps"], 2),
@@ -486,9 +513,14 @@ def report(summary: list[dict], two_pass: list[dict], guide_ab: list[dict], rows
             f"{fmt(s['peak_local_vram_mib'], 0)}|{fmt(s['nvml_total_used_peak_mib'], 0)}",
             fmt(s["flicker_added"]), fmt(s["temporal_sigma_added"]), fmt(s["false_motion_rate"], 4),
             fmt(s["cell_flip_added"], 4), fmt(s["cut_f1_output"], 2),
-            fmt(s["delta_e_mean"], 2), fmt(s["psnr_mean"], 2), fmt(s["ssim_mean"], 4),
-            f"{fmt(s['ocr_output'])}|{fmt(s['ocr_source'])}" if s["ocr_output"] is not None else "-",
-            fmt(s["face_cosine"]), fmt(s["history_resets"], 0)]) + " |")
+            fmt(s["delta_e_mean"], 2), fmt(s["psnr_mean"], 2), fmt(s["ssim_mean"], 4)]
+        if has_bands:
+            cells.append(f"{fmt(s['band_psnr_low'], 2)}/{fmt(s['band_psnr_mid'], 2)}/"
+                         f"{fmt(s['band_psnr_high'], 2)}|{fmt(s['band_detail_high'], 4)}"
+                         f"|{fmt(s['band_kstar_high'], 4)}")
+        cells += [f"{fmt(s['ocr_output'])}|{fmt(s['ocr_source'])}" if s["ocr_output"] is not None else "-",
+                  fmt(s["face_cosine"]), fmt(s["history_resets"], 0)]
+        lines.append("| " + " | ".join(cells) + " |")
     failed = [r for r in rows if not r["ok"]]
     if failed:
         lines += ["", "## Failed runs", ""] + [f"- {r['run']}: {r['failure']}" for r in failed]
@@ -557,6 +589,9 @@ def main() -> int:
                         help="frame stride for dE/PSNR/SSIM/OCR/faces; pair metrics always use every frame")
     parser.add_argument("--no-ocr", action="store_true")
     parser.add_argument("--no-faces", action="store_true")
+    parser.add_argument("--bands", action="store_true",
+                        help="add the three-band residual split and the high-band texture ratio; "
+                             "costs four full-resolution blurs per frame")
     parser.add_argument("--force", action="store_true", help="recompute runs that already have metrics.json")
     args = parser.parse_args()
     manifest = load_manifest(args.corpus)
@@ -587,7 +622,7 @@ def main() -> int:
             rows.append(json.loads(cached.read_text(encoding="utf-8")))
             print(f"cached {run.name}", flush=True)
             continue
-        m = analyze_run(run, clip, ocr, faces, args.sample_every)
+        m = analyze_run(run, clip, ocr, faces, args.sample_every, bands_enabled=args.bands)
         rows.append(m)
         print(f"{run.name}: ok={m['ok']} psnr={fmt(m.get('psnr_mean'), 2)} dE={fmt(m.get('delta_e_mean'), 2)} "
               f"flicker+={fmt(m.get('flicker_added'))} sigma+={fmt(m.get('temporal_sigma_added'))} "

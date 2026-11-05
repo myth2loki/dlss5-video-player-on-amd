@@ -390,6 +390,16 @@ To A/B a guide against the **upscaling** feature rather than neural rendering,
 writes every captured output frame as raw BGRA, so two runs can be compared byte
 for byte. That is how the mask question was settled for DLSS-SR.
 
+The head-line PSNR is not a reconstruction score on this pipeline. Splitting the luma
+residual by scale shows the band below sigma 4 holding 97% of the squared error, so a pass
+can improve the 1-4 px band by 2 dB and move the head-line by 0.03 - and a pass that
+quietly softens the image can gain dB while giving away the only detail the eye reads at
+1080p. `analyze.py --bands` adds the three-band residual split, the output's high-band
+energy against the source's, and `bands.verdict()`, which refuses to call a change an
+improvement unless every band holds and the texture survives. The measurements, the
+calibration against deliberately degraded sources, and the twelve-arm re-judgement are in
+`docs/BENCHMARK-METRIC-VALIDITY-zh.md`.
+
 ## Which neural settings change the image (2026-09-24, RenoDX 6.5.3)
 
 Re-measured on the pinned runtime (ReShade 6.8.0.2155, RenoDX 6.5.3, DLSS-NR 310.8.0,

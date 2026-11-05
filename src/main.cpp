@@ -485,6 +485,10 @@ static constexpr int IDC_RENO_PASS_RESET = 7725;
 static constexpr int IDC_RENO_PASS_APPLY = 7726;
 static constexpr int IDC_RENO_PASS_CLOSE = 7727;
 static constexpr int IDC_RENO_PASS_OPEN = 7728;
+// reno_chained_history: whether passes 2+ keep their own recursion between
+// frames. Only means anything above one pass; off is what takes the cross-pass
+// residue out of motion.
+static constexpr int IDC_RENO_CHAINED = 7729;
 // The preset strip, the line that says what the preset does, the line that
 // says what Apply will do, and the way across to Image adjustments.
 static constexpr int IDC_NS_PRESET = 7342;
@@ -9399,7 +9403,7 @@ private:
     // unsaved mark until Apply. reno_look_mode is the grade's own on/off switch;
     // Reset returns to the route's measured group (detail 2.00, shadows 0.90)
     // rather than to package defaults.
-    static constexpr int kRenoDesignW=470,kRenoDesignH=614;
+    static constexpr int kRenoDesignW=470,kRenoDesignH=652;
 
     void ShowRenoDxSettings(){
         if(m_renoWnd&&IsWindow(m_renoWnd)){ShowWindow(m_renoWnd,SW_SHOWNORMAL);SetForegroundWindow(m_renoWnd);return;}
@@ -9446,19 +9450,25 @@ private:
         CreateNeuralCombo(h,IDC_RENO_LOOK_STABILIZE,L"neural.renodx.look_stabilize",366,
             {L"Off",L"On"},L"neural.tip.renodx_look_stabilize");
         CreateAdjustmentRow(h,IDC_RENO_STABILIZE_MS,L"neural.renodx.stabilize_ms",404,L"neural.tip.renodx_stabilize_ms");
+        // The cross-pass recursion. Above one pass it is the difference between
+        // the stack steadying the picture and the stack dragging the last frame
+        // into this one, so it sits next to the stabiliser rather than with the
+        // per-pass window - it is not a look, it is how much of the last frame
+        // the stack is allowed to remember.
+        CreateNeuralCheck(h,IDC_RENO_CHAINED,L"neural.renodx.chained",16,442,320,L"neural.tip.renodx_chained");
         {
-            const int y=442;
+            const int y=480;
             DialogControl(h,L"STATIC",T(L"neural.renodx.passes").c_str(),SS_LEFT,16,y,116,20);
             HWND combo=DialogControl(h,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST,132,y-3,120,200,IDC_RENO_PASSES);
             for(int p=1;p<=30;++p){const std::wstring s=std::to_wstring(p);SendMessageW(combo,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(s.c_str()));}
             AddTip(h,combo,L"neural.tip.renodx_passes");
         }
-        CreateAdjustmentRow(h,IDC_RENO_MVEC_X,L"neural.renodx.mvec_x",480,L"neural.tip.renodx_mvec_x");
-        CreateAdjustmentRow(h,IDC_RENO_MVEC_Y,L"neural.renodx.mvec_y",518,L"neural.tip.renodx_mvec_y");
-        DialogButton(h,L"neural.renodx.pass_open",IDC_RENO_PASS_OPEN,16,566,120,30);
-        DialogButton(h,L"neural.settings.reset",IDC_RENO_RESET,144,566,86,30);
-        DialogButton(h,L"neural.settings.apply",IDC_RENO_APPLY,238,566,122,30,true);
-        DialogButton(h,L"neural.settings.close",IDC_RENO_CLOSE,368,566,86,30);
+        CreateAdjustmentRow(h,IDC_RENO_MVEC_X,L"neural.renodx.mvec_x",518,L"neural.tip.renodx_mvec_x");
+        CreateAdjustmentRow(h,IDC_RENO_MVEC_Y,L"neural.renodx.mvec_y",556,L"neural.tip.renodx_mvec_y");
+        DialogButton(h,L"neural.renodx.pass_open",IDC_RENO_PASS_OPEN,16,604,120,30);
+        DialogButton(h,L"neural.settings.reset",IDC_RENO_RESET,144,604,86,30);
+        DialogButton(h,L"neural.settings.apply",IDC_RENO_APPLY,238,604,122,30,true);
+        DialogButton(h,L"neural.settings.close",IDC_RENO_CLOSE,368,604,86,30);
         SyncRenoDxControls(h);
         UpdateRenoRouteNote(h);
         CaptureSettingsDesignLayout(h);
@@ -9525,6 +9535,7 @@ private:
         if(HWND c=GetDlgItem(h,IDC_RENO_LOOK_STABILIZE))SendMessageW(c,CB_SETCURSEL,static_cast<WPARAM>(int(m_renoWorking.value[R::LookStabilize])),0);
         if(HWND c=GetDlgItem(h,IDC_RENO_LOOK_MODE))SendMessageW(c,CB_SETCURSEL,static_cast<WPARAM>(int(m_renoWorking.value[R::LookMode])),0);
         if(HWND c=GetDlgItem(h,IDC_RENO_PASSES))SendMessageW(c,CB_SETCURSEL,static_cast<WPARAM>(int(m_renoWorking.value[R::RenoPasses])-1),0);
+        SetCheckBoxState(GetDlgItem(h,IDC_RENO_CHAINED),m_renoWorking.value[R::ChainedHistory]!=0.0);
         UpdateRenoValueLabels(h);
         RenoMarkDirty(h);
     }
@@ -9546,6 +9557,7 @@ private:
         m_renoWorking.value[R::RenoPasses]=std::clamp(double(sel(IDC_RENO_PASSES,1)+1),R::kLow[R::RenoPasses],R::kHigh[R::RenoPasses]);
         m_renoWorking.value[R::MvecScaleX]=std::clamp(pos(IDC_RENO_MVEC_X)/100.0,R::kLow[R::MvecScaleX],R::kHigh[R::MvecScaleX]);
         m_renoWorking.value[R::MvecScaleY]=std::clamp(pos(IDC_RENO_MVEC_Y)/100.0,R::kLow[R::MvecScaleY],R::kHigh[R::MvecScaleY]);
+        m_renoWorking.value[R::ChainedHistory]=CheckBoxState(GetDlgItem(h,IDC_RENO_CHAINED))?1.0:0.0;
         RenoMarkDirty(h);
     }
 
@@ -9605,7 +9617,19 @@ private:
                     <<" detail="<<m_renoDx.value[RenoDxSettings::Detail]
                     <<" shadows="<<m_renoDx.value[RenoDxSettings::Shadows]
                     <<" grade="<<m_renoDx.value[RenoDxSettings::LookMode]
-                    <<" passes="<<m_renoDx.value[RenoDxSettings::RenoPasses]);
+                    <<" passes="<<m_renoDx.value[RenoDxSettings::RenoPasses]
+                    // Chained history is the one switch that changes what the
+                    // later passes remember between frames; log it so a report
+                    // of trailing can be tied to what was actually applied.
+                    <<" chained="<<m_renoDx.value[RenoDxSettings::ChainedHistory]
+                    // The stabiliser pair, because which one is running is not
+                    // obvious from the panel: detail stability only engages
+                    // while look stabilise is off (0), and Auto (0) never
+                    // engages at all - this host sends no AFTER_UPSCALE flag.
+                    // So "stability=2 stabilise=0" is the working combination
+                    // and "stability=0" or "stabilise!=0" is a silent no-op.
+                    <<" stability="<<m_renoDx.value[RenoDxSettings::DetailStability]
+                    <<" stabilise="<<m_renoDx.value[RenoDxSettings::LookStabilize]);
                 ApplyNeuralSettings();
                 RenoMarkDirty(h);
                 UpdateRenoRouteNote(h);
@@ -9613,6 +9637,9 @@ private:
             if(id==IDC_RENO_PASS_OPEN){ShowRenoPassSettings();return 0;}
             if(id==IDC_RENO_CLOSE){DestroyWindow(h);return 0;}
             if((id==IDC_RENO_DETAIL_STABILITY||id==IDC_RENO_LOOK_STABILIZE||id==IDC_RENO_PASSES||id==IDC_RENO_LOOK_MODE)&&code==CBN_SELCHANGE){ReadRenoDxControls(h);UpdateRenoRouteNote(h);return 0;}
+            // The owner-drawn boxes do not flip their own check; the click is
+            // only a click until this turns the state over.
+            if(id==IDC_RENO_CHAINED&&code==BN_CLICKED){if(HWND box=GetDlgItem(h,id))SetCheckBoxState(box,!CheckBoxState(box));ReadRenoDxControls(h);return 0;}
             break;
         }
         case WM_CLOSE:DestroyWindow(h);return 0;

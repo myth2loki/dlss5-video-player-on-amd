@@ -16838,13 +16838,14 @@ void renodx_settings_dialog_test()
         return std::optional<double>{};
     };
 
-    // The measured group the route migrates into and Reset returns to: detail
-    // 2.00 buys back the texture the grading layer smooths away, shadows 0.90
-    // keeps the dark end from lifting, every other knob at its package default.
+    // The look the route migrates into and Reset returns to: shadows 0.90 keeps
+    // the dark end from lifting, the stabiliser is Always, two passes, and detail
+    // stays at the package's neutral 1.00 - the stabiliser already softens the
+    // picture, so raising detail at the same time over-corrects.
     const RS baseline = RS::MeasuredBaseline();
     // The look that was tuned in the player and swept on the calibration clip,
     // which is also where a fresh profile starts and what Reset returns to.
-    CHECK_EQ(baseline.value[RS::Detail], 2.00);
+    CHECK_EQ(baseline.value[RS::Detail], 1.00); // neutral, same as the package
     CHECK_EQ(baseline.value[RS::Shadows], 0.90);
     CHECK_EQ(baseline.value[RS::RenoPasses], 2.00);
     // The stabiliser, on by default: Auto is a measured no-op in this player.
@@ -16895,7 +16896,7 @@ void renodx_settings_dialog_test()
     // from kDefault are exactly the ones ApplyNeuralRoute writes into the render.
     // (If kDefault were also the start, they would read as "unset" and the panel
     // would show a grade the picture never had.)
-    CHECK(baseline.value[RS::Detail] != RS::kDefault[RS::Detail]);
+    CHECK_EQ(baseline.value[RS::Detail], RS::kDefault[RS::Detail]); // left neutral
     CHECK(baseline.value[RS::Shadows] != RS::kDefault[RS::Shadows]);
     CHECK(baseline.value[RS::RenoPasses] != RS::kDefault[RS::RenoPasses]);
     CHECK(baseline.value[RS::Pass2Follow] != RS::kDefault[RS::Pass2Follow]);
@@ -16919,6 +16920,13 @@ void renodx_settings_dialog_test()
     CHECK_EQ(RS::kDefault[RS::MvecScaleX], 1.00);
     CHECK_EQ(RS::kDefault[RS::MvecScaleY], 1.00);
     CHECK_EQ(RS::kDefault[RS::LookMode], 1.00);         // the route forces the grade on
+    // Chained history is on in the package: later passes keep their own
+    // recursion. Off is the knob that takes the cross-pass residue out of
+    // motion, so it has to be reachable and it has to be written when moved.
+    CHECK_EQ(RS::kDefault[RS::ChainedHistory], 1.00);
+    CHECK_EQ(RS::kStart[RS::ChainedHistory], 1.00);
+    CHECK_EQ(RS::kLow[RS::ChainedHistory], 0.0);
+    CHECK_EQ(RS::kHigh[RS::ChainedHistory], 1.0);
     CHECK_EQ(RS::kLow[RS::DetailRadius], 0.25);
     CHECK_EQ(RS::kLow[RS::StabilizeMs], 10.0);
     CHECK_EQ(RS::kHigh[RS::StabilizeMs], 250.0);
@@ -16984,11 +16992,16 @@ void renodx_settings_dialog_test()
     // unwritten).
     MochizukiOptions on;
     ApplyNeuralRoute(on, true, baseline);
-    CHECK_EQ(on.overrides.size(), 17u);
+    CHECK_EQ(on.overrides.size(), 16u);
     CHECK_EQ(find(on, "renodx_enabled").value_or(0), 1.0);
     CHECK_EQ(find(on, "reno_look_mode").value_or(0), 1.0);
-    CHECK_EQ(find(on, "reno_look_detail").value_or(0), 2.0);
+    // Detail is at the package's own 1.00, so it is deliberately NOT written:
+    // pinning it would take the knob away from the package for no visual gain.
+    CHECK(find(on, "reno_look_detail") == std::nullopt);
     CHECK_EQ(find(on, "reno_look_shadows").value_or(0), 0.9);
+    // At its default the chained-history key is left unwritten, the same rule
+    // every other knob follows.
+    CHECK(find(on, "reno_chained_history") == std::nullopt);
     CHECK_EQ(find(on, "reno_passes").value_or(0), 2.0);
     // Always, not the package's Auto: Auto is a no-op here (no AFTER_UPSCALE
     // frame flag is ever sent), so the start has to say Always out loud or the
@@ -17014,7 +17027,7 @@ void renodx_settings_dialog_test()
     CHECK(MochizukiLookTerm(untouched, 1.0f, 1.0f, 1.0f, -1.0f, true).empty());
     const std::string routeTerm = MochizukiLookTerm(on, 1.0f, 1.0f, 1.0f, -1.0f, true);
     CHECK(!routeTerm.empty());
-    CHECK(routeTerm.find("reno_look_detail") != std::string::npos);
+    CHECK(routeTerm.find("reno_look_shadows") != std::string::npos);
     // A look move the panel offers must produce a different term...
     RS stabilityOff = baseline;
     stabilityOff.value[RS::DetailStability] = 1.00;
@@ -17035,6 +17048,7 @@ void renodx_settings_dialog_test()
                      {"reno_look_detail", 2.0},
                      {"reno_pass_follow_0", 0.0},
                      {"reno_pass_style_1", 2.0},
+                     {"reno_chained_history", 0.0},
                      {"some_other", 3.0}};
     ApplyNeuralRoute(off, false, baseline);
     CHECK(find(off, "renodx_enabled") == std::nullopt);
@@ -17044,7 +17058,17 @@ void renodx_settings_dialog_test()
     // frame the route says is not graded.
     CHECK(find(off, "reno_pass_follow_0") == std::nullopt);
     CHECK(find(off, "reno_pass_style_1") == std::nullopt);
+    CHECK(find(off, "reno_chained_history") == std::nullopt);
     CHECK_EQ(find(off, "some_other").value_or(0), 3.0);
+
+    // Turning chaining off is a real setting, not a default: it must be written
+    // or the panel would offer a switch the render never sees.
+    RS unchained = baseline;
+    unchained.value[RS::ChainedHistory] = 0.00;
+    MochizukiOptions chainOff;
+    ApplyNeuralRoute(chainOff, true, unchained);
+    CHECK_EQ(find(chainOff, "reno_chained_history").value_or(-1), 0.0);
+    CHECK_EQ(chainOff.overrides.size(), on.overrides.size() + 1);
 
     // A count above four asks the runtime for its unlock. It clamps a RenoDX
     // stack to four on its own, so the panel's 1..30 would quietly be four -

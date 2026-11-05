@@ -199,8 +199,8 @@ struct MochizukiOptions {
 //
 // The defaults are the package's own (MochizukiRenoOptions.inc), so a knob the
 // user never moved is not written into the controls the render reads and the
-// package stays free to change it. The measured group - reno_look_detail 2.00
-// and reno_look_shadows 0.90 - is the look this renderer was A/B'd at and the
+// package stays free to change it. The shipped look - reno_look_detail left at the package's neutral 1.00 and
+// reno_look_shadows 0.90 - is the look this renderer was A/B'd at and the
 // migration target the first time RenoDX is enabled.
 struct RenoDxSettings {
     enum Field : int {
@@ -217,6 +217,11 @@ struct RenoDxSettings {
         MvecScaleX,       // reno_mvec_scale_x       -4.0 .. 4.0
         MvecScaleY,       // reno_mvec_scale_y       -4.0 .. 4.0
         LookMode,         // reno_look_mode           0 .. 1 (bool: the grade on/off)
+        // Whether passes 2+ keep their own recursion between frames. Off, each
+        // later pass restarts its history every frame, which is what takes the
+        // cross-pass residue out of motion - at the price of a little of the
+        // temporal steadiness the stack buys.
+        ChainedHistory,   // reno_chained_history     0 .. 1 (bool)
         // What the second, third and fourth pass of the RenoDX stack does on
         // its own. The package carries three such slots and a fifth pass takes
         // the fourth's, so these cover every count the stack can reach. Left
@@ -264,10 +269,11 @@ struct RenoDxSettings {
     bool operator!=(const RenoDxSettings& o) const { return !(*this == o); }
 
     // The look this renderer was measured at, which is also where a fresh
-    // profile starts and what Reset returns to: detail 2.00 buys back the
-    // texture the grading layer smooths away, shadows 0.90 keeps the dark end
-    // from lifting, and the stack runs two passes. Every other knob is the
-    // package's own.
+    // profile starts and what Reset returns to: shadows 0.90 keeps the dark end
+    // from lifting, the stabiliser is Always so stacked passes do not flicker,
+    // and the stack runs two passes. Detail stays at the package's neutral 1.00
+    // - the stabiliser already softens the picture and pushing detail up at the
+    // same time over-corrects.
     //
     // One set for all three - the first time RenoDX is enabled, Reset, and a
     // profile that never touched the section - because three answers to "what
@@ -297,7 +303,7 @@ struct RenoDxSettings {
         "RenoDetail", "RenoDetailRadius", "RenoShadows", "RenoHighlights",
         "RenoColour", "RenoTone", "RenoDetailStability", "RenoLookStabilize",
         "RenoStabilizeMs", "RenoPasses", "RenoMvecScaleX", "RenoMvecScaleY",
-        "RenoLookMode",
+        "RenoLookMode", "RenoChainedHistory",
         "RenoPass2Follow", "RenoPass2Style", "RenoPass2Intensity", "RenoPass2Tone",
         "RenoPass3Follow", "RenoPass3Style", "RenoPass3Intensity", "RenoPass3Tone",
         "RenoPass4Follow", "RenoPass4Style", "RenoPass4Intensity", "RenoPass4Tone"};
@@ -306,7 +312,7 @@ struct RenoDxSettings {
         "reno_look_highlights", "reno_look_colour", "reno_look_tone",
         "reno_detail_stability", "reno_look_stabilize", "reno_look_stabilize_ms",
         "reno_passes", "reno_mvec_scale_x", "reno_mvec_scale_y",
-        "reno_look_mode",
+        "reno_look_mode", "reno_chained_history",
         "reno_pass_follow_0", "reno_pass_style_0", "reno_pass_intensity_0", "reno_pass_local_tone_0",
         "reno_pass_follow_1", "reno_pass_style_1", "reno_pass_intensity_1", "reno_pass_local_tone_1",
         "reno_pass_follow_2", "reno_pass_style_2", "reno_pass_intensity_2", "reno_pass_local_tone_2"};
@@ -326,6 +332,7 @@ struct RenoDxSettings {
     static constexpr double kDefault[Count] = {
         1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 0.00, 0.00, 60.00, 1.00, 1.00, 1.00,
         1.00,
+        1.00, // chained history: on, the package's own
         // The per-pass slots, three times over: a later pass follows pass 1
         // (true), in the standard style (0), at pass 1's strength (1.00) and
         // pass 1's tone (1.00). The package's own defaults, so a profile that
@@ -334,18 +341,26 @@ struct RenoDxSettings {
         1.00, 0.00, 1.00, 1.00,
         1.00, 0.00, 1.00, 1.00};
     // The look a fresh profile starts at and Reset returns to - the set that was
-    // tuned in the player and measured: detail 2.00, shadows 0.90, detail
-    // stability Always, two passes.
+    // tuned in the player and measured: detail 1.00 (neutral), shadows 0.90,
+    // detail stability Always, two passes.
     // kDefault above stays the package's identity and is still the reference a
     // knob is judged against when deciding whether it is worth writing into the
     // render; this table is what the panel shows and what [RenoDX] records
     // deviations from. Splitting them is what lets the starting look be a real
-    // look: if kDefault were the start, detail 2.00 would equal "unset" and
+    // look: if kDefault were the start, shadows 0.90 would equal "unset" and
     // would never reach the runtime, and the panel would show a grade the
     // picture never had.
     static constexpr double kStart[Count] = {
         //            detail  radius  shadows highlights colour tone
-        2.00, 1.00, 0.90, 1.00, 1.00, 1.00,
+        // Detail is the package's own 1.00, i.e. neutral. 2.00 was the value the
+        // first sweep picked (it buys back the texture the grading layer smooths
+        // away), but with the stabiliser on by default the picture is already
+        // softer, and stacking both left it over-corrected: the two knobs pull
+        // the same way, so the shipped look keeps the sharpening at neutral and
+        // lets the stabiliser do the whole job. Raise it to taste - it is one
+        // slider, and it is still written into the render when it differs from
+        // the package (see ApplyNeuralRoute).
+        1.00, 1.00, 0.90, 1.00, 1.00, 1.00,
         //            stability stabilise ms  passes
         // Stability is Always (2), not the package's Auto (0): Auto only engages
         // when the host marks a frame AFTER_UPSCALE, and this player never does
@@ -357,8 +372,8 @@ struct RenoDxSettings {
         // below it. It sits in kStart (not kDefault) so it is still written into
         // the render: kDefault is the package's identity, kStart is this look.
         2.00, 0.00, 60.00, 2.00,
-        //            mvec x  mvec y  look mode
-        1.00, 1.00, 1.00,
+        //            mvec x  mvec y  look mode chained
+        1.00, 1.00, 1.00, 1.00,
         // The per-pass slots, swept on the project's calibration clip
         // (face_clip, 1920x800, 48 frames) through `--render` and measured as
         // frame-to-frame change against the source's own (ghosting) and
@@ -385,13 +400,13 @@ struct RenoDxSettings {
     // runtime accepts, not past it.
     static constexpr double kLow[Count] = {
         0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 1.0, -2.0, -2.0,
-        0.0,
+        0.0, 0.0,
         0.0, 0.0, 0.0, 0.0,
         0.0, 0.0, 0.0, 0.0,
         0.0, 0.0, 0.0, 0.0};
     static constexpr double kHigh[Count] = {
         2.0, 4.0, 2.0, 2.0, 2.0, 2.0, 2.0, 1.0, 250.0, 30.0, 2.0, 2.0,
-        1.0,
+        1.0, 1.0,
         1.0, 2.0, 2.0, 2.0,
         1.0, 2.0, 2.0, 2.0,
         1.0, 2.0, 2.0, 2.0};
@@ -405,9 +420,10 @@ inline bool MochizukiOptionsAreDefault(const MochizukiOptions& options) noexcept
 
 // The panel's processing route, spelled as control overrides so the dialog, a
 // live session and `--render` all mean the same thing by "RenoDX": the route
-// owns the switch and the look this renderer was A/B'd at (detail 2.00 buys back
-// the texture the grading layer smooths away, shadows 0.90 keeps the dark end
-// from lifting, both measured on moving and still content).
+// owns the switch and the look this renderer was A/B'd at (shadows 0.90 keeps the
+// dark end from lifting, detail left neutral at 1.00 so the Always stabiliser is
+// the only thing softening the picture, both measured on moving and still
+// content).
 //
 // Route 0 removes the keys rather than writing renodx_enabled=0: off is the
 // runtime's own default, and an override list that only says "off" would make
@@ -443,7 +459,7 @@ inline void ApplyNeuralRoute(MochizukiOptions& options, bool renoDx, const RenoD
         "renodx_enabled", "reno_look_mode", "reno_look_detail", "reno_look_shadows",
         "reno_look_detail_radius", "reno_look_highlights", "reno_look_colour", "reno_look_tone",
         "reno_detail_stability", "reno_look_stabilize", "reno_look_stabilize_ms", "reno_passes",
-        "reno_unlock_passes", "reno_mvec_scale_x", "reno_mvec_scale_y",
+        "reno_unlock_passes", "reno_mvec_scale_x", "reno_mvec_scale_y", "reno_chained_history",
         // The later passes' own look. They are the route's too: a route turned
         // off must not leave a per-pass override behind, and a second Apply must
         // not append them twice - a doubled key would double the cache term.
