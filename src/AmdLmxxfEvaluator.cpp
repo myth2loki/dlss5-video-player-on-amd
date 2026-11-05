@@ -1569,7 +1569,22 @@ bool AmdLmxxfEvaluator::ApplyMochizukiControls()
     // else - linear input, max passes, preprocessing, RenoDX - is left at 0, the
     // documented default.
     const MochizukiOptions& asked = config_.mochizuki;
+    // Start from the package's own defaults rather than a zeroed struct. Most of
+    // the fields this host has no panel for are only "default" at the values the
+    // runtime reports - RenoDX's grade controls default to 1.0, chained history
+    // to on, the pass count to 1 - and a zeroed struct asks for something else
+    // without saying so. `defaults=0` in the override list is the A/B arm that
+    // puts the old, zeroed behaviour back.
+    bool seedDefaults = true;
+    for (const auto& [name, value] : asked.overrides)
+        if (name == "defaults") seedDefaults = value != 0.0;
     MochizukiNrControls controls{};
+    if (!seedDefaults)
+        Log("  controls: defaults=0, starting from a zeroed struct (pre-0.0.8.2 host behaviour)");
+    else if (runtime_.MochizukiControlDefaults(controls))
+        Log("  controls: seeded from the runtime's own defaults (MochizukiNrGetControlDefaults)");
+    else
+        Log("  controls: the runtime exported no control defaults; starting from a zeroed struct");
     controls.struct_size = sizeof(controls);
     controls.intensity = asked.intensity;
     controls.style = config_.style > 2u ? 2u : config_.style;
@@ -1635,6 +1650,21 @@ bool AmdLmxxfEvaluator::ApplyMochizukiControls()
     // from dlssnr-amd/aco. Fixed when the Vulkan device is created, which is why
     // this has to be handed over before PrepareSession.
     controls.aco_mode = AcoModeFromEnvironment();
+
+    // The named overrides go last, so a job can move any field the panel does not
+    // own - including the ones written above, which is how a sweep drives one
+    // knob at a time without a dialog entry for it. A name this build does not
+    // know is named in the log rather than dropping the whole line.
+    if (!asked.overrides.empty()) {
+        const std::vector<std::string> unknown =
+            amd_mochizuki::ApplyControlFields(controls, asked.overrides);
+        if (!unknown.empty()) {
+            std::string names;
+            for (const std::string& name : unknown)
+                names += (names.empty() ? "" : ", ") + name;
+            Log("  controls: unknown MochizukiOverride field(s) ignored: " + names);
+        }
+    }
 
     std::wstring error;
     if (!runtime_.SetControls(controls, &error)) {

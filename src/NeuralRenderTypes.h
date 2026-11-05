@@ -18,6 +18,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 // Which neural backend a job runs on. Selected per job rather than per build:
 // this binary carries both, so a machine with no NGX is not a machine that has
@@ -176,14 +178,302 @@ struct MochizukiOptions {
     // two passes pass3 is inert, at one neither is.
     MochizukiPassOptions pass2;
     MochizukiPassOptions pass3;
+    // Named fields of the control struct this host has no panel for, in the
+    // header's own member names (see amd_mochizuki::kControlFields). Empty is the
+    // package's own defaults, which is what a job that moved nothing sends. This
+    // is how a knob with no dialog entry still reaches a pixel without a new
+    // field on the wire, a new ini key per knob, or a rebuilt runtime.
+    std::vector<std::pair<std::string, double>> overrides;
 
     friend bool operator==(const MochizukiOptions&, const MochizukiOptions&) = default;
+};
+
+// The RenoDX grading controls the player exposes, owned solely by the [RenoDX]
+// settings section and its dialog. There are twelve per-knob grades (detail,
+// shadows, ...) plus reno_look_mode, which the package carries as a bool
+// (NRLookMode): the grade itself, on or off. With it off every look knob is an
+// identity gain and the picture does not move, which is why the dialog shows
+// it as a switch rather than a number. Every other knob the package carries
+// that this host does not surface stays at the runtime's own defaults (see
+// kControlFields in AmdMochizukiApi.h).
+//
+// The defaults are the package's own (MochizukiRenoOptions.inc), so a knob the
+// user never moved is not written into the controls the render reads and the
+// package stays free to change it. The measured group - reno_look_detail 2.00
+// and reno_look_shadows 0.90 - is the look this renderer was A/B'd at and the
+// migration target the first time RenoDX is enabled.
+struct RenoDxSettings {
+    enum Field : int {
+        Detail,            // reno_look_detail       0.00 .. 2.00
+        DetailRadius,     // reno_look_detail_radius 0.00 .. 4.00
+        Shadows,          // reno_look_shadows       0.00 .. 2.00
+        Highlights,       // reno_look_highlights    0.00 .. 2.00
+        Colour,           // reno_look_colour        0.00 .. 2.00
+        Tone,             // reno_look_tone          0.00 .. 2.00
+        DetailStability,  // reno_detail_stability    0 .. 2 (uint)
+        LookStabilize,    // reno_look_stabilize      0 .. 1 (uint)
+        StabilizeMs,      // reno_look_stabilize_ms   0.0 .. 500.0
+        RenoPasses,       // reno_passes              1 .. 30 (uint)
+        MvecScaleX,       // reno_mvec_scale_x       -4.0 .. 4.0
+        MvecScaleY,       // reno_mvec_scale_y       -4.0 .. 4.0
+        LookMode,         // reno_look_mode           0 .. 1 (bool: the grade on/off)
+        // What the second, third and fourth pass of the RenoDX stack does on
+        // its own. The package carries three such slots and a fifth pass takes
+        // the fourth's, so these cover every count the stack can reach. Left
+        // alone a later pass inherits pass 1's look entirely, which is why a
+        // pass count changed the work done and not the picture.
+        Pass2Follow,      // reno_pass_follow_0       0 .. 1 (bool)
+        Pass2Style,       // reno_pass_style_0        0 .. 2
+        Pass2Intensity,   // reno_pass_intensity_0    0 .. 2
+        Pass2Tone,        // reno_pass_local_tone_0   0 .. 2
+        Pass3Follow,      // reno_pass_follow_1       0 .. 1 (bool)
+        Pass3Style,       // reno_pass_style_1        0 .. 2
+        Pass3Intensity,   // reno_pass_intensity_1    0 .. 2
+        Pass3Tone,        // reno_pass_local_tone_1   0 .. 2
+        Pass4Follow,      // reno_pass_follow_2       0 .. 1 (bool)
+        Pass4Style,       // reno_pass_style_2        0 .. 2
+        Pass4Intensity,   // reno_pass_intensity_2    0 .. 2
+        Pass4Tone,        // reno_pass_local_tone_2   0 .. 2
+        Count
+    };
+
+    double value[Count];
+
+    RenoDxSettings() {
+        for (int i = 0; i < Count; ++i) value[i] = kStart[i];
+    }
+
+    // True when every field is at the look a fresh profile starts at, i.e. the
+    // user has never moved anything in [RenoDX] - the signal to migrate the
+    // measured group in, and the reference the ini's sparseness is kept
+    // against. Judged against kStart, not kDefault: the starting look is a real
+    // look, so a profile sitting on it has nothing of its own to record.
+    bool IsEmpty() const {
+        for (int i = 0; i < Count; ++i)
+            if (std::fabs(value[i] - kStart[i]) > 1e-6) return false;
+        return true;
+    }
+
+    // Equality within the override precision (two decimals), so the RenoDX
+    // Settings window can show an unsaved mark only when a knob actually moved.
+    bool operator==(const RenoDxSettings& o) const {
+        for (int i = 0; i < Count; ++i)
+            if (std::fabs(value[i] - o.value[i]) > 1e-6) return false;
+        return true;
+    }
+    bool operator!=(const RenoDxSettings& o) const { return !(*this == o); }
+
+    // The look this renderer was measured at, which is also where a fresh
+    // profile starts and what Reset returns to: detail 2.00 buys back the
+    // texture the grading layer smooths away, shadows 0.90 keeps the dark end
+    // from lifting, and the stack runs two passes. Every other knob is the
+    // package's own.
+    //
+    // One set for all three - the first time RenoDX is enabled, Reset, and a
+    // profile that never touched the section - because three answers to "what
+    // does RenoDX look like" is how the panel and the render drift apart. It is
+    // deliberately NOT the package's identity: kDefault is what the render uses
+    // when the host says nothing, and every knob where this look differs from it
+    // is written into the controls, so the picture matches the panel.
+    static RenoDxSettings MeasuredBaseline() { return RenoDxSettings{}; }
+
+    // Where a later pass's four fields live: slot 1 is the second pass of the
+    // stack, slot 3 the fourth. The dialog edits one slot at a time, so its
+    // Reset has to restore one slot - and it restores kStart, not kDefault: the
+    // starting look gives every later pass its own style, so resetting a slot to
+    // the package's "follow pass 1 / standard style / tone 1" would quietly undo
+    // the look the rest of the panel claims to be at (and tone 1 would compound
+    // across passes on the next Apply).
+    static constexpr int PassSlotBase(int slot) { return Pass2Follow + (slot - 1) * 4; }
+    void ResetPassSlot(int slot) {
+        const int base = PassSlotBase(slot);
+        for (int k = 0; k < 4; ++k) value[base + k] = kStart[base + k];
+    }
+
+    // The [RenoDX] ini key for each knob (one key per control, the dialog's
+    // sole owner) and the matching control-struct member name ApplyControlFields
+    // writes into.
+    static constexpr const char* kIniKey[Count] = {
+        "RenoDetail", "RenoDetailRadius", "RenoShadows", "RenoHighlights",
+        "RenoColour", "RenoTone", "RenoDetailStability", "RenoLookStabilize",
+        "RenoStabilizeMs", "RenoPasses", "RenoMvecScaleX", "RenoMvecScaleY",
+        "RenoLookMode",
+        "RenoPass2Follow", "RenoPass2Style", "RenoPass2Intensity", "RenoPass2Tone",
+        "RenoPass3Follow", "RenoPass3Style", "RenoPass3Intensity", "RenoPass3Tone",
+        "RenoPass4Follow", "RenoPass4Style", "RenoPass4Intensity", "RenoPass4Tone"};
+    static constexpr const char* kControlName[Count] = {
+        "reno_look_detail", "reno_look_detail_radius", "reno_look_shadows",
+        "reno_look_highlights", "reno_look_colour", "reno_look_tone",
+        "reno_detail_stability", "reno_look_stabilize", "reno_look_stabilize_ms",
+        "reno_passes", "reno_mvec_scale_x", "reno_mvec_scale_y",
+        "reno_look_mode",
+        "reno_pass_follow_0", "reno_pass_style_0", "reno_pass_intensity_0", "reno_pass_local_tone_0",
+        "reno_pass_follow_1", "reno_pass_style_1", "reno_pass_intensity_1", "reno_pass_local_tone_1",
+        "reno_pass_follow_2", "reno_pass_style_2", "reno_pass_intensity_2", "reno_pass_local_tone_2"};
+    // The runtime's own table, copied from MochizukiRenoOptions.inc in the
+    // package (the RDX_ lines name every field with its default and its range):
+    // the look floats 1.00, detail stability 0 (auto), the stabilisers 0,
+    // stabilise 60 ms, passes 1, motion-vector scale 1.00. It used to be a
+    // different table, and the difference was not cosmetic: detail stability 1
+    // ("off") is not the runtime's default, and a stabilise window of 0 is
+    // clamped up to the 10 ms floor, so the panel said one thing and the render
+    // did another. Copying the package's numbers is the only version of this
+    // table that cannot drift from it.
+    //
+    // reno_look_mode is a bool in the package (NRLookMode, 0..1), not the
+    // 0..3 selector this once assumed; it defaults to 1 here because the route
+    // has always forced it on, and 1 is what the panel's switch shows.
+    static constexpr double kDefault[Count] = {
+        1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 0.00, 0.00, 60.00, 1.00, 1.00, 1.00,
+        1.00,
+        // The per-pass slots, three times over: a later pass follows pass 1
+        // (true), in the standard style (0), at pass 1's strength (1.00) and
+        // pass 1's tone (1.00). The package's own defaults, so a profile that
+        // never touched them keeps the picture it had.
+        1.00, 0.00, 1.00, 1.00,
+        1.00, 0.00, 1.00, 1.00,
+        1.00, 0.00, 1.00, 1.00};
+    // The look a fresh profile starts at and Reset returns to - the set that was
+    // tuned in the player and measured: detail 2.00, shadows 0.90, detail
+    // stability Always, two passes.
+    // kDefault above stays the package's identity and is still the reference a
+    // knob is judged against when deciding whether it is worth writing into the
+    // render; this table is what the panel shows and what [RenoDX] records
+    // deviations from. Splitting them is what lets the starting look be a real
+    // look: if kDefault were the start, detail 2.00 would equal "unset" and
+    // would never reach the runtime, and the panel would show a grade the
+    // picture never had.
+    static constexpr double kStart[Count] = {
+        //            detail  radius  shadows highlights colour tone
+        2.00, 1.00, 0.90, 1.00, 1.00, 1.00,
+        //            stability stabilise ms  passes
+        // Stability is Always (2), not the package's Auto (0): Auto only engages
+        // when the host marks a frame AFTER_UPSCALE, and this player never does
+        // (the flag is for NR-after-upscaler game paths), so Auto is a measured
+        // no-op here - bit-identical to Off. Always is the one setting that
+        // actually damps the flicker stacked passes produce: frame-to-frame
+        // change 3.84 -> 3.22 (-16%) for texture 1.76 -> 1.45 on the
+        // calibration clip, and 1.45 is still the source's own 1.38 rather than
+        // below it. It sits in kStart (not kDefault) so it is still written into
+        // the render: kDefault is the package's identity, kStart is this look.
+        2.00, 0.00, 60.00, 2.00,
+        //            mvec x  mvec y  look mode
+        1.00, 1.00, 1.00,
+        // The per-pass slots, swept on the project's calibration clip
+        // (face_clip, 1920x800, 48 frames) through `--render` and measured as
+        // frame-to-frame change against the source's own (ghosting) and
+        // high-frequency energy (texture recovered):
+        //   follow, std 1.00   temporal 4.66 texture 2.86  - within 35 dB of
+        //     following, i.e. turning follow off with the same style changes
+        //     nothing: the style is what a later pass actually owns;
+        //   natural 1.00       temporal 3.84 texture 1.76  - clearly its own
+        //     picture (30.8 dB from the follow arm), structure without the
+        //     crunch;
+        //   cinematic 1.00     temporal 3.34 texture 1.51  - closest to the
+        //     source on both, the calmest, and the least recovered;
+        //   std 0.50           temporal 4.02 texture 2.23.
+        // Natural at full strength is the middle of that trade-off and the one
+        // a later pass can call its own. Tone 0 follows the project's own rule
+        // for stacked passes (tone re-applied on every pass compounds), and the
+        // third and fourth run at half strength, which is where the measured
+        // ghosting stops being worth the extra structure.
+        0.00, 1.00, 1.00, 0.00,
+        0.00, 1.00, 0.50, 0.00,
+        0.00, 1.00, 0.50, 0.00};
+    // Clamp ranges, copied from the same table so a hand-edited or out-of-range
+    // [RenoDX] value is pinned rather than refused - and pinned to what the
+    // runtime accepts, not past it.
+    static constexpr double kLow[Count] = {
+        0.0, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 1.0, -2.0, -2.0,
+        0.0,
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0};
+    static constexpr double kHigh[Count] = {
+        2.0, 4.0, 2.0, 2.0, 2.0, 2.0, 2.0, 1.0, 250.0, 30.0, 2.0, 2.0,
+        1.0,
+        1.0, 2.0, 2.0, 2.0,
+        1.0, 2.0, 2.0, 2.0,
+        1.0, 2.0, 2.0, 2.0};
 };
 
 // Whether every value is the runtime's own default.
 inline bool MochizukiOptionsAreDefault(const MochizukiOptions& options) noexcept
 {
     return options == MochizukiOptions{};
+}
+
+// The panel's processing route, spelled as control overrides so the dialog, a
+// live session and `--render` all mean the same thing by "RenoDX": the route
+// owns the switch and the look this renderer was A/B'd at (detail 2.00 buys back
+// the texture the grading layer smooths away, shadows 0.90 keeps the dark end
+// from lifting, both measured on moving and still content).
+//
+// Route 0 removes the keys rather than writing renodx_enabled=0: off is the
+// runtime's own default, and an override list that only says "off" would make
+// every job carry a "mochizuki=" term in its cache key - a key that claims a
+// different picture for one that is byte-identical to the default panel's.
+// A profile written before the route existed asked for the grading layer by
+// putting renodx_enabled=1 in MochizukiOverride rather than by picking a route.
+// Reading that back is the migration: without it the new default (0) would
+// silently switch the layer off on the next start, changing a picture the user
+// never asked to change. Only consulted when the file has no route key at all,
+// so a real choice is never overridden by a leftover override.
+inline int MigrateRouteFromOverrides(int route, bool routeKeyPresent,
+                                    const MochizukiOptions& options)
+{
+    if (routeKeyPresent) return route;
+    for (const auto& entry : options.overrides)
+        if (entry.first == "renodx_enabled" && entry.second != 0.0) return 1;
+    return route;
+}
+
+// The panel's processing route, spelled as control overrides so the dialog, a
+// live session and `--render` all mean the same thing by "RenoDX": the route
+// owns the switch and the look this renderer was A/B'd at. When the route is on,
+// renodx_enabled is forced on and reno_look_mode is written from the panel's
+// switch, then every RenoDX knob the user has moved from its package default -
+// so a knob left at its default is not pinned into the controls the render
+// reads. When it is off, every one of these keys is cleared so the render falls
+// back to the runtime's own defaults.
+inline void ApplyNeuralRoute(MochizukiOptions& options, bool renoDx, const RenoDxSettings& reno)
+{
+    auto& overrides = options.overrides;
+    static constexpr const char* kRouteKeys[]{
+        "renodx_enabled", "reno_look_mode", "reno_look_detail", "reno_look_shadows",
+        "reno_look_detail_radius", "reno_look_highlights", "reno_look_colour", "reno_look_tone",
+        "reno_detail_stability", "reno_look_stabilize", "reno_look_stabilize_ms", "reno_passes",
+        "reno_unlock_passes", "reno_mvec_scale_x", "reno_mvec_scale_y",
+        // The later passes' own look. They are the route's too: a route turned
+        // off must not leave a per-pass override behind, and a second Apply must
+        // not append them twice - a doubled key would double the cache term.
+        "reno_pass_follow_0", "reno_pass_style_0", "reno_pass_intensity_0", "reno_pass_local_tone_0",
+        "reno_pass_follow_1", "reno_pass_style_1", "reno_pass_intensity_1", "reno_pass_local_tone_1",
+        "reno_pass_follow_2", "reno_pass_style_2", "reno_pass_intensity_2", "reno_pass_local_tone_2"};
+    std::erase_if(overrides, [](const std::pair<std::string, double>& entry) {
+        for (const char* key : kRouteKeys)
+            if (entry.first == key) return true;
+        return false;
+    });
+    if (!renoDx) return;
+    overrides.emplace_back("renodx_enabled", 1.0);
+    // reno_look_mode is written unconditionally from the user's selection. The
+    // runtime's own default is 0, and the route used to force 1, so leaving it
+    // out here would change the picture for existing profiles; defaulting the
+    // field to 1 keeps that forced-1 behaviour until the user picks otherwise.
+    overrides.emplace_back("reno_look_mode", reno.value[RenoDxSettings::LookMode]);
+    for (int i = 0; i < RenoDxSettings::Count; ++i) {
+        if (i == RenoDxSettings::LookMode) continue; // written above, always
+        if (std::fabs(reno.value[i] - RenoDxSettings::kDefault[i]) > 1e-6)
+            overrides.emplace_back(RenoDxSettings::kControlName[i], reno.value[i]);
+    }
+    // A RenoDX stack runs at most four passes unless the runtime's own unlock is
+    // set, and it clamps the count itself rather than refusing it: the panel
+    // offers 1..30 and a count of eight would quietly be four. Asking for the
+    // unlock with the count is what makes the number on the panel the number
+    // that runs - the same switch the package's own UI calls NRUnlockPasses.
+    if (reno.value[RenoDxSettings::RenoPasses] > 4.0)
+        overrides.emplace_back("reno_unlock_passes", 1.0);
 }
 
 // One line, so the helper's command line stays one argument: `key=value` pairs
@@ -196,8 +486,19 @@ inline std::string FormatMochizukiOptions(const MochizukiOptions& options)
 {
     if (MochizukiOptionsAreDefault(options)) return {};
     // Two lines' worth of fields: a pass block is seven values and there are
-    // two of them, so 256 was no longer enough once they existed.
-    char line[512]{};
+    // two of them, so 256 was no longer enough once they existed. The override
+    // list is open-ended, so the buffer grows with it rather than capping it.
+    std::string overrides;
+    for (size_t index = 0; index < options.overrides.size(); ++index) {
+        if (index != 0) overrides.push_back(';');
+        overrides += options.overrides[index].first;
+        char value[32]{};
+        std::snprintf(value, sizeof(value), "=%.2f", options.overrides[index].second);
+        overrides += value;
+    }
+    if (overrides.empty()) overrides = "none";
+    std::string line;
+    line.resize(512 + overrides.size() * 2);
     // `|` inside a pass block: the outer separator is the comma, and a nested
     // comma would split a pass into two fields that parse as neither.
     const auto pass = [](const MochizukiPassOptions& p) {
@@ -207,16 +508,48 @@ inline std::string FormatMochizukiOptions(const MochizukiOptions& options)
                       double(p.localStructure), double(p.skinStructure), p.autoMask ? 1 : 0);
         return std::string(block);
     };
-    std::snprintf(line, sizeof(line),
+    std::snprintf(line.data(), line.size(),
                   "intensity=%.2f,tone=%.2f,structure=%.2f,skin=%.2f,mask=%d,maxratio=%.2f,"
-                  "history=%.2f,apply=%d,pre=%d,int4=%d,drs=%u,network=%u,pass2=%s,pass3=%s",
+                  "history=%.2f,apply=%d,pre=%d,int4=%d,drs=%u,network=%u,pass2=%s,pass3=%s,mz=%s",
                   double(options.intensity), double(options.localTone),
                   double(options.localStructure), double(options.skinStructure),
                   options.autoMask ? 1 : 0, double(options.maxRatio),
                   double(options.historyStrength), options.applyModel ? 1 : 0,
                   options.preprocess ? 1 : 0, options.int4Mixed ? 1 : 0, options.drsMode,
-                  options.networkModel, pass(options.pass2).c_str(), pass(options.pass3).c_str());
+                  options.networkModel, pass(options.pass2).c_str(), pass(options.pass3).c_str(),
+                  overrides.c_str());
+    // snprintf leaves the rest of the resized buffer as NUL, and a command-line
+    // argument cannot carry one: the child would see a truncated or split value
+    // and refuse the whole line. Trim to what was written.
+    line.resize(std::strlen(line.c_str()));
     return line;
+}
+
+// The part of the picture the add-on's canonical settings string cannot say: the
+// Mochizuki controls (where the RenoDX route puts its whole look) plus the five
+// look values the job borrows from the panel rather than carrying in the struct.
+//
+// Apply restarts a live session when any of these moves, so two looks must not
+// share a retention key: a restart that finds the key it had before adopts the
+// segments the OLD look produced, and the change reaches no frame that was
+// already rendered. Measured on 2026-11-05, before this term existed: switching
+// detail stability Always -> Off restarted the session at 28.9 s and the next
+// stop still reported coverage from 4.13 s, i.e. the 19 segments rendered under
+// the old look were adopted and the new one was written only into new ground.
+//
+// Empty when the merged controls are the runtime's own defaults, so a profile
+// that never touched them keeps byte-identical retention keys.
+inline std::string MochizukiLookTerm(const MochizukiOptions& options,
+                                     float intensity, float localTone, float localStructure,
+                                     float skinStructure, bool autoMask)
+{
+    MochizukiOptions merged = options;
+    merged.intensity = intensity;
+    merged.localTone = localTone;
+    merged.localStructure = localStructure;
+    merged.skinStructure = skinStructure;
+    merged.autoMask = autoMask;
+    return FormatMochizukiOptions(merged);
 }
 
 // Absent or malformed returns nullopt rather than a default: a job that named
@@ -292,8 +625,12 @@ inline std::optional<MochizukiOptions> ParseMochizukiOptions(std::string_view te
         // plain decimal point and no exponent, and strtof is what reads that
         // without a locale in the way.
         char buffer[64]{};
-        if (value.size() >= sizeof(buffer)) return std::nullopt;
-        std::memcpy(buffer, value.data(), value.size());
+        // The `mz` list is the one value that is not a single number: it is a
+        // `;`-separated list whose length grows with the number of overrides the
+        // job carries, so the per-number bound below does not apply to it. It is
+        // bounded on its own in that branch.
+        if (key != "mz" && value.size() >= sizeof(buffer)) return std::nullopt;
+        std::memcpy(buffer, value.data(), std::min(value.size(), sizeof(buffer) - 1));
         const auto number = [&]() -> std::optional<double> {
             char* end = nullptr;
             const double parsed = std::strtod(buffer, &end);
@@ -334,10 +671,40 @@ inline std::optional<MochizukiOptions> ParseMochizukiOptions(std::string_view te
             if (!block) return std::nullopt;
             (key == "pass2" ? options.pass2 : options.pass3) = *block;
         }
+        else if (key == "mz") {
+            // The override list: `name=value` pairs separated by `;`, or `none`
+            // for "the package's own defaults". Only the shape is checked here -
+            // a name this build does not know still parses, so the evaluator can
+            // log it by name instead of the whole line failing on a typo.
+            if (value != "none") {
+                if (value.size() > 1024) return std::nullopt;   // 1024 is ~40 pairs, far past any panel
+                std::string_view list = value;
+                while (!list.empty()) {
+                    const size_t semi = list.find(';');
+                    const std::string_view pair = list.substr(0, semi);
+                    list = semi == std::string_view::npos ? std::string_view{} : list.substr(semi + 1);
+                    const size_t eq = pair.find('=');
+                    if (eq == std::string_view::npos || eq == 0 || eq + 1 >= pair.size())
+                        return std::nullopt;
+                    const std::string_view name = pair.substr(0, eq);
+                    const std::string_view valueText = pair.substr(eq + 1);
+                    if (name.size() >= 48 || valueText.size() >= 32) return std::nullopt;
+                    for (const char c : name)
+                        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'))
+                            return std::nullopt;
+                    char scratch[32]{};
+                    std::memcpy(scratch, valueText.data(), valueText.size());
+                    char* end = nullptr;
+                    const double parsed = std::strtod(scratch, &end);
+                    if (end == scratch || *end != '\0' || !std::isfinite(parsed)) return std::nullopt;
+                    options.overrides.emplace_back(std::string(name), parsed);
+                }
+            }
+        }
         else return std::nullopt;
         ++seen;
     }
-    if (seen != 14) return std::nullopt;
+    if (seen != 15) return std::nullopt;
     return options;
 }
 

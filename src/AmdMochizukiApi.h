@@ -9,6 +9,13 @@
 #include <cstdint>
 #include <string_view>
 
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <string>
+#include <utility>
+#include <vector>
+
 namespace amd_mochizuki {
 
 // The two exports a Mochizuki session cannot work without. The rest of the call
@@ -144,6 +151,161 @@ inline MochizukiNrFrameInfo ConvertFrame(const LmxxfNrFrameInfo& source,
     if ((source.flags & LMXXF_NR_FRAME_FLAG_STRENGTH) == 0)
         info.flags &= ~uint32_t(LMXXF_NR_FRAME_FLAG_STRENGTH);
     return info;
+}
+
+/* Host-side overrides of the control struct.
+ *
+ * The 532-byte struct carries every knob the package has; this host has a panel
+ * for a dozen of them and leaves the rest at whatever the payload carried. That
+ * "whatever" used to be zero, which is not the package's default for most
+ * fields - RenoDX's look controls default to 1.0, not 0 - so the job now starts
+ * from GetControlDefaults (Runtime::MochizukiControlDefaults) and these entries
+ * move single fields by their header name afterwards.
+ *
+ * The names are the struct's own member names, so an override list reads as the
+ * struct it writes and there is no second spelling to drift. The ranges are the
+ * ones the header documents (and the ones MochizukiRenoOptions.inc states
+ * upstream, for the RenoDX block). A value outside its range is clamped here
+ * rather than refused: the runtime clamps the same way, and a hand-edited INI
+ * should not fail a render over a decimal.
+ *
+ * `name` 0 or a value that is not finite is ignored, and the field keeps the
+ * default it was seeded with. */
+struct ControlField {
+    const char* name;
+    size_t offset;
+    enum class Kind { Float, Uint, Bool };
+    Kind kind;
+    float low, high;
+};
+
+// Nothing here is a new ABI: every entry is a member of the struct the package
+// already validates by size, at the offset this build's header gives it.
+inline constexpr ControlField kControlFields[] = {
+    // The RenoDX layer and its own NR: this is the block a film's grade comes
+    // from, and it is off by default in the package (renodx_enabled = 0).
+    {"renodx_enabled", offsetof(MochizukiNrControls, renodx_enabled), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_nr_enabled", offsetof(MochizukiNrControls, reno_nr_enabled), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_intensity", offsetof(MochizukiNrControls, reno_intensity), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_style", offsetof(MochizukiNrControls, reno_style), ControlField::Kind::Uint, 0.f, 2.f},
+    {"reno_local_tone", offsetof(MochizukiNrControls, reno_local_tone), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_local_structure", offsetof(MochizukiNrControls, reno_local_structure), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_skin_structure", offsetof(MochizukiNrControls, reno_skin_structure), ControlField::Kind::Float, -1.f, 1.f},
+    {"reno_auto_mask", offsetof(MochizukiNrControls, reno_auto_mask), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_skin_independent", offsetof(MochizukiNrControls, reno_skin_independent), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_passes", offsetof(MochizukiNrControls, reno_passes), ControlField::Kind::Uint, 1.f, 30.f},
+    {"reno_unlock_passes", offsetof(MochizukiNrControls, reno_unlock_passes), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_chained_history", offsetof(MochizukiNrControls, reno_chained_history), ControlField::Kind::Bool, 0.f, 1.f},
+    // What a later pass of the RenoDX stack does on its own. The package
+    // carries three slots - the second, third and fourth pass - and a fifth
+    // pass takes the fourth's, so three slots cover every count the stack can
+    // reach. Without these in the table a per-pass setting would be named in an
+    // override and dropped as unknown, and every extra pass would keep
+    // inheriting pass 1's look: the count would change and the picture would
+    // not.
+    {"reno_pass_follow_0", offsetof(MochizukiNrControls, reno_pass_follow_0), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_pass_style_0", offsetof(MochizukiNrControls, reno_pass_style_0), ControlField::Kind::Uint, 0.f, 2.f},
+    {"reno_pass_intensity_0", offsetof(MochizukiNrControls, reno_pass_intensity_0), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_pass_local_tone_0", offsetof(MochizukiNrControls, reno_pass_local_tone_0), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_pass_follow_1", offsetof(MochizukiNrControls, reno_pass_follow_1), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_pass_style_1", offsetof(MochizukiNrControls, reno_pass_style_1), ControlField::Kind::Uint, 0.f, 2.f},
+    {"reno_pass_intensity_1", offsetof(MochizukiNrControls, reno_pass_intensity_1), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_pass_local_tone_1", offsetof(MochizukiNrControls, reno_pass_local_tone_1), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_pass_follow_2", offsetof(MochizukiNrControls, reno_pass_follow_2), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_pass_style_2", offsetof(MochizukiNrControls, reno_pass_style_2), ControlField::Kind::Uint, 0.f, 2.f},
+    {"reno_pass_intensity_2", offsetof(MochizukiNrControls, reno_pass_intensity_2), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_pass_local_tone_2", offsetof(MochizukiNrControls, reno_pass_local_tone_2), ControlField::Kind::Float, 0.f, 2.f},
+    // The grade: the knobs that decide whether skin reads as skin or as wax.
+    {"reno_look_mode", offsetof(MochizukiNrControls, reno_look_mode), ControlField::Kind::Uint, 0.f, 3.f},
+    {"reno_look_strength", offsetof(MochizukiNrControls, reno_look_strength), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_look_brighten", offsetof(MochizukiNrControls, reno_look_brighten), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_look_darken", offsetof(MochizukiNrControls, reno_look_darken), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_look_colour", offsetof(MochizukiNrControls, reno_look_colour), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_look_hue", offsetof(MochizukiNrControls, reno_look_hue), ControlField::Kind::Float, -0.5f, 0.5f},
+    {"reno_look_shadows", offsetof(MochizukiNrControls, reno_look_shadows), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_look_midtones", offsetof(MochizukiNrControls, reno_look_midtones), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_look_highlights", offsetof(MochizukiNrControls, reno_look_highlights), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_look_tone", offsetof(MochizukiNrControls, reno_look_tone), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_look_detail", offsetof(MochizukiNrControls, reno_look_detail), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_look_detail_radius", offsetof(MochizukiNrControls, reno_look_detail_radius), ControlField::Kind::Float, 0.f, 4.f},
+    {"reno_look_halo", offsetof(MochizukiNrControls, reno_look_halo), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_look_halo_bright", offsetof(MochizukiNrControls, reno_look_halo_bright), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_look_stabilize", offsetof(MochizukiNrControls, reno_look_stabilize), ControlField::Kind::Uint, 0.f, 1.f},
+    {"reno_look_stabilize_ms", offsetof(MochizukiNrControls, reno_look_stabilize_ms), ControlField::Kind::Float, 0.f, 500.f},
+    // 0 auto, 1 off (the runtime's own default), 2 always. The clamp was 0..1,
+    // which made "always" - the only setting that forces the stabiliser on -
+    // unreachable from here.
+    {"reno_detail_stability", offsetof(MochizukiNrControls, reno_detail_stability), ControlField::Kind::Uint, 0.f, 2.f},
+    // 0 from the format, 1 SDR, 2 linear, 3 PQ. A film that reads as linear when
+    // it is SDR is what an over-bright, waxy picture looks like from the inside.
+    {"reno_source_encoding", offsetof(MochizukiNrControls, reno_source_encoding), ControlField::Kind::Uint, 0.f, 3.f},
+    {"reno_color_strength", offsetof(MochizukiNrControls, reno_color_strength), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_transfer_strength", offsetof(MochizukiNrControls, reno_transfer_strength), ControlField::Kind::Float, 0.f, 1.f},
+    {"reno_chroma_clamp_stops", offsetof(MochizukiNrControls, reno_chroma_clamp_stops), ControlField::Kind::Float, 0.f, 8.f},
+    {"reno_resolution_scale", offsetof(MochizukiNrControls, reno_resolution_scale), ControlField::Kind::Float, 0.25f, 1.f},
+    {"reno_codec_mode", offsetof(MochizukiNrControls, reno_codec_mode), ControlField::Kind::Uint, 0.f, 2.f},
+    {"reno_neural_floor_guard", offsetof(MochizukiNrControls, reno_neural_floor_guard), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_norm_governor", offsetof(MochizukiNrControls, reno_norm_governor), ControlField::Kind::Uint, 0.f, 2.f},
+    {"reno_norm_cut_aware", offsetof(MochizukiNrControls, reno_norm_cut_aware), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_mvec_scale_x", offsetof(MochizukiNrControls, reno_mvec_scale_x), ControlField::Kind::Float, -4.f, 4.f},
+    {"reno_mvec_scale_y", offsetof(MochizukiNrControls, reno_mvec_scale_y), ControlField::Kind::Float, -4.f, 4.f},
+    // What the network is shown, which is where an over-bright film turns waxy.
+    {"preprocess", offsetof(MochizukiNrControls, preprocess), ControlField::Kind::Uint, 0.f, 1.f},
+    {"preprocess_exposure", offsetof(MochizukiNrControls, preprocess_exposure), ControlField::Kind::Uint, 0.f, 2.f},
+    {"preprocess_curve", offsetof(MochizukiNrControls, preprocess_curve), ControlField::Kind::Uint, 0.f, 6.f},
+    {"preprocess_contrast", offsetof(MochizukiNrControls, preprocess_contrast), ControlField::Kind::Float, 0.5f, 2.f},
+    {"preprocess_saturation", offsetof(MochizukiNrControls, preprocess_saturation), ControlField::Kind::Float, 0.05f, 2.f},
+    {"preprocess_bias_ev", offsetof(MochizukiNrControls, preprocess_bias_ev), ControlField::Kind::Float, -8.f, 8.f},
+    // The model's own picture controls, repeated here so one override list can
+    // carry a whole experiment instead of half of it.
+    {"intensity", offsetof(MochizukiNrControls, intensity), ControlField::Kind::Float, 0.f, 2.f},
+    {"style", offsetof(MochizukiNrControls, style), ControlField::Kind::Uint, 0.f, 2.f},
+    {"local_tone", offsetof(MochizukiNrControls, local_tone), ControlField::Kind::Float, 0.f, 2.f},
+    {"local_structure", offsetof(MochizukiNrControls, local_structure), ControlField::Kind::Float, 0.f, 2.f},
+    {"skin_structure", offsetof(MochizukiNrControls, skin_structure), ControlField::Kind::Float, -1.f, 2.f},
+    {"automatic_mask", offsetof(MochizukiNrControls, automatic_mask), ControlField::Kind::Bool, 0.f, 1.f},
+    {"max_ratio", offsetof(MochizukiNrControls, max_ratio), ControlField::Kind::Float, 1.f, 8.f},
+    {"history_strength", offsetof(MochizukiNrControls, history_strength), ControlField::Kind::Float, 0.f, 1.f},
+    {"white_point", offsetof(MochizukiNrControls, white_point), ControlField::Kind::Float, 0.01f, 100.f},
+    {"noise_every_frame", offsetof(MochizukiNrControls, noise_every_frame), ControlField::Kind::Bool, 0.f, 1.f},
+    {"max_passes", offsetof(MochizukiNrControls, max_passes), ControlField::Kind::Uint, 0.f, 30.f},
+    {"linear_input", offsetof(MochizukiNrControls, linear_input), ControlField::Kind::Uint, 0.f, 2.f},
+    {"compact_transfer", offsetof(MochizukiNrControls, compact_transfer), ControlField::Kind::Bool, 0.f, 1.f},
+    {"classic_scaler", offsetof(MochizukiNrControls, classic_scaler), ControlField::Kind::Uint, 0.f, 3.f},
+};
+
+// Applies the `name=value` pairs to a struct that has already been seeded (from
+// GetControlDefaults, or zeroed). Returns the names it did not know, in the order
+// they were given, so the caller can say so once: a typo that silently rendered
+// the default is worse than a line in the log.
+inline std::vector<std::string> ApplyControlFields(
+    MochizukiNrControls& controls, const std::vector<std::pair<std::string, double>>& values)
+{
+    std::vector<std::string> unknown;
+    for (const auto& [name, value] : values) {
+        const ControlField* field = nullptr;
+        for (const ControlField& candidate : kControlFields)
+            if (name == candidate.name) { field = &candidate; break; }
+        if (field == nullptr) {
+            unknown.push_back(name);
+            continue;
+        }
+        if (!std::isfinite(value)) continue;
+        auto* base = reinterpret_cast<uint8_t*>(&controls) + field->offset;
+        const double clamped = std::clamp(value, double(field->low), double(field->high));
+        switch (field->kind) {
+        case ControlField::Kind::Float:
+            *reinterpret_cast<float*>(base) = static_cast<float>(clamped);
+            break;
+        case ControlField::Kind::Uint:
+            *reinterpret_cast<uint32_t*>(base) = static_cast<uint32_t>(std::llround(clamped));
+            break;
+        case ControlField::Kind::Bool:
+            *reinterpret_cast<uint32_t*>(base) = clamped != 0.0 ? 1u : 0u;
+            break;
+        }
+    }
+    return unknown;
 }
 
 } // namespace amd_mochizuki

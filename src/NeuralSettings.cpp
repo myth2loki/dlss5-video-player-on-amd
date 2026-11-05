@@ -29,11 +29,12 @@ std::wstring AbsoluteIni(const std::filesystem::path& ini)
     return (error ? ini : absolute).wstring();
 }
 
-std::optional<std::wstring> ReadKey(const std::wstring& path, const wchar_t* key)
+std::optional<std::wstring> ReadKey(const std::wstring& section, const std::wstring& path,
+                              const wchar_t* key)
 {
     constexpr wchar_t sentinel[] = L"\x01";
     wchar_t buffer[128]{};
-    const DWORD length = GetPrivateProfileStringW(kSection, key, sentinel, buffer,
+    const DWORD length = GetPrivateProfileStringW(section.c_str(), key, sentinel, buffer,
                                                   static_cast<DWORD>(std::size(buffer)),
                                                   path.c_str());
     if (std::wstring_view(buffer, length) == sentinel) return std::nullopt;
@@ -43,7 +44,7 @@ std::optional<std::wstring> ReadKey(const std::wstring& path, const wchar_t* key
 bool ReadFloat(const std::wstring& path, const wchar_t* key, float& value, float low,
                float high)
 {
-    const auto text = ReadKey(path, key);
+    const auto text = ReadKey(kSection, path, key);
     if (!text) return false;
     wchar_t* end = nullptr;
     const double parsed = std::wcstod(text->c_str(), &end);
@@ -54,7 +55,7 @@ bool ReadFloat(const std::wstring& path, const wchar_t* key, float& value, float
 
 bool ReadInt(const std::wstring& path, const wchar_t* key, int& value, int low, int high)
 {
-    const auto text = ReadKey(path, key);
+    const auto text = ReadKey(kSection, path, key);
     if (!text) return false;
     wchar_t* end = nullptr;
     const long parsed = std::wcstol(text->c_str(), &end, 10);
@@ -118,6 +119,7 @@ bool LoadNeuralSettings(const std::filesystem::path& ini, NeuralSettings& settin
         ReadInt(path, L"Style", settings.style, 0, 2),
         ReadBool(path, L"AutoMask", settings.autoMask),
         ReadInt(path, L"Passes", settings.passes, 1, kMaxNeuralPasses),
+        ReadInt(path, L"Route", settings.route, 0, 1),
         ReadBool(path, L"ChainedHistory", settings.chainedHistory),
     };
     // The migration of a pre-Off value: see skin_structure. The next save
@@ -139,9 +141,63 @@ bool SaveNeuralSettings(const std::filesystem::path& ini, const NeuralSettings& 
         WriteKey(path, L"Style", std::to_string(settings.style)),
         WriteKey(path, L"AutoMask", settings.autoMask ? "1" : "0"),
         WriteKey(path, L"Passes", std::to_string(settings.passes)),
+        WriteKey(path, L"Route", std::to_string(settings.route)),
         WriteKey(path, L"ChainedHistory", settings.chainedHistory ? "1" : "0"),
     };
     return std::ranges::all_of(written, [](bool value) { return value; });
+}
+
+namespace {
+// The [RenoDX] keys are ASCII; widen to the wide string the profile API wants.
+std::wstring WideKey(const char* key)
+{
+    std::wstring wide;
+    for (const char* p = key; *p; ++p) wide.push_back(static_cast<wchar_t>(*p));
+    return wide;
+}
+} // namespace
+
+bool LoadRenoDxSettings(const std::filesystem::path& ini, RenoDxSettings& settings)
+{
+    const std::wstring path = AbsoluteIni(ini);
+    settings = RenoDxSettings{}; // start at every default
+    bool any = false;
+    for (int i = 0; i < RenoDxSettings::Count; ++i) {
+        const std::wstring key = WideKey(RenoDxSettings::kIniKey[i]);
+        const auto text = ReadKey(L"RenoDX", path, key.c_str());
+        if (!text) continue;
+        any = true;
+        wchar_t* end = nullptr;
+        const double parsed = std::wcstod(text->c_str(), &end);
+        if (end && end != text->c_str() && std::isfinite(parsed))
+            settings.value[i] =
+                std::clamp(parsed, RenoDxSettings::kLow[i], RenoDxSettings::kHigh[i]);
+    }
+    return any;
+}
+
+bool SaveRenoDxSettings(const std::filesystem::path& ini, const RenoDxSettings& settings)
+{
+    const std::wstring path = AbsoluteIni(ini);
+    bool ok = true;
+    for (int i = 0; i < RenoDxSettings::Count; ++i) {
+        const std::wstring key = WideKey(RenoDxSettings::kIniKey[i]);
+        // A knob at the look a fresh profile starts at is left out entirely:
+        // the starting look is compiled in (RenoDxSettings::kStart), so writing
+        // it would only pin a value the build already carries, and the section
+        // stays as sparse as the user's own deviations. Deleting the key
+        // (nullptr) is what keeps "the section is empty" exact - it means "this
+        // profile never moved a knob", which is what the first-time migration
+        // keys off.
+        if (std::fabs(settings.value[i] - RenoDxSettings::kStart[i]) > 1e-6) {
+            wchar_t number[32]{};
+            swprintf_s(number, L"%.2f", settings.value[i]);
+            ok &= WritePrivateProfileStringW(L"RenoDX", key.c_str(), number, path.c_str()) != FALSE;
+        } else {
+            ok &= WritePrivateProfileStringW(L"RenoDX", key.c_str(), nullptr, path.c_str()) != FALSE;
+        }
+    }
+    return ok;
 }
 
 std::string CanonicalNeuralSettings(const NeuralSettings& settings)

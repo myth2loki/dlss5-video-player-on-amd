@@ -126,6 +126,12 @@ public:
     // from GetControlDefaults (see the .cpp). 0 until probed, and 0 when the
     // runtime exports no control surface at all.
     uint32_t MochizukiControlsSize();
+    // The package's own values for the whole accepted struct, straight from
+    // GetControlDefaults. The fields this host does not expose are only "default"
+    // at the values the runtime itself reports - a zeroed struct asks for
+    // something else (RenoDX look at 0 instead of 1, no chained history, a pass
+    // count of 0). False when the runtime exports no control surface.
+    bool MochizukiControlDefaults(MochizukiNrControls& out);
     // What the session is doing: extents, passes, the last build's duration, and
     // whether the ACO import actually took rather than being merely requested.
     bool Info(MochizukiNrInfo& out) const;

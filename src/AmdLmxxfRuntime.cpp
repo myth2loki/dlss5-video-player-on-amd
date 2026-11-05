@@ -468,6 +468,24 @@ uint32_t Runtime::MochizukiControlsSize()
     return 0;
 }
 
+bool Runtime::MochizukiControlDefaults(MochizukiNrControls& out)
+{
+    out = MochizukiNrControls{};
+    const uint32_t size = MochizukiControlsSize();
+    if (size == 0 || mochizukiGetControlDefaults_ == nullptr) return false;
+    // The payload is the package's own size, with its own struct_size stamped in:
+    // the export refuses any other value, the same exact-size contract SetControls
+    // obeys below.
+    std::vector<uint8_t> payload(size, 0);
+    std::memcpy(payload.data(), &size, sizeof(size));
+    if (mochizukiGetControlDefaults_(reinterpret_cast<MochizukiNrControls*>(payload.data())) !=
+        static_cast<int32_t>(LMXXF_NR_OK))
+        return false;
+    std::memcpy(&out, payload.data(), std::min<size_t>(sizeof(out), payload.size()));
+    out.struct_size = sizeof(out);
+    return true;
+}
+
 bool Runtime::EnableLogging(bool enabled)
 {
     if (mochizukiSetLogging_ == nullptr) return false;

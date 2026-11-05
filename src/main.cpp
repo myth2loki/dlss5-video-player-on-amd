@@ -426,6 +426,12 @@ static constexpr int IDC_NS_MZ_PASSES = 7376;
 // strength measured best for it, and moves the ladder so the pass runs.
 static constexpr int IDC_NS_MZ_PASS2_PRESET = 7378;
 static constexpr int IDC_NS_MZ_PASS3_PRESET = 7379;
+// The RenoDX route as a switch: on hands the frame to the runtime's RenoDX
+// grading layer, off stacks the model (the passes ladder). 7377 sits between the
+// ladder it disables and the two presets it also disables.
+static constexpr int IDC_NS_RENODX = 7377;
+// Opens the RenoDX Settings tool window; greyed while the route is off.
+static constexpr int IDC_NS_RENODX_SETTINGS = 7380;
 // That dialog's block. 7401-7409 are the encoder's, 7501-7510 the export
 // dialog's and the timecode strip's, so this starts past both; the sliders take
 // their readout at id+100 (see CreateAdjustmentRow), which is why the block is
@@ -447,6 +453,38 @@ static constexpr int IDC_PP_P3_MASK = 7615;
 static constexpr int IDC_PP_RESET = 7616;
 static constexpr int IDC_PP_CLOSE = 7617;
 static constexpr int IDC_PP_APPLY = 7618;
+// RenoDX Settings tool window: the twelve knobs of the grading layer, owned by
+// that window alone. 7700+ is clear of the pass window (7600-7618), the neural
+// panel (7300s) and the encoder/export blocks. The sliders take their readout at
+// id+100 (see CreateAdjustmentRow), so the block is laid out with that in mind.
+static constexpr int IDC_RENO_DETAIL = 7700;
+static constexpr int IDC_RENO_DETAIL_RADIUS = 7701;
+static constexpr int IDC_RENO_SHADOWS = 7702;
+static constexpr int IDC_RENO_HIGHLIGHTS = 7703;
+static constexpr int IDC_RENO_COLOUR = 7704;
+static constexpr int IDC_RENO_TONE = 7705;
+static constexpr int IDC_RENO_DETAIL_STABILITY = 7706; // combo 0..2
+static constexpr int IDC_RENO_LOOK_STABILIZE = 7707;   // combo 0..1
+static constexpr int IDC_RENO_STABILIZE_MS = 7708;
+static constexpr int IDC_RENO_PASSES = 7709;           // combo 1..30
+static constexpr int IDC_RENO_MVEC_X = 7710;
+static constexpr int IDC_RENO_MVEC_Y = 7711;
+static constexpr int IDC_RENO_RESET = 7712;
+static constexpr int IDC_RENO_APPLY = 7713;
+static constexpr int IDC_RENO_CLOSE = 7714;
+static constexpr int IDC_RENO_LOOK_MODE = 7715;   // reno_look_mode: the grade's own on/off
+static constexpr int IDC_RENO_ROUTE_NOTE = 7716; // the route's state, the window's first row
+// The later-pass window: one pass at a time, chosen by the slot combo, so the
+// window does not grow with the pass count.
+static constexpr int IDC_RENO_PASS_SLOT = 7720;
+static constexpr int IDC_RENO_PASS_FOLLOW = 7721;
+static constexpr int IDC_RENO_PASS_STYLE = 7722;
+static constexpr int IDC_RENO_PASS_INTENSITY = 7723;
+static constexpr int IDC_RENO_PASS_TONE = 7724;
+static constexpr int IDC_RENO_PASS_RESET = 7725;
+static constexpr int IDC_RENO_PASS_APPLY = 7726;
+static constexpr int IDC_RENO_PASS_CLOSE = 7727;
+static constexpr int IDC_RENO_PASS_OPEN = 7728;
 // The preset strip, the line that says what the preset does, the line that
 // says what Apply will do, and the way across to Image adjustments.
 static constexpr int IDC_NS_PRESET = 7342;
@@ -2517,6 +2555,18 @@ static float ReadSavedFloat(const wchar_t* section, const wchar_t* key, float fa
     return static_cast<float>(value);
 }
 
+// Whether this profile says which NR route it wants. A file written before the
+// route existed does not, and carries the answer in MochizukiOverride instead -
+// which is why the two are read together (see MigrateRouteFromOverrides).
+static bool IniHasNeuralRoute(const std::filesystem::path& settingsPath)
+{
+    constexpr wchar_t sentinel[]=L"\x01";
+    wchar_t text[8]{};
+    const DWORD length=GetPrivateProfileStringW(L"NeuralSettings",L"Route",sentinel,text,
+        static_cast<DWORD>(std::size(text)),settingsPath.c_str());
+    return std::wstring_view(text,length)!=sentinel;
+}
+
 static MochizukiOptions ReadSavedMochizukiOptions(const std::filesystem::path& settingsPath)
 {
     const MochizukiOptions defaults{};
@@ -2552,6 +2602,37 @@ static MochizukiOptions ReadSavedMochizukiOptions(const std::filesystem::path& s
     };
     options.pass2=readPass(L"MochizukiPass2",defaults.pass2);
     options.pass3=readPass(L"MochizukiPass3",defaults.pass3);
+    // Named fields of the Mochizuki control struct this panel has no entry for,
+    // by the header's own member names:
+    //   [AmdNeural] MochizukiOverride=renodx_enabled=1;reno_intensity=1.20
+    // Read as text here and applied by the evaluator, where the struct and its
+    // ranges live, so an unknown name is reported there by name instead of
+    // vanishing in the settings reader. Names and values are ASCII by
+    // construction, which is why this narrows rather than transcodes.
+    {
+        wchar_t text[512]{};
+        const DWORD length=GetPrivateProfileStringW(L"AmdNeural",L"MochizukiOverride",L"",text,
+            static_cast<DWORD>(std::size(text)),settingsPath.c_str());
+        std::string list;
+        list.reserve(length);
+        for(DWORD index=0;index<length;++index){
+            if(text[index]<0x20||text[index]>0x7e)continue;
+            list.push_back(static_cast<char>(text[index]));
+        }
+        size_t start=0;
+        while(start<list.size()){
+            const size_t semi=list.find(';',start);
+            const std::string pair=list.substr(start,
+                semi==std::string::npos?std::string::npos:semi-start);
+            start=(semi==std::string::npos)?list.size():semi+1;
+            const size_t eq=pair.find('=');
+            if(eq==std::string::npos||eq==0||eq+1>=pair.size())continue;
+            char* end=nullptr;
+            const double value=std::strtod(pair.c_str()+eq+1,&end);
+            if(end==pair.c_str()+eq+1||*end!='\0'||!std::isfinite(value))continue;
+            options.overrides.emplace_back(pair.substr(0,eq),value);
+        }
+    }
     return options;
 }
 
@@ -6478,6 +6559,22 @@ private:
         // which is not lmxxf's (see DefaultPassesFor).
         m_neuralSettings.passes=DefaultPassesFor(m_opt.neuralBackend,m_amdNrRuntime);
         LoadNeuralSettings(SettingsPath(),m_neuralSettings);
+        // The route is stored as the choice, not as the overrides it implies:
+        // MochizukiOverride in the ini is for the knobs this panel has no control
+        // for, so the route's four keys are re-derived on every start. The
+        // migration runs first so a profile that predates the key keeps the layer
+        // it was rendering with.
+        m_neuralSettings.route=MigrateRouteFromOverrides(
+            m_neuralSettings.route,IniHasNeuralRoute(SettingsPath()),m_mochizuki);
+        LoadRenoDxSettings(SettingsPath(),m_renoDx);
+        // First time RenoDX is enabled on a profile that predates [RenoDX]: the
+        // measured look (detail 2.00, shadows 0.90, two passes) is what the
+        // settings object already starts at, so this is normally a no-op - it
+        // stays as the one place that says what an empty section under an on
+        // route must look like, so the answer cannot drift from the
+        // constructor's.
+        if(m_neuralSettings.route==1&&m_renoDx.IsEmpty())m_renoDx=RenoDxSettings::MeasuredBaseline();
+        ApplyNeuralRoute(m_mochizuki,m_neuralSettings.route==1,m_renoDx);
         const int mode=static_cast<int>(GetPrivateProfileIntW(L"Comparison",L"Mode",0,SettingsPath().c_str()));
         m_comparison={};
         // The Mix replaced the strength dial and Blend; compare_settings::Migrate reads
@@ -6689,6 +6786,10 @@ private:
             WritePrivateProfileStringW(L"Encoding",L"CacheQuality",std::wstring(rung.begin(),rung.end()).c_str(),SettingsPath().c_str());
         }
         SaveNeuralSettings(SettingsPath(),m_neuralSettings);
+        // The RenoDX layer knobs, owned by [RenoDX] and the RenoDX Settings
+        // window. Written after the neural settings so a single Apply commits
+        // both the route switch and the knobs it gates.
+        SaveRenoDxSettings(SettingsPath(),m_renoDx);
         WritePrivateProfileStringW(L"Comparison",L"Mode",std::to_wstring(static_cast<int>(m_comparison.mode)).c_str(),SettingsPath().c_str());
         WriteIniFloat(L"Comparison",L"Mix",m_comparison.strength);
         WritePrivateProfileStringW(L"Comparison",L"Swap",m_comparison.swap?L"1":L"0",SettingsPath().c_str());
@@ -8107,6 +8208,12 @@ private:
             const int index=int(SendMessageW(ladder,CB_GETCURSEL,0,0));
             if(index!=CB_ERR)passes=std::clamp(index+1,1,4);
         }
+        // Under RenoDX the runtime builds its network for a single pass, so the
+        // later-pass door and the two one-click presets have no subject: the
+        // count is one whatever the ladder says.
+        const bool renoDxRoute=m_opt.neuralBackend==NeuralBackend::Amd&&
+                               m_amdNrRuntime==AmdNrRuntime::Mochizuki&&m_neuralSettings.route==1;
+        if(renoDxRoute)passes=1;
         if(HWND button=GetDlgItem(h,IDC_NS_MZ_PASSES))
             ShowWindow(button,passes>=2?SW_SHOW:SW_HIDE);
         // Two passes show one column, three show two. A window built for the
@@ -8137,6 +8244,8 @@ private:
         // Two items, index = value: 0 is the 310.8.0 network and 1 the small
         // one, so unlike the pass ladder above there is no offset to get wrong.
         select(IDC_NS_MZ_NETWORK,m_mochizuki.networkModel>1?0:int(m_mochizuki.networkModel));
+        // Two items, index = value, like the network combo above.
+        SetCheckBoxState(GetDlgItem(h,IDC_NS_RENODX),m_neuralSettings.route==1);
         // The combo lists 1..4 and the setting IS the pass count, so the
         // index is one below it.
         // The AMD combo's first rung is the Small model rather than a pass
@@ -8151,7 +8260,7 @@ private:
         // an empty combo, and one at two showed "3 passes".
         if(m_opt.neuralBackend==NeuralBackend::Amd)
             select(IDC_NS_PASSES,m_amdNrRuntime==AmdNrRuntime::Mochizuki
-                                     ?std::clamp(m_neuralSettings.passes,1,3)-1
+                                     ?(m_neuralSettings.route==1?0:std::clamp(m_neuralSettings.passes,1,3)-1)
                                      :(m_amdSmallModel?0:std::clamp(m_neuralSettings.passes,1,3)));
         else
             select(IDC_NS_PASSES,std::clamp(m_neuralSettings.passes,1,4)-1);
@@ -8199,6 +8308,17 @@ private:
         }
         m_neuralSettings.style=sel(IDC_NS_STYLE,m_neuralSettings.style);
         m_neuralSettings.autoMask=checked(IDC_NS_AUTOMASK);
+        // The route is read before the ladder because it decides what the ladder
+        // means. Under RenoDX the count is not a question the picture asks - the
+        // runtime builds that network for one pass - and the combo is greyed; a
+        // greyed combo still holds a value, so leaving it to be read would put a
+        // stale 3 into the key of a render that ran once.
+        // The RenoDX switch is the route: on hands the frame to the grading
+        // layer, off stacks the model. Read before the ladder because it decides
+        // what the ladder means.
+        m_neuralSettings.route=checked(IDC_NS_RENODX)?1:0;
+        const bool renoDxRoute=m_neuralSettings.route==1&&m_opt.neuralBackend==NeuralBackend::Amd&&
+                               m_amdNrRuntime==AmdNrRuntime::Mochizuki;
         // Three ladders, three mappings, and reading one with another's rule is
         // silent: a combo three items long read as the four-item lmxxf ladder
         // gives count-1, so picking "3 passes" stored 2, picking "2 passes"
@@ -8209,7 +8329,7 @@ private:
             // No Small rung here, so the index is one below the count. The
             // lmxxf model switch is left alone: it has nothing to do with this
             // runtime and it is still set the way that panel left it.
-            m_neuralSettings.passes=std::clamp(sel(IDC_NS_PASSES,m_neuralSettings.passes-1)+1,1,3);
+            m_neuralSettings.passes=renoDxRoute?1:std::clamp(sel(IDC_NS_PASSES,m_neuralSettings.passes-1)+1,1,3);
         } else if(m_opt.neuralBackend==NeuralBackend::Amd){
             // The AMD ladder's first rung is the Small model: it reads as a single
             // Original pass everywhere below - the stacking switches grey out at
@@ -8275,6 +8395,18 @@ private:
         // the rung comes back when the Small rung is left.
         if(HWND mode=GetDlgItem(h,IDC_NS_TEMPORAL_MODE))
             EnableWindow(mode,m_opt.neuralBackend==NeuralBackend::Amd&&AmdTemporalModeCanRun());
+        // The route greys what belongs to the route it did not take: under
+        // RenoDX the runtime builds the network for a single pass, so the ladder,
+        // the per-pass dialog and the two later-pass presets are all controls
+        // over a count the picture never runs. Under Passes the grading layer is
+        // simply off - it has no control of its own on this panel to grey.
+        const bool renoDxRoute=m_opt.neuralBackend==NeuralBackend::Amd&&
+                               m_amdNrRuntime==AmdNrRuntime::Mochizuki&&m_neuralSettings.route==1;
+        for(const int id:{IDC_NS_PASSES,IDC_NS_MZ_PASSES,IDC_NS_MZ_PASS2_PRESET,IDC_NS_MZ_PASS3_PRESET})
+            if(HWND control=GetDlgItem(h,id))EnableWindow(control,!renoDxRoute);
+        // The RenoDX Settings door opens the only editor of [RenoDX]; its knobs
+        // are inert while the route is off, so the door is too.
+        if(HWND renoBtn=GetDlgItem(h,IDC_NS_RENODX_SETTINGS))EnableWindow(renoBtn,renoDxRoute);
     }
 
     // The persisted guide switches also drive the live (non-cached) guide
@@ -8357,10 +8489,23 @@ private:
     // ones.
     void BuildMochizukiCostGroup(HWND h,int top,int right){
         CreateSettingsGroupHeading(h,L"neural.settings.group_cost",12+top,right,400);
-        // No Small rung: the 0.44 Small network belongs to lmxxf, and a Mochizuki
-        // session handed that rung would run the Original at one pass while the
-        // panel said otherwise.
-        CreateNeuralCombo(h,IDC_NS_PASSES,L"neural.settings.passes",40+top,
+        // The parent question, as a switch rather than a dropdown: on hands the
+        // frame to the runtime's RenoDX grading layer, off stacks the model (the
+        // ladder below). The ladder and the per-pass door are greyed under
+        // RenoDX because that route runs the network once whatever the ladder
+        // says. The knob window it opens is greyed beside the switch it depends
+        // on - RenoDX values do nothing while the route is off.
+        CreateNeuralCheck(h,IDC_NS_RENODX,L"neural.settings.renodx",12+right,38+top,300,L"neural.tip.renodx");
+        {
+            HWND button=DialogControl(h,L"BUTTON",T(L"neural.settings.renodx_open").c_str(),
+                WS_TABSTOP|BS_OWNERDRAW,332+right,36+top,200,26,IDC_NS_RENODX_SETTINGS);
+            AddTip(h,button,L"neural.tip.renodx_open");
+        }
+        // The one line the panel owes the user: the route's knobs are inert
+        // while it is off, so a switch left unchecked does not hide a picture it
+        // did not change. Stays put under both routes so the rule reads either way.
+        DialogControl(h,L"STATIC",T(L"neural.settings.renodx_hint").c_str(),SS_LEFT,12+right,66+top,460,20,0);
+        CreateNeuralCombo(h,IDC_NS_PASSES,L"neural.settings.passes",92+top,
                           {L"1 (single pass)",L"2 passes",L"3 passes"},L"neural.tip.passes",right,170);
         // Right of the ladder, because it is the same question: the count picks
         // how many passes run, this opens the look for the later ones. One door
@@ -8368,17 +8513,17 @@ private:
         // at three, so there is nothing to choose before opening it.
         {
             HWND passes=DialogControl(h,L"BUTTON",T(L"neural.settings.mz_passes").c_str(),WS_TABSTOP|BS_OWNERDRAW,
-                                      832,37+top,150,26,IDC_NS_MZ_PASSES);
+                                      832,89+top,150,26,IDC_NS_MZ_PASSES);
             AddTip(h,passes,L"neural.tip.mz_passes");
         }
         // One click each. Not a dropdown: there is no choice to make - it is
         // "give this pass the look that measured best at its depth", and every
         // value is written at once (docs 15.8).
-        CreateSettingsGroupHeading(h,L"neural.settings.group_later_passes",74+top,right,400);
+        CreateSettingsGroupHeading(h,L"neural.settings.group_later_passes",120+top,right,400);
         {
             const auto preset=[&](int id,const wchar_t* label,const wchar_t* tip,int x){
                 if(HWND button=DialogControl(h,L"BUTTON",T(label).c_str(),WS_TABSTOP|BS_OWNERDRAW,
-                                             x,96+top,236,26,id))
+                                             x,142+top,236,26,id))
                     AddTip(h,button,tip);
             };
             preset(IDC_NS_MZ_PASS2_PRESET,L"neural.settings.mz_pass2_preset",
@@ -8386,25 +8531,25 @@ private:
             preset(IDC_NS_MZ_PASS3_PRESET,L"neural.settings.mz_pass3_preset",
                    L"neural.tip.mz_pass3_preset",right+248);
         }
-        CreateSettingsGroupHeading(h,L"neural.settings.group_mochizuki",130+top,right,400);
+        CreateSettingsGroupHeading(h,L"neural.settings.group_mochizuki",174+top,right,400);
         // Which of the two networks the runtime builds. Its own row above the
         // runtime's sliders because it is the wider question: the two are
         // differently trained models, not two settings of one, and every value
         // below it means something different on each. A combo rather than a
         // check box so the row already reads which release each file comes from.
-        CreateNeuralCombo(h,IDC_NS_MZ_NETWORK,L"neural.settings.mz_network",152+top,
+        CreateNeuralCombo(h,IDC_NS_MZ_NETWORK,L"neural.settings.mz_network",194+top,
                           {L"310.8.0 \u00b7 original (599 weights, dlssnr.bin)",
                            L"310.9.16 \u00b7 small (255 weights, dlssnr-small.bin)"},
                           L"neural.tip.mz_network",right,360);
         // The two sliders the runtime has and the add-on does not.
-        CreateAdjustmentRow(h,IDC_NS_MZ_MAXRATIO,L"neural.settings.mz_maxratio",182+top,L"neural.tip.mz_maxratio",0,right,true,240);
-        CreateAdjustmentRow(h,IDC_NS_MZ_HISTORY,L"neural.settings.mz_history",224+top,L"neural.tip.mz_history",0,right,true,240);
-        CreateNeuralCheck(h,IDC_NS_MZ_APPLY,L"neural.settings.mz_apply",12+right,268+top,300,L"neural.tip.mz_apply");
-        CreateNeuralCheck(h,IDC_NS_MZ_PREPROCESS,L"neural.settings.mz_preprocess",12+right,292+top,330,L"neural.tip.mz_preprocess");
-        CreateNeuralCheck(h,IDC_NS_MZ_INT4,L"neural.settings.mz_int4",12+right,316+top,330,L"neural.tip.mz_int4");
-        CreateSettingsGroupHeading(h,L"neural.settings.group_guides",342+top,right,400);
-        CreateNeuralCheck(h,IDC_NS_GUIDE_MV,L"neural.settings.guide_mv",132+right,368+top,116,L"neural.tip.guide_mv");
-        CreateNeuralCheck(h,IDC_NS_GUIDE_DEPTH,L"neural.settings.guide_depth",252+right,368+top,80,L"neural.tip.guide_depth");
+        CreateAdjustmentRow(h,IDC_NS_MZ_MAXRATIO,L"neural.settings.mz_maxratio",222+top,L"neural.tip.mz_maxratio",0,right,true,240);
+        CreateAdjustmentRow(h,IDC_NS_MZ_HISTORY,L"neural.settings.mz_history",260+top,L"neural.tip.mz_history",0,right,true,240);
+        CreateNeuralCheck(h,IDC_NS_MZ_APPLY,L"neural.settings.mz_apply",12+right,296+top,300,L"neural.tip.mz_apply");
+        CreateNeuralCheck(h,IDC_NS_MZ_PREPROCESS,L"neural.settings.mz_preprocess",12+right,320+top,330,L"neural.tip.mz_preprocess");
+        CreateNeuralCheck(h,IDC_NS_MZ_INT4,L"neural.settings.mz_int4",12+right,344+top,330,L"neural.tip.mz_int4");
+        CreateSettingsGroupHeading(h,L"neural.settings.group_guides",370+top,right,400);
+        CreateNeuralCheck(h,IDC_NS_GUIDE_MV,L"neural.settings.guide_mv",132+right,396+top,116,L"neural.tip.guide_mv");
+        CreateNeuralCheck(h,IDC_NS_GUIDE_DEPTH,L"neural.settings.guide_depth",252+right,396+top,80,L"neural.tip.guide_depth");
     }
 
     void BuildNeuralSettingControls(HWND h){
@@ -8507,7 +8652,9 @@ private:
         // The Mochizuki panel is one row taller than lmxxf's - the two one-click
         // looks for the later passes - so the note and the button row move down
         // with it, and NeuralPanelHeight() grows to match.
-        const int drop=mochizukiColumns?56:0;
+        // Mochizuki's column gained one row (the RenoDX on/off hint) on top of
+        // the two one-click looks, so the note and button row move down with it.
+        const int drop=mochizukiColumns?82:0;
         DialogControl(h,L"STATIC",L"",SS_LEFT|SS_NOPREFIX,16,372+drop,1008,20,IDC_NS_STATE,DialogAnchor::StretchNote);
         DialogControl(h,L"STATIC",T(L"neural.settings.note").c_str(),SS_LEFT,16,396+drop,1008,38,0,DialogAnchor::StretchNote);
         HWND adjust=DialogControl(h,L"BUTTON",T(L"neural.settings.open_adjustments").c_str(),WS_TABSTOP|BS_OWNERDRAW,16,442+drop,170,30,IDC_NS_OPEN_ADJUST,DialogAnchor::BottomLeft);
@@ -8524,8 +8671,11 @@ private:
     // looks), so the window is too, and everything below that row moves with
     // it. Everything that asks for the panel's size goes through here.
     int NeuralPanelHeight() const {
+        // Mochizuki's column is three rows taller than lmxxf's: the two one-click
+        // looks plus the RenoDX on/off hint. Everything that asks for the panel's
+        // size goes through here.
         return (m_opt.neuralBackend==NeuralBackend::Amd&&m_amdNrRuntime==AmdNrRuntime::Mochizuki)
-                   ?kNeuralDesignH+56:kNeuralDesignH;
+                   ?kNeuralDesignH+82:kNeuralDesignH;
     }
 
     // Playback takes it on the next frame (the renderer reads it per frame, and a
@@ -8797,6 +8947,10 @@ private:
     }
 
     void ApplyNeuralSettings(){
+        // Before the save: the route decides the override keys, and a save taken
+        // ahead of it would persist the previous route's answer as if the user
+        // had typed it.
+        ApplyNeuralRoute(m_mochizuki,m_neuralSettings.route==1,m_renoDx);
         SaveVideoSettings();
         WriteAmdTemporalModeToRuntime();
         if(m_liveSession){
@@ -8828,6 +8982,11 @@ private:
             const bool restart=BackendReadsNeuralSettings(m_opt.neuralBackend)||
                                m_temporalSettings.stability!=m_liveRenderSettings.temporal.stability||
                                m_neuralSettings.passes!=m_liveRenderSettings.neural.passes||
+                               // The route is a wider question than the count:
+                               // it decides whether the grading layer runs at all,
+                               // so a session left under the previous one renders
+                               // the other picture until it restarts.
+                               m_neuralSettings.route!=m_liveRenderSettings.neural.route||
                                m_amdSkinProtect!=m_liveRenderSettings.amdSkinProtect||
                                m_amdMultiPassPredict!=m_liveRenderSettings.amdMultiPassPredict||
                                m_amdMultiPassSkip!=m_liveRenderSettings.amdMultiPassSkip||
@@ -8907,6 +9066,7 @@ private:
                 ApplyLiveGuideControls();SyncNeuralSettingControls(h);SaveVideoSettings();SchedulePausedSettingsPreview();return 0;}
             if(id==IDC_NS_APPLY){ApplyNeuralSettings();return 0;}
             if(id==IDC_NS_MZ_PASSES&&code==BN_CLICKED){ShowMochizukiPassSettings();return 0;}
+            if(id==IDC_NS_RENODX_SETTINGS&&code==BN_CLICKED){ShowRenoDxSettings();return 0;}
             if((id==IDC_NS_MZ_PASS2_PRESET||id==IDC_NS_MZ_PASS3_PRESET)&&code==BN_CLICKED){
                 ApplyLaterPassPreset(id==IDC_NS_MZ_PASS3_PRESET?3:2);return 0;}
             if(id==IDC_NS_CLOSE){DestroyWindow(h);return 0;}
@@ -8925,7 +9085,7 @@ private:
             // line is the one mistake this dialog invites, and it is silent.
             if(((id==IDC_NS_STYLE||id==IDC_NS_PASSES||id==IDC_NS_SCENE_CUTS||id==IDC_NS_STABILITY||id==IDC_NS_MP_SKIP||id==IDC_NS_MZ_NETWORK)&&code==CBN_SELCHANGE)||
                ((id==IDC_NS_AUTOMASK||id==IDC_NS_GUIDE_MV||id==IDC_NS_GUIDE_DEPTH||id==IDC_NS_CHAINED||id==IDC_NS_SKIN_PROTECT||id==IDC_NS_MP_PREDICT||
-                 id==IDC_NS_MZ_APPLY||id==IDC_NS_MZ_PREPROCESS||id==IDC_NS_MZ_INT4)&&code==BN_CLICKED)){
+                 id==IDC_NS_MZ_APPLY||id==IDC_NS_MZ_PREPROCESS||id==IDC_NS_MZ_INT4||id==IDC_NS_RENODX)&&code==BN_CLICKED)){
                 // The owner-drawn check boxes do not flip their own check: the
                 // click is only a click until this turns the state over, and
                 // the read below is what carries it into the settings.
@@ -9228,6 +9388,410 @@ private:
         if(m==WM_NCCREATE){auto* cs=reinterpret_cast<CREATESTRUCTW*>(l);a=static_cast<PlayerApp*>(cs->lpCreateParams);SetWindowLongPtrW(h,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(a));}
         else a=reinterpret_cast<PlayerApp*>(GetWindowLongPtrW(h,GWLP_USERDATA));
         return a?a->PassWndProc(h,m,w,l):DefWindowProcW(h,m,w,l);
+    }
+
+    // ---- RenoDX Settings -------------------------------------------------
+    //
+    // The RenoDX grading layer's knobs, in their own tool window because the
+    // neural panel is already full. The dialog is the sole editor of [RenoDX];
+    // it edits a working copy (m_renoWorking) and commits it to the saved
+    // m_renoDx on Apply, discarding it on Close, so the title bar shows an
+    // unsaved mark until Apply. reno_look_mode is the grade's own on/off switch;
+    // Reset returns to the route's measured group (detail 2.00, shadows 0.90)
+    // rather than to package defaults.
+    static constexpr int kRenoDesignW=470,kRenoDesignH=614;
+
+    void ShowRenoDxSettings(){
+        if(m_renoWnd&&IsWindow(m_renoWnd)){ShowWindow(m_renoWnd,SW_SHOWNORMAL);SetForegroundWindow(m_renoWnd);return;}
+        static constexpr const wchar_t* kClassName=L"DLSSVideoRenoDxSettingsClassV1";
+        WNDCLASSW n{};n.lpfnWndProc=RenoWndProcStatic;n.hInstance=GetModuleHandleW(nullptr);n.lpszClassName=kClassName;n.hCursor=LoadCursor(nullptr,IDC_ARROW);n.hbrBackground=DarkDialogBrush();
+        if(!RegisterClassW(&n)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return;
+        m_renoWorking=m_renoDx; // start from the committed set; Close discards nothing committed
+        constexpr DWORD style=(WS_OVERLAPPEDWINDOW&~WS_MAXIMIZEBOX)|WS_VISIBLE;
+        const RECT wr=SettingsWindowRect(kRenoDesignW,kRenoDesignH,style,WS_EX_TOOLWINDOW,ActiveWindowDpi(m_hwnd));
+        const int w=int(wr.right-wr.left),h=int(wr.bottom-wr.top);
+        RECT pr{};GetWindowRect(m_hwnd,&pr);const int pw=int(pr.right-pr.left),ph=int(pr.bottom-pr.top);int x=int(pr.left)+std::max(0,(pw-w)/2),y=int(pr.top)+std::max(0,(ph-h)/2);
+        m_renoWnd=CreateWindowExW(WS_EX_TOOLWINDOW,kClassName,T(L"neural.renodx.title").c_str(),
+            style,x,y,w,h,m_hwnd,nullptr,GetModuleHandleW(nullptr),this);
+    }
+
+    // One column of rows: the look sliders, the three enums (the grade's own
+    // on/off switch, detail stability 0..2, look stabilise 0..1) and the
+    // RenoDX pass count 1..30 - the small integer choices are combos rather than
+    // sliders. The motion-vector scales carry a negative range, so their tracks
+    // run -200..200 (hundredths).
+    //
+    // The first row is the route's own state. The knobs below are only read
+    // while the route is on, and a profile with the route off used to swallow
+    // every one of them in silence: the panel said "applied" and the picture
+    // never moved. The row says which of the two it is, before any knob is
+    // touched.
+    void BuildRenoDxControls(HWND h){
+        using R=RenoDxSettings;
+        CreateSettingsGroupHeading(h,L"neural.renodx.group",12);
+        DialogControl(h,L"STATIC",L"",SS_LEFT,16,32,436,18,IDC_RENO_ROUTE_NOTE);
+        CreateAdjustmentRow(h,IDC_RENO_DETAIL,L"neural.renodx.detail",62,L"neural.tip.renodx_detail");
+        CreateAdjustmentRow(h,IDC_RENO_DETAIL_RADIUS,L"neural.renodx.detail_radius",100,L"neural.tip.renodx_detail_radius");
+        CreateAdjustmentRow(h,IDC_RENO_SHADOWS,L"neural.renodx.shadows",138,L"neural.tip.renodx_shadows");
+        CreateAdjustmentRow(h,IDC_RENO_HIGHLIGHTS,L"neural.renodx.highlights",176,L"neural.tip.renodx_highlights");
+        CreateAdjustmentRow(h,IDC_RENO_COLOUR,L"neural.renodx.colour",214,L"neural.tip.renodx_colour");
+        CreateAdjustmentRow(h,IDC_RENO_TONE,L"neural.renodx.tone",252,L"neural.tip.renodx_tone");
+        // reno_look_mode: the package carries it as a bool (NRLookMode, 0..1) -
+        // the grade itself, on or off. With it off every look knob below is an
+        // identity gain, so the picture does not move at all.
+        CreateNeuralCombo(h,IDC_RENO_LOOK_MODE,L"neural.renodx.look_mode",290,
+            {L"Off",L"On"},L"neural.tip.renodx_look_mode");
+        CreateNeuralCombo(h,IDC_RENO_DETAIL_STABILITY,L"neural.renodx.detail_stability",328,
+            {L"Auto (no-op)",L"Off",L"Always"},L"neural.tip.renodx_detail_stability");
+        CreateNeuralCombo(h,IDC_RENO_LOOK_STABILIZE,L"neural.renodx.look_stabilize",366,
+            {L"Off",L"On"},L"neural.tip.renodx_look_stabilize");
+        CreateAdjustmentRow(h,IDC_RENO_STABILIZE_MS,L"neural.renodx.stabilize_ms",404,L"neural.tip.renodx_stabilize_ms");
+        {
+            const int y=442;
+            DialogControl(h,L"STATIC",T(L"neural.renodx.passes").c_str(),SS_LEFT,16,y,116,20);
+            HWND combo=DialogControl(h,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST,132,y-3,120,200,IDC_RENO_PASSES);
+            for(int p=1;p<=30;++p){const std::wstring s=std::to_wstring(p);SendMessageW(combo,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(s.c_str()));}
+            AddTip(h,combo,L"neural.tip.renodx_passes");
+        }
+        CreateAdjustmentRow(h,IDC_RENO_MVEC_X,L"neural.renodx.mvec_x",480,L"neural.tip.renodx_mvec_x");
+        CreateAdjustmentRow(h,IDC_RENO_MVEC_Y,L"neural.renodx.mvec_y",518,L"neural.tip.renodx_mvec_y");
+        DialogButton(h,L"neural.renodx.pass_open",IDC_RENO_PASS_OPEN,16,566,120,30);
+        DialogButton(h,L"neural.settings.reset",IDC_RENO_RESET,144,566,86,30);
+        DialogButton(h,L"neural.settings.apply",IDC_RENO_APPLY,238,566,122,30,true);
+        DialogButton(h,L"neural.settings.close",IDC_RENO_CLOSE,368,566,86,30);
+        SyncRenoDxControls(h);
+        UpdateRenoRouteNote(h);
+        CaptureSettingsDesignLayout(h);
+    }
+
+    // The route's state, in the RenoDX window's own first row. It is read from
+    // the settings, not from the check box: the route is a setting, and the
+    // check box in the neural panel is only one of the two places it is written.
+    //
+    // Two gates stand between these knobs and the picture, and both used to
+    // swallow the whole panel without a word. The route decides whether the
+    // knobs are read at all; reno_look_mode decides whether the grade itself
+    // runs, and with it off every look gain is an identity - so the rows it
+    // gates are greyed out rather than left looking movable.
+    void UpdateRenoRouteNote(HWND h){
+        if(!h)return;
+        HWND note=GetDlgItem(h,IDC_RENO_ROUTE_NOTE);
+        if(!note)return;
+        const bool routeOn=m_neuralSettings.route==1;
+        const bool gradeOn=m_renoWorking.value[RenoDxSettings::LookMode]!=0;
+        const wchar_t* key=!routeOn?L"neural.renodx.route_off"
+                         :!gradeOn?L"neural.renodx.grade_off"
+                                  :L"neural.renodx.route_on";
+        SetWindowTextW(note,T(key).c_str());
+        InvalidateRect(note,nullptr,TRUE);
+        // The rows the grade gates: detail, radius, shadows, highlights,
+        // colour, tone and the two stabiliser rows. The pass count, the
+        // motion-vector scales and detail stability are not the grade's and
+        // stay live.
+        const bool live=routeOn&&gradeOn;
+        for(const int id:{IDC_RENO_DETAIL,IDC_RENO_DETAIL_RADIUS,IDC_RENO_SHADOWS,
+                          IDC_RENO_HIGHLIGHTS,IDC_RENO_COLOUR,IDC_RENO_TONE,
+                          IDC_RENO_LOOK_STABILIZE,IDC_RENO_STABILIZE_MS}){
+            if(HWND track=GetDlgItem(h,id))EnableWindow(track,live);
+            if(HWND value=GetDlgItem(h,id+100))EnableWindow(value,live);
+        }
+    }
+
+    void UpdateRenoValueLabels(HWND h){
+        using R=RenoDxSettings;
+        SetAdjustmentValue(h,IDC_RENO_DETAIL,PlainValue(float(m_renoWorking.value[R::Detail])));
+        SetAdjustmentValue(h,IDC_RENO_DETAIL_RADIUS,PlainValue(float(m_renoWorking.value[R::DetailRadius])));
+        SetAdjustmentValue(h,IDC_RENO_SHADOWS,PlainValue(float(m_renoWorking.value[R::Shadows])));
+        SetAdjustmentValue(h,IDC_RENO_HIGHLIGHTS,PlainValue(float(m_renoWorking.value[R::Highlights])));
+        SetAdjustmentValue(h,IDC_RENO_COLOUR,PlainValue(float(m_renoWorking.value[R::Colour])));
+        SetAdjustmentValue(h,IDC_RENO_TONE,PlainValue(float(m_renoWorking.value[R::Tone])));
+        SetAdjustmentValue(h,IDC_RENO_STABILIZE_MS,PlainValue(float(m_renoWorking.value[R::StabilizeMs]),L" ms"));
+        SetAdjustmentValue(h,IDC_RENO_MVEC_X,PlainValue(float(m_renoWorking.value[R::MvecScaleX])));
+        SetAdjustmentValue(h,IDC_RENO_MVEC_Y,PlainValue(float(m_renoWorking.value[R::MvecScaleY])));
+    }
+
+    void SyncRenoDxControls(HWND h){
+        using R=RenoDxSettings;
+        SetTrack(h,IDC_RENO_DETAIL,0,200,int(std::lround(m_renoWorking.value[R::Detail]*100.0)));
+        SetTrack(h,IDC_RENO_DETAIL_RADIUS,25,400,int(std::lround(m_renoWorking.value[R::DetailRadius]*100.0)));
+        SetTrack(h,IDC_RENO_SHADOWS,0,200,int(std::lround(m_renoWorking.value[R::Shadows]*100.0)));
+        SetTrack(h,IDC_RENO_HIGHLIGHTS,0,200,int(std::lround(m_renoWorking.value[R::Highlights]*100.0)));
+        SetTrack(h,IDC_RENO_COLOUR,0,200,int(std::lround(m_renoWorking.value[R::Colour]*100.0)));
+        SetTrack(h,IDC_RENO_TONE,0,200,int(std::lround(m_renoWorking.value[R::Tone]*100.0)));
+        SetTrack(h,IDC_RENO_STABILIZE_MS,1000,25000,int(std::lround(m_renoWorking.value[R::StabilizeMs]*100.0)));
+        SetTrack(h,IDC_RENO_MVEC_X,-200,200,int(std::lround(m_renoWorking.value[R::MvecScaleX]*100.0)));
+        SetTrack(h,IDC_RENO_MVEC_Y,-200,200,int(std::lround(m_renoWorking.value[R::MvecScaleY]*100.0)));
+        if(HWND c=GetDlgItem(h,IDC_RENO_DETAIL_STABILITY))SendMessageW(c,CB_SETCURSEL,static_cast<WPARAM>(int(m_renoWorking.value[R::DetailStability])),0);
+        if(HWND c=GetDlgItem(h,IDC_RENO_LOOK_STABILIZE))SendMessageW(c,CB_SETCURSEL,static_cast<WPARAM>(int(m_renoWorking.value[R::LookStabilize])),0);
+        if(HWND c=GetDlgItem(h,IDC_RENO_LOOK_MODE))SendMessageW(c,CB_SETCURSEL,static_cast<WPARAM>(int(m_renoWorking.value[R::LookMode])),0);
+        if(HWND c=GetDlgItem(h,IDC_RENO_PASSES))SendMessageW(c,CB_SETCURSEL,static_cast<WPARAM>(int(m_renoWorking.value[R::RenoPasses])-1),0);
+        UpdateRenoValueLabels(h);
+        RenoMarkDirty(h);
+    }
+
+    void ReadRenoDxControls(HWND h){
+        auto pos=[&](int id)->int{HWND t=GetDlgItem(h,id);return t?int(SendMessageW(t,TBM_GETPOS,0,0)):0;};
+        auto sel=[&](int id,int fallback)->int{HWND c=GetDlgItem(h,id);const int i=c?int(SendMessageW(c,CB_GETCURSEL,0,0)):CB_ERR;return i==CB_ERR?fallback:i;};
+        using R=RenoDxSettings;
+        m_renoWorking.value[R::Detail]=std::clamp(pos(IDC_RENO_DETAIL)/100.0,R::kLow[R::Detail],R::kHigh[R::Detail]);
+        m_renoWorking.value[R::DetailRadius]=std::clamp(pos(IDC_RENO_DETAIL_RADIUS)/100.0,R::kLow[R::DetailRadius],R::kHigh[R::DetailRadius]);
+        m_renoWorking.value[R::Shadows]=std::clamp(pos(IDC_RENO_SHADOWS)/100.0,R::kLow[R::Shadows],R::kHigh[R::Shadows]);
+        m_renoWorking.value[R::Highlights]=std::clamp(pos(IDC_RENO_HIGHLIGHTS)/100.0,R::kLow[R::Highlights],R::kHigh[R::Highlights]);
+        m_renoWorking.value[R::Colour]=std::clamp(pos(IDC_RENO_COLOUR)/100.0,R::kLow[R::Colour],R::kHigh[R::Colour]);
+        m_renoWorking.value[R::Tone]=std::clamp(pos(IDC_RENO_TONE)/100.0,R::kLow[R::Tone],R::kHigh[R::Tone]);
+        m_renoWorking.value[R::DetailStability]=std::clamp(double(sel(IDC_RENO_DETAIL_STABILITY,int(m_renoWorking.value[R::DetailStability]))),R::kLow[R::DetailStability],R::kHigh[R::DetailStability]);
+        m_renoWorking.value[R::LookStabilize]=std::clamp(double(sel(IDC_RENO_LOOK_STABILIZE,int(m_renoWorking.value[R::LookStabilize]))),R::kLow[R::LookStabilize],R::kHigh[R::LookStabilize]);
+        m_renoWorking.value[R::LookMode]=std::clamp(double(sel(IDC_RENO_LOOK_MODE,int(m_renoWorking.value[R::LookMode]))),R::kLow[R::LookMode],R::kHigh[R::LookMode]);
+        m_renoWorking.value[R::StabilizeMs]=std::clamp(pos(IDC_RENO_STABILIZE_MS)/100.0,R::kLow[R::StabilizeMs],R::kHigh[R::StabilizeMs]);
+        m_renoWorking.value[R::RenoPasses]=std::clamp(double(sel(IDC_RENO_PASSES,1)+1),R::kLow[R::RenoPasses],R::kHigh[R::RenoPasses]);
+        m_renoWorking.value[R::MvecScaleX]=std::clamp(pos(IDC_RENO_MVEC_X)/100.0,R::kLow[R::MvecScaleX],R::kHigh[R::MvecScaleX]);
+        m_renoWorking.value[R::MvecScaleY]=std::clamp(pos(IDC_RENO_MVEC_Y)/100.0,R::kLow[R::MvecScaleY],R::kHigh[R::MvecScaleY]);
+        RenoMarkDirty(h);
+    }
+
+    // The title carries an unsaved mark while the working copy differs from what
+    // is saved, so Close's discard is visible before it happens.
+    void RenoMarkDirty(HWND h){
+        // The later-pass window marks the RenoDX window dirty, and that window
+        // may be closed by then.
+        if(!h||!IsWindow(h))return;
+        const bool dirty=m_renoWorking!=m_renoDx;
+        const std::wstring base=T(L"neural.renodx.title");
+        SetWindowTextW(h,(dirty?base+L"  \u2022":base).c_str());
+    }
+
+    LRESULT RenoWndProc(HWND h,UINT m,WPARAM w,LPARAM l){
+        if(LRESULT result=0;SettingsDialogChrome(h,m,w,l,result))return result;
+        switch(m){
+        case WM_CREATE:ApplyDarkTitleBar(h);BuildRenoDxControls(h);return 0;
+        case WM_GETMINMAXINFO:{
+            const RECT wr=SettingsWindowRect(kRenoDesignW,kRenoDesignH,DWORD(GetWindowLongPtrW(h,GWL_STYLE)),DWORD(GetWindowLongPtrW(h,GWL_EXSTYLE)),ActiveWindowDpi(h));
+            auto* mmi=reinterpret_cast<MINMAXINFO*>(l);mmi->ptMinTrackSize={wr.right-wr.left,wr.bottom-wr.top};return 0;
+        }
+        case WM_SIZE:ResizeSettingsChildren(h,kRenoDesignW,kRenoDesignH);return 0;
+        // The route can be turned on in the neural panel while this window is
+        // open, so the row that says which state it is in follows the setting
+        // rather than the moment the window was built.
+        case WM_ACTIVATE:UpdateRenoRouteNote(h);return 0;
+        // A slider reports through WM_HSCROLL: read the working copy, repaint the
+        // readouts, and leave saving to Apply or to the window closing.
+        case WM_HSCROLL:ReadRenoDxControls(h);UpdateRenoValueLabels(h);return 0;
+        case WM_COMMAND:{
+            const int id=LOWORD(w);const int code=HIWORD(w);
+            if(id==IDC_RENO_RESET){
+                m_renoWorking=RenoDxSettings::MeasuredBaseline();
+                SyncRenoDxControls(h);UpdateRenoRouteNote(h);
+                // The pass window edits the same working copy, so a Reset here
+                // has to repaint it or it goes on showing the values it had.
+                if(m_renoPassWnd&&IsWindow(m_renoPassWnd))SyncRenoPassControls(m_renoPassWnd);
+                return 0;}
+            if(id==IDC_RENO_APPLY){
+                ReadRenoDxControls(h);
+                m_renoDx=m_renoWorking;
+                // The route decides whether these knobs are read at all. With it
+                // off, Apply dropped every one of them without a word: the panel
+                // said "applied", the picture never moved, and nothing on screen
+                // said why. The question is asked instead, and the route comes on
+                // with the answer.
+                if(m_neuralSettings.route!=1){
+                    const int answer=MessageBoxW(h,T(L"neural.renodx.apply_needs_route").c_str(),
+                        T(L"neural.renodx.title").c_str(),MB_YESNO|MB_ICONWARNING);
+                    if(answer!=IDYES){RenoMarkDirty(h);return 0;}
+                    m_neuralSettings.route=1;
+                    if(m_neuralWnd&&IsWindow(m_neuralWnd))
+                        SetCheckBoxState(GetDlgItem(m_neuralWnd,IDC_NS_RENODX),true);
+                }
+                LOG("RenoDX applied: route="<<m_neuralSettings.route
+                    <<" detail="<<m_renoDx.value[RenoDxSettings::Detail]
+                    <<" shadows="<<m_renoDx.value[RenoDxSettings::Shadows]
+                    <<" grade="<<m_renoDx.value[RenoDxSettings::LookMode]
+                    <<" passes="<<m_renoDx.value[RenoDxSettings::RenoPasses]);
+                ApplyNeuralSettings();
+                RenoMarkDirty(h);
+                UpdateRenoRouteNote(h);
+                return 0;}
+            if(id==IDC_RENO_PASS_OPEN){ShowRenoPassSettings();return 0;}
+            if(id==IDC_RENO_CLOSE){DestroyWindow(h);return 0;}
+            if((id==IDC_RENO_DETAIL_STABILITY||id==IDC_RENO_LOOK_STABILIZE||id==IDC_RENO_PASSES||id==IDC_RENO_LOOK_MODE)&&code==CBN_SELCHANGE){ReadRenoDxControls(h);UpdateRenoRouteNote(h);return 0;}
+            break;
+        }
+        case WM_CLOSE:DestroyWindow(h);return 0;
+        case WM_DESTROY:SaveVideoSettings();m_settingsDesignLayout.erase(h);ReleaseDialogTips(h);if(h==m_renoWnd)m_renoWnd=nullptr;return 0;
+        }
+        return DefWindowProcW(h,m,w,l);
+    }
+
+    static LRESULT CALLBACK RenoWndProcStatic(HWND h,UINT m,WPARAM w,LPARAM l){
+        PlayerApp* a=nullptr;
+        if(m==WM_NCCREATE){auto* cs=reinterpret_cast<CREATESTRUCTW*>(l);a=static_cast<PlayerApp*>(cs->lpCreateParams);SetWindowLongPtrW(h,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(a));}
+        else a=reinterpret_cast<PlayerApp*>(GetWindowLongPtrW(h,GWLP_USERDATA));
+        return a?a->RenoWndProc(h,m,w,l):DefWindowProcW(h,m,w,l);
+    }
+
+    // ---- RenoDX later passes ----------------------------------------------
+    //
+    // What the second, third and fourth pass of the RenoDX stack does on its
+    // own. The package gives every later pass four things that matter: whether
+    // it inherits pass 1's look, which style it runs in, how strong it is and
+    // how much tone it adds. Left alone it inherits everything, so a pass count
+    // changed the work done and not the picture - the count was real, the
+    // difference was not.
+    //
+    // One pass at a time, chosen by a combo: the window is the same size
+    // whether the stack runs two passes or thirty.
+    static constexpr int kRenoPassDesignW=470,kRenoPassDesignH=286;
+
+    void ShowRenoPassSettings(){
+        if(m_renoPassWnd&&IsWindow(m_renoPassWnd)){ShowWindow(m_renoPassWnd,SW_SHOWNORMAL);SetForegroundWindow(m_renoPassWnd);return;}
+        static constexpr const wchar_t* kClassName=L"DLSSVideoRenoPassClassV1";
+        WNDCLASSW n{};n.lpfnWndProc=RenoPassWndProcStatic;n.hInstance=GetModuleHandleW(nullptr);n.lpszClassName=kClassName;n.hCursor=LoadCursor(nullptr,IDC_ARROW);n.hbrBackground=DarkDialogBrush();
+        if(!RegisterClassW(&n)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return;
+        constexpr DWORD style=(WS_OVERLAPPEDWINDOW&~WS_MAXIMIZEBOX)|WS_VISIBLE;
+        const RECT wr=SettingsWindowRect(kRenoPassDesignW,kRenoPassDesignH,style,WS_EX_TOOLWINDOW,ActiveWindowDpi(m_hwnd));
+        const int w=int(wr.right-wr.left),h=int(wr.bottom-wr.top);
+        RECT pr{};GetWindowRect(m_hwnd,&pr);const int pw=int(pr.right-pr.left),ph=int(pr.bottom-pr.top);int x=int(pr.left)+std::max(0,(pw-w)/2),y=int(pr.top)+std::max(0,(ph-h)/2);
+        m_renoPassWnd=CreateWindowExW(WS_EX_TOOLWINDOW,kClassName,T(L"neural.renodx.pass.title").c_str(),
+            style,x,y,w,h,m_hwnd,nullptr,GetModuleHandleW(nullptr),this);
+    }
+
+    // The four fields of one later pass, by slot: the second, third and fourth
+    // pass of the stack. The package carries three such slots, and a fifth pass
+    // takes the fourth's.
+    static void RenoPassField(int slot,int& follow,int& style,int& intensity,int& tone){
+        using R=RenoDxSettings;
+        const int base=R::PassSlotBase(slot);
+        follow=base;style=base+1;intensity=base+2;tone=base+3;
+    }
+
+    // Which pass the window is showing: 1, 2 or 3 for the second, third and
+    // fourth pass of the stack.
+    int RenoPassSlot(HWND h){
+        if(HWND combo=GetDlgItem(h,IDC_RENO_PASS_SLOT)){
+            const int index=int(SendMessageW(combo,CB_GETCURSEL,0,0));
+            if(index!=CB_ERR)return std::clamp(index+1,1,3);
+        }
+        return 1;
+    }
+
+    void BuildRenoPassControls(HWND h){
+        CreateSettingsGroupHeading(h,L"neural.renodx.pass.group",12);
+        DialogControl(h,L"STATIC",T(L"neural.renodx.pass.note").c_str(),SS_LEFT,16,32,436,32,0,DialogAnchor::StretchNote);
+        CreateNeuralCombo(h,IDC_RENO_PASS_SLOT,L"neural.renodx.pass.slot",72,
+            {L"\u7b2c 2 \u904d",L"\u7b2c 3 \u904d",L"\u7b2c 4 \u904d"},L"neural.tip.renodx_pass_slot",0,300);
+        CreateNeuralCheck(h,IDC_RENO_PASS_FOLLOW,L"neural.renodx.pass.follow",16,106,420,L"neural.tip.renodx_pass_follow");
+        CreateNeuralCombo(h,IDC_RENO_PASS_STYLE,L"neural.renodx.pass.style",134,
+            {L"Default",L"Natural",L"Cinematic"},L"neural.tip.renodx_pass_style",0,300);
+        CreateAdjustmentRow(h,IDC_RENO_PASS_INTENSITY,L"neural.renodx.pass.intensity",166,L"neural.tip.renodx_pass_intensity");
+        CreateAdjustmentRow(h,IDC_RENO_PASS_TONE,L"neural.renodx.pass.tone",208,L"neural.tip.renodx_pass_tone");
+        DialogButton(h,L"neural.settings.reset",IDC_RENO_PASS_RESET,144,238,86,30);
+        DialogButton(h,L"neural.settings.apply",IDC_RENO_PASS_APPLY,238,238,122,30,true);
+        DialogButton(h,L"neural.settings.close",IDC_RENO_PASS_CLOSE,368,238,86,30);
+        SyncRenoPassControls(h);
+        CaptureSettingsDesignLayout(h);
+    }
+
+    void UpdateRenoPassLabels(HWND h){
+        int follow,style,intensity,tone;
+        RenoPassField(RenoPassSlot(h),follow,style,intensity,tone);
+        SetAdjustmentValue(h,IDC_RENO_PASS_INTENSITY,PlainValue(float(m_renoWorking.value[intensity])));
+        SetAdjustmentValue(h,IDC_RENO_PASS_TONE,PlainValue(float(m_renoWorking.value[tone])));
+    }
+
+    // A pass that follows pass 1 has nothing of its own to edit: the runtime
+    // hands it pass 1's style and tone. Its own intensity is the one thing it
+    // still has, so that row stays live.
+    void EnableRenoPassControls(HWND h){
+        int follow,style,intensity,tone;
+        RenoPassField(RenoPassSlot(h),follow,style,intensity,tone);
+        const bool own=m_renoWorking.value[follow]==0;
+        for(const int id:{IDC_RENO_PASS_STYLE,IDC_RENO_PASS_TONE}){
+            if(HWND control=GetDlgItem(h,id))EnableWindow(control,own);
+            if(HWND value=GetDlgItem(h,id+100))EnableWindow(value,own);
+        }
+    }
+
+    void SyncRenoPassControls(HWND h){
+        int follow,style,intensity,tone;
+        RenoPassField(RenoPassSlot(h),follow,style,intensity,tone);
+        SetCheckBoxState(GetDlgItem(h,IDC_RENO_PASS_FOLLOW),m_renoWorking.value[follow]!=0);
+        if(HWND combo=GetDlgItem(h,IDC_RENO_PASS_STYLE))
+            SendMessageW(combo,CB_SETCURSEL,static_cast<WPARAM>(std::clamp(int(m_renoWorking.value[style]),0,2)),0);
+        SetTrack(h,IDC_RENO_PASS_INTENSITY,0,200,int(std::lround(m_renoWorking.value[intensity]*100.0)));
+        SetTrack(h,IDC_RENO_PASS_TONE,0,200,int(std::lround(m_renoWorking.value[tone]*100.0)));
+        UpdateRenoPassLabels(h);
+        EnableRenoPassControls(h);
+    }
+
+    void ReadRenoPassControls(HWND h){
+        using R=RenoDxSettings;
+        int follow,style,intensity,tone;
+        RenoPassField(RenoPassSlot(h),follow,style,intensity,tone);
+        if(HWND box=GetDlgItem(h,IDC_RENO_PASS_FOLLOW))
+            m_renoWorking.value[follow]=CheckBoxState(box)?1.0:0.0;
+        if(HWND combo=GetDlgItem(h,IDC_RENO_PASS_STYLE)){
+            const int index=int(SendMessageW(combo,CB_GETCURSEL,0,0));
+            if(index!=CB_ERR)m_renoWorking.value[style]=double(std::clamp(index,0,2));
+        }
+        const auto slider=[&](int id,int field){
+            if(HWND track=GetDlgItem(h,id))
+                m_renoWorking.value[field]=std::clamp(
+                    double(int(SendMessageW(track,TBM_GETPOS,0,0)))/100.0,
+                    R::kLow[field],R::kHigh[field]);
+        };
+        slider(IDC_RENO_PASS_INTENSITY,intensity);
+        slider(IDC_RENO_PASS_TONE,tone);
+        RenoMarkDirty(m_renoWnd);
+        EnableRenoPassControls(h);
+    }
+
+    LRESULT RenoPassWndProc(HWND h,UINT m,WPARAM w,LPARAM l){
+        if(LRESULT result=0;SettingsDialogChrome(h,m,w,l,result))return result;
+        switch(m){
+        case WM_CREATE:ApplyDarkTitleBar(h);BuildRenoPassControls(h);return 0;
+        case WM_GETMINMAXINFO:{
+            const RECT wr=SettingsWindowRect(kRenoPassDesignW,kRenoPassDesignH,DWORD(GetWindowLongPtrW(h,GWL_STYLE)),DWORD(GetWindowLongPtrW(h,GWL_EXSTYLE)),ActiveWindowDpi(h));
+            auto* mmi=reinterpret_cast<MINMAXINFO*>(l);mmi->ptMinTrackSize={wr.right-wr.left,wr.bottom-wr.top};return 0;
+        }
+        case WM_SIZE:ResizeSettingsChildren(h,kRenoPassDesignW,kRenoPassDesignH);return 0;
+        case WM_HSCROLL:ReadRenoPassControls(h);UpdateRenoPassLabels(h);return 0;
+        case WM_COMMAND:{
+            const int id=LOWORD(w);const int code=HIWORD(w);
+            if(id==IDC_RENO_PASS_RESET){
+                // Back to this pass's place in the starting look, not to the
+                // package's defaults: the package would put it back to
+                // "follow pass 1, standard style, tone 1", which is the look
+                // this build exists to replace.
+                m_renoWorking.ResetPassSlot(RenoPassSlot(h));
+                SyncRenoPassControls(h);
+                RenoMarkDirty(m_renoWnd);
+                return 0;}
+            if(id==IDC_RENO_PASS_APPLY){
+                ReadRenoPassControls(h);
+                m_renoDx=m_renoWorking;
+                ApplyNeuralSettings();
+                RenoMarkDirty(m_renoWnd);
+                return 0;}
+            if(id==IDC_RENO_PASS_CLOSE){DestroyWindow(h);return 0;}
+            if(id==IDC_RENO_PASS_SLOT&&code==CBN_SELCHANGE){SyncRenoPassControls(h);return 0;}
+            // The owner-drawn check box does not flip itself: the click is only
+            // a click until the state is turned over here.
+            if(id==IDC_RENO_PASS_FOLLOW&&code==BN_CLICKED){
+                if(HWND box=GetDlgItem(h,IDC_RENO_PASS_FOLLOW))SetCheckBoxState(box,!CheckBoxState(box));
+                ReadRenoPassControls(h);
+                return 0;}
+            break;
+        }
+        case WM_CLOSE:DestroyWindow(h);return 0;
+        case WM_DESTROY:ReleaseDialogTips(h);if(h==m_renoPassWnd)m_renoPassWnd=nullptr;return 0;
+        }
+        return DefWindowProcW(h,m,w,l);
+    }
+
+    static LRESULT CALLBACK RenoPassWndProcStatic(HWND h,UINT m,WPARAM w,LPARAM l){
+        PlayerApp* a=nullptr;
+        if(m==WM_NCCREATE){auto* cs=reinterpret_cast<CREATESTRUCTW*>(l);a=static_cast<PlayerApp*>(cs->lpCreateParams);SetWindowLongPtrW(h,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(a));}
+        else a=reinterpret_cast<PlayerApp*>(GetWindowLongPtrW(h,GWLP_USERDATA));
+        return a?a->RenoPassWndProc(h,m,w,l):DefWindowProcW(h,m,w,l);
     }
 
     static constexpr int kEncoderDesignW=466,kEncoderDesignH=424;
@@ -12846,8 +13410,23 @@ private:
     // takes the rung from the temporal term instead - hashing the panel there
     // would retire coverage a restart would have rendered identically.
     std::string RetentionKeyFor(const RenderSettings& render)const{
-        return LiveSourceGeometryKey()+"|"+CanonicalNeuralSettingsForBackend(m_opt.neuralBackend,render.neural,render.amdSkinProtect,render.amdMultiPassPredict,render.amdMultiPassSkip,render.amdStyle,render.amdSmallModel,render.amdTemporalMode)+"|"+CanonicalGuideControls(render.guides)+
+        std::string key=LiveSourceGeometryKey()+"|"+CanonicalNeuralSettingsForBackend(m_opt.neuralBackend,render.neural,render.amdSkinProtect,render.amdMultiPassPredict,render.amdMultiPassSkip,render.amdStyle,render.amdSmallModel,render.amdTemporalMode)+"|"+CanonicalGuideControls(render.guides)+
                "|"+CanonicalTemporalSettings(render.temporal);
+        // The Mochizuki look, which the add-on's canonical string does not carry:
+        // the RenoDX route writes its whole look as runtime controls, and the five
+        // look values beside them are copied in when the job is built. Apply
+        // restarts the session on a change to any of them, so a key that ignored
+        // them let the restart adopt the segments the old look rendered - the
+        // change landed, the session came back, and the picture was the one it had
+        // before. Empty at the runtime's defaults, so keys are unchanged for
+        // anyone not using the panel.
+        if(m_opt.neuralBackend==NeuralBackend::Amd&&render.amdNrRuntime==AmdNrRuntime::Mochizuki){
+            const std::string look=MochizukiLookTerm(render.mochizuki,render.neural.intensity,
+                render.neural.localTone,render.neural.localStructure,render.neural.skinStructure,
+                render.neural.autoMask);
+            if(!look.empty())key+="|mz="+look;
+        }
+        return key;
     }
     std::string LiveRetentionKey()const{return RetentionKeyFor(CurrentRenderSettings());}
     // A live session renders with the settings it started with. The dialog
@@ -15784,6 +16363,10 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // two; a change of the ladder while it is open closes it, because a column
     // for a pass the panel no longer runs edits a value nothing reads.
     HWND m_passWnd=nullptr;
+    // The RenoDX Settings tool window, the sole editor of [RenoDX] (see
+    // RenoDxSettings). Null while closed; the dialog edits a working copy and
+    // commits it to m_renoDx on Apply, discarding it on Close.
+    HWND m_renoWnd=nullptr;
     int m_passColumns=3;
     int m_passDesignW=1040;
     // Tooltip host per settings dialog, and the strings each host points at:
@@ -15922,6 +16505,16 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // runtime reads it; the look knobs it shares with NVIDIA live in
     // m_neuralSettings and are copied in when a job is built.
     MochizukiOptions m_mochizuki{};
+    // The twelve RenoDX layer knobs. m_renoDx is the committed (saved) set the
+    // render reads through MochizukiOptions::overrides; m_renoWorking is the
+    // RenoDX Settings window's scratch, committed on Apply and discarded on
+    // Close, so the title bar can show an unsaved mark until Apply.
+    RenoDxSettings m_renoDx{};
+    RenoDxSettings m_renoWorking{};
+    // The later-pass window edits the same working copy the RenoDX Settings
+    // window does, so the two share one commit point: its Apply writes the
+    // working copy out, the RenoDX window's Apply writes the same one.
+    HWND m_renoPassWnd=nullptr;
     // The preset the Look settings were last taken from, so Custom can say
     // which one it departed from. kPresetCount when none is known yet.
     size_t m_lastNeuralPreset=neural_presets::kPresetCount;
@@ -16507,6 +17100,17 @@ static int RunRenderCommand(const render_command::Parsed& parsed,const std::vect
         // The same saved values the interactive path reads, so an export renders
         // what the panel showed.
         job.mochizuki=ReadSavedMochizukiOptions(settings);
+        // The saved route, and the same migration the interactive path runs: an
+        // export renders the route the panel is set to, which is what makes the
+        // two paths one picture. Applied here rather than inside
+        // ReadSavedMochizukiOptions because the route lives in [NeuralSettings]
+        // and that reader only sees the Mochizuki keys.
+        const int route=MigrateRouteFromOverrides(neuralSettings.route,IniHasNeuralRoute(settings),
+                                                 job.mochizuki);
+        RenoDxSettings reno{};
+        LoadRenoDxSettings(settings,reno);
+        if(route==1&&reno.IsEmpty())reno=RenoDxSettings::MeasuredBaseline();
+        ApplyNeuralRoute(job.mochizuki,route==1,reno);
         // The look knobs come from the settings this export already resolved
         // (the preset or the file, then any command-line override), so an export
         // renders the look the panel would render.

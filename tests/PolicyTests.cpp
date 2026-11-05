@@ -20,6 +20,11 @@
 // The Mochizuki panel's wire format and the AMD key it writes into
 // (NeuralRenderTypes.h, NeuralStabilitySettings.h).
 #include "NeuralStabilitySettings.h"
+// The control table the named overrides are written through: the per-pass
+// settings are only delivered if their names are in it. The controls struct
+// comes with it, because the table's entries are offsets into it.
+#include "../third_party/mochizuki/MochizukiNrControls.h"
+#include "AmdMochizukiApi.h"
 #include "GpuPreference.h"
 #include "ReShadeConfig.h"
 #include "Localization.h"
@@ -16817,8 +16822,295 @@ void mochizuki_options_wire_and_key_test()
     CHECK(lmxxfKey != plainDefault);
 }
 
+// The RenoDX Settings dialog owns exactly one ini section, [RenoDX], one key per
+// knob, and the migration target it first fills and Reset always returns to.
+// These cases pin the three promises the UI makes: what hits the disk survives a
+// restart unchanged, a knob left at its package default is never pinned into the
+// file, and the route's override set is exactly the knobs moved from default -
+// so the render, the dialog and `--render` all mean the same picture by
+// "RenoDX" and the cache key does not change when nothing did.
+void renodx_settings_dialog_test()
+{
+    using RS = RenoDxSettings;
+    const auto find = [](const MochizukiOptions& o, std::string_view key) {
+        for (const auto& e : o.overrides)
+            if (e.first == key) return std::optional<double>(e.second);
+        return std::optional<double>{};
+    };
+
+    // The measured group the route migrates into and Reset returns to: detail
+    // 2.00 buys back the texture the grading layer smooths away, shadows 0.90
+    // keeps the dark end from lifting, every other knob at its package default.
+    const RS baseline = RS::MeasuredBaseline();
+    // The look that was tuned in the player and swept on the calibration clip,
+    // which is also where a fresh profile starts and what Reset returns to.
+    CHECK_EQ(baseline.value[RS::Detail], 2.00);
+    CHECK_EQ(baseline.value[RS::Shadows], 0.90);
+    CHECK_EQ(baseline.value[RS::RenoPasses], 2.00);
+    // The stabiliser, on by default: Auto is a measured no-op in this player.
+    CHECK_EQ(baseline.value[RS::DetailStability], 2.00);
+    // The second pass does its own thing: follow off, natural style, full
+    // strength, tone 0 (tone compounds when it is re-applied every pass).
+    CHECK_EQ(baseline.value[RS::Pass2Follow], 0.00);
+    CHECK_EQ(baseline.value[RS::Pass2Style], 1.00);
+    CHECK_EQ(baseline.value[RS::Pass2Intensity], 1.00);
+    CHECK_EQ(baseline.value[RS::Pass2Tone], 0.00);
+    // The third and fourth run at half strength, and follow off as well.
+    CHECK_EQ(baseline.value[RS::Pass3Follow], 0.00);
+    CHECK_EQ(baseline.value[RS::Pass3Intensity], 0.50);
+    CHECK_EQ(baseline.value[RS::Pass4Follow], 0.00);
+    CHECK_EQ(baseline.value[RS::Pass4Intensity], 0.50);
+    // A Reset inside the per-pass window restores ONE slot, and it restores this
+    // look's slot - not the package's. The package's slot is "follow pass 1,
+    // standard style, strength 1, tone 1", which is the look this build exists
+    // to replace (and tone 1 compounds across passes on the next Apply). This
+    // caught the window resetting a slot to kDefault.
+    for (int slot = 1; slot <= 3; ++slot) {
+        RS wiped{};
+        for (int k = 0; k < 4; ++k) wiped.value[RS::PassSlotBase(slot) + k] = 99.0;
+        wiped.value[RS::Detail] = 98.0; // a knob outside every slot
+        wiped.ResetPassSlot(slot);
+        for (int k = 0; k < 4; ++k) {
+            const int index = RS::PassSlotBase(slot) + k;
+            CHECK_EQ(wiped.value[index], RS::kStart[index]);
+            CHECK_EQ(wiped.value[index], baseline.value[index]);
+        }
+        CHECK_EQ(wiped.value[RS::Detail], 98.0); // and it moved nothing else
+    }
+    // The slots really are four contiguous fields apart, and slot 1 is the
+    // second pass of the stack.
+    CHECK_EQ(RS::PassSlotBase(1), int(RS::Pass2Follow));
+    CHECK_EQ(RS::PassSlotBase(2) - RS::PassSlotBase(1), 4);
+    CHECK_EQ(RS::PassSlotBase(3) + 3, int(RS::Pass4Tone));
+    // The starting value of a slot is not the package's.
+    CHECK_EQ(RS::kStart[RS::PassSlotBase(1) + 3], 0.00); // tone
+    CHECK(RS::kStart[RS::PassSlotBase(1) + 1] != RS::kDefault[RS::Pass2Style]);
+    CHECK(RS::kStart[RS::PassSlotBase(1)] != RS::kDefault[RS::Pass2Follow]);
+    // A fresh settings object IS that look, so it counts as "never moved" and a
+    // profile sitting on it records nothing in [RenoDX].
+    CHECK(baseline == RS{});
+    CHECK(baseline.IsEmpty());
+    for (int i = 0; i < RS::Count; ++i) CHECK_EQ(RS::kStart[i], baseline.value[i]);
+    // But it is a real look, not the package's identity: the knobs it moves away
+    // from kDefault are exactly the ones ApplyNeuralRoute writes into the render.
+    // (If kDefault were also the start, they would read as "unset" and the panel
+    // would show a grade the picture never had.)
+    CHECK(baseline.value[RS::Detail] != RS::kDefault[RS::Detail]);
+    CHECK(baseline.value[RS::Shadows] != RS::kDefault[RS::Shadows]);
+    CHECK(baseline.value[RS::RenoPasses] != RS::kDefault[RS::RenoPasses]);
+    CHECK(baseline.value[RS::Pass2Follow] != RS::kDefault[RS::Pass2Follow]);
+    CHECK(baseline.value[RS::Pass2Style] != RS::kDefault[RS::Pass2Style]);
+    CHECK(baseline.value[RS::Pass2Tone] != RS::kDefault[RS::Pass2Tone]);
+    // The knobs it leaves at the package's own value stay unwritten.
+    CHECK_EQ(baseline.value[RS::DetailRadius], RS::kDefault[RS::DetailRadius]);
+    CHECK_EQ(baseline.value[RS::Colour], RS::kDefault[RS::Colour]);
+
+    // The package's own table (MochizukiRenoOptions.inc): every default and
+    // range here is the runtime's, so the panel cannot say one thing and the
+    // render do another. These numbers were wrong once - detail stability 1
+    // instead of 0, a stabilise window of 0 ms instead of 60, motion-vector
+    // scales out to 4 instead of 2 - and the runtime clamped them silently.
+    CHECK_EQ(RS::kDefault[RS::Detail], 1.00);
+    CHECK_EQ(RS::kDefault[RS::DetailRadius], 1.00);
+    CHECK_EQ(RS::kDefault[RS::DetailStability], 0.00);  // auto
+    CHECK_EQ(RS::kDefault[RS::LookStabilize], 0.00);
+    CHECK_EQ(RS::kDefault[RS::StabilizeMs], 60.00);
+    CHECK_EQ(RS::kDefault[RS::RenoPasses], 1.00);
+    CHECK_EQ(RS::kDefault[RS::MvecScaleX], 1.00);
+    CHECK_EQ(RS::kDefault[RS::MvecScaleY], 1.00);
+    CHECK_EQ(RS::kDefault[RS::LookMode], 1.00);         // the route forces the grade on
+    CHECK_EQ(RS::kLow[RS::DetailRadius], 0.25);
+    CHECK_EQ(RS::kLow[RS::StabilizeMs], 10.0);
+    CHECK_EQ(RS::kHigh[RS::StabilizeMs], 250.0);
+    CHECK_EQ(RS::kLow[RS::MvecScaleX], -2.0);
+    CHECK_EQ(RS::kHigh[RS::MvecScaleX], 2.0);
+    CHECK_EQ(RS::kLow[RS::MvecScaleY], -2.0);
+    CHECK_EQ(RS::kHigh[RS::MvecScaleY], 2.0);
+    // reno_look_mode is a bool in the package (NRLookMode): a 0..3 selector
+    // would be clamped by the runtime, so the panel would offer a choice the
+    // runtime never sees.
+    CHECK_EQ(RS::kLow[RS::LookMode], 0.0);
+    CHECK_EQ(RS::kHigh[RS::LookMode], 1.0);
+
+    // Reset / migration shape: a copy compares equal, and moving a single knob
+    // flips the unsaved mark (the window title's "•").
+    CHECK(baseline == RS::MeasuredBaseline());
+    RS tweaked = baseline;
+    tweaked.value[RS::Detail] = 1.50;
+    CHECK(baseline != tweaked);
+    CHECK(!tweaked.IsEmpty());
+
+    // Persistence round-trip against a throwaway profile: the knob that moved
+    // survives a restart, and every knob sitting on the starting look is left
+    // out of the file.
+    const std::filesystem::path ini = std::filesystem::temp_directory_path() /
+        (L"PolicyTests-RenoDx-" + std::to_wstring(GetCurrentProcessId()) + L".ini");
+    std::error_code ec;
+    std::filesystem::remove(ini, ec);
+    CHECK(SaveRenoDxSettings(ini, tweaked));
+    RS loaded{};
+    CHECK(LoadRenoDxSettings(ini, loaded)); // the moved key was written
+    CHECK(loaded == tweaked);               // survives a restart byte-for-byte
+    CHECK_EQ(loaded.value[RS::Detail], 1.50);
+    CHECK_EQ(loaded.value[RS::Shadows], 0.90); // never written, still the start
+
+    // Sparseness: a profile at the starting look writes nothing at all, so
+    // [RenoDX] carries only what the user moved and "empty means never moved"
+    // stays exact.
+    CHECK(SaveRenoDxSettings(ini, RS{}));
+    RS back{};
+    CHECK(!LoadRenoDxSettings(ini, back)); // nothing written -> nothing found
+    CHECK(back.IsEmpty());
+    CHECK(back == RS{});
+
+    // Load-time clamp: a hand-edited or out-of-range value is pinned to range
+    // rather than refused, so a corrupted [RenoDX] cannot push a knob past what
+    // the control struct allows.
+    RS clamped{};
+    {
+        RS src = baseline;
+        src.value[RS::Detail] = 99.0; // outside [0.0, 2.0]
+        CHECK(SaveRenoDxSettings(ini, src));
+        CHECK(LoadRenoDxSettings(ini, clamped));
+    }
+    CHECK_EQ(clamped.value[RS::Detail], RS::kHigh[RS::Detail]); // pinned to 2.0
+    CHECK_EQ(clamped.value[RS::Shadows], 0.90);                // the good key unchanged
+
+    // The route spells itself as control overrides so the dialog, a live session
+    // and `--render` agree. On, it writes renodx_enabled + reno_look_mode plus
+    // every knob the starting look moves away from the package: detail, shadows,
+    // detail stability, the pass count and eleven of the twelve later-pass fields
+    // (the second pass's strength is the package's own 1.00, so it stays
+    // unwritten).
+    MochizukiOptions on;
+    ApplyNeuralRoute(on, true, baseline);
+    CHECK_EQ(on.overrides.size(), 17u);
+    CHECK_EQ(find(on, "renodx_enabled").value_or(0), 1.0);
+    CHECK_EQ(find(on, "reno_look_mode").value_or(0), 1.0);
+    CHECK_EQ(find(on, "reno_look_detail").value_or(0), 2.0);
+    CHECK_EQ(find(on, "reno_look_shadows").value_or(0), 0.9);
+    CHECK_EQ(find(on, "reno_passes").value_or(0), 2.0);
+    // Always, not the package's Auto: Auto is a no-op here (no AFTER_UPSCALE
+    // frame flag is ever sent), so the start has to say Always out loud or the
+    // stacked passes flicker. It has to be WRITTEN for that to reach the render.
+    CHECK_EQ(find(on, "reno_detail_stability").value_or(-1), 2.0);
+    // The knobs the starting look leaves at the package's own value are not
+    // pinned, so the package stays free to change them.
+    CHECK(find(on, "reno_look_colour") == std::nullopt);
+    // Applied twice it does not duplicate - the dialog's Apply and the offline
+    // assembly both run it, and a doubled key would double the cache term.
+    MochizukiOptions onAgain = on;
+    ApplyNeuralRoute(onAgain, true, baseline);
+    CHECK(onAgain.overrides == on.overrides);
+
+    // The live session's retention key has to carry the look, because the
+    // add-on's canonical settings string cannot say what this route did. Without
+    // it, Apply restarts the session, the restart finds the key it had before
+    // and adopts the segments the OLD look rendered - measured 2026-11-05:
+    // stability Always -> Off restarted at 28.9 s and the next stop still
+    // reported coverage from 4.13 s. Empty at the runtime's defaults so a
+    // profile that never moved anything keeps byte-identical keys.
+    MochizukiOptions untouched;
+    CHECK(MochizukiLookTerm(untouched, 1.0f, 1.0f, 1.0f, -1.0f, true).empty());
+    const std::string routeTerm = MochizukiLookTerm(on, 1.0f, 1.0f, 1.0f, -1.0f, true);
+    CHECK(!routeTerm.empty());
+    CHECK(routeTerm.find("reno_look_detail") != std::string::npos);
+    // A look move the panel offers must produce a different term...
+    RS stabilityOff = baseline;
+    stabilityOff.value[RS::DetailStability] = 1.00;
+    MochizukiOptions moved;
+    ApplyNeuralRoute(moved, true, stabilityOff);
+    CHECK(MochizukiLookTerm(moved, 1.0f, 1.0f, 1.0f, -1.0f, true) != routeTerm);
+    // ...and so must the five look values the job borrows from the panel.
+    CHECK(MochizukiLookTerm(on, 0.80f, 1.0f, 1.0f, -1.0f, true) != routeTerm);
+    CHECK(MochizukiLookTerm(on, 1.0f, 1.0f, 1.0f, -1.0f, true) == routeTerm);
+
+    // Off, it clears every route key but leaves unrelated overrides alone. This
+    // is the observable reason the dialog greys its Settings button when the
+    // route is off: with the route off, no RenoDX knob participates in the
+    // render, so opening the dialog would edit values nothing reads.
+    MochizukiOptions off;
+    off.overrides = {{"renodx_enabled", 1.0},
+                     {"reno_look_mode", 1.0},
+                     {"reno_look_detail", 2.0},
+                     {"reno_pass_follow_0", 0.0},
+                     {"reno_pass_style_1", 2.0},
+                     {"some_other", 3.0}};
+    ApplyNeuralRoute(off, false, baseline);
+    CHECK(find(off, "renodx_enabled") == std::nullopt);
+    CHECK(find(off, "reno_look_mode") == std::nullopt);
+    CHECK(find(off, "reno_look_detail") == std::nullopt);
+    // The later passes are the route's too: leaving one behind would grade a
+    // frame the route says is not graded.
+    CHECK(find(off, "reno_pass_follow_0") == std::nullopt);
+    CHECK(find(off, "reno_pass_style_1") == std::nullopt);
+    CHECK_EQ(find(off, "some_other").value_or(0), 3.0);
+
+    // A count above four asks the runtime for its unlock. It clamps a RenoDX
+    // stack to four on its own, so the panel's 1..30 would quietly be four -
+    // and the count the user typed would not be the count that ran.
+    RS many = baseline;
+    many.value[RS::RenoPasses] = 8.0;
+    MochizukiOptions manyRoute;
+    ApplyNeuralRoute(manyRoute, true, many);
+    CHECK_EQ(find(manyRoute, "reno_passes").value_or(0), 8.0);
+    CHECK_EQ(find(manyRoute, "reno_unlock_passes").value_or(0), 1.0);
+    // And back to four the unlock is gone again: the route keys are erased on
+    // every pass, so it cannot outlive the count that asked for it.
+    RS few = baseline;
+    few.value[RS::RenoPasses] = 4.0;
+    MochizukiOptions fewRoute;
+    ApplyNeuralRoute(fewRoute, true, few);
+    CHECK(find(fewRoute, "reno_unlock_passes") == std::nullopt);
+
+    // The later passes of the RenoDX stack. The package's own defaults: a later
+    // pass follows pass 1, runs in the standard style, at pass 1's strength and
+    // pass 1's tone. The three slots are the second, third and fourth pass of
+    // the stack.
+    for(int slot=0;slot<3;++slot){
+        const int follow=RS::Pass2Follow+slot*4;
+        CHECK_EQ(RS::kDefault[follow], 1.00);
+        CHECK_EQ(RS::kDefault[follow+1], 0.00);
+        CHECK_EQ(RS::kDefault[follow+2], 1.00);
+        CHECK_EQ(RS::kDefault[follow+3], 1.00);
+        CHECK_EQ(RS::kHigh[follow], 1.0);
+        CHECK_EQ(RS::kHigh[follow+1], 2.0);
+        CHECK_EQ(RS::kHigh[follow+2], 2.0);
+        CHECK_EQ(RS::kHigh[follow+3], 2.0);
+    }
+    CHECK(std::string(RS::kControlName[RS::Pass2Follow]) == std::string("reno_pass_follow_0"));
+    CHECK(std::string(RS::kControlName[RS::Pass3Follow]) == std::string("reno_pass_follow_1"));
+    CHECK(std::string(RS::kControlName[RS::Pass4Follow]) == std::string("reno_pass_follow_2"));
+    // Every name this host writes must be in the control table. One that is not
+    // would be named in an override and dropped as unknown, and the knob would
+    // sit in the panel claiming a value the render never sees - which is how
+    // the later passes went on inheriting pass 1's look.
+    for(int i=0;i<RS::Count;++i){
+        bool known=false;
+        for(const auto& field:amd_mochizuki::kControlFields)
+            if(std::string_view(field.name)==std::string_view(RS::kControlName[i])){known=true;break;}
+        CHECK(known);
+    }
+    // A moved later pass is written under its own name, so the runtime stops
+    // inheriting and the pass count changes the picture.
+    RS perPass=baseline;
+    perPass.value[RS::Pass2Follow]=0.0;
+    perPass.value[RS::Pass3Style]=2.0;
+    perPass.value[RS::Pass4Intensity]=1.50;
+    perPass.value[RS::RenoPasses]=3.0;
+    MochizukiOptions perPassRoute;
+    ApplyNeuralRoute(perPassRoute, true, perPass);
+    CHECK_EQ(find(perPassRoute, "reno_pass_follow_0").value_or(-1), 0.0);
+    CHECK_EQ(find(perPassRoute, "reno_pass_style_1").value_or(-1), 2.0);
+    CHECK_EQ(find(perPassRoute, "reno_pass_intensity_2").value_or(-1), 1.5);
+    CHECK_EQ(find(perPassRoute, "reno_passes").value_or(0), 3.0);
+
+    std::filesystem::remove(ini, ec);
+}
+
 constexpr test_support::TestCase kCases[] = {
     TEST_CASE(mochizuki_options_wire_and_key_test),
+    TEST_CASE(renodx_settings_dialog_test),
     TEST_CASE(harness_isolates_a_failing_case_from_the_ones_after_it_test),
     TEST_CASE(runtime_shutdown_releases_player_before_media_foundation_and_com_test),
     TEST_CASE(runtime_shutdown_rethrows_only_after_single_ordered_cleanup_test),

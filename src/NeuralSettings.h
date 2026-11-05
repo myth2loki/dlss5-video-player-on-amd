@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ReShadeConfig.h"
+#include "NeuralRenderTypes.h"
 
 #include <filesystem>
 #include <string>
@@ -37,6 +38,13 @@ struct NeuralSettings {
     int style{0};                // NRStyle
     bool autoMask{true};         // NRAutoMask
     int passes{1};               // NRPasses
+    // The parent question on the Mochizuki runtime: 0 stacks the model (the
+    // passes ladder above), 1 hands the frame to that runtime's RenoDX layer
+    // instead. The two are exclusive rather than additive - the adapter's renodx
+    // branch sets max_passes = 1 when it builds the network, so a count above
+    // one under route 1 is a number the picture never sees - which is why the
+    // panel greys the ladder instead of leaving the two to disagree.
+    int route{0};                // NRRoute, Mochizuki only
     bool chainedHistory{true};   // NRChainedHistory
 
     friend bool operator==(const NeuralSettings&, const NeuralSettings&) = default;
@@ -130,6 +138,21 @@ std::vector<NeuralAddonOverride> NeuralAddonOverridesFor(const NeuralSettings& s
 // directory before use.
 bool LoadNeuralSettings(const std::filesystem::path& ini, NeuralSettings& settings);
 bool SaveNeuralSettings(const std::filesystem::path& ini, const NeuralSettings& settings);
+
+// [RenoDX] section of the player's DLSSVideoPlayer.ini: the player-owned home of
+// the twelve RenoDX layer knobs (see RenoDxSettings in NeuralRenderTypes.h).
+// The dialog is the section's sole writer; ApplyNeuralRoute reads it through
+// MochizukiOptions::overrides and the dialog commits it on Apply, so a knob the
+// user never moved is never pinned into the controls the render reads.
+//
+// Load leaves an absent knob at its package default and clamps a hand-edited or
+// out-of-range value into range; it returns false when the section holds no
+// recognised knob, which is the signal to migrate the measured group in the
+// first time RenoDX is enabled. Save writes only the knobs that differ from
+// their default (a key is deleted, not left at its default) so an all-default
+// profile keeps no [RenoDX] noise and the migration's "empty" test stays exact.
+bool LoadRenoDxSettings(const std::filesystem::path& ini, RenoDxSettings& settings);
+bool SaveRenoDxSettings(const std::filesystem::path& ini, const RenoDxSettings& settings);
 
 // One-line canonical form for logs, e.g.
 // "intensity=1.000000 localTone=1.000000 ... preset=0 style=0 autoMask=1".
