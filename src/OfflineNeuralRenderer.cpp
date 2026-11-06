@@ -3998,6 +3998,13 @@ NeuralRenderResult OfflineNeuralRenderer::RunAmdJob(const NeuralRenderRequest& r
     state.amdEvaluator.config.modelPasses =
         request.amdPasses < 1u ? 1u : (request.amdPasses > 3u ? 3u : request.amdPasses);
     state.amdEvaluator.config.mochizuki = request.mochizuki;
+    // Last line of defence: a payload from an older host can still carry the
+    // pair the runtime refuses. The offline path clears the evaluator's own log
+    // sink below, so say it here, in the worker/player log that actually exists.
+    if (nrKind == amd_lmxxf::NrKind::Mochizuki &&
+        state.amdEvaluator.config.mochizuki.NormaliseInt4())
+        LOG("Mochizuki job: dropping an INT4 request for the small network "
+            "(only the original network ships INT4 weights); rendering int4=0.");
     state.amdEvaluator.config.runtimeDirectory=
         amd_lmxxf::ResolveRuntimeDirectory(request.amdRuntimeDirectory, nrKind);
     // The capture size and the CAS strength the export asked for. The runtime

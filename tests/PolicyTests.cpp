@@ -16713,7 +16713,10 @@ void mochizuki_options_wire_and_key_test()
     asked.historyStrength = 0.25f;
     asked.applyModel = false;
     asked.preprocess = true;
-    asked.int4Mixed = true;
+    // INT4 + the small network is a pair the runtime refuses, so it is no
+    // longer a renderable combination to round trip. The dedicated test below
+    // covers what happens to that pair; every field here stays on a real render.
+    asked.int4Mixed = false;
     asked.drsMode = 2;
     asked.networkModel = 1;
     // Passes 2 and 3 travel as two `|`-separated blocks; both are moved here so
@@ -17129,11 +17132,207 @@ void renodx_settings_dialog_test()
     CHECK_EQ(find(perPassRoute, "reno_pass_intensity_2").value_or(-1), 1.5);
     CHECK_EQ(find(perPassRoute, "reno_passes").value_or(0), 3.0);
 
+    // Passes (fast). The table has to be the package's own numbers exactly
+    // (MochizukiRenoOptions.inc). A wrong default here is not cosmetic: the
+    // mode makes the runtime's stack_passes() return 1, so defaulting it to 1
+    // would quietly turn every existing profile's multi-pass stack into one
+    // pass and every Passes slider on every profile dead.
+    CHECK_EQ(RS::kDefault[RS::PassesMode], 0.00);
+    CHECK_EQ(RS::kDefault[RS::FastMethod], 0.00);
+    CHECK_EQ(RS::kDefault[RS::FastPasses0], 3.00);
+    CHECK_EQ(RS::kDefault[RS::FastHalo0], 0.00);
+    CHECK_EQ(RS::kDefault[RS::FastFine0], 0.00);
+    CHECK_EQ(RS::kDefault[RS::FastPasses1], 3.00);
+    CHECK_EQ(RS::kDefault[RS::FastFine1], 1.00);
+    CHECK_EQ(RS::kDefault[RS::FastPasses2], 3.00);
+    CHECK_EQ(RS::kDefault[RS::FastFine2], 1.00);
+    CHECK_EQ(RS::kDefault[RS::FastEditStrength], 2.00);
+    // But the panel's starting look IS the measured recommended fast set, so
+    // a fresh profile already shows 3.00 / HaloLimit on / Fine 0.24 and a
+    // switch to fast needs no second "apply the preset" step. kDefault stays
+    // the package's identity: those two values are exactly what the route has
+    // to write when the mode is on. kStart and kDefault are different tables.
+    CHECK_EQ(RS::kStart[RS::PassesMode], 0.00);   // legacy until the user asks
+    CHECK_EQ(RS::kStart[RS::FastMethod], 0.00);
+    CHECK_EQ(RS::kStart[RS::FastPasses0], 3.00);
+    CHECK_EQ(RS::kStart[RS::FastHalo0], 1.00);
+    CHECK(std::fabs(RS::kStart[RS::FastFine0] - 0.24) < 1e-9);
+    CHECK_EQ(RS::kStart[RS::FastEditStrength], 2.00);
+    CHECK(RS::kStart[RS::FastHalo0] != RS::kDefault[RS::FastHalo0]);
+    // The ranges are the runtime's too. 1 is the floor of a strength and it is
+    // also "off" (the runtime's test is `> 1`), so it must not be excluded.
+    CHECK_EQ(RS::kLow[RS::FastPasses0], 1.00);
+    CHECK_EQ(RS::kHigh[RS::FastPasses0], 8.00);
+    CHECK_EQ(RS::kHigh[RS::FastMethod], 3.00);
+    CHECK_EQ(RS::kHigh[RS::FastFine0], 2.00);
+    CHECK_EQ(RS::kHigh[RS::FastHalo0], 1.00);
+    CHECK_EQ(RS::kHigh[RS::FastEditStrength], 4.00);
+    // A fresh profile is legacy, so none of it reaches the render: switching the
+    // mode on is a different picture by construction (one network pass, the edit
+    // amplified k times), which is a thing the user asks for.
+    CHECK_EQ(baseline.value[RS::PassesMode], RS::kDefault[RS::PassesMode]);
+    CHECK(find(on, "reno_passes_mode") == std::nullopt);
+    CHECK(find(on, "reno_fast_passes_0") == std::nullopt);
+    // Switched on, it reaches the render under the runtime's own key names - a
+    // key missing from kControlFields would be dropped as unknown with no error
+    // (the loop above already pins that every kControlName is known).
+    RS fast = baseline;
+    fast.value[RS::PassesMode] = 1.00;
+    fast.value[RS::FastPasses0] = 5.06;
+    fast.value[RS::FastFine0] = 0.24;
+    MochizukiOptions fastRoute;
+    ApplyNeuralRoute(fastRoute, true, fast);
+    CHECK_EQ(find(fastRoute, "reno_passes_mode").value_or(-1), 1.0);
+    CHECK(std::fabs(find(fastRoute, "reno_fast_passes_0").value_or(0) - 5.06) < 1e-9);
+    CHECK(std::fabs(find(fastRoute, "reno_fast_fine_0").value_or(0) - 0.24) < 1e-9);
+    // Two decimals on the wire, like every other float, and San() clamps without
+    // rounding: 5.06 has to survive the format or the strength the panel shows
+    // is not the strength that runs.
+    const std::string fastLine = FormatMochizukiOptions(fastRoute);
+    CHECK(fastLine.find("reno_passes_mode=1.00") != std::string::npos);
+    CHECK(fastLine.find("reno_fast_passes_0=5.06") != std::string::npos);
+    // The route off clears it. A stale reno_passes_mode = 1 would survive into
+    // the next session and make the Passes slider dead without saying so - the
+    // exact shape of every "selectable but does nothing" bug in this tree.
+    MochizukiOptions fastOff;
+    fastOff.overrides = {{"reno_passes_mode", 1.0},
+                         {"reno_fast_passes_0", 5.06},
+                         {"reno_fast_edit_strength", 3.0},
+                         {"some_other", 1.0}};
+    ApplyNeuralRoute(fastOff, false, baseline);
+    CHECK(find(fastOff, "reno_passes_mode") == std::nullopt);
+    CHECK(find(fastOff, "reno_fast_passes_0") == std::nullopt);
+    CHECK(find(fastOff, "reno_fast_edit_strength") == std::nullopt);
+    CHECK_EQ(find(fastOff, "some_other").value_or(0), 1.0);
+
+    // ---- fast is a first-class mode with a recommended default ------------
+    // The RenoDX window's mode switch, Reset and "restore recommended" button
+    // all land here. It must be one set of numbers, not three answers to what
+    // "fast" looks like.
+    RS recommended = baseline;
+    RS::ApplyRecommendedFast(recommended);
+    CHECK_EQ(recommended.value[RS::PassesMode], 1.00);
+    CHECK_EQ(recommended.value[RS::FastMethod], 0.00);
+    CHECK_EQ(recommended.value[RS::FastPasses0], 3.00);
+    CHECK_EQ(recommended.value[RS::FastHalo0], 1.00);
+    CHECK(std::fabs(recommended.value[RS::FastFine0] - 0.24) < 1e-9);
+    CHECK_EQ(recommended.value[RS::FastEditStrength], 2.00);
+    CHECK(RS::FastSectionAtRecommended(recommended));
+    // It resets the fast section only: the look the user tuned is not the fast
+    // mode's to overwrite.
+    CHECK_EQ(recommended.value[RS::Shadows], baseline.value[RS::Shadows]);
+    CHECK_EQ(recommended.value[RS::DetailStability], baseline.value[RS::DetailStability]);
+    CHECK_EQ(recommended.value[RS::Pass2Style], baseline.value[RS::Pass2Style]);
+    RS custom = recommended;
+    custom.value[RS::FastPasses0] = 5.06;
+    CHECK(!RS::FastSectionAtRecommended(custom));
+
+    // A legacy profile must not carry fast keys. The recommended values now
+    // live in kStart, so writing them here would lengthen every existing
+    // profile's override list and change its retention/cache key without
+    // changing a single pixel. The erase pass still clears any stale fast key.
+    MochizukiOptions legacyRoute;
+    ApplyNeuralRoute(legacyRoute, true, baseline);
+    CHECK_EQ(legacyRoute.overrides.size(), 16u);
+    CHECK(find(legacyRoute, "reno_passes_mode") == std::nullopt);
+    CHECK(find(legacyRoute, "reno_fast_halo_limit_0") == std::nullopt);
+    CHECK(find(legacyRoute, "reno_fast_fine_0") == std::nullopt);
+    // Switched to fast, the two knobs that differ from the runtime's identity
+    // are written. 3.00 passes is deliberately absent: that IS the runtime's
+    // own default, so leaving it out is what keeps the wire sparse.
+    MochizukiOptions recommendedRoute;
+    ApplyNeuralRoute(recommendedRoute, true, recommended);
+    CHECK_EQ(find(recommendedRoute, "reno_passes_mode").value_or(0), 1.0);
+    CHECK_EQ(find(recommendedRoute, "reno_fast_halo_limit_0").value_or(0), 1.0);
+    CHECK(std::fabs(find(recommendedRoute, "reno_fast_fine_0").value_or(0) - 0.24) < 1e-9);
+    CHECK(find(recommendedRoute, "reno_fast_passes_0") == std::nullopt);
+    // ... and the mode is visible to the retention key, so Apply cannot adopt
+    // segments the other mode rendered.
+    const std::string legacyTerm = MochizukiLookTerm(legacyRoute, 1.0f, 1.0f, 1.0f, -1.0f, true);
+    const std::string fastTerm = MochizukiLookTerm(recommendedRoute, 1.0f, 1.0f, 1.0f, -1.0f, true);
+    CHECK(legacyTerm != fastTerm);
+    CHECK(fastTerm.find("reno_fast_halo_limit_0") != std::string::npos);
+    // Reset while fast keeps the mode and lands on the same recommended set.
+    RS resetFast = RS::MeasuredBaseline();
+    RS::ApplyRecommendedFast(resetFast);
+    CHECK_EQ(resetFast.value[RS::PassesMode], 1.00);
+    CHECK(RS::FastSectionAtRecommended(resetFast));
+    CHECK_EQ(resetFast.value[RS::Shadows], baseline.value[RS::Shadows]);
+    // ini round trip: the recommended knobs equal kStart so they are omitted
+    // from the section, but the mode is a real deviation and must reload as 1.
+    CHECK(SaveRenoDxSettings(ini, recommended));
+    RS reloaded;
+    CHECK(LoadRenoDxSettings(ini, reloaded));
+    CHECK_EQ(reloaded.value[RS::PassesMode], 1.00);
+    CHECK_EQ(reloaded.value[RS::FastHalo0], 1.00);
+    CHECK(std::fabs(reloaded.value[RS::FastFine0] - 0.24) < 1e-9);
+    CHECK_EQ(reloaded.value[RS::FastPasses0], 3.00);
+
     std::filesystem::remove(ini, ec);
+}
+
+// INT4 records/weights ship for the 310.8.0 original network only. The runtime
+// clears the request on the small network without a word, so the host has to
+// collapse the impossible pair before it reaches the worker's command line or
+// the cache key. Otherwise one byte-identical picture gets two cache entries
+// and the panel claims a setting the render never had.
+void mochizuki_int4_normalise_test()
+{
+    // A legal pair is left alone and survives the round trip.
+    MochizukiOptions original;
+    original.int4Mixed = true;
+    original.networkModel = 0;
+    CHECK(!original.NormaliseInt4());
+    CHECK(original.int4Mixed);
+    const std::string line = FormatMochizukiOptions(original);
+    CHECK(line.find("int4=1") != std::string::npos);
+    const auto parsed = ParseMochizukiOptions(line);
+    CHECK(parsed.has_value());
+    if (parsed) {
+        CHECK(parsed->int4Mixed);
+        CHECK_EQ(parsed->networkModel, 0u);
+    }
+
+    // The impossible pair is dropped by the member itself.
+    MochizukiOptions dropped;
+    dropped.int4Mixed = true;
+    dropped.networkModel = 1;
+    CHECK(dropped.NormaliseInt4());
+    CHECK(!dropped.int4Mixed);
+    CHECK(!dropped.NormaliseInt4());   // idempotent
+
+    // And by the formatter even when the caller forgot: two spellings of the
+    // same render must produce exactly one wire value and one cache key.
+    MochizukiOptions incompatible;
+    incompatible.int4Mixed = true;
+    incompatible.networkModel = 1;
+    MochizukiOptions plainSmall;
+    plainSmall.networkModel = 1;
+    const std::string canonical = FormatMochizukiOptions(plainSmall);
+    CHECK_EQ(FormatMochizukiOptions(incompatible), canonical);
+    CHECK(canonical.find("int4=0") != std::string::npos);
+    CHECK(canonical.find("network=1") != std::string::npos);
+
+    // A payload from an older host that still sends int4=1 with network=1 is
+    // normalised on the way in, so the worker cannot render something the job's
+    // key does not describe.
+    std::string legacy = canonical;
+    const size_t at = legacy.find("int4=0");
+    CHECK(at != std::string::npos);
+    if (at != std::string::npos) {
+        legacy[at + 5] = '1';
+        const auto fromOld = ParseMochizukiOptions(legacy);
+        CHECK(fromOld.has_value());
+        if (fromOld) {
+            CHECK(!fromOld->int4Mixed);
+            CHECK_EQ(fromOld->networkModel, 1u);
+        }
+    }
 }
 
 constexpr test_support::TestCase kCases[] = {
     TEST_CASE(mochizuki_options_wire_and_key_test),
+    TEST_CASE(mochizuki_int4_normalise_test),
     TEST_CASE(renodx_settings_dialog_test),
     TEST_CASE(harness_isolates_a_failing_case_from_the_ones_after_it_test),
     TEST_CASE(runtime_shutdown_releases_player_before_media_foundation_and_com_test),

@@ -4643,6 +4643,9 @@ struct LiveFrameLibrary {
         // process start on the thread that presents frames.
         bool known{};
         std::thread::id thread{};
+        // Which thread retired this decoder. A live boundary must not close the
+        // segment it is leaving on the thread that presents frames.
+        std::thread::id closeThread{};
         // The duration the last known open declared, and where the last seek
         // landed: a known open clamps its seeks to what it was told, exactly
         // as VideoDecoder::SeekSeconds does.
@@ -4682,6 +4685,10 @@ struct LiveFrameLibrary {
     {
         std::lock_guard lock(mutex);return streams[path].thread;
     }
+    std::thread::id CloseThread(const std::filesystem::path& path)
+    {
+        std::lock_guard lock(mutex);return streams[path].closeThread;
+    }
     std::map<std::filesystem::path,Stream> streams;
     std::mutex mutex;
 };
@@ -4708,7 +4715,8 @@ public:
     void Close() override
     {
         std::lock_guard lock(library_.mutex);
-        if(stream_)++stream_->closes;stream_=nullptr;
+        if(stream_){++stream_->closes;stream_->closeThread=std::this_thread::get_id();}
+        stream_=nullptr;
     }
     VideoReadResult Read(VideoFrame& frame,std::stop_token stop) override
     {
@@ -5206,6 +5214,97 @@ void live_playback_prefetches_across_a_seam_published_after_the_open_test()
     }
     CHECK_EQ(1,library.Opens(L"neural-00001.mkv"));
     CHECK(library.OpenThread(L"neural-00001.mkv")!=std::this_thread::get_id());
+    CHECK(playback.LastFault().empty());
+}
+
+// A live boundary must be a pointer swap. Two things used to sit on the
+// presenting thread: opening the next ffmpeg child (the one-second prefetch
+// lead put its spawn inside the last second being presented) and closing the
+// decoder being left (StopFrameQueue joins a thread parked in a blocking pipe
+// read, then StopFFmpeg waits on the child). Both showed up as 100-500 ms of
+// lateness, which the cadence amplified into 1-in-8 skips.
+void live_segment_boundary_is_a_pointer_swap_test()
+{
+    // 2 s segments at 30 fps: a one-second lead would not start the prefetch
+    // until frame 30, while a whole-segment lead starts it at the first frame.
+    constexpr uint64_t kFrames=60;
+    LiveFrameLibrary library;
+    library.Add(L"original.mkv",kFrames*2);
+    library.Add(L"neural-00000.mkv",kFrames);
+    library.Add(L"neural-00001.mkv",kFrames);
+    LiveLibrarySource original(library);
+    SynchronizedPlayback playback(original,LiveSegmentFactory(library));
+    const auto segments=std::make_shared<NeuralSegmentIndex>();
+    segments->Append(LiveSegmentRecord(L"neural-00000.mkv",0,0,kFrames));
+    segments->Append(LiveSegmentRecord(L"neural-00001.mkv",1,kFrames,kFrames));
+    CHECK(playback.OpenLive(L"original.mkv",segments,SynchronizedRange{},{}));
+    for(uint64_t expected=0;expected<5;++expected){
+        CHECK_EQ(SynchronizedReadResult::PairReady,playback.ReadNextAvailable({}));
+        const auto* pair=playback.CurrentPair();CHECK(pair!=nullptr);
+        if(!pair)return;
+        CHECK_EQ(expected,pair->frameNumber);
+    }
+    CHECK(library.WaitForOpen(L"neural-00001.mkv",1));
+    for(uint64_t expected=5;expected<kFrames*2;++expected){
+        CHECK_EQ(SynchronizedReadResult::PairReady,playback.ReadNextAvailable({}));
+        const auto* pair=playback.CurrentPair();CHECK(pair!=nullptr);
+        if(!pair)return;
+        CHECK_EQ(expected,pair->frameNumber);
+    }
+    // One open, on a helper thread - the boundary never started a process.
+    CHECK_EQ(1,library.Opens(L"neural-00001.mkv"));
+    CHECK(library.OpenThread(L"neural-00001.mkv")!=std::this_thread::get_id());
+    // The retired decoder is closed on a helper thread too, and its close is
+    // waited for at teardown rather than between two presented frames.
+    for(int attempt=0;attempt<400&&library.Closes(L"neural-00000.mkv")<1;++attempt)
+        std::this_thread::sleep_for(5ms);
+    CHECK_EQ(1,library.Closes(L"neural-00000.mkv"));
+    CHECK(library.CloseThread(L"neural-00000.mkv")!=std::this_thread::get_id());
+    CHECK(playback.LastFault().empty());
+}
+
+// A pair is one source frame in two forms, but the neural member's pts is
+// rebased from its own segment file's zero. A seam between two segments steps
+// that rebase, which steps the timestamp the playback cadence reads: the player
+// widened its stride and dropped a burst of frames at every boundary. Joining
+// the segments into one published file removed the steps and the drops with
+// them. The paired member must stay on the original's continuous CFR grid.
+void live_segment_boundary_keeps_the_paired_clock_on_the_source_grid_test()
+{
+    constexpr uint64_t kFrames=10;
+    // An encoder time base a little coarser than the source's. Frame 0 keeps
+    // its zero (as a real segment file does), the rest drift until the last
+    // frame is ~90 ms out. Nothing about the INDEX is touched: its record still
+    // starts on the source CFR grid and covers exactly these ten frame numbers,
+    // so pairing, prefetch and the boundary all behave normally. Only the pts
+    // the file hands out is off-grid - which is what used to step the visible
+    // member's timestamp at every segment boundary.
+    constexpr int64_t kPtsDrift100ns=100000;
+    LiveFrameLibrary library;
+    library.Add(L"original.mkv",kFrames*2);
+    library.Add(L"neural-00000.mkv",kFrames);
+    library.Add(L"neural-00001.mkv",kFrames);
+    for(uint64_t index=1;index<kFrames;++index)
+        library.streams[L"neural-00001.mkv"].frames[index].timestamp100ns+=int64_t(index)*kPtsDrift100ns;
+    // The injection really is off the source grid, so a pass cannot be vacuous.
+    CHECK(int64_t{(kFrames-1)*kLiveFrame100ns}!=
+          library.streams[L"neural-00001.mkv"].frames[kFrames-1].timestamp100ns);
+    LiveLibrarySource original(library);
+    SynchronizedPlayback playback(original,LiveSegmentFactory(library));
+    const auto segments=std::make_shared<NeuralSegmentIndex>();
+    segments->Append(LiveSegmentRecord(L"neural-00000.mkv",0,0,kFrames));
+    segments->Append(LiveSegmentRecord(L"neural-00001.mkv",1,kFrames,kFrames));
+    CHECK(playback.OpenLive(L"original.mkv",segments,SynchronizedRange{},{}));
+    for(uint64_t expected=0;expected<kFrames*2;++expected){
+        CHECK_EQ(SynchronizedReadResult::PairReady,playback.ReadNextAvailable({}));
+        const auto* pair=playback.CurrentPair();CHECK(pair!=nullptr);
+        if(!pair)return;
+        CHECK_EQ(expected,pair->frameNumber);
+        CHECK_EQ(int64_t(expected)*kLiveFrame100ns,pair->timestamp100ns);
+        CHECK_EQ(pair->original.timestamp100ns,pair->neural.timestamp100ns);
+        CHECK_EQ(pair->timestamp100ns,pair->neural.timestamp100ns);
+        CHECK_EQ(pair->original.frameNumber,pair->neural.frameNumber);
+    }
     CHECK(playback.LastFault().empty());
 }
 
@@ -6630,6 +6729,8 @@ int wmain(int argc, wchar_t* argv[])
     neural_segment_index_orders_appends_and_locates_by_timestamp_test();
     neural_segment_index_resumes_after_retained_coverage_test();
     live_playback_prefetches_across_a_seam_published_after_the_open_test();
+    live_segment_boundary_is_a_pointer_swap_test();
+    live_segment_boundary_keeps_the_paired_clock_on_the_source_grid_test();
     neural_segment_index_covers_the_rounding_hole_but_not_a_real_gap_test();
     live_playback_waits_at_the_render_head_and_resumes_on_a_new_segment_test();
     live_playback_crosses_a_segment_boundary_without_a_gap_or_stall_test();

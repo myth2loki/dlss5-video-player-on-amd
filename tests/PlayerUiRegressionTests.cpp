@@ -672,11 +672,115 @@ struct PlayerAppTestAccess {
         CHECK(!app.m_residentHelper.Resident());
     }
 
+    // The legacy / fast switch is a real route, not a preset that only moves
+    // the panel: fast makes stack_passes() return 1 and its default is the
+    // measured recommended set. Every control below must be wired to the
+    // working copy, greyed when dead and survive Apply - the failure shape
+    // this pins is the "selectable but does nothing" one.
+    static void CheckRenoDxFastModeDialog(PlayerApp& app)
+    {
+        using R = RenoDxSettings;
+        app.m_renoDx = R{};
+        app.m_renoWorking = R{};
+        app.m_neuralSettings.route = 1;
+        app.ShowRenoDxSettings();
+        REQUIRE(app.m_renoWnd != nullptr);
+        HWND reno = app.m_renoWnd;
+        const auto sel = [&](int id) { return int(SendMessageW(GetDlgItem(reno, id), CB_GETCURSEL, 0, 0)); };
+        const auto pos = [&](int id) { return int(SendMessageW(GetDlgItem(reno, id), TBM_GETPOS, 0, 0)); };
+        const auto enabled = [&](int id) { return IsWindowEnabled(GetDlgItem(reno, id)) != FALSE; };
+        const auto combo = [&](int id, int index) {
+            SendMessageW(GetDlgItem(reno, id), CB_SETCURSEL, index, 0);
+            app.RenoWndProc(reno, WM_COMMAND, MAKEWPARAM(id, CBN_SELCHANGE), 0);
+        };
+        const auto click = [&](int id) {
+            app.RenoWndProc(reno, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), 0);
+        };
+
+        // The mode starts at legacy, but the recommended numbers are already
+        // on the fast knobs (kStart, not kDefault): switching needs no second
+        // "load the preset" step.
+        for (int id : {IDC_RENO_MODE, IDC_RENO_FAST_METHOD, IDC_RENO_FAST_PASSES,
+                       IDC_RENO_FAST_HALO, IDC_RENO_FAST_FINE, IDC_RENO_FAST_EDIT,
+                       IDC_RENO_FAST_NOTE, IDC_RENO_FAST_RECOMMENDED})
+            CHECK(GetDlgItem(reno, id) != nullptr);
+        CHECK_EQ(sel(IDC_RENO_MODE), 0);
+        CHECK_EQ(pos(IDC_RENO_FAST_PASSES), 300);
+        CHECK_EQ(ReadText(GetDlgItem(reno, IDC_RENO_FAST_FINE + 100)), std::wstring(L"0.24"));
+        CHECK_EQ(app.m_renoWorking.value[R::FastHalo0], 1.00);
+        CHECK(enabled(IDC_RENO_PASSES));
+        CHECK(!enabled(IDC_RENO_FAST_PASSES));
+        CHECK(!enabled(IDC_RENO_FAST_RECOMMENDED));
+        if (const auto shots = windowShotDirectory(); !shots.empty())
+            SaveWindowShot(reno, shots / L"renodx-fast-legacy.png");
+
+        combo(IDC_RENO_MODE, 1);
+        CHECK_EQ(app.m_renoWorking.value[R::PassesMode], 1.00);
+        CHECK(!enabled(IDC_RENO_PASSES));
+        CHECK(!enabled(IDC_RENO_CHAINED));
+        CHECK(enabled(IDC_RENO_FAST_PASSES));
+        CHECK(!enabled(IDC_RENO_FAST_EDIT));   // method 0 leaves edit strength dead
+        CHECK(enabled(IDC_RENO_FAST_RECOMMENDED));
+        CHECK(ReadText(GetDlgItem(reno, IDC_RENO_FAST_NOTE)).find(L"推荐配置") != std::wstring::npos);
+        if (const auto shots = windowShotDirectory(); !shots.empty())
+            SaveWindowShot(reno, shots / L"renodx-fast-recommended.png");
+
+        // Method 3 swaps which knobs are live.
+        combo(IDC_RENO_FAST_METHOD, 3);
+        CHECK_EQ(app.m_renoWorking.value[R::FastMethod], 3.00);
+        CHECK(!enabled(IDC_RENO_FAST_PASSES));
+        CHECK(enabled(IDC_RENO_FAST_EDIT));
+        // Feedback / Hybrid are refused with a reason, not a silent no-op.
+        const int boxes = messageBoxes;
+        combo(IDC_RENO_FAST_METHOD, 1);
+        CHECK_EQ(messageBoxes, boxes + 1);
+        CHECK_EQ(app.m_renoWorking.value[R::FastMethod], 0.00);
+        CHECK(lastMessageBox.find(L"运动矢量") != std::wstring::npos);
+
+        // "Restore recommended" resets the fast section only, keeps the mode,
+        // and leaves the look the user tuned alone.
+        SendMessageW(GetDlgItem(reno, IDC_RENO_DETAIL), TBM_SETPOS, TRUE, 150);
+        SendMessageW(GetDlgItem(reno, IDC_RENO_FAST_PASSES), TBM_SETPOS, TRUE, 600);
+        app.RenoWndProc(reno, WM_HSCROLL, 0, 0);
+        CHECK(std::fabs(app.m_renoWorking.value[R::Detail] - 1.50) < 1e-9);
+        CHECK_EQ(app.m_renoWorking.value[R::FastPasses0], 6.00);
+        CHECK(ReadText(GetDlgItem(reno, IDC_RENO_FAST_NOTE)).find(L"明显压黑") != std::wstring::npos);
+        click(IDC_RENO_FAST_RECOMMENDED);
+        CHECK_EQ(app.m_renoWorking.value[R::FastPasses0], 3.00);
+        CHECK_EQ(app.m_renoWorking.value[R::PassesMode], 1.00);
+        CHECK(std::fabs(app.m_renoWorking.value[R::Detail] - 1.50) < 1e-9);
+        // Reset while fast stays fast.
+        click(IDC_RENO_RESET);
+        CHECK_EQ(app.m_renoWorking.value[R::PassesMode], 1.00);
+        CHECK_EQ(app.m_renoWorking.value[R::FastPasses0], 3.00);
+        // Apply persists the mode, and the route writes the recommended knobs.
+        click(IDC_RENO_APPLY);
+        CHECK_EQ(app.m_renoDx.value[R::PassesMode], 1.00);
+        wchar_t mode[32]{};
+        GetPrivateProfileStringW(L"RenoDX", L"RenoPassesMode", L"", mode, 32, app.SettingsPath().c_str());
+        CHECK_EQ(std::wstring(L"1.00"), std::wstring(mode));
+        MochizukiOptions routed;
+        ApplyNeuralRoute(routed, true, app.m_renoDx);
+        const auto valueOf = [&](const char* key) {
+            for (const auto& entry : routed.overrides)
+                if (entry.first == key) return entry.second;
+            return -1.0;
+        };
+        CHECK_EQ(valueOf("reno_fast_halo_limit_0"), 1.0);
+        CHECK(std::fabs(valueOf("reno_fast_fine_0") - 0.24) < 1e-9);
+
+        app.m_neuralSettings.route = 0;
+        app.m_renoDx = R{};
+        app.SaveVideoSettings();
+        DestroyWindow(reno);
+    }
+
     static void neural_settings_dialog_test()
     {
         PlayerApp& app = fixture->app;
 
         CheckNeuralSettingsDialog(app);
+        CheckRenoDxFastModeDialog(app);
     }
 
     // The AMD backend's first rung is the Small model rather than a pass count:

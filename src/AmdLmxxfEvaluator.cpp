@@ -1568,7 +1568,12 @@ bool AmdLmxxfEvaluator::ApplyMochizukiControls()
     // structure follows the structure value) are written explicitly. Everything
     // else - linear input, max passes, preprocessing, RenoDX - is left at 0, the
     // documented default.
-    const MochizukiOptions& asked = config_.mochizuki;
+    // By value: the config may have come straight from a payload the worker
+    // parsed, or from a hand-built job. Normalise the one impossible pair here
+    // too, so `controls.int4_mixed` below never claims a setting the runtime
+    // will clear without telling us.
+    MochizukiOptions asked = config_.mochizuki;
+    const bool droppedInt4 = asked.NormaliseInt4();
     // Start from the package's own defaults rather than a zeroed struct. Most of
     // the fields this host has no panel for are only "default" at the values the
     // runtime reports - RenoDX's grade controls default to 1.0, chained history
@@ -1691,6 +1696,9 @@ bool AmdLmxxfEvaluator::ApplyMochizukiControls()
         ", pass2=" + (asked.pass2.followPass1 ? "follow" : "own") +
         ", pass3=" + (asked.pass3.followPass1 ? "follow" : "own") +
         (MochizukiOptionsAreDefault(asked) ? " (all defaults)" : " (from the panel)"));
+    if (droppedInt4)
+        Log("  controls: INT4 was requested but this network has no INT4 weights; "
+            "running int4=0 (the runtime clears that pair)");
     return true;
 }
 
@@ -1775,6 +1783,26 @@ bool AmdLmxxfEvaluator::WaitForMochizukiNetwork()
                 (sessionInfo.aco_fallback[0] != '\0'
                      ? std::string(" (") + sessionInfo.aco_fallback + ")"
                      : std::string()));
+            // Requested is not effective for INT4 either: the runtime drops the
+            // request when the selected network has no INT4 records/weights.
+            // Say it by name instead of leaving a panel value describing a
+            // picture that was never rendered. This evaluator's log sink is
+            // cleared on the offline export path (OfflineNeuralRenderer clears
+            // config.log), so the player/worker LOG in ReadSavedMochizukiOptions
+            // and RunAmdJob is the one a --render user actually sees; these
+            // lines cover the direct/smoke paths. An older package that does
+            // not export these fields leaves both at zero and reports nothing.
+            const bool int4Dropped = sessionInfo.int4_requested != 0u &&
+                                     sessionInfo.int4_effective == 0u;
+            Log(std::string("  INT4: requested=") +
+                (sessionInfo.int4_requested ? "1" : "0") +
+                " effective=" + (sessionInfo.int4_effective ? "1" : "0") +
+                (int4Dropped
+                     ? "  <-- REQUEST DROPPED BY RUNTIME (no INT4 weights for this network)"
+                     : ""));
+            Log("  network: requested=" + std::to_string(sessionInfo.network_requested) +
+                " effective=" + std::to_string(sessionInfo.network_effective) +
+                ", RenoDX effective=" + std::to_string(sessionInfo.renodx_effective));
         }
     }
     Log("Mochizuki network ready after " +

@@ -10,6 +10,8 @@
 #include <optional>
 #include <thread>
 #include <utility>
+#include <vector>
+#include "Log.h"
 
 namespace {
 
@@ -160,6 +162,7 @@ struct SynchronizedPlayback::Impl {
         std::future<std::unique_ptr<ISynchronizedFrameSource>> future;
         std::stop_source stop;
         NeuralSegment segment;
+        std::chrono::steady_clock::time_point started{};
     };
     std::optional<PendingOpen> pendingOpen;
     bool live{};
@@ -176,6 +179,36 @@ struct SynchronizedPlayback::Impl {
     };
     Fault fault{};
     int64_t prefetchLead100ns{10000000};
+    // A segment decoder retired at a boundary carries a decode thread parked in
+    // a blocking pipe read plus an ffmpeg child. StopFrameQueue joins the one
+    // and StopFFmpeg waits on the other; running both between two presented
+    // frames is where an active live session's 100-500 ms of lateness came from.
+    // The boundary is now a pointer swap and the close happens on a helper
+    // thread. std::async's future BLOCKS on destruction, so finished ones are
+    // reaped on an ordinary tick rather than left to accumulate.
+    std::vector<std::future<void>> retiredSources;
+
+    void Retire(std::unique_ptr<ISynchronizedFrameSource> source)
+    {
+        if(!source)return;
+        auto shared=std::shared_ptr<ISynchronizedFrameSource>(std::move(source));
+        try{
+            retiredSources.emplace_back(std::async(std::launch::async,[shared]{shared->Close();}));
+        }catch(const std::system_error&){
+            // No helper thread available: slower here, but still correct.
+            shared->Close();
+        }
+    }
+
+    void ReapRetired()
+    {
+        retiredSources.erase(
+            std::remove_if(retiredSources.begin(),retiredSources.end(),
+                [](std::future<void>& future){
+                    return future.wait_for(std::chrono::seconds(0))==std::future_status::ready;
+                }),
+            retiredSources.end());
+    }
     // What the caller asked the members to decode to. Every segment opened
     // later this session inherits it, so one answer covers the whole pair.
     bool preferNv12{};
@@ -211,6 +244,11 @@ struct SynchronizedPlayback::Impl {
     void CloseSegmentSources()
     {
         CancelPendingOpen();
+        // Teardown is off the presenting path. Reap what has finished and let
+        // the few futures still in flight be joined here rather than at a
+        // boundary (a seek closes sources, and a seek is allowed to wait).
+        ReapRetired();
+        retiredSources.clear();
         if(segmentSource)segmentSource->Close();
         if(prefetchSource)prefetchSource->Close();
         segmentSource.reset();prefetchSource.reset();
@@ -254,6 +292,7 @@ struct SynchronizedPlayback::Impl {
         if(pendingOpen||!makeSegmentSource)return;
         PendingOpen pending{};
         pending.segment=wanted;
+        pending.started=std::chrono::steady_clock::now();
         // The worker touches nothing this object owns: it gets its own copies.
         auto factory=makeSegmentSource;
         const VideoDecoder::KnownMedia media=MediaFor(wanted);
@@ -296,7 +335,12 @@ struct SynchronizedPlayback::Impl {
         if(pendingOpen->future.wait_for(std::chrono::seconds(0))!=std::future_status::ready)return;
         auto source=pendingOpen->future.get();
         NeuralSegment landed=pendingOpen->segment;
+        const auto started=pendingOpen->started;
         pendingOpen.reset();
+        const double openMs=std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-started).count();
+        LOG("Live segment "<<landed.index<<" prefetch "<<(source?"ready":"failed")<<" in "
+            <<openMs<<" ms (off the presenting thread).");
         if(!source)return;
         // Layout beside geometry, and for the same reason: both members feed
         // one renderer whose source layout was fixed at Initialize. A segment
@@ -357,6 +401,24 @@ struct SynchronizedPlayback::Impl {
 
     SynchronizedReadResult CommitPair(SynchronizedFramePair& pair)
     {
+        // A pair is ONE source frame in two forms, so both members must carry
+        // the same source timestamp. A live segment file starts at its own pts
+        // zero and the index rebases it onto the source timeline; that sum is
+        // not necessarily the original's CFR tick (container rounding, encoder
+        // delay). In neural view the visible member is `pair.neural`, and its
+        // timestamp is what the playback cadence reads as `due` and what
+        // RenderVideoFrame turns into the `ms` handed to the upscaler/framegen.
+        // Pin it to the original's grid - the one continuous source, already
+        // used by pair.timestamp100ns and by the audio clock.
+        //
+        // Hardening, not a live-drop fix: on the measured 23.976 fps sessions
+        // `due` was already on the CFR grid to within 0.0035 frames. The live
+        // drops came from per-frame progress flooding the UI thread; see
+        // kCoalesceNeuralProgress in main.cpp.
+        if(pendingNeural){
+            pendingNeural->frame.timestamp100ns=pendingOriginal->frame.timestamp100ns;
+            pendingNeural->frame.frameNumber=pendingOriginal->frame.frameNumber;
+        }
         pair.original=std::move(pendingOriginal->frame);
         pair.neural=pendingNeural?std::move(pendingNeural->frame):VideoFrame{};
         pair.timestamp100ns=pair.original.timestamp100ns;pair.frameNumber=pair.original.frameNumber;
@@ -497,16 +559,20 @@ struct SynchronizedPlayback::Impl {
         // the same frames (see PrefetchNextSegment). Switching to the entry
         // here would open it on the presenting thread, mid-file.
         if(prefetchSource&&(SameSegment(prefetchSegment,wanted)||ContinuesAt(prefetchSegment,timestamp100ns))){
-            if(segmentSource)segmentSource->Close();
+            // The boundary is a pointer swap: closing the decoder we are leaving
+            // joins its frame-queue thread and waits on its ffmpeg child, and
+            // neither belongs between two presented frames.
+            Retire(std::move(segmentSource));
             segmentSource=std::move(prefetchSource);segment=std::move(prefetchSegment);
             pendingNeural=std::move(prefetchPending);prefetchPending.reset();
             prefetchSegment=NeuralSegment{};segmentExhausted=false;
+            LOG("Live segment boundary -> "<<segment.index<<": prefetch hit, old decoder retired off-thread.");
             return SynchronizedReadResult::PairReady;
         }
         // A prefetch for a segment the playhead skipped would otherwise sit
         // there and block every later one.
         if(prefetchSource){
-            prefetchSource->Close();prefetchSource.reset();
+            Retire(std::move(prefetchSource));
             prefetchSegment=NeuralSegment{};prefetchPending.reset();
         }
         if(pendingOpen)CancelPendingOpen();
@@ -529,9 +595,10 @@ struct SynchronizedPlayback::Impl {
         if(local>=tolerance100ns/2&&!source->SeekSeconds(double(local)*1e-7)){
             source->Close();return SynchronizedReadResult::Error;
         }
-        if(segmentSource)segmentSource->Close();
+        Retire(std::move(segmentSource));
         segmentSource=std::move(source);segment=std::move(wanted);
         pendingNeural.reset();segmentExhausted=false;
+        LOG("Live segment boundary -> "<<segment.index<<": SYNCHRONOUS open, prefetch missed.");
         return SynchronizedReadResult::PairReady;
     }
 
@@ -605,11 +672,20 @@ struct SynchronizedPlayback::Impl {
     // silent: the boundary itself opens the file if none of this worked.
     void PrefetchNextSegment(int64_t timestamp100ns,std::stop_token stop)
     {
+        ReapRetired();
         if(!segmentSource||stop.stop_requested())return;
         HarvestAsyncOpen();
         // An open in flight is judged once it has landed, never waited for.
         if(pendingOpen)return;
-        if(timestamp100ns<segment.end100ns-prefetchLead100ns)return;
+        // A live render publishes its files far ahead of the playhead, so the
+        // next one can be opened as soon as this one is entered. The old
+        // one-second lead put the spawn (antivirus scan, D3D11VA init) inside
+        // the last second being presented; a spawn that lost that race made the
+        // boundary open AND close a child on the presenting thread, and that
+        // lateness cascaded through the cadence into 1-in-8 skips.
+        const int64_t span=std::max<int64_t>(0,segment.end100ns-segment.firstTimestamp100ns);
+        const int64_t lead=std::max(prefetchLead100ns,span);
+        if(timestamp100ns<segment.end100ns-lead)return;
         const auto next=Continuation();
         // A file warmed before its run was joined holds the right frames and is
         // kept: it is out of the index's service, but still on disk (HoldsFile

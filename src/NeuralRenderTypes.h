@@ -185,6 +185,22 @@ struct MochizukiOptions {
     // field on the wire, a new ini key per knob, or a rebuilt runtime.
     std::vector<std::pair<std::string, double>> overrides;
 
+    // The runtime carries INT4 records/weights for the ORIGINAL network only
+    // (MochizukiNrRuntime.cpp: `key.int4 = int4 && networkModel == 0`). On the
+    // small network it clears the request without telling anyone, so leaving the
+    // pair on the wire would claim a setting the render does not have - and
+    // would give one byte-identical picture two different cache keys. Collapse
+    // the impossible pair here, on the one type every path passes through:
+    // saved ini, the dialog, the worker's command line and the cache key.
+    // Returns true when a requested value had to be dropped, so a caller that
+    // has a log can say so instead of silently rendering something else.
+    bool NormaliseInt4() noexcept
+    {
+        if (networkModel == 0 || !int4Mixed) return false;
+        int4Mixed = false;
+        return true;
+    }
+
     friend bool operator==(const MochizukiOptions&, const MochizukiOptions&) = default;
 };
 
@@ -239,6 +255,27 @@ struct RenoDxSettings {
         Pass4Style,       // reno_pass_style_2        0 .. 2
         Pass4Intensity,   // reno_pass_intensity_2    0 .. 2
         Pass4Tone,        // reno_pass_local_tone_2   0 .. 2
+        // Passes (fast): one network pass, strengthened afterwards, instead of
+        // running the network once per pass. The strength is still referred to
+        // legacy pass counts, hence the float range 1..8. Two things read
+        // differently from the legacy knobs and both are in the runtime:
+        // reno_passes_mode = 1 makes stack_passes() return 1, so RenoPasses is
+        // dead there; and reno_fast_passes_N = 1 means "no strengthening",
+        // i.e. off, not "one pass". Three methods carry their own settings,
+        // Extrapolation (0) / Feedback (1) / Hybrid (2); method 3 (Edit
+        // strength) has no slot and uses FastEditStrength instead.
+        PassesMode,       // reno_passes_mode         0 .. 1 (0 legacy, 1 fast)
+        FastMethod,       // reno_fast_method         0 .. 3
+        FastPasses0,      // reno_fast_passes_0       1 .. 8 (extrapolation)
+        FastHalo0,        // reno_fast_halo_limit_0   0 .. 1 (bool)
+        FastFine0,        // reno_fast_fine_0         0 .. 2
+        FastPasses1,      // reno_fast_passes_1       1 .. 8 (feedback)
+        FastHalo1,        // reno_fast_halo_limit_1   0 .. 1 (bool)
+        FastFine1,        // reno_fast_fine_1         0 .. 2
+        FastPasses2,      // reno_fast_passes_2       1 .. 8 (hybrid)
+        FastHalo2,        // reno_fast_halo_limit_2   0 .. 1 (bool)
+        FastFine2,        // reno_fast_fine_2         0 .. 2
+        FastEditStrength, // reno_fast_edit_strength  0 .. 4
         Count
     };
 
@@ -283,6 +320,25 @@ struct RenoDxSettings {
     // is written into the controls, so the picture matches the panel.
     static RenoDxSettings MeasuredBaseline() { return RenoDxSettings{}; }
 
+    // The recommended fast-mode configuration, used by the RenoDX window's
+    // "restore recommended" button and by Reset while fast is selected. It only
+    // touches the fast section: the look knobs the user tuned (shadows, detail,
+    // stabiliser, ...) are not the fast mode's to reset. The mode switch itself
+    // is deliberately left alone by the caller when it just wants the values.
+    static void ApplyRecommendedFast(RenoDxSettings& settings) {
+        for (int i = FastMethod; i < Count; ++i) settings.value[i] = kStart[i];
+        settings.value[PassesMode] = 1.0;
+    }
+
+    // Whether the fast knobs are still the recommended ones. Drives the note
+    // under the fast section, so a profile carrying hand-edited values says so
+    // rather than claiming to be at the measured configuration.
+    static bool FastSectionAtRecommended(const RenoDxSettings& settings) noexcept {
+        for (int i = FastMethod; i < Count; ++i)
+            if (std::fabs(settings.value[i] - kStart[i]) > 1e-6) return false;
+        return true;
+    }
+
     // Where a later pass's four fields live: slot 1 is the second pass of the
     // stack, slot 3 the fourth. The dialog edits one slot at a time, so its
     // Reset has to restore one slot - and it restores kStart, not kDefault: the
@@ -306,7 +362,12 @@ struct RenoDxSettings {
         "RenoLookMode", "RenoChainedHistory",
         "RenoPass2Follow", "RenoPass2Style", "RenoPass2Intensity", "RenoPass2Tone",
         "RenoPass3Follow", "RenoPass3Style", "RenoPass3Intensity", "RenoPass3Tone",
-        "RenoPass4Follow", "RenoPass4Style", "RenoPass4Intensity", "RenoPass4Tone"};
+        "RenoPass4Follow", "RenoPass4Style", "RenoPass4Intensity", "RenoPass4Tone",
+        "RenoPassesMode", "RenoFastMethod", "RenoFastExtrapolationPasses",
+        "RenoFastExtrapolationHaloLimit", "RenoFastExtrapolationFine",
+        "RenoFastFeedbackPasses", "RenoFastFeedbackHaloLimit", "RenoFastFeedbackFine",
+        "RenoFastHybridPasses", "RenoFastHybridHaloLimit", "RenoFastHybridFine",
+        "RenoFastEditStrength"};
     static constexpr const char* kControlName[Count] = {
         "reno_look_detail", "reno_look_detail_radius", "reno_look_shadows",
         "reno_look_highlights", "reno_look_colour", "reno_look_tone",
@@ -315,7 +376,12 @@ struct RenoDxSettings {
         "reno_look_mode", "reno_chained_history",
         "reno_pass_follow_0", "reno_pass_style_0", "reno_pass_intensity_0", "reno_pass_local_tone_0",
         "reno_pass_follow_1", "reno_pass_style_1", "reno_pass_intensity_1", "reno_pass_local_tone_1",
-        "reno_pass_follow_2", "reno_pass_style_2", "reno_pass_intensity_2", "reno_pass_local_tone_2"};
+        "reno_pass_follow_2", "reno_pass_style_2", "reno_pass_intensity_2", "reno_pass_local_tone_2",
+        "reno_passes_mode", "reno_fast_method", "reno_fast_passes_0",
+        "reno_fast_halo_limit_0", "reno_fast_fine_0",
+        "reno_fast_passes_1", "reno_fast_halo_limit_1", "reno_fast_fine_1",
+        "reno_fast_passes_2", "reno_fast_halo_limit_2", "reno_fast_fine_2",
+        "reno_fast_edit_strength"};
     // The runtime's own table, copied from MochizukiRenoOptions.inc in the
     // package (the RDX_ lines name every field with its default and its range):
     // the look floats 1.00, detail stability 0 (auto), the stabilisers 0,
@@ -339,7 +405,12 @@ struct RenoDxSettings {
         // never touched them keeps the picture it had.
         1.00, 0.00, 1.00, 1.00,
         1.00, 0.00, 1.00, 1.00,
-        1.00, 0.00, 1.00, 1.00};
+        1.00, 0.00, 1.00, 1.00,
+        // Passes (fast), the package's own (MochizukiRenoOptions.inc): legacy
+        // mode, Extrapolation, 3 legacy passes, no halo limit, Fine 0 / 1 / 1,
+        // Edit strength 2.00. Fine 0 on Extrapolation is the package's choice,
+        // not an omission: the guided filter already carries the fine band.
+        0.00, 0.00, 3.00, 0.00, 0.00, 3.00, 0.00, 1.00, 3.00, 0.00, 1.00, 2.00};
     // The look a fresh profile starts at and Reset returns to - the set that was
     // tuned in the player and measured: detail 1.00 (neutral), shadows 0.90,
     // detail stability Always, two passes.
@@ -394,7 +465,19 @@ struct RenoDxSettings {
         // ghosting stops being worth the extra structure.
         0.00, 1.00, 1.00, 0.00,
         0.00, 1.00, 0.50, 0.00,
-        0.00, 1.00, 0.50, 0.00};
+        0.00, 1.00, 0.50, 0.00,
+        // Passes (fast) starts at the measured RECOMMENDED configuration, with
+        // the mode itself still on legacy: switching to fast is a different
+        // picture by construction (one network pass, the edit amplified k
+        // times), so it stays a thing the user asks for. HaloLimit=1 / Fine=0.24
+        // are not cosmetic: at the same 3 passes they buy +0.50 dB / +0.0063
+        // SSIM against the source and take the high-frequency ratio 1.114 ->
+        // 1.107 (docs/RENODX-FAST-MODE-INTEGRATION-zh.md section 12). They
+        // differ from kDefault on purpose - kStart is the look this player
+        // shows and writes, kDefault stays the runtime's identity - and
+        // ApplyNeuralRoute drops the whole fast section in legacy mode so no
+        // existing profile's cache/retention key changes just because of this.
+        0.00, 0.00, 3.00, 1.00, 0.24, 3.00, 0.00, 1.00, 3.00, 0.00, 1.00, 2.00};
     // Clamp ranges, copied from the same table so a hand-edited or out-of-range
     // [RenoDX] value is pinned rather than refused - and pinned to what the
     // runtime accepts, not past it.
@@ -403,13 +486,17 @@ struct RenoDxSettings {
         0.0, 0.0,
         0.0, 0.0, 0.0, 0.0,
         0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0};
+        0.0, 0.0, 0.0, 0.0,
+        // Passes (fast): mode 0..1, method 0..3, passes 1..8, halo 0..1,
+        // fine 0..2, edit strength 0..4 (the .inc's own ranges).
+        0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0};
     static constexpr double kHigh[Count] = {
         2.0, 4.0, 2.0, 2.0, 2.0, 2.0, 2.0, 1.0, 250.0, 30.0, 2.0, 2.0,
         1.0, 1.0,
         1.0, 2.0, 2.0, 2.0,
         1.0, 2.0, 2.0, 2.0,
-        1.0, 2.0, 2.0, 2.0};
+        1.0, 2.0, 2.0, 2.0,
+        1.0, 3.0, 8.0, 1.0, 2.0, 8.0, 1.0, 2.0, 8.0, 1.0, 2.0, 4.0};
 };
 
 // Whether every value is the runtime's own default.
@@ -465,7 +552,15 @@ inline void ApplyNeuralRoute(MochizukiOptions& options, bool renoDx, const RenoD
         // not append them twice - a doubled key would double the cache term.
         "reno_pass_follow_0", "reno_pass_style_0", "reno_pass_intensity_0", "reno_pass_local_tone_0",
         "reno_pass_follow_1", "reno_pass_style_1", "reno_pass_intensity_1", "reno_pass_local_tone_1",
-        "reno_pass_follow_2", "reno_pass_style_2", "reno_pass_intensity_2", "reno_pass_local_tone_2"};
+        "reno_pass_follow_2", "reno_pass_style_2", "reno_pass_intensity_2", "reno_pass_local_tone_2",
+        // Passes (fast) is the route's too. A route turned off must leave none
+        // of it behind: a stale reno_passes_mode = 1 would survive into the next
+        // session and make the panel's Passes slider dead without saying so.
+        "reno_passes_mode", "reno_fast_method", "reno_fast_passes_0",
+        "reno_fast_halo_limit_0", "reno_fast_fine_0",
+        "reno_fast_passes_1", "reno_fast_halo_limit_1", "reno_fast_fine_1",
+        "reno_fast_passes_2", "reno_fast_halo_limit_2", "reno_fast_fine_2",
+        "reno_fast_edit_strength"};
     std::erase_if(overrides, [](const std::pair<std::string, double>& entry) {
         for (const char* key : kRouteKeys)
             if (entry.first == key) return true;
@@ -478,8 +573,16 @@ inline void ApplyNeuralRoute(MochizukiOptions& options, bool renoDx, const RenoD
     // out here would change the picture for existing profiles; defaulting the
     // field to 1 keeps that forced-1 behaviour until the user picks otherwise.
     overrides.emplace_back("reno_look_mode", reno.value[RenoDxSettings::LookMode]);
+    const bool fastMode = reno.value[RenoDxSettings::PassesMode] != 0.0;
     for (int i = 0; i < RenoDxSettings::Count; ++i) {
         if (i == RenoDxSettings::LookMode) continue; // written above, always
+        // In legacy mode stack_passes() runs the legacy count, so every fast
+        // key is dead. The starting look deliberately carries the recommended
+        // fast values (kStart), and writing those here would lengthen the
+        // override list for every existing profile - changing its retention
+        // and cache keys without changing a single pixel. The erase above
+        // still removes any fast key left by a previous fast session.
+        if (!fastMode && i >= RenoDxSettings::PassesMode) continue;
         if (std::fabs(reno.value[i] - RenoDxSettings::kDefault[i]) > 1e-6)
             overrides.emplace_back(RenoDxSettings::kControlName[i], reno.value[i]);
     }
@@ -498,8 +601,12 @@ inline void ApplyNeuralRoute(MochizukiOptions& options, bool renoDx, const RenoD
 // An empty string is the runtime's defaults, which is what a job that changed
 // nothing sends: the helper then takes no argument at all and an older helper -
 // one that has never heard of this key - renders the same picture.
-inline std::string FormatMochizukiOptions(const MochizukiOptions& options)
+// By value on purpose: what goes on the wire is the NORMALISED value. A caller
+// must not be able to hand the helper a pair the runtime refuses (INT4 + small
+// network) while the cache key still claims INT4 was on.
+inline std::string FormatMochizukiOptions(MochizukiOptions options)
 {
+    options.NormaliseInt4();
     if (MochizukiOptionsAreDefault(options)) return {};
     // Two lines' worth of fields: a pass block is seven values and there are
     // two of them, so 256 was no longer enough once they existed. The override
@@ -721,6 +828,10 @@ inline std::optional<MochizukiOptions> ParseMochizukiOptions(std::string_view te
         ++seen;
     }
     if (seen != 15) return std::nullopt;
+    // An older host (or a hand-edited command line) can still send the pair the
+    // runtime refuses. Normalise on the way in too, so the worker's request and
+    // the job's cache key cannot disagree about what was asked for.
+    options.NormaliseInt4();
     return options;
 }
 

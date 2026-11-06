@@ -194,6 +194,25 @@ inline constexpr ControlField kControlFields[] = {
     {"reno_auto_mask", offsetof(MochizukiNrControls, reno_auto_mask), ControlField::Kind::Bool, 0.f, 1.f},
     {"reno_skin_independent", offsetof(MochizukiNrControls, reno_skin_independent), ControlField::Kind::Bool, 0.f, 1.f},
     {"reno_passes", offsetof(MochizukiNrControls, reno_passes), ControlField::Kind::Uint, 1.f, 30.f},
+    // Passes (fast): one network pass strengthened afterwards, its strength
+    // spoken in legacy pass counts (hence 1..8). Note what is NOT a mistake
+    // here: reno_passes_mode = 1 makes the runtime's stack_passes() return 1,
+    // so reno_passes above stops being read; and reno_fast_passes_N = 1 means
+    // "no strengthening" - off - because the runtime's test is `> 1`. A key
+    // missing from this table would be dropped as unknown with no error, which
+    // is the shape every "selectable but does nothing" bug has taken here.
+    {"reno_passes_mode", offsetof(MochizukiNrControls, reno_passes_mode), ControlField::Kind::Uint, 0.f, 1.f},
+    {"reno_fast_method", offsetof(MochizukiNrControls, reno_fast_method), ControlField::Kind::Uint, 0.f, 3.f},
+    {"reno_fast_passes_0", offsetof(MochizukiNrControls, reno_fast_passes_0), ControlField::Kind::Float, 1.f, 8.f},
+    {"reno_fast_halo_limit_0", offsetof(MochizukiNrControls, reno_fast_halo_limit_0), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_fast_fine_0", offsetof(MochizukiNrControls, reno_fast_fine_0), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_fast_passes_1", offsetof(MochizukiNrControls, reno_fast_passes_1), ControlField::Kind::Float, 1.f, 8.f},
+    {"reno_fast_halo_limit_1", offsetof(MochizukiNrControls, reno_fast_halo_limit_1), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_fast_fine_1", offsetof(MochizukiNrControls, reno_fast_fine_1), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_fast_passes_2", offsetof(MochizukiNrControls, reno_fast_passes_2), ControlField::Kind::Float, 1.f, 8.f},
+    {"reno_fast_halo_limit_2", offsetof(MochizukiNrControls, reno_fast_halo_limit_2), ControlField::Kind::Bool, 0.f, 1.f},
+    {"reno_fast_fine_2", offsetof(MochizukiNrControls, reno_fast_fine_2), ControlField::Kind::Float, 0.f, 2.f},
+    {"reno_fast_edit_strength", offsetof(MochizukiNrControls, reno_fast_edit_strength), ControlField::Kind::Float, 0.f, 4.f},
     {"reno_unlock_passes", offsetof(MochizukiNrControls, reno_unlock_passes), ControlField::Kind::Bool, 0.f, 1.f},
     {"reno_chained_history", offsetof(MochizukiNrControls, reno_chained_history), ControlField::Kind::Bool, 0.f, 1.f},
     // What a later pass of the RenoDX stack does on its own. The package

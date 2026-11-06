@@ -108,6 +108,18 @@ extern "C"
         uint32_t reno_auto_mask;
         uint32_t reno_skin_independent;
         uint32_t reno_passes;
+        uint32_t reno_passes_mode;    /* NRPassesMode: 0 legacy (reno_passes), 1 fast */
+        uint32_t reno_fast_method;    /* NRFastMethod: 0 Extrapolation, 1 Feedback, 2 Hybrid, 3 Edit strength */
+        float reno_fast_passes_0;     /* NRFastExtrapolationPasses 1..8 */
+        uint32_t reno_fast_halo_limit_0;
+        float reno_fast_fine_0;
+        float reno_fast_passes_1;     /* NRFastFeedbackPasses */
+        uint32_t reno_fast_halo_limit_1;
+        float reno_fast_fine_1;
+        float reno_fast_passes_2;     /* NRFastHybridPasses */
+        uint32_t reno_fast_halo_limit_2;
+        float reno_fast_fine_2;
+        float reno_fast_edit_strength; /* NRFastEditStrength 0..4 */
         uint32_t reno_unlock_passes;
         uint32_t reno_chained_history;
         float reno_pass_transfer_0;

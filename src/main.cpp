@@ -489,6 +489,17 @@ static constexpr int IDC_RENO_PASS_OPEN = 7728;
 // frames. Only means anything above one pass; off is what takes the cross-pass
 // residue out of motion.
 static constexpr int IDC_RENO_CHAINED = 7729;
+// The legacy / fast switch and the fast section. 7730+ is clear of the pass
+// window's readouts (7720+100 = 7820), and the three new slider readouts land
+// at 7832/7834/7835, clear of every other control id in this file.
+static constexpr int IDC_RENO_MODE = 7730;              // combo 0 legacy / 1 fast
+static constexpr int IDC_RENO_FAST_METHOD = 7731;       // combo 0..3
+static constexpr int IDC_RENO_FAST_PASSES = 7732;       // slider 1.00..8.00
+static constexpr int IDC_RENO_FAST_HALO = 7733;         // owner-drawn check
+static constexpr int IDC_RENO_FAST_FINE = 7734;         // slider 0.00..2.00
+static constexpr int IDC_RENO_FAST_EDIT = 7735;         // slider 0.00..4.00
+static constexpr int IDC_RENO_FAST_NOTE = 7736;         // what is live / recommended
+static constexpr int IDC_RENO_FAST_RECOMMENDED = 7737;  // one-click restore
 // The preset strip, the line that says what the preset does, the line that
 // says what Apply will do, and the way across to Image adjustments.
 static constexpr int IDC_NS_PRESET = 7342;
@@ -545,6 +556,13 @@ static constexpr UINT WM_MEDIA_SEEK = WM_APP + 51;
 static constexpr UINT WM_START_SCREEN = WM_APP + 52;
 // The dlssg_sm86 add-on download finished (wParam: its completion token).
 static constexpr UINT WM_FRAMEGEN_ADDON_INSTALLED = WM_APP + 53;
+
+// Whether neural progress is coalesced before it reaches the UI thread.
+// false reproduces the old behaviour - one posted message and one full-window
+// invalidation per rendered frame - and is the KNOWN-BAD control arm for the
+// live-playback drop A/B. It is kept as a switch so the two arms can be built
+// from the same source and compared against the same tick-gap instrumentation.
+static constexpr bool kCoalesceNeuralProgress = true;
 
 struct YouTubeUrlDialogState {
     const Localizer* localizer{};
@@ -879,7 +897,10 @@ static void DrawDarkCheckBox(const DRAWITEMSTRUCT& item)
     const RECT square{item.rcItem.left,top,item.rcItem.left+box,top+box};
     const COLORREF border=enabled?(checked?ui_palette::PrimaryBlue:(pressed?ui_palette::Hover:dark_mode::Rule))
                                   :ui_palette::Inactive;
-    const COLORREF fill=checked?ui_palette::PrimaryBlue:ui_palette::ControlSurface;
+    // A disabled switch has to read as one even when it is still checked: the
+    // fast mode greys "chained history" and "halo limit" in place, and a blue
+    // tick on a grey label looks like the setting still counts.
+    const COLORREF fill=!enabled?ui_palette::Inactive:(checked?ui_palette::PrimaryBlue:ui_palette::ControlSurface);
     HBRUSH brush=CreateSolidBrush(fill);HPEN pen=CreatePen(PS_SOLID,1,border);
     const HGDIOBJ oldBrush=SelectObject(item.hDC,brush),oldPen=SelectObject(item.hDC,pen);
     Rectangle(item.hDC,square.left,square.top,square.right,square.bottom);
@@ -890,7 +911,8 @@ static void DrawDarkCheckBox(const DRAWITEMSTRUCT& item)
         POINT tick[3]={{square.left+inset,square.top+box-inset*2},
                        {square.left+box/2,square.bottom-inset},
                        {square.right-inset/2,square.top+inset}};
-        HPEN tickPen=CreatePen(PS_SOLID,MulDiv(2,static_cast<int>(dpi),USER_DEFAULT_SCREEN_DPI),RGB(255,255,255));
+        HPEN tickPen=CreatePen(PS_SOLID,MulDiv(2,static_cast<int>(dpi),USER_DEFAULT_SCREEN_DPI),
+                               enabled?RGB(255,255,255):dark_mode::QuietText);
         const HGDIOBJ oldTickPen=SelectObject(item.hDC,tickPen);
         Polyline(item.hDC,tick,3);
         SelectObject(item.hDC,oldTickPen);DeleteObject(tickPen);
@@ -2637,6 +2659,14 @@ static MochizukiOptions ReadSavedMochizukiOptions(const std::filesystem::path& s
             options.overrides.emplace_back(pair.substr(0,eq),value);
         }
     }
+    // A hand-edited `MochizukiInt4=1` alongside `MochizukiNetwork=1` cannot be
+    // rendered: the runtime only ships INT4 weights for the original network and
+    // clears the request silently. Normalise before the value reaches the panel,
+    // an export job or the cache key, so the ini written back on Apply and the
+    // picture the render made agree. The dialog greys the box out to say why.
+    if (options.NormaliseInt4())
+        LOG("Mochizuki settings: INT4 was requested with the small network, which has no "
+            "INT4 weights; using int4=0 (the runtime clears that request silently).");
     return options;
 }
 
@@ -2853,7 +2883,30 @@ public:
     }
 
 private:
-    void PostProgress(const NeuralRenderProgress& progress){auto message=std::make_unique<NeuralProgressMessage>();message->generation=in_.generation;message->progress=progress;message->width=progressWidth_;message->height=progressHeight_;message->sourcePath=progressSourcePath_;message->sourceKey=progressSourceKey_;message->pageUrl=in_.pageUrl;in_.progressMessages->RegisterAndPost(std::move(message),[&](uint64_t token){return PostMessageW(in_.target,WM_NEURAL_PROGRESS,static_cast<WPARAM>(token),0)!=FALSE;});}
+    // The render loop reports ONCE PER FRAME (~58 Hz here). Each report used to
+    // become a posted UI message, and each message rebuilt the status row and
+    // invalidated the whole window: 58 full GDI paints a second on the very
+    // thread that presents video. Measured live sessions dropped 300-450 frames
+    // while the render ran and none the instant it stopped; lowering the
+    // worker's CPU priority changed nothing, because the work was on this
+    // thread. A progress indicator needs ~10 Hz, not one message per rendered
+    // frame. Phase changes, recoveries and the final report always go through:
+    // those are what the UI state machine and the silence watchdog watch.
+    static constexpr auto kProgressPostInterval=std::chrono::milliseconds(100);
+    std::mutex progressPostMutex_;
+    Clock::time_point lastProgressPost_{};
+    std::optional<NeuralRenderPhase> lastPostedPhase_{};
+    void PostProgress(const NeuralRenderProgress& progress){
+        if constexpr(kCoalesceNeuralProgress){
+            const auto now=Clock::now();
+            std::lock_guard lock(progressPostMutex_);
+            const bool important=!lastPostedPhase_||*lastPostedPhase_!=progress.phase||
+                                 progress.recovering!=NeuralRenderFailure::None||
+                                 (progress.totalFrames>0&&progress.completedFrames>=progress.totalFrames);
+            if(!important&&now-lastProgressPost_<kProgressPostInterval)return;
+            lastProgressPost_=now;lastPostedPhase_=progress.phase;
+        }
+        auto message=std::make_unique<NeuralProgressMessage>();message->generation=in_.generation;message->progress=progress;message->width=progressWidth_;message->height=progressHeight_;message->sourcePath=progressSourcePath_;message->sourceKey=progressSourceKey_;message->pageUrl=in_.pageUrl;in_.progressMessages->RegisterAndPost(std::move(message),[&](uint64_t token){return PostMessageW(in_.target,WM_NEURAL_PROGRESS,static_cast<WPARAM>(token),0)!=FALSE;});}
     bool Cancelled(){completion_->result.cancelled=true;completion_->result.detail=L"Neural render was cancelled.";return false;}
 
     // The local file to render: the path itself, or a stream's verified copy
@@ -3067,6 +3120,10 @@ private:
             in_.amdNrRuntime==AmdNrRuntime::Mochizuki?FormatMochizukiOptions(in_.mochizuki):std::string{});
         settingsDigest_=Sha256Bytes(*settingsSnapshot_);
         if(!settingsDigest_){completion_->result.detail=L"The neural settings digest could not be computed.";return false;}
+        // The other end of the runtime's own "renodx style" line. The runtime logs what it received; this records
+        // what was sent, so a knob that is dead on the panel can be told apart from one that never left the host.
+        // Offline renders clear the evaluator's log buffer (OfflineNeuralRenderer), so this has to be written here.
+        if(in_.amdNrRuntime==AmdNrRuntime::Mochizuki){const std::string mz=FormatMochizukiOptions(in_.mochizuki);LOG("Mochizuki overrides: "<<(mz.empty()?"(defaults, nothing sent)":mz));}
         return true;
     }
 
@@ -3705,6 +3762,13 @@ public:
         TickOnce();
     }
     void TickOnce() {
+        const auto tickAt=Clock::now();
+        if(m_playing&&m_lastTickAt!=Clock::time_point{}&&m_loaded){
+            const double gapMs=std::chrono::duration<double,std::milli>(tickAt-m_lastTickAt).count();
+            if(gapMs>m_tickGapMaxMs)m_tickGapMaxMs=gapMs;
+            if(gapMs>50.0)++m_tickGapsOver50;
+        }
+        m_lastTickAt=tickAt;
         ReapSourcePrefetch();
         ReapRetiringNeuralWorker();
         // Headphones unplugged, a default-device change, a driver restart: the
@@ -6069,10 +6133,12 @@ private:
             <<" ms/frame; guide="<<(m_renderMsFrames?m_guideMsTotal/double(m_renderMsFrames):0.0)
             <<" ms present="<<(m_renderMsFrames?m_renderMsTotal/double(m_renderMsFrames):0.0)
             <<" ms over "<<m_renderMsFrames<<" frames; stride=1in"<<m_presentStride<<" live="<<m_liveSession
-            <<" rendering="<<NeuralJobActive()<<" upscaling="<<UpscalingActive());
+            <<" rendering="<<NeuralJobActive()<<" upscaling="<<UpscalingActive()
+            <<" tickGapMax="<<m_tickGapMaxMs<<"ms tickGaps>50="<<m_tickGapsOver50);
         // An interval with no re-anchor in it is the session recovering, and
         // the limit exists to catch one that never does.
         m_guideMsTotal=0.0;m_renderMsTotal=0.0;m_renderMsFrames=0;
+        m_tickGapMaxMs=0.0;m_tickGapsOver50=0;
         if(!m_cadenceReanchoredRecently)m_cadenceReanchors=0;
         m_cadenceReanchoredRecently=false;
         m_playbackHealthAt=now;m_playbackHealthDropped=m_droppedFrames;
@@ -8228,6 +8294,18 @@ private:
             DestroyWindow(m_passWnd);
     }
 
+    // INT4 records/weights exist only for the 310.8.0 original network; on the
+    // small one the runtime silently clears the request. Grey the box out rather
+    // than leave a switch that changes nothing. DrawDarkCheckBox paints
+    // ODS_DISABLED in the quiet greys, and a disabled window gets no click.
+    void SyncMochizukiInt4(HWND h){
+        if(HWND box=GetDlgItem(h,IDC_NS_MZ_INT4)){
+            const bool available=m_mochizuki.networkModel==0;
+            EnableWindow(box,available);
+            if(!available)SetCheckBoxState(box,false);
+        }
+    }
+
     void SyncNeuralSettingControls(HWND h){
         SetTrack(h,IDC_NS_INTENSITY,0,int(std::lround(kIntensityMax*100.0f)),int(std::lround(m_neuralSettings.intensity*100.0f)));
         SetTrack(h,IDC_NS_STRUCTURE,0,200,int(std::lround(m_neuralSettings.localStructure*100.0f)));
@@ -8243,6 +8321,7 @@ private:
         SetCheckBoxState(GetDlgItem(h,IDC_NS_MZ_APPLY),m_mochizuki.applyModel);
         SetCheckBoxState(GetDlgItem(h,IDC_NS_MZ_PREPROCESS),m_mochizuki.preprocess);
         SetCheckBoxState(GetDlgItem(h,IDC_NS_MZ_INT4),m_mochizuki.int4Mixed);
+        SyncMochizukiInt4(h);
         const auto select=[&](int id,int index){if(HWND combo=GetDlgItem(h,id))SendMessageW(combo,CB_SETCURSEL,static_cast<WPARAM>(index),0);};
         select(IDC_NS_STYLE,std::clamp(m_neuralSettings.style,0,2));
         // Two items, index = value: 0 is the 310.8.0 network and 1 the small
@@ -8310,6 +8389,12 @@ private:
             const int index=int(SendMessageW(combo,CB_GETCURSEL,0,0));
             if(index!=CB_ERR)m_mochizuki.networkModel=index==1?1u:0u;
         }
+        // The two are read separately but cannot be used together: INT4 has no
+        // weights for the small network. Normalise after BOTH reads, then let the
+        // dialog grey the box out and uncheck it, so what Apply writes to the ini
+        // is exactly what the render can do.
+        m_mochizuki.NormaliseInt4();
+        SyncMochizukiInt4(h);
         m_neuralSettings.style=sel(IDC_NS_STYLE,m_neuralSettings.style);
         m_neuralSettings.autoMask=checked(IDC_NS_AUTOMASK);
         // The route is read before the ladder because it decides what the ladder
@@ -9093,7 +9178,11 @@ private:
                 // The owner-drawn check boxes do not flip their own check: the
                 // click is only a click until this turns the state over, and
                 // the read below is what carries it into the settings.
-                if(HWND box=GetDlgItem(h,id))SetCheckBoxState(box,!CheckBoxState(box));
+                // A disabled box must not flip: the INT4 switch is greyed out on
+                // the small network, and an owner-drawn button has no system
+                // check state to protect it from a stray message.
+                if(HWND box=GetDlgItem(h,id);box&&IsWindowEnabled(box))
+                    SetCheckBoxState(box,!CheckBoxState(box));
                 ReadNeuralSettingControls(h);return 0;
             }
             break;
@@ -9403,7 +9492,9 @@ private:
     // unsaved mark until Apply. reno_look_mode is the grade's own on/off switch;
     // Reset returns to the route's measured group (detail 2.00, shadows 0.90)
     // rather than to package defaults.
-    static constexpr int kRenoDesignW=470,kRenoDesignH=652;
+    // The fast section adds seven rows below the legacy knobs; the window grew
+    // with them rather than hiding them behind another tool window.
+    static constexpr int kRenoDesignW=470,kRenoDesignH=952;
 
     void ShowRenoDxSettings(){
         if(m_renoWnd&&IsWindow(m_renoWnd)){ShowWindow(m_renoWnd,SW_SHOWNORMAL);SetForegroundWindow(m_renoWnd);return;}
@@ -9434,41 +9525,68 @@ private:
         using R=RenoDxSettings;
         CreateSettingsGroupHeading(h,L"neural.renodx.group",12);
         DialogControl(h,L"STATIC",L"",SS_LEFT,16,32,436,18,IDC_RENO_ROUTE_NOTE);
-        CreateAdjustmentRow(h,IDC_RENO_DETAIL,L"neural.renodx.detail",62,L"neural.tip.renodx_detail");
-        CreateAdjustmentRow(h,IDC_RENO_DETAIL_RADIUS,L"neural.renodx.detail_radius",100,L"neural.tip.renodx_detail_radius");
-        CreateAdjustmentRow(h,IDC_RENO_SHADOWS,L"neural.renodx.shadows",138,L"neural.tip.renodx_shadows");
-        CreateAdjustmentRow(h,IDC_RENO_HIGHLIGHTS,L"neural.renodx.highlights",176,L"neural.tip.renodx_highlights");
-        CreateAdjustmentRow(h,IDC_RENO_COLOUR,L"neural.renodx.colour",214,L"neural.tip.renodx_colour");
-        CreateAdjustmentRow(h,IDC_RENO_TONE,L"neural.renodx.tone",252,L"neural.tip.renodx_tone");
+        // The legacy / fast switch sits on the first row: it decides which of
+        // the two sets of knobs below actually reaches the render, so hiding it
+        // at the bottom would let a profile look like one mode and render as
+        // the other. Switching to fast lands on the measured recommended set
+        // (kStart) unless the user has already edited those knobs.
+        CreateNeuralCombo(h,IDC_RENO_MODE,L"neural.renodx.mode",62,
+            {L"传统（多遍）",L"快速 fast（推荐）"},L"neural.tip.renodx_mode",0,220);
+        CreateAdjustmentRow(h,IDC_RENO_DETAIL,L"neural.renodx.detail",100,L"neural.tip.renodx_detail");
+        CreateAdjustmentRow(h,IDC_RENO_DETAIL_RADIUS,L"neural.renodx.detail_radius",138,L"neural.tip.renodx_detail_radius");
+        CreateAdjustmentRow(h,IDC_RENO_SHADOWS,L"neural.renodx.shadows",176,L"neural.tip.renodx_shadows");
+        CreateAdjustmentRow(h,IDC_RENO_HIGHLIGHTS,L"neural.renodx.highlights",214,L"neural.tip.renodx_highlights");
+        CreateAdjustmentRow(h,IDC_RENO_COLOUR,L"neural.renodx.colour",252,L"neural.tip.renodx_colour");
+        CreateAdjustmentRow(h,IDC_RENO_TONE,L"neural.renodx.tone",290,L"neural.tip.renodx_tone");
         // reno_look_mode: the package carries it as a bool (NRLookMode, 0..1) -
         // the grade itself, on or off. With it off every look knob below is an
         // identity gain, so the picture does not move at all.
-        CreateNeuralCombo(h,IDC_RENO_LOOK_MODE,L"neural.renodx.look_mode",290,
+        CreateNeuralCombo(h,IDC_RENO_LOOK_MODE,L"neural.renodx.look_mode",328,
             {L"Off",L"On"},L"neural.tip.renodx_look_mode");
-        CreateNeuralCombo(h,IDC_RENO_DETAIL_STABILITY,L"neural.renodx.detail_stability",328,
+        CreateNeuralCombo(h,IDC_RENO_DETAIL_STABILITY,L"neural.renodx.detail_stability",366,
             {L"Auto (no-op)",L"Off",L"Always"},L"neural.tip.renodx_detail_stability");
-        CreateNeuralCombo(h,IDC_RENO_LOOK_STABILIZE,L"neural.renodx.look_stabilize",366,
+        CreateNeuralCombo(h,IDC_RENO_LOOK_STABILIZE,L"neural.renodx.look_stabilize",404,
             {L"Off",L"On"},L"neural.tip.renodx_look_stabilize");
-        CreateAdjustmentRow(h,IDC_RENO_STABILIZE_MS,L"neural.renodx.stabilize_ms",404,L"neural.tip.renodx_stabilize_ms");
+        CreateAdjustmentRow(h,IDC_RENO_STABILIZE_MS,L"neural.renodx.stabilize_ms",442,L"neural.tip.renodx_stabilize_ms");
         // The cross-pass recursion. Above one pass it is the difference between
         // the stack steadying the picture and the stack dragging the last frame
         // into this one, so it sits next to the stabiliser rather than with the
         // per-pass window - it is not a look, it is how much of the last frame
-        // the stack is allowed to remember.
-        CreateNeuralCheck(h,IDC_RENO_CHAINED,L"neural.renodx.chained",16,442,320,L"neural.tip.renodx_chained");
+        // the stack is allowed to remember. Dead in fast mode: it is greyed.
+        CreateNeuralCheck(h,IDC_RENO_CHAINED,L"neural.renodx.chained",16,480,320,L"neural.tip.renodx_chained");
         {
-            const int y=480;
+            const int y=518;
             DialogControl(h,L"STATIC",T(L"neural.renodx.passes").c_str(),SS_LEFT,16,y,116,20);
             HWND combo=DialogControl(h,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST,132,y-3,120,200,IDC_RENO_PASSES);
             for(int p=1;p<=30;++p){const std::wstring s=std::to_wstring(p);SendMessageW(combo,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(s.c_str()));}
             AddTip(h,combo,L"neural.tip.renodx_passes");
         }
-        CreateAdjustmentRow(h,IDC_RENO_MVEC_X,L"neural.renodx.mvec_x",518,L"neural.tip.renodx_mvec_x");
-        CreateAdjustmentRow(h,IDC_RENO_MVEC_Y,L"neural.renodx.mvec_y",556,L"neural.tip.renodx_mvec_y");
-        DialogButton(h,L"neural.renodx.pass_open",IDC_RENO_PASS_OPEN,16,604,120,30);
-        DialogButton(h,L"neural.settings.reset",IDC_RENO_RESET,144,604,86,30);
-        DialogButton(h,L"neural.settings.apply",IDC_RENO_APPLY,238,604,122,30,true);
-        DialogButton(h,L"neural.settings.close",IDC_RENO_CLOSE,368,604,86,30);
+        CreateAdjustmentRow(h,IDC_RENO_MVEC_X,L"neural.renodx.mvec_x",556,L"neural.tip.renodx_mvec_x");
+        CreateAdjustmentRow(h,IDC_RENO_MVEC_Y,L"neural.renodx.mvec_y",594,L"neural.tip.renodx_mvec_y");
+        // ---- Passes (fast) ------------------------------------------------
+        // Only Extrapolation's slot 0 and Edit strength are surfaced: Feedback
+        // and Hybrid need real motion vectors, and this host feeds a constant
+        // one. Selecting either is refused with the note below rather than
+        // silently rendering something else.
+        CreateSettingsGroupHeading(h,L"neural.renodx.fast_group",632,0,280);
+        DialogButton(h,L"neural.renodx.fast_recommended",IDC_RENO_FAST_RECOMMENDED,306,628,148,26);
+        AddTip(h,GetDlgItem(h,IDC_RENO_FAST_RECOMMENDED),L"neural.tip.renodx_fast_recommended");
+        CreateNeuralCombo(h,IDC_RENO_FAST_METHOD,L"neural.renodx.fast_method",670,
+            {L"外推 Extrapolation（推荐）",L"Feedback（本机不可用）",
+             L"Hybrid（本机不可用）",L"Edit strength（不压黑）"},
+            L"neural.tip.renodx_fast_method",0,220);
+        CreateAdjustmentRow(h,IDC_RENO_FAST_PASSES,L"neural.renodx.fast_passes",708,L"neural.tip.renodx_fast_passes");
+        CreateNeuralCheck(h,IDC_RENO_FAST_HALO,L"neural.renodx.fast_halo",16,746,320,L"neural.tip.renodx_fast_halo");
+        CreateAdjustmentRow(h,IDC_RENO_FAST_FINE,L"neural.renodx.fast_fine",784,L"neural.tip.renodx_fast_fine");
+        CreateAdjustmentRow(h,IDC_RENO_FAST_EDIT,L"neural.renodx.fast_edit",822,L"neural.tip.renodx_fast_edit");
+        // Two explicit lines: a plain SS_LEFT static does not wrap Chinese
+        // text on its own (no spaces to break at), so the note carries its
+        // own newline and gets the full 436 design units of width.
+        DialogControl(h,L"STATIC",L"",SS_LEFT,16,860,436,36,IDC_RENO_FAST_NOTE);
+        DialogButton(h,L"neural.renodx.pass_open",IDC_RENO_PASS_OPEN,16,898,120,30);
+        DialogButton(h,L"neural.settings.reset",IDC_RENO_RESET,144,898,86,30);
+        DialogButton(h,L"neural.settings.apply",IDC_RENO_APPLY,238,898,122,30,true);
+        DialogButton(h,L"neural.settings.close",IDC_RENO_CLOSE,368,898,86,30);
         SyncRenoDxControls(h);
         UpdateRenoRouteNote(h);
         CaptureSettingsDesignLayout(h);
@@ -9485,10 +9603,11 @@ private:
     // gates are greyed out rather than left looking movable.
     void UpdateRenoRouteNote(HWND h){
         if(!h)return;
+        using R=RenoDxSettings;
         HWND note=GetDlgItem(h,IDC_RENO_ROUTE_NOTE);
         if(!note)return;
         const bool routeOn=m_neuralSettings.route==1;
-        const bool gradeOn=m_renoWorking.value[RenoDxSettings::LookMode]!=0;
+        const bool gradeOn=m_renoWorking.value[R::LookMode]!=0;
         const wchar_t* key=!routeOn?L"neural.renodx.route_off"
                          :!gradeOn?L"neural.renodx.grade_off"
                                   :L"neural.renodx.route_on";
@@ -9505,6 +9624,41 @@ private:
             if(HWND track=GetDlgItem(h,id))EnableWindow(track,live);
             if(HWND value=GetDlgItem(h,id+100))EnableWindow(value,live);
         }
+        // Which of the two sets of strength knobs is live. In fast mode
+        // stack_passes() returns 1, so the legacy pass count and chained
+        // history are dead - greying them is the difference between "a mode
+        // switch" and the fifth "selectable but does nothing" control.
+        // Method 3 (Edit strength) ignores Passes/Halo/Fine just as strictly.
+        const bool fast=m_renoWorking.value[R::PassesMode]!=0.0;
+        const int method=int(m_renoWorking.value[R::FastMethod]);
+        auto gate=[&](int id,bool on){if(HWND c=GetDlgItem(h,id))EnableWindow(c,on);};
+        gate(IDC_RENO_MODE,true);
+        gate(IDC_RENO_PASSES,!fast);
+        gate(IDC_RENO_CHAINED,!fast);
+        const bool fastLive=live&&fast;
+        const bool extrap=fastLive&&method==0;
+        const bool edit=fastLive&&method==3;
+        gate(IDC_RENO_FAST_METHOD,fastLive);
+        for(const int id:{IDC_RENO_FAST_PASSES,IDC_RENO_FAST_FINE}){
+            gate(id,extrap);gate(id+100,extrap);
+        }
+        gate(IDC_RENO_FAST_HALO,extrap);
+        gate(IDC_RENO_FAST_EDIT,edit);gate(IDC_RENO_FAST_EDIT+100,edit);
+        gate(IDC_RENO_FAST_RECOMMENDED,fastLive);
+        // The note says which configuration is running and warns about the two
+        // things measured to be harmful: a hand-edited strength and >5 passes.
+        const wchar_t* fastKey=L"neural.renodx.fast_note_off";
+        if(!live)fastKey=L"neural.renodx.fast_note_inactive";
+        else if(!fast)fastKey=L"neural.renodx.fast_note_off";
+        else if(method==1||method==2)fastKey=L"neural.renodx.fast_note_unsafe";
+        else if(method==3)fastKey=L"neural.renodx.fast_note_edit";
+        else if(m_renoWorking.value[R::FastPasses0]>5.0)fastKey=L"neural.renodx.fast_note_strong";
+        else if(!R::FastSectionAtRecommended(m_renoWorking))fastKey=L"neural.renodx.fast_note_custom";
+        else fastKey=L"neural.renodx.fast_note_recommended";
+        if(HWND fn=GetDlgItem(h,IDC_RENO_FAST_NOTE)){
+            SetWindowTextW(fn,T(fastKey).c_str());
+            InvalidateRect(fn,nullptr,TRUE);
+        }
     }
 
     void UpdateRenoValueLabels(HWND h){
@@ -9518,6 +9672,9 @@ private:
         SetAdjustmentValue(h,IDC_RENO_STABILIZE_MS,PlainValue(float(m_renoWorking.value[R::StabilizeMs]),L" ms"));
         SetAdjustmentValue(h,IDC_RENO_MVEC_X,PlainValue(float(m_renoWorking.value[R::MvecScaleX])));
         SetAdjustmentValue(h,IDC_RENO_MVEC_Y,PlainValue(float(m_renoWorking.value[R::MvecScaleY])));
+        SetAdjustmentValue(h,IDC_RENO_FAST_PASSES,PlainValue(float(m_renoWorking.value[R::FastPasses0])));
+        SetAdjustmentValue(h,IDC_RENO_FAST_FINE,PlainValue(float(m_renoWorking.value[R::FastFine0])));
+        SetAdjustmentValue(h,IDC_RENO_FAST_EDIT,PlainValue(float(m_renoWorking.value[R::FastEditStrength])));
     }
 
     void SyncRenoDxControls(HWND h){
@@ -9536,6 +9693,16 @@ private:
         if(HWND c=GetDlgItem(h,IDC_RENO_LOOK_MODE))SendMessageW(c,CB_SETCURSEL,static_cast<WPARAM>(int(m_renoWorking.value[R::LookMode])),0);
         if(HWND c=GetDlgItem(h,IDC_RENO_PASSES))SendMessageW(c,CB_SETCURSEL,static_cast<WPARAM>(int(m_renoWorking.value[R::RenoPasses])-1),0);
         SetCheckBoxState(GetDlgItem(h,IDC_RENO_CHAINED),m_renoWorking.value[R::ChainedHistory]!=0.0);
+        // The fast section. Its sliders are in hundredths, like every other
+        // float row here; CB_SETCURSEL does not notify, so Sync never looks
+        // like a user edit to the window procedure.
+        if(HWND c=GetDlgItem(h,IDC_RENO_MODE))SendMessageW(c,CB_SETCURSEL,static_cast<WPARAM>(int(m_renoWorking.value[R::PassesMode])),0);
+        if(HWND c=GetDlgItem(h,IDC_RENO_FAST_METHOD))SendMessageW(c,CB_SETCURSEL,static_cast<WPARAM>(int(m_renoWorking.value[R::FastMethod])),0);
+        SetTrack(h,IDC_RENO_FAST_PASSES,100,800,int(std::lround(m_renoWorking.value[R::FastPasses0]*100.0)));
+        SetTrack(h,IDC_RENO_FAST_FINE,0,200,int(std::lround(m_renoWorking.value[R::FastFine0]*100.0)));
+        SetTrack(h,IDC_RENO_FAST_EDIT,0,400,int(std::lround(m_renoWorking.value[R::FastEditStrength]*100.0)));
+        SetCheckBoxState(GetDlgItem(h,IDC_RENO_FAST_HALO),m_renoWorking.value[R::FastHalo0]!=0.0);
+        UpdateRenoRouteNote(h);
         UpdateRenoValueLabels(h);
         RenoMarkDirty(h);
     }
@@ -9558,6 +9725,14 @@ private:
         m_renoWorking.value[R::MvecScaleX]=std::clamp(pos(IDC_RENO_MVEC_X)/100.0,R::kLow[R::MvecScaleX],R::kHigh[R::MvecScaleX]);
         m_renoWorking.value[R::MvecScaleY]=std::clamp(pos(IDC_RENO_MVEC_Y)/100.0,R::kLow[R::MvecScaleY],R::kHigh[R::MvecScaleY]);
         m_renoWorking.value[R::ChainedHistory]=CheckBoxState(GetDlgItem(h,IDC_RENO_CHAINED))?1.0:0.0;
+        // The fast section is read even while it is greyed out: a mode switch
+        // must not lose values the user set before switching away.
+        m_renoWorking.value[R::PassesMode]=std::clamp(double(sel(IDC_RENO_MODE,int(m_renoWorking.value[R::PassesMode]))),R::kLow[R::PassesMode],R::kHigh[R::PassesMode]);
+        m_renoWorking.value[R::FastMethod]=std::clamp(double(sel(IDC_RENO_FAST_METHOD,int(m_renoWorking.value[R::FastMethod]))),R::kLow[R::FastMethod],R::kHigh[R::FastMethod]);
+        m_renoWorking.value[R::FastPasses0]=std::clamp(pos(IDC_RENO_FAST_PASSES)/100.0,R::kLow[R::FastPasses0],R::kHigh[R::FastPasses0]);
+        m_renoWorking.value[R::FastFine0]=std::clamp(pos(IDC_RENO_FAST_FINE)/100.0,R::kLow[R::FastFine0],R::kHigh[R::FastFine0]);
+        m_renoWorking.value[R::FastEditStrength]=std::clamp(pos(IDC_RENO_FAST_EDIT)/100.0,R::kLow[R::FastEditStrength],R::kHigh[R::FastEditStrength]);
+        m_renoWorking.value[R::FastHalo0]=CheckBoxState(GetDlgItem(h,IDC_RENO_FAST_HALO))?1.0:0.0;
         RenoMarkDirty(h);
     }
 
@@ -9587,15 +9762,29 @@ private:
         case WM_ACTIVATE:UpdateRenoRouteNote(h);return 0;
         // A slider reports through WM_HSCROLL: read the working copy, repaint the
         // readouts, and leave saving to Apply or to the window closing.
-        case WM_HSCROLL:ReadRenoDxControls(h);UpdateRenoValueLabels(h);return 0;
+        case WM_HSCROLL:ReadRenoDxControls(h);UpdateRenoValueLabels(h);UpdateRenoRouteNote(h);return 0;
         case WM_COMMAND:{
             const int id=LOWORD(w);const int code=HIWORD(w);
             if(id==IDC_RENO_RESET){
+                const bool wasFast=m_renoWorking.value[RenoDxSettings::PassesMode]!=0.0;
                 m_renoWorking=RenoDxSettings::MeasuredBaseline();
+                // Reset while fast stays fast and lands on the recommended set:
+                // the mode's default is the measured configuration, not the
+                // package's halo=0 / fine=0 identity.
+                if(wasFast)RenoDxSettings::ApplyRecommendedFast(m_renoWorking);
                 SyncRenoDxControls(h);UpdateRenoRouteNote(h);
                 // The pass window edits the same working copy, so a Reset here
                 // has to repaint it or it goes on showing the values it had.
                 if(m_renoPassWnd&&IsWindow(m_renoPassWnd))SyncRenoPassControls(m_renoPassWnd);
+                return 0;}
+            // One click back to the measured configuration. It restores the
+            // fast knobs only (not the look the user tuned) and keeps whichever
+            // mode is selected, so it is safe to press while experimenting.
+            if(id==IDC_RENO_FAST_RECOMMENDED){
+                const double mode=m_renoWorking.value[RenoDxSettings::PassesMode];
+                RenoDxSettings::ApplyRecommendedFast(m_renoWorking);
+                m_renoWorking.value[RenoDxSettings::PassesMode]=mode;
+                SyncRenoDxControls(h);UpdateRenoRouteNote(h);
                 return 0;}
             if(id==IDC_RENO_APPLY){
                 ReadRenoDxControls(h);
@@ -9629,17 +9818,43 @@ private:
                     // So "stability=2 stabilise=0" is the working combination
                     // and "stability=0" or "stabilise!=0" is a silent no-op.
                     <<" stability="<<m_renoDx.value[RenoDxSettings::DetailStability]
-                    <<" stabilise="<<m_renoDx.value[RenoDxSettings::LookStabilize]);
+                    <<" stabilise="<<m_renoDx.value[RenoDxSettings::LookStabilize]
+                    // The fast section is a whole second route: a report of
+                    // "getting darker" cannot be tied to a setting without
+                    // seeing which mode and which strength was applied.
+                    <<" mode="<<m_renoDx.value[RenoDxSettings::PassesMode]
+                    <<" fast_method="<<m_renoDx.value[RenoDxSettings::FastMethod]
+                    <<" fast_passes="<<m_renoDx.value[RenoDxSettings::FastPasses0]
+                    <<" fast_halo="<<m_renoDx.value[RenoDxSettings::FastHalo0]
+                    <<" fast_fine="<<m_renoDx.value[RenoDxSettings::FastFine0]);
                 ApplyNeuralSettings();
                 RenoMarkDirty(h);
                 UpdateRenoRouteNote(h);
                 return 0;}
             if(id==IDC_RENO_PASS_OPEN){ShowRenoPassSettings();return 0;}
             if(id==IDC_RENO_CLOSE){DestroyWindow(h);return 0;}
-            if((id==IDC_RENO_DETAIL_STABILITY||id==IDC_RENO_LOOK_STABILIZE||id==IDC_RENO_PASSES||id==IDC_RENO_LOOK_MODE)&&code==CBN_SELCHANGE){ReadRenoDxControls(h);UpdateRenoRouteNote(h);return 0;}
+            if((id==IDC_RENO_DETAIL_STABILITY||id==IDC_RENO_LOOK_STABILIZE||id==IDC_RENO_PASSES||id==IDC_RENO_LOOK_MODE
+                ||id==IDC_RENO_MODE||id==IDC_RENO_FAST_METHOD)&&code==CBN_SELCHANGE){
+                ReadRenoDxControls(h);
+                // Feedback / Hybrid need real motion vectors; this host feeds a
+                // constant one, and the two methods read slots 1/2 rather than
+                // the slot 0 these knobs edit. Refuse the choice with a reason
+                // rather than leave a mode selected whose controls do nothing.
+                if(id==IDC_RENO_FAST_METHOD){
+                    const int method=int(m_renoWorking.value[RenoDxSettings::FastMethod]);
+                    if(method==1||method==2){
+                        MessageBoxW(h,T(L"neural.renodx.fast_method_unavailable").c_str(),
+                            T(L"neural.renodx.title").c_str(),MB_OK|MB_ICONINFORMATION);
+                        m_renoWorking.value[RenoDxSettings::FastMethod]=0.0;
+                        SyncRenoDxControls(h);
+                    }
+                }
+                UpdateRenoRouteNote(h);
+                return 0;}
             // The owner-drawn boxes do not flip their own check; the click is
             // only a click until this turns the state over.
             if(id==IDC_RENO_CHAINED&&code==BN_CLICKED){if(HWND box=GetDlgItem(h,id))SetCheckBoxState(box,!CheckBoxState(box));ReadRenoDxControls(h);return 0;}
+            if(id==IDC_RENO_FAST_HALO&&code==BN_CLICKED){if(HWND box=GetDlgItem(h,id))SetCheckBoxState(box,!CheckBoxState(box));ReadRenoDxControls(h);UpdateRenoRouteNote(h);return 0;}
             break;
         }
         case WM_CLOSE:DestroyWindow(h);return 0;
@@ -14679,7 +14894,16 @@ private:
         // The status line and the chips are cached text: a phase change is
         // what the warm-up line reports, so it has to reach them.
         if(m_liveSession)UpdateCachedStatus();
-        InvalidateRect(m_hwnd,nullptr,FALSE);
+        // Both of those invalidate their OWN rectangles when their text
+        // changes. Invalidating the whole window on every progress report
+        // repainted the entire chrome 58 times a second on the presenting
+        // thread, which is where the live-render frame drops came from.
+        // A full repaint is still due when the layout itself can change -
+        // the start screen, transport and warm-up all follow the phase.
+        const bool phaseChanged=!m_progressPaintPhase||*m_progressPaintPhase!=message->progress.phase;
+        if constexpr(!kCoalesceNeuralProgress)InvalidateRect(m_hwnd,nullptr,FALSE);
+        else if(!m_loaded||phaseChanged)InvalidateRect(m_hwnd,nullptr,FALSE);
+        if(phaseChanged)m_progressPaintPhase=message->progress.phase;
     }
     // Silence budget per phase, in seconds; 0 means the phase is not watched.
     // Only phases that must keep reporting are: acquisition now reports
@@ -15996,6 +16220,11 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // dropped count it spoke with.
     Clock::time_point m_playbackHealthAt{};
     uint64_t m_playbackHealthDropped=0,m_playbackHealthPresented=0;
+    // How long the UI thread went without a tick. A stuck decoder, a full GDI
+    // repaint or a starved message loop all show up here; the presented fps
+    // and dropped count alone cannot say which. Reported per health window.
+    Clock::time_point m_lastTickAt{};
+    double m_tickGapMaxMs=0.0;uint32_t m_tickGapsOver50=0;
     // Presentation cadence for neural pairs: show one pair in m_presentStride,
     // m_presentPhase counting pairs since the last presented one. See
     // PlaybackCadence.h.
@@ -16133,6 +16362,8 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // Progress-watchdog state: the last progress the job reported and when it
     // moved, so a phase that stops reporting can be told from a slow one.
     Clock::time_point m_neuralProgressAt{};NeuralRenderPhase m_watchedPhase{};uint64_t m_watchedFrames=0,m_watchedBytes=0;
+    // Last phase whose full-window repaint was paid for; see CompleteNeuralProgress.
+    std::optional<NeuralRenderPhase> m_progressPaintPhase{};
     // The loaded original is the acquired local copy of a network source: its
     // identity stays YouTube, but decode, seek and audio are local-file work.
     bool m_cachedSourceFile=false;
