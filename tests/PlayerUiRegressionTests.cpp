@@ -5196,6 +5196,57 @@ struct PlayerAppTestAccess {
         app.NoteSettingsAheadOfRender();
         CHECK_EQ(std::wstring(L"driver below floor"), app.m_neuralNotice);
 
+        // A paused settings preview retains its OWN pair, so the comparison
+        // toolbox stays usable without switching the player into cached
+        // playback. Leaving the preview has to take that pair away with it, or
+        // every mode would keep compositing against a frame playback has left.
+        {
+            const bool loadedBefore=app.m_loaded, neuralRequestedBefore=app.m_neuralRequested;
+            const bool cachedBefore=app.m_cachedPlayback, presentedBefore=app.m_havePresentedPair;
+            const bool shownBefore=app.m_previewShown, playingBefore=app.m_playing;
+            app.m_cachedPlayback=false;app.m_loaded=true;app.m_neuralRequested=true;
+            app.m_previewShown=false;app.m_playing=false;
+            CHECK(!app.ComparisonModesAvailable());
+            auto previewPair=std::make_shared<SynchronizedFramePair>();
+            previewPair->original.bgra={0,0,0,255};previewPair->neural.bgra={255,255,255,255};
+            app.m_settingsPreviewPair=previewPair;app.m_havePresentedPair=true;app.m_previewShown=true;
+            CHECK(app.ComparisonModesAvailable());
+            app.LeaveSettingsPreviewFrame();
+            CHECK(!app.m_previewShown);
+            CHECK(!app.m_settingsPreviewPair);
+            CHECK(!app.ComparisonModesAvailable());
+            CHECK(!app.m_havePresentedPair);
+            app.m_loaded=loadedBefore;app.m_neuralRequested=neuralRequestedBefore;
+            app.m_cachedPlayback=cachedBefore;app.m_havePresentedPair=presentedBefore;
+            app.m_previewShown=shownBefore;app.m_playing=playingBefore;
+        }
+
+        // Opening the panel takes the picture away from playback; closing it
+        // puts back exactly what it took. A panel rebuild (AMD runtime switch)
+        // must keep the takeover alive, and an unloaded player must not start
+        // GPU work while the window is being torn down.
+        {
+            const bool loadedBefore=app.m_loaded, requestedBefore=app.m_neuralRequested;
+            app.m_loaded=false;app.m_settingsPreviewSession={};
+            app.EnterSettingsPreviewSession();
+            CHECK(!app.SettingsPreviewSessionActive());
+
+            app.m_settingsPreviewSession.active=true;
+            app.m_settingsPreviewSession.wasPlaying=true;
+            app.m_settingsPreviewSession.hadLiveSession=true;
+            app.m_settingsPreviewSession.neuralRequestedBefore=false;
+            app.m_neuralRequested=true;app.m_previewShown=false;app.m_previewJob=false;
+            CHECK(app.SettingsPreviewSessionActive());
+            app.m_settingsPanelRebuilding=true;
+            app.FinishSettingsPreviewSession();
+            CHECK(app.SettingsPreviewSessionActive());
+            app.m_settingsPanelRebuilding=false;
+            app.FinishSettingsPreviewSession();
+            CHECK(!app.SettingsPreviewSessionActive());
+            CHECK_EQ(false, app.m_neuralRequested);
+            app.m_loaded=loadedBefore;app.m_neuralRequested=requestedBefore;
+        }
+
         app.m_neuralNotice.clear(); app.m_renderGuides = {}; app.m_neuralSettings = {};
         app.m_cachedPlayback = false; app.m_playing = false;
     }

@@ -3561,7 +3561,7 @@ class PlayerApp {
 #endif
 public:
     explicit PlayerApp(AppOptions o):m_opt(std::move(o)),m_youtubeSourceQuality(YouTubeSourceQuality::Auto),m_neuralPauseEvent(CreateEventW(nullptr,TRUE,FALSE,nullptr)){}
-    ~PlayerApp(){if(m_activityTimer&&m_hwnd)KillTimer(m_hwnd,m_activityTimer);CancelExport();CancelFrameGeneration();CancelNeuralJob(false);CancelYouTubeResolution(false);SaveVideoSettings();if(m_adjustWnd)DestroyWindow(m_adjustWnd);if(m_neuralWnd)DestroyWindow(m_neuralWnd);if(m_encoderWnd)DestroyWindow(m_encoderWnd);UnregisterOverlayHotkeys();Unload(); if(m_font)DeleteObject(m_font); if(m_fontSmall)DeleteObject(m_fontSmall); if(m_fontTitle)DeleteObject(m_fontTitle); if(m_iconFont)DeleteObject(m_iconFont); if(m_neuralPauseEvent)CloseHandle(m_neuralPauseEvent);for(const auto& icon:m_thumbIcons)DestroyIcon(icon.second);}
+    ~PlayerApp(){if(m_activityTimer&&m_hwnd)KillTimer(m_hwnd,m_activityTimer);CancelExport();CancelFrameGeneration();CancelNeuralJob(false);CancelYouTubeResolution(false);SaveVideoSettings();m_settingsPreviewSession={};if(m_adjustWnd)DestroyWindow(m_adjustWnd);if(m_neuralWnd)DestroyWindow(m_neuralWnd);if(m_encoderWnd)DestroyWindow(m_encoderWnd);UnregisterOverlayHotkeys();Unload(); if(m_font)DeleteObject(m_font); if(m_fontSmall)DeleteObject(m_fontSmall); if(m_fontTitle)DeleteObject(m_fontTitle); if(m_iconFont)DeleteObject(m_iconFont); if(m_neuralPauseEvent)CloseHandle(m_neuralPauseEvent);for(const auto& icon:m_thumbIcons)DestroyIcon(icon.second);}
 
     bool Create(HINSTANCE hi) {
         if(!m_uiResources.Load(hi))LOG("Embedded Tabler icon font unavailable; continuing with label-only controls.");
@@ -6431,7 +6431,16 @@ private:
     // m_havePresentedPair or checks for null.
     const VideoFrame* LastOriginalFrame()const{return m_lastPair?&m_lastPair->original:nullptr;}
     const VideoFrame* LastNeuralFrame()const{return m_previewNeuralValid?&m_previewNeuralFrame:(m_lastPair?&m_lastPair->neural:nullptr);}
-    void ForgetRenderedCachedPair(){m_lastPair.reset();m_referencePair.reset();m_referenceRenderer=nullptr;m_previewNeuralValid=false;m_previewNeuralFrame=VideoFrame{};}
+    // A settings preview presents a pair without cached playback, so comparison
+    // modes have a reference that does not come from SynchronizedPlayback. The
+    // preview frame itself keeps its own storage (see m_previewNeuralFrame).
+    bool SettingsPreviewPairResident()const{return m_settingsPreviewPair!=nullptr;}
+    void ForgetSettingsPreviewPair(){
+        if(!m_settingsPreviewPair)return;
+        m_settingsPreviewPair.reset();m_referencePair.reset();m_referenceRenderer=nullptr;
+        if(!m_cachedPlayback)m_havePresentedPair=false;
+    }
+    void ForgetRenderedCachedPair(){m_lastPair.reset();m_settingsPreviewPair.reset();m_referencePair.reset();m_referenceRenderer=nullptr;m_previewNeuralValid=false;m_previewNeuralFrame=VideoFrame{};}
     NetworkReadAction ApplyNetworkRead(VideoReadResult result,NetworkReadPosition position){
         const NetworkReadDecision decision=m_networkReadState.Resolve(result,position);
         switch(decision.action){
@@ -6881,8 +6890,10 @@ private:
     }
 
     // Blend/Split/Wipe compare the neural member against the original of the
-    // same pair; that only exists during cached playback with the neural view.
-    bool ComparisonModesAvailable()const{return m_loaded&&m_cachedPlayback&&m_neuralRequested;}
+    // same pair. That used to exist only during cached playback; a paused
+    // settings preview now retains a pair of its own so the whole comparison
+    // toolbox stays usable while the panel is open.
+    bool ComparisonModesAvailable()const{return m_loaded&&m_neuralRequested&&(m_cachedPlayback||SettingsPreviewPairResident());}
     // Without a resident pair there is no original to composite against, so the mode
     // degrades to Neural and the strength dial degrades to 1: a missing reference shows
     // today's picture instead of compositing the neural frame against a black texture.
@@ -7025,9 +7036,12 @@ private:
     // renderer is compared as well as the pair: a rebuilt renderer starts with
     // no reference, whatever the pair was.
     void UploadPausedComparisonReference(){
-        if(!m_havePresentedPair||!m_lastPair||!m_renderer)return;
-        if(m_referencePair==m_lastPair&&m_referenceRenderer==m_renderer.get()&&m_renderer->HasReference())return;
-        if(UploadComparisonReference(m_lastPair->original)){m_referencePair=m_lastPair;m_referenceRenderer=m_renderer.get();}
+        // A shown settings preview owns the reference for as long as the panel
+        // is open; otherwise the last presented cached pair does.
+        const std::shared_ptr<const SynchronizedFramePair> pair=m_settingsPreviewPair?m_settingsPreviewPair:m_lastPair;
+        if(!m_havePresentedPair||!pair||!m_renderer)return;
+        if(m_referencePair==pair&&m_referenceRenderer==m_renderer.get()&&m_renderer->HasReference())return;
+        if(UploadComparisonReference(pair->original)){m_referencePair=pair;m_referenceRenderer=m_renderer.get();}
     }
     void ApplyComparison(bool refreshPaused=true){
         if(m_renderer){
@@ -8861,6 +8875,9 @@ private:
         RECT panelRect{};
         const bool hadPanel=m_neuralWnd&&IsWindow(m_neuralWnd)&&
                             GetWindowRect(m_neuralWnd,&panelRect)!=FALSE;
+        // The panel is rebuilt below, not closed: its WM_DESTROY must not hand
+        // playback back in the middle of the switch.
+        m_settingsPanelRebuilding=hadPanel;
         if(m_neuralWnd&&IsWindow(m_neuralWnd))DestroyWindow(m_neuralWnd);
         m_amdNrRuntime=runtime;
         LOG("AMD neural runtime set to "<<AmdNrRuntimeName(runtime)<<" (was "<<AmdNrRuntimeName(previous)<<").");
@@ -8877,6 +8894,7 @@ private:
             SchedulePausedSettingsPreview();
         }
         if(hadPanel){
+            m_settingsPanelRebuilding=false;
             ShowNeuralSettings();
             if(m_neuralWnd)
                 SetWindowPos(m_neuralWnd,nullptr,panelRect.left,panelRect.top,
@@ -8886,8 +8904,78 @@ private:
         SyncFeatureMenuState();
     }
 
+    bool SettingsPreviewSessionActive()const{return m_settingsPreviewSession.active;}
+
+    // Take the picture away from playback for as long as the settings panel is
+    // open. Idempotent: rebuilding the panel (SetAmdNrRuntime) must not take
+    // over twice, and showing an already-open panel must not seek again.
+    void EnterSettingsPreviewSession(){
+        if(m_settingsPreviewSession.active||!m_loaded)return;
+        auto& s=m_settingsPreviewSession;
+        s.position=Position();
+        s.wasPlaying=m_playing||m_liveResumePlaying;
+        s.hadLiveSession=m_liveSession;
+        s.neuralRequestedBefore=m_neuralRequested;
+        s.active=true;
+        LOG("Neural settings preview taking over playback at "<<s.position
+            <<" s (playing="<<s.wasPlaying<<" liveSession="<<s.hadLiveSession<<").");
+        if(m_liveSession){
+            // Same order ApplyNeuralSettings uses to restart a session. The
+            // seek is what puts the original decoder back on the current frame
+            // after DetachLivePlayback() closed the live pair.
+            DetachLivePlayback();
+            StopLiveNeuralSession(false);
+            PerformSeek(s.position,false);
+        }else if(m_playing){
+            SetPaused(true);
+        }
+        // StopLiveNeuralSession clears the neural view flag; the comparison
+        // modes need it while the preview pair is resident.
+        m_neuralRequested=true;
+        SyncFeatureMenuState();UpdateCachedStatus();InvalidateControls();
+    }
+
+    // Put playback back the way it was. Called from the panel's WM_DESTROY,
+    // which also fires for a rebuild and during application shutdown, so those
+    // two paths are told apart before anything that starts GPU work runs.
+    void FinishSettingsPreviewSession(){
+        auto& s=m_settingsPreviewSession;
+        if(!s.active)return;
+        if(m_settingsPanelRebuilding){
+            LeaveSettingsPreviewFrame();CancelPausedSettingsPreview();
+            return;
+        }
+        const bool wasPlaying=s.wasPlaying, hadLive=s.hadLiveSession;
+        const bool neuralBefore=s.neuralRequestedBefore;
+        const double at=Position();
+        s={};
+        LeaveSettingsPreviewFrame();
+        CancelPausedSettingsPreview();
+        // A preview job still in flight would have its completion handed to the
+        // NEW live session through HandleNeuralCompletion's m_previewJob branch.
+        // CancelNeuralJob drains the worker and its queued completion messages.
+        if(m_previewJob||NeuralJobActive())CancelNeuralJob(false);
+        m_previewJob=false;m_previewQueued=false;HideBufferOverlay();
+        if(!m_loaded||!m_hwnd){
+            m_neuralRequested=neuralBefore;
+            SyncSourceActionAvailability();UpdateCachedStatus();InvalidateControls();
+            return;
+        }
+        if(hadLive&&LiveSessionAvailable()){
+            PerformSeek(at,false);
+            StartLiveNeuralSession();
+            m_liveResumePlaying=wasPlaying;
+            LOG("Neural settings preview closed; active session resumed with the final settings (playing="<<wasPlaying<<").");
+        }else{
+            m_neuralRequested=neuralBefore;m_liveResumePlaying=false;
+            if(wasPlaying&&!m_playing)SetPaused(false);
+            LOG("Neural settings preview closed; original playback resumed (playing="<<wasPlaying<<").");
+        }
+        NoteSettingsAheadOfRender();SyncSourceActionAvailability();UpdateCachedStatus();InvalidateControls();
+    }
+
     void ShowNeuralSettings(){
-        if(m_neuralWnd&&IsWindow(m_neuralWnd)){ShowWindow(m_neuralWnd,SW_SHOWNORMAL);SetForegroundWindow(m_neuralWnd);return;}
+        if(m_neuralWnd&&IsWindow(m_neuralWnd)){EnterSettingsPreviewSession();ShowWindow(m_neuralWnd,SW_SHOWNORMAL);SetForegroundWindow(m_neuralWnd);return;}
         static constexpr const wchar_t* kClassName=L"DLSSVideoNeuralSettingsClassV14";
         WNDCLASSW n{};n.lpfnWndProc=NeuralWndProcStatic;n.hInstance=GetModuleHandleW(nullptr);n.lpszClassName=kClassName;n.hCursor=LoadCursor(nullptr,IDC_ARROW);n.hbrBackground=DarkDialogBrush();
         if(!RegisterClassW(&n)&&GetLastError()!=ERROR_CLASS_ALREADY_EXISTS)return;
@@ -8902,6 +8990,7 @@ private:
             (m_amdNrRuntime==AmdNrRuntime::Mochizuki?L" \u00b7 mochizuki":L"");
         m_neuralWnd=CreateWindowExW(WS_EX_TOOLWINDOW,kClassName,panelTitle.c_str(),
             style,x,y,w,h,m_hwnd,nullptr,GetModuleHandleW(nullptr),this);
+        if(m_neuralWnd)EnterSettingsPreviewSession();
     }
 
     // Everything the neural settings dialog decides about how a render looks.
@@ -8985,6 +9074,11 @@ private:
     void LeaveSettingsPreviewFrame(){
         if(!m_previewShown)return;
         m_previewShown=false;
+        // The comparison pair the preview owned goes with the preview frame.
+        // Without this, ComparisonModesAvailable() would keep claiming a pair
+        // that is no longer on screen, and the renderer would keep compositing
+        // against a source frame from a position playback has left.
+        if(SettingsPreviewPairResident()){ForgetSettingsPreviewPair();ApplyComparison();}
         NoteSettingsAheadOfRender();
     }
     // Apply changes what the player is showing now: an active session restarts
@@ -9188,7 +9282,13 @@ private:
             break;
         }
         case WM_CLOSE:DestroyWindow(h);return 0;
-        case WM_DESTROY:SaveVideoSettings();m_settingsDesignLayout.erase(h);ReleaseDialogTips(h);if(h==m_neuralWnd)m_neuralWnd=nullptr;return 0;
+        case WM_DESTROY:
+            // The panel used to leave the paused preview frame, its timer and
+            // the comparison reference behind when closed. FinishSettingsPreviewSession
+            // drains the preview job, gives the picture back to playback and
+            // resumes the live session with the settings the user settled on.
+            if(h==m_neuralWnd){m_neuralWnd=nullptr;FinishSettingsPreviewSession();}
+            SaveVideoSettings();m_settingsDesignLayout.erase(h);ReleaseDialogTips(h);return 0;
         }
         return DefWindowProcW(h,m,w,l);
     }
@@ -10443,6 +10543,9 @@ private:
         // a settings preview still settling, or a neural toggle pressed during
         // a seek, would otherwise fire on the next file's first seek.
         CancelPausedSettingsPreview();m_previewShown=false;m_neuralToggleDeferred=false;m_livePaceConfirmedKey.clear();
+        // A takeover belongs to the media it was taken from; a later close of a
+        // still-open panel must not resume a session for the previous file.
+        m_settingsPreviewSession={};m_settingsPanelRebuilding=false;
         m_lastPlaybackFrame={};m_ownedPlaybackFrame.reset();m_upscalingError.clear();m_neuralNotice.clear();m_sourceNotice.clear();m_decodeNotice.clear();m_neuralPath.clear();m_cachedRange={};m_cachedReceiptPath.clear();m_cachedSettings={};m_cachedGuides={};m_cachedTemporal={};m_markers={};m_dragSplit=false;m_renderMouseKnown=false;m_gesture={};m_peekOriginal=false;m_dragMix=false;m_middlePan=false;m_renderTracking=false;
         m_seekPending=false;m_seeking=false;m_layoutMismatchLogged=false;Audio().Stop();m_networkAudio.reset();m_renderer.reset();m_decoder.Close();m_cachedPlayback=false;m_cachedSourceFile=false;m_cachedPresentedFrames=0;m_havePresentedPair=false;ForgetRenderedCachedPair();m_guides.Reset();m_haveNext=false;m_waitingForNetworkFrame=false;m_networkReadState.Reset();m_next=VideoFrame{};m_nextPairFrame.reset();m_loaded=false;m_playing=false;m_currentSec=0;m_lastRenderedTs=-1;m_path.clear();m_youtubeAudioUrl.clear();m_youtubePageUrl.clear();m_displayTitle.clear();m_sourceKind=MediaSourceKind::LocalFile;m_cachedStatus.clear();InvalidateFrameGenerationCopy();
         m_jobSourcePath.clear();m_jobSourceKey.clear();m_jobSourcePageUrl.clear();m_sourceCache.reset();
@@ -10814,7 +10917,8 @@ private:
         // where a guide actually computed one.
         bool r = reason != HistoryReset::None;
         if (guidesNeeded) r = r || !g.hasHistory;
-        if(m_cachedPlayback){if(const auto* pair=m_synchronizedPlayback.CurrentPair())UploadComparisonReference(pair->original);}
+        if(m_settingsPreviewPair){UploadComparisonReference(m_settingsPreviewPair->original);}
+        else if(m_cachedPlayback){if(const auto* pair=m_synchronizedPlayback.CurrentPair())UploadComparisonReference(pair->original);}
         // Read before RememberPlaybackFrame, which may take `f`'s storage.
         const int64_t renderedTs=f.timestamp100ns;
         const auto renderStart=Clock::now();
@@ -11083,7 +11187,10 @@ private:
     void ResumeAudio(){const bool restart=m_audioStaleAfterStep&&!Audio().Active();m_audioStaleAfterStep=false;if(!restart){Audio().Pause(false);return;}if(Audio().Start(m_path,m_currentSec))Audio().SetVolume(m_muted?0.0f:m_volume);}
     // Space pauses playback during an active session; the render behind it keeps
     // filling the buffer, and only an offline job takes the pause event.
-    void TogglePause(){if(NeuralJobActive()&&!JobBehindPlayback()){SetNeuralJobPaused(!NeuralJobPaused());return;}if(m_liveBuffering){m_liveResumePlaying=!m_liveResumePlaying;InvalidateControls();return;}CancelPausedSettingsPreview();SetPaused(m_playing);}
+    // The settings preview owns the picture while the panel is open: letting a
+    // play press resume the clocks would flush the paused preview frame and
+    // put the m_playing guard back in the way of every later change.
+    void TogglePause(){if(SettingsPreviewSessionActive())return;if(NeuralJobActive()&&!JobBehindPlayback()){SetNeuralJobPaused(!NeuralJobPaused());return;}if(m_liveBuffering){m_liveResumePlaying=!m_liveResumePlaying;InvalidateControls();return;}CancelPausedSettingsPreview();SetPaused(m_playing);}
     // A play press made while the buffer fills is remembered, not obeyed yet.
     bool LiveResumePending()const{return m_liveBuffering&&m_liveResumePlaying;}
     void StepCachedFrame(){
@@ -11941,7 +12048,7 @@ private:
     IdleSurfaceLayout IdleLayout()const{return StartLayout().core;}
     std::vector<ToolbarItem> ToolbarItems()const{if(!ControlsVisible())return {};RECT c{};GetClientRect(m_hwnd,&c);return LayoutToolbar(static_cast<int>(c.right-c.left),static_cast<int>(c.bottom-c.top),ActiveWindowDpi(m_hwnd));}
     std::vector<ToolbarItem> FocusableItems()const{if(m_loaded)return ToolbarItems();const auto idle=IdleLayout();return{idle.actions.begin(),idle.actions.end()};}
-    ToolbarAvailability ToolbarState()const{return{m_loaded,m_seeking||m_seekPending,m_renderer!=nullptr,YouTubePlaybackAvailable(),m_youtubeLifecycle.IsResolving()||(NeuralJobActive()&&!JobBehindPlayback()),m_cachedPlayback&&m_havePresentedPair&&m_renderer!=nullptr,m_liveSession||LiveSessionAvailable()||StillImageRenderAvailable(),UpscalingAvailable(),FrameGenerationAvailable(),m_frameGenWorker.joinable()&&!m_frameGenCancelling,PlaybackFrameGenerationSupported(),SubtitlesAvailable(),SubtitlesActive(),SubtitlesWorking()};}
+    ToolbarAvailability ToolbarState()const{return{m_loaded,m_seeking||m_seekPending,m_renderer!=nullptr,YouTubePlaybackAvailable(),m_youtubeLifecycle.IsResolving()||(NeuralJobActive()&&!JobBehindPlayback()),m_cachedPlayback&&m_havePresentedPair&&m_renderer!=nullptr,!SettingsPreviewSessionActive()&&(m_liveSession||LiveSessionAvailable()||StillImageRenderAvailable()),UpscalingAvailable(),FrameGenerationAvailable(),m_frameGenWorker.joinable()&&!m_frameGenCancelling,PlaybackFrameGenerationSupported(),SubtitlesAvailable(),SubtitlesActive(),SubtitlesWorking()};}
     std::optional<RECT> VolumeRect()const{if(!ControlsVisible())return std::nullopt;RECT c{};GetClientRect(m_hwnd,&c);const auto items=ToolbarItems();return LayoutVolumeSlider(static_cast<int>(c.right-c.left),static_cast<int>(c.bottom-c.top),ActiveWindowDpi(m_hwnd),items);}
     bool PtIn(const RECT&r,int x,int y)const{return x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom;}
 
@@ -14164,6 +14271,10 @@ private:
     // exactly where it was, so the next setting can be compared against it.
     void CompletePausedPreview(const NeuralJobCompletion& completion){
         m_previewJob=false;HideBufferOverlay();
+        // Whatever the previous preview retained is stale the moment a new one
+        // completes; a failed render must not leave the old comparison pair
+        // standing in for a picture that was never presented.
+        ForgetSettingsPreviewPair();
         const bool stillHere=m_loaded&&!m_playing&&SnapToFrame(Position100ns())==m_previewRange.start100ns;
         if(!completion.result.ok||completion.neuralPath.empty()){
             LOG("Neural settings preview failed: "<<NeuralRenderFailureName(completion.result.failure)<<" detail="<<WideToUtf8(completion.result.detail));
@@ -14172,11 +14283,51 @@ private:
         }
         m_neuralLifecycle.Transition(NeuralPlaybackState::Ready);
         if(stillHere){
+            // A pair's two members feed one renderer whose layout is fixed by
+            // the main decoder. SynchronizedPlayback already opens its neural
+            // member with PairPrefersNv12() for exactly this reason; the old
+            // one-frame preview asked for the default BGRA instead, so on an
+            // NV12 source RenderVideoFrame refused the frame and the preview
+            // silently never appeared. Match the live renderer's layout.
             VideoDecoder preview;VideoFrame frame;
-            if(preview.Open(completion.neuralPath.wstring(),MediaSourceKind::LocalFile)&&preview.ReadNext(frame)){
+            if(preview.Open(completion.neuralPath.wstring(),MediaSourceKind::LocalFile,{},PairPrefersNv12())&&preview.ReadNext(frame)){
                 frame.timestamp100ns=m_previewRange.start100ns;
+                // Blend/Split/Wipe/Difference read the ORIGINAL member of a pair.
+                // Cached playback gets one from SynchronizedPlayback, but a
+                // one-frame preview has no such decoder. Decode the source frame
+                // at the same timestamp and retain the pair without switching
+                // the player into cached playback - that would make the tick
+                // start consuming pairs. If the source cannot be decoded the
+                // rendered frame is still worth showing, so degrade to the old
+                // single-frame preview and say why the modes stay unavailable.
+                VideoDecoder source;VideoFrame original;bool haveOriginal=false;
+                if(!m_path.empty()){
+                    const double at=double(m_previewRange.start100ns)*1e-7;
+                    if(source.Open(m_path,MediaSourceKind::LocalFile,{},PairPrefersNv12())&&
+                       source.SeekSeconds(at)&&source.ReadNext(original)){
+                        original.timestamp100ns=frame.timestamp100ns;haveOriginal=true;
+                    }
+                    source.Close();
+                }
+                if(haveOriginal){
+                    auto pair=std::make_shared<SynchronizedFramePair>();
+                    pair->original=std::move(original);pair->neural=frame;
+                    pair->timestamp100ns=frame.timestamp100ns;pair->frameNumber=frame.frameNumber;
+                    m_settingsPreviewPair=std::move(pair);
+                    m_havePresentedPair=true;
+                }else LOG("Neural settings preview found no source frame for comparison; comparison modes stay unavailable.");
                 m_guides.Reset();m_guideReset=true;m_dlssReset=true;m_lastRenderedTs=-1;
-                if(RenderVideoFrame(frame,true)){m_previewNeuralFrame=frame;m_previewNeuralValid=true;m_previewShown=true;LOG("Neural settings preview presented for the paused frame.");}
+                if(RenderVideoFrame(frame,true)){
+                    m_previewNeuralFrame=frame;m_previewNeuralValid=true;m_previewShown=true;
+                    if(m_settingsPreviewPair)ApplyComparison();
+                    LOG("Neural settings preview presented for the paused frame.");
+                }else{
+                    // The renderer can refuse a frame (layout mismatch, device
+                    // loss). Say so instead of leaving a blank pause frame with
+                    // no trace: that silence is why the layout bug survived.
+                    LOG("Neural settings preview could not present its rendered frame.");
+                    ForgetSettingsPreviewPair();
+                }
                 m_guideReset=false;m_dlssReset=false;
             }else LOG("Neural settings preview could not decode its rendered frame.");
             preview.Close();
@@ -15839,6 +15990,11 @@ private:
         // has. That is the same job the frame preview submits, and the cache
         // entry it writes is what the toggle then switches between.
         if(!m_cachedPlayback&&m_decoder.IsStillImage()){PreviewCurrentFrame();return;}
+        // A settings preview owns the picture for as long as the panel is open
+        // (before the first pair exists too). Starting a live session here
+        // would leave m_previewJob set while a live job runs, and that job's
+        // completion would be handed to CompletePausedPreview.
+        if(SettingsPreviewSessionActive())return;
         if(!m_cachedPlayback){StartLiveNeuralSession();return;}
         m_neuralRequested=!m_neuralRequested;const ComparisonView next=m_neuralRequested?ComparisonView::Neural:ComparisonView::Original;if(!m_synchronizedPlayback.SetView(next)){m_neuralRequested=!m_neuralRequested;return;}m_comparisonView=next;if(m_renderer)m_renderer->SetComparison(EffectiveComparison());const VideoFrame* presented=next==ComparisonView::Neural?LastNeuralFrame():LastOriginalFrame();m_guides.Reset();m_guideReset=true;m_dlssReset=true;
         // Null only before any pair has been presented. The value members this
@@ -16356,6 +16512,11 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // neural frame that does NOT come from a pair (a paused settings preview), so
     // it keeps its own storage and supersedes the pair's neural member while set.
     std::shared_ptr<const SynchronizedFramePair> m_lastPair;VideoFrame m_previewNeuralFrame;bool m_previewNeuralValid=false;RECT m_neuralCancelBounds{};uint32_t m_neuralSourceWidth=0,m_neuralSourceHeight=0;
+    // A paused settings preview's own pair. It is NOT read from SynchronizedPlayback:
+    // opening that would turn on cached playback and make the tick consume pairs.
+    // Keeping the original member here is what lets Blend/Split/Wipe/Difference and
+    // the paused comparison reference work while the settings panel is open.
+    std::shared_ptr<const SynchronizedFramePair> m_settingsPreviewPair;
     // A worker a live retarget asked to stop, until its completion arrives.
     // Declared after m_residentHelper for the reason m_neuralWorker is.
     std::jthread m_retiringNeuralWorker;uint64_t m_retiringNeuralGeneration=0;
@@ -16615,6 +16776,22 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     bool m_middlePan=false,m_renderTracking=false;
     POINT m_panLast{};
     HWND m_neuralWnd=nullptr;
+    // While the settings panel is open the picture belongs to the preview, not
+    // to playback. Opening it pauses the clocks and, when one is running, stops
+    // the live session: RangeRenderAvailable() refuses a preview job for as
+    // long as that session owns the job channel. Closing it puts back exactly
+    // what was taken, using the final settings for the new session.
+    struct SettingsPreviewSession {
+        bool active=false;
+        bool wasPlaying=false;
+        bool hadLiveSession=false;
+        bool neuralRequestedBefore=false;
+        double position=0.0;
+    };
+    SettingsPreviewSession m_settingsPreviewSession;
+    // SetAmdNrRuntime destroys and immediately recreates the panel to rebuild
+    // its right column. That is a rebuild, not the user closing the session.
+    bool m_settingsPanelRebuilding=false;
     HWND m_encoderWnd=nullptr;
     // The per-pass dialog, opened from the neural panel's Mochizuki group, and
     // how many later passes it shows. Two passes open one column, three open
