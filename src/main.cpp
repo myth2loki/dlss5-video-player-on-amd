@@ -3701,8 +3701,36 @@ public:
     void RunTick(){
         if(m_inTick)return;
         m_inTick=true;
-        struct TickScope{bool& active;~TickScope(){active=false;}}scope{m_inTick};
+        // Where a hitch goes. The cadence line says a tick arrived late; it
+        // cannot say whether the thread was busy inside the tick or busy
+        // somewhere else first, and those have different owners. This splits
+        // them: the gap is the time this loop was NOT running - a message
+        // handler, a modal loop, a blocked present - while the body is the
+        // time it was.
+        //
+        // Both are judged against the source's own frame interval, because
+        // that is the only honest scale: between two presents this loop waits
+        // out the rest of the frame, so a 28 ms gap is ordinary at 24 fps and
+        // a stall at 60. A gap of 1.5 frames means a slot was missed; a body
+        // of 0.75 means the tick ate the budget it was supposed to leave for
+        // the next one.
+        const auto tickStart=Clock::now();
+        const double gapMs=m_lastTickEnd.time_since_epoch().count()
+            ?std::chrono::duration<double,std::milli>(tickStart-m_lastTickEnd).count():0.0;
+        struct TickScope{bool& active;Clock::time_point& last;Clock::time_point start;
+            ~TickScope(){active=false;last=Clock::now();}}scope{m_inTick,m_lastTickEnd,tickStart};
         TickOnce();
+        const double bodyMs=std::chrono::duration<double,std::milli>(Clock::now()-tickStart).count();
+        // Only while playing: a load, a seek and a settings preview all run long
+        // tick bodies by design, and none of them is a dropped frame.
+        if(m_loaded&&m_playing&&m_decoder.FrameRate()>0.0){
+            const double frameMs=1000.0/m_decoder.FrameRate();
+            if(gapMs>=frameMs*1.5||bodyMs>=frameMs*0.75){
+                LOG("Tick hitch: gap="<<gapMs<<" ms body="<<bodyMs<<" ms of a "<<frameMs
+                    <<" ms frame"<<(m_cachedPlayback?" (pair)":"")<<"; stride 1 in "
+                    <<m_presentStride<<", dropped so far="<<m_droppedFrames);
+            }
+        }
     }
     void TickOnce() {
         ReapSourcePrefetch();
@@ -16257,6 +16285,9 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     shortcut_sheet::Metrics m_shortcutMetrics{};shortcut_sheet::Layout m_shortcutLayout{};
     // Drives Tick while a modal loop owns the thread; see StartModalTick.
     UINT_PTR m_modalTickTimer=0;bool m_inTick=false;
+    // Written by the tick probe in RunTick: when the loop last finished, so the
+    // next entry can tell time spent outside it from time spent inside.
+    Clock::time_point m_lastTickEnd{};
     // The paused frame needs presenting again: the window under it was resized
     // or repainted. Renderer-side changes answer PresentationStale instead. The
     // count is what the regression suite reads.

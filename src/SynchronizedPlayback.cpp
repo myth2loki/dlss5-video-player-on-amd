@@ -1,4 +1,5 @@
 #include "SynchronizedPlayback.h"
+#include "Log.h"
 
 #include <algorithm>
 #include <cmath>
@@ -10,6 +11,7 @@
 #include <optional>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -162,6 +164,20 @@ struct SynchronizedPlayback::Impl {
         NeuralSegment segment;
     };
     std::optional<PendingOpen> pendingOpen;
+    // Opens that were told to stop but have not unwound yet. A std::async
+    // future blocks in its destructor as well as in get(), so simply dropping
+    // a cancelled one would still hold up the presenting thread; they are
+    // reaped in HarvestAsyncOpen once they are ready instead.
+    std::vector<std::future<std::unique_ptr<ISynchronizedFrameSource>>> retiringOpens;
+    // PrefetchNextSegment runs on every tick; this bounds its index walk once
+    // it already holds the following file.
+    std::chrono::steady_clock::time_point lastPrefetchPoll{};
+    // When the warmed file landed, so a boundary can say how much lead it had.
+    std::chrono::steady_clock::time_point prefetchLandedAt{};
+    // Whether that file was opened by the lead-time prefetch or by the
+    // boundary's own deferred open. The lead number alone can be zero for
+    // both; saying which one it was keeps the boundary line honest.
+    bool prefetchFromLead{};
     bool live{};
     // Set when the open segment file ended before its declared window.
     bool segmentExhausted{};
@@ -175,7 +191,6 @@ struct SynchronizedPlayback::Impl {
         bool exhausted{},numbered{};
     };
     Fault fault{};
-    int64_t prefetchLead100ns{10000000};
     // What the caller asked the members to decode to. Every segment opened
     // later this session inherits it, so one answer covers the whole pair.
     bool preferNv12{};
@@ -211,22 +226,45 @@ struct SynchronizedPlayback::Impl {
     void CloseSegmentSources()
     {
         CancelPendingOpen();
+        // Teardown is not the presenting thread, so waiting for the cancelled
+        // opens to unwind here is both safe and what releases their child
+        // processes instead of leaving them to the vector's destructor.
+        for(auto& future:retiringOpens){
+            if(!future.valid())continue;
+            auto source=future.get();
+            if(source)source->Close();
+        }
+        retiringOpens.clear();
         if(segmentSource)segmentSource->Close();
         if(prefetchSource)prefetchSource->Close();
         segmentSource.reset();prefetchSource.reset();
         segment=NeuralSegment{};prefetchSegment=NeuralSegment{};
-        prefetchPending.reset();segmentExhausted=false;
+        prefetchPending.reset();prefetchLandedAt={};prefetchFromLead=false;
+        lastPrefetchPoll={};segmentExhausted=false;
     }
 
     void CancelPendingOpen()
     {
         if(!pendingOpen)return;
         pendingOpen->stop.request_stop();
-        if(pendingOpen->future.valid()){
-            auto source=pendingOpen->future.get();
-            if(source)source->Close();
-        }
+        // Neither get() nor the future's destructor may run here: both wait
+        // for an std::async task, and a cancelled ffmpeg start can take as
+        // long as a real one. Hand it to the reaper and return immediately.
+        if(pendingOpen->future.valid())
+            retiringOpens.push_back(std::move(pendingOpen->future));
         pendingOpen.reset();
+    }
+
+    void ReapRetiringOpens()
+    {
+        for(auto it=retiringOpens.begin();it!=retiringOpens.end();){
+            if(!it->valid()||it->wait_for(std::chrono::seconds(0))!=std::future_status::ready){
+                ++it;continue;
+            }
+            auto source=it->get();
+            if(source)source->Close();
+            it=retiringOpens.erase(it);
+        }
     }
 
     // What `wanted` is opened with once the first segment was probed. Geometry,
@@ -247,8 +285,8 @@ struct SynchronizedPlayback::Impl {
 
     // Starts the open of `wanted` on another thread, positioned at `entry100ns`
     // on the source timeline - its own start unless the file began before the
-    // one playing now. Failures are silent: the boundary itself opens the file
-    // if this never produces one.
+    // one playing now. A failure leaves no pending open; the caller turns that
+    // into an error rather than opening anything on the presenting thread.
     void StartAsyncOpen(NeuralSegment wanted,int64_t entry100ns)
     {
         if(pendingOpen||!makeSegmentSource)return;
@@ -292,6 +330,7 @@ struct SynchronizedPlayback::Impl {
     // one; the synchronous path then reports it.
     void HarvestAsyncOpen()
     {
+        ReapRetiringOpens();
         if(!pendingOpen||!pendingOpen->future.valid())return;
         if(pendingOpen->future.wait_for(std::chrono::seconds(0))!=std::future_status::ready)return;
         auto source=pendingOpen->future.get();
@@ -307,9 +346,14 @@ struct SynchronizedPlayback::Impl {
            source->Layout()!=original->Layout()){
             source->Close();return;
         }
+        // The first file this session opened is the one that pays for a probe;
+        // every later open inherits its parameters. If the first file came
+        // from this background path rather than the boundary's own open, take
+        // them here or every following segment would probe again.
+        if(!segmentMedia.Valid())segmentMedia=source->Media();
         if(prefetchSource)prefetchSource->Close();
         prefetchSource=std::move(source);prefetchSegment=std::move(landed);
-        prefetchPending.reset();
+        prefetchPending.reset();prefetchLandedAt=std::chrono::steady_clock::now();
     }
 
     // End of the playable window in seconds on the original timeline.
@@ -480,6 +524,7 @@ struct SynchronizedPlayback::Impl {
         // against the original until the resync guard fired.
         if(!allowLateStart&&timestamp100ns+tolerance100ns/2<wanted.firstTimestamp100ns)
             return SynchronizedReadResult::WaitingForRender;
+        ReapRetiringOpens();
         // Only a disagreement between number and timestamp coverage can ask for
         // the file already open; serving it beats reopening it every frame.
         if(segmentSource&&SameSegment(segment,wanted))return SynchronizedReadResult::PairReady;
@@ -496,43 +541,79 @@ struct SynchronizedPlayback::Impl {
         // before this boundary - the retired file warmed for it, which holds
         // the same frames (see PrefetchNextSegment). Switching to the entry
         // here would open it on the presenting thread, mid-file.
-        if(prefetchSource&&(SameSegment(prefetchSegment,wanted)||ContinuesAt(prefetchSegment,timestamp100ns))){
+        const auto takePrefetch=[&]()->bool{
+            if(!prefetchSource||
+               !(SameSegment(prefetchSegment,wanted)||ContinuesAt(prefetchSegment,timestamp100ns)))
+                return false;
+            const double leadMs=prefetchLandedAt.time_since_epoch().count()
+                ?std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-prefetchLandedAt).count():0.0;
+            LOG("Segment boundary: index="<<prefetchSegment.index
+                <<" source="<<(prefetchFromLead?"prefetched":"opened at the seam")
+                <<" lead="<<leadMs<<" ms; nothing was opened on this thread.");
             if(segmentSource)segmentSource->Close();
             segmentSource=std::move(prefetchSource);segment=std::move(prefetchSegment);
             pendingNeural=std::move(prefetchPending);prefetchPending.reset();
-            prefetchSegment=NeuralSegment{};segmentExhausted=false;
-            return SynchronizedReadResult::PairReady;
-        }
+            prefetchSegment=NeuralSegment{};prefetchLandedAt={};segmentExhausted=false;
+            return true;
+        };
+        if(takePrefetch())return SynchronizedReadResult::PairReady;
         // A prefetch for a segment the playhead skipped would otherwise sit
         // there and block every later one.
         if(prefetchSource){
             prefetchSource->Close();prefetchSource.reset();
-            prefetchSegment=NeuralSegment{};prefetchPending.reset();
+            prefetchSegment=NeuralSegment{};prefetchPending.reset();prefetchLandedAt={};
         }
         if(pendingOpen)CancelPendingOpen();
-        auto source=makeSegmentSource?makeSegmentSource():nullptr;
-        if(!source)return SynchronizedReadResult::Error;
-        source->PreferNv12(preferNv12);
-        const bool ready=segmentMedia.Valid()?source->OpenKnown(wanted.path,MediaFor(wanted),stop)
-                                             :source->Open(wanted.path,stop);
-        if(!ready)
-            return stop.stop_requested()?SynchronizedReadResult::Cancelled:SynchronizedReadResult::Error;
-        if(source->Width()!=original->Width()||source->Height()!=original->Height()||
-           source->Layout()!=original->Layout()){
-            source->Close();return SynchronizedReadResult::Error;
+        // Only the FIRST file of a session has no predecessor that could have
+        // warmed it. That one open still happens here, at attach, where the
+        // cold start already costs hundreds of milliseconds and no frame is
+        // being paced yet; it is also the probe that gives every later file
+        // its parameters. Everything else is a boundary, and a boundary must
+        // never start a decoder on the thread that presents.
+        if(!segmentSource){
+            auto source=makeSegmentSource?makeSegmentSource():nullptr;
+            if(!source)return SynchronizedReadResult::Error;
+            source->PreferNv12(preferNv12);
+            const bool ready=segmentMedia.Valid()?source->OpenKnown(wanted.path,MediaFor(wanted),stop)
+                                                 :source->Open(wanted.path,stop);
+            if(!ready)
+                return stop.stop_requested()?SynchronizedReadResult::Cancelled:SynchronizedReadResult::Error;
+            if(source->Width()!=original->Width()||source->Height()!=original->Height()||
+               source->Layout()!=original->Layout()){
+                source->Close();return SynchronizedReadResult::Error;
+            }
+            if(!segmentMedia.Valid())segmentMedia=source->Media();
+            // Segment files start at their own zero, so entering one mid-way
+            // (a seek) seeks the file, not the source timeline.
+            const int64_t local=timestamp100ns-wanted.firstTimestamp100ns;
+            if(local>=tolerance100ns/2&&!source->SeekSeconds(double(local)*1e-7)){
+                source->Close();return SynchronizedReadResult::Error;
+            }
+            segmentSource=std::move(source);segment=std::move(wanted);
+            pendingNeural.reset();segmentExhausted=false;
+            return SynchronizedReadResult::PairReady;
         }
-        // The first segment of a session is the one that pays for a probe.
-        if(!segmentMedia.Valid())segmentMedia=source->Media();
-        // Segment files start at their own zero, so entering one mid-way (a seek)
-        // seeks the file, not the source timeline.
-        const int64_t local=timestamp100ns-wanted.firstTimestamp100ns;
-        if(local>=tolerance100ns/2&&!source->SeekSeconds(double(local)*1e-7)){
-            source->Close();return SynchronizedReadResult::Error;
+        // A boundary with no warmed file: hand the open to the worker and let
+        // the read come back next tick. A real open is 130-250 ms; holding the
+        // presenting thread for it is what widened the cadence to 1 in 8 and
+        // dropped 5-14 frames at one seam. NotReady is the player's own
+        // contract for "a segment source is reopening", and its 3 s bound is
+        // far longer than an ffmpeg start.
+        prefetchFromLead=false;
+        StartAsyncOpen(wanted,timestamp100ns);
+        if(!pendingOpen)return SynchronizedReadResult::Error;
+        LOG("Segment boundary had no warmed prefetch: index="<<wanted.index
+            <<"; its open was deferred to a background thread.");
+        // A bounded wait keeps a source that needs no real work (the injected
+        // ones in the live tests, and a warm OS cache) on the old synchronous
+        // contract, without ever holding the thread for a process spawn. 25 ms
+        // is below one frame at 24 fps.
+        if(pendingOpen->future.wait_for(std::chrono::milliseconds(25))==std::future_status::ready){
+            HarvestAsyncOpen();
+            if(takePrefetch())return SynchronizedReadResult::PairReady;
         }
-        if(segmentSource)segmentSource->Close();
-        segmentSource=std::move(source);segment=std::move(wanted);
-        pendingNeural.reset();segmentExhausted=false;
-        return SynchronizedReadResult::PairReady;
+        return SynchronizedReadResult::NotReady;
     }
 
     // A warmed file that serves the frame at `timestamp100ns` from its first
@@ -599,17 +680,28 @@ struct SynchronizedPlayback::Impl {
         return following;
     }
 
-    // A boundary costs a process start (and a probe, for the first segment of a
-    // session), so the next file is opened on another thread once the playhead
-    // enters the lead window, and warmed here once that open lands. Failures are
-    // silent: the boundary itself opens the file if none of this worked.
-    void PrefetchNextSegment(int64_t timestamp100ns,std::stop_token stop)
+    // A boundary costs a process start, so the next file is opened on another
+    // thread as soon as the index knows about it, and warmed here once that
+    // open lands. Watching from the FIRST frame of the current file is the
+    // whole point: a one-second lead window assumed the following segment was
+    // already published before it opened, which live rendering does not
+    // promise - a joined run can publish it tens of milliseconds before the
+    // seam, far too late for a 175-250 ms open. The boundary never pays for
+    // that race any more (see AdoptSegment), but the lead is what keeps the
+    // picture from waiting at all.
+    void PrefetchNextSegment(std::stop_token stop)
     {
         if(!segmentSource||stop.stop_requested())return;
         HarvestAsyncOpen();
         // An open in flight is judged once it has landed, never waited for.
         if(pendingOpen)return;
-        if(timestamp100ns<segment.end100ns-prefetchLead100ns)return;
+        // This runs on every 2 ms tick. Once the following file is in hand the
+        // index only needs polling for a later join, and 25 ms is far shorter
+        // than any open; with no file in hand we poll every tick so a segment
+        // published late is picked up the moment it appears.
+        const auto now=std::chrono::steady_clock::now();
+        if(prefetchSource&&now-lastPrefetchPoll<std::chrono::milliseconds(25))return;
+        lastPrefetchPoll=now;
         const auto next=Continuation();
         // A file warmed before its run was joined holds the right frames and is
         // kept: it is out of the index's service, but still on disk (HoldsFile
@@ -627,7 +719,7 @@ struct SynchronizedPlayback::Impl {
             prefetchSegment=NeuralSegment{};prefetchPending.reset();
         }
         if(!prefetchSource){
-            if(next)StartAsyncOpen(*next,segment.end100ns);
+            if(next){prefetchFromLead=true;StartAsyncOpen(*next,segment.end100ns);}
             return;
         }
         if(!prefetchPending)
@@ -658,7 +750,7 @@ struct SynchronizedPlayback::Impl {
             switch(MatchPending()){
                 case Match::Pair:{
                     const auto committed=CommitPair(pair);
-                    PrefetchNextSegment(pair.timestamp100ns,stop);
+                    PrefetchNextSegment(stop);
                     return committed;
                 }
                 case Match::Mismatch:return Desync("live-frame-mismatch");
@@ -829,8 +921,9 @@ bool SynchronizedPlayback::OpenLive(const std::filesystem::path& originalPath,
     impl_->rangeOffsetFrames=static_cast<uint64_t>(std::llround(startSeconds*originalFps));
     impl_->rangeEndFrames=range.end100ns>0
         ? static_cast<uint64_t>(std::llround(double(range.end100ns)*1e-7*originalFps)) : 0;
-    // One second of lead is more than an ffmpeg start plus a first decode.
-    impl_->prefetchLead100ns=std::max<int64_t>(10000000,2*impl_->tolerance100ns);
+    // The whole current segment is the lead now: PrefetchNextSegment watches
+    // for the following file from its first frame, so a late publish costs
+    // nothing at the seam.
     impl_->segments=std::move(segments);impl_->live=true;
     // A different render can be a different encoder or geometry: this session's
     // first segment establishes the parameters again.
