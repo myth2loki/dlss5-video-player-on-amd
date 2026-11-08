@@ -16839,7 +16839,8 @@ void renodx_settings_dialog_test()
     };
 
     // The look the route migrates into and Reset returns to: shadows 0.90 keeps
-    // the dark end from lifting, the stabiliser is Always, two passes, and detail
+    // the dark end from lifting, the stabiliser is Always over a 108 ms window,
+    // three passes (the third one ungraded at half strength), and detail
     // stays at the package's neutral 1.00 - the stabiliser already softens the
     // picture, so raising detail at the same time over-corrects.
     const RS baseline = RS::MeasuredBaseline();
@@ -16847,7 +16848,8 @@ void renodx_settings_dialog_test()
     // which is also where a fresh profile starts and what Reset returns to.
     CHECK_EQ(baseline.value[RS::Detail], 1.00); // neutral, same as the package
     CHECK_EQ(baseline.value[RS::Shadows], 0.90);
-    CHECK_EQ(baseline.value[RS::RenoPasses], 2.00);
+    CHECK_EQ(baseline.value[RS::RenoPasses], 3.00);
+    CHECK_EQ(baseline.value[RS::StabilizeMs], 108.00);
     // The stabiliser, on by default: Auto is a measured no-op in this player.
     CHECK_EQ(baseline.value[RS::DetailStability], 2.00);
     // The second pass does its own thing: follow off, natural style, full
@@ -16856,8 +16858,12 @@ void renodx_settings_dialog_test()
     CHECK_EQ(baseline.value[RS::Pass2Style], 1.00);
     CHECK_EQ(baseline.value[RS::Pass2Intensity], 1.00);
     CHECK_EQ(baseline.value[RS::Pass2Tone], 0.00);
-    // The third and fourth run at half strength, and follow off as well.
+    // The third and fourth run at half strength, and follow off as well. The
+    // third carries the package's standard style - the tuned profile runs its
+    // last reachable pass ungraded, so that a third pass adds structure rather
+    // than a second coat of the same grade.
     CHECK_EQ(baseline.value[RS::Pass3Follow], 0.00);
+    CHECK_EQ(baseline.value[RS::Pass3Style], 0.00);
     CHECK_EQ(baseline.value[RS::Pass3Intensity], 0.50);
     CHECK_EQ(baseline.value[RS::Pass4Follow], 0.00);
     CHECK_EQ(baseline.value[RS::Pass4Intensity], 0.50);
@@ -16883,10 +16889,13 @@ void renodx_settings_dialog_test()
     CHECK_EQ(RS::PassSlotBase(1), int(RS::Pass2Follow));
     CHECK_EQ(RS::PassSlotBase(2) - RS::PassSlotBase(1), 4);
     CHECK_EQ(RS::PassSlotBase(3) + 3, int(RS::Pass4Tone));
-    // The starting value of a slot is not the package's.
+    // The starting value of a slot is not the package's. The third pass's style
+    // now IS the package's standard one (the tuned profile leaves that pass
+    // ungraded), so the two fields that still carry this look are the ones this
+    // pins: follow off and tone 0, both of which the package sets the other way.
     CHECK_EQ(RS::kStart[RS::PassSlotBase(1) + 3], 0.00); // tone
-    CHECK(RS::kStart[RS::PassSlotBase(1) + 1] != RS::kDefault[RS::Pass2Style]);
     CHECK(RS::kStart[RS::PassSlotBase(1)] != RS::kDefault[RS::Pass2Follow]);
+    CHECK(RS::kStart[RS::PassSlotBase(1) + 3] != RS::kDefault[RS::Pass2Tone]);
     // A fresh settings object IS that look, so it counts as "never moved" and a
     // profile sitting on it records nothing in [RenoDX].
     CHECK(baseline == RS{});
@@ -17002,7 +17011,7 @@ void renodx_settings_dialog_test()
     // At its default the chained-history key is left unwritten, the same rule
     // every other knob follows.
     CHECK(find(on, "reno_chained_history") == std::nullopt);
-    CHECK_EQ(find(on, "reno_passes").value_or(0), 2.0);
+    CHECK_EQ(find(on, "reno_passes").value_or(0), 3.0);
     // Always, not the package's Auto: Auto is a no-op here (no AFTER_UPSCALE
     // frame flag is ever sent), so the start has to say Always out loud or the
     // stacked passes flicker. It has to be WRITTEN for that to reach the render.

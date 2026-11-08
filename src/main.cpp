@@ -8244,7 +8244,17 @@ private:
         SetCheckBoxState(GetDlgItem(h,IDC_NS_MZ_PREPROCESS),m_mochizuki.preprocess);
         SetCheckBoxState(GetDlgItem(h,IDC_NS_MZ_INT4),m_mochizuki.int4Mixed);
         const auto select=[&](int id,int index){if(HWND combo=GetDlgItem(h,id))SendMessageW(combo,CB_SETCURSEL,static_cast<WPARAM>(index),0);};
-        select(IDC_NS_STYLE,std::clamp(m_neuralSettings.style,0,2));
+        // One knob, two rows. On AMD the render reads the runtime's own style -
+        // DLSS5_STYLE on lmxxf, MochizukiNrControls::style on Mochizuki - and the
+        // menu's "AMD style" radio is what writes it, so this row shows that value
+        // rather than the panel's own copy. Measured 2026-11-08: a panel Style of
+        // 1 beside [AmdNeural] Style=0 rendered frame-for-frame identical pictures
+        // and Apply did not even restart the session, because m_neuralSettings.style
+        // only ever reached the add-on's NRStyle, which this backend never reads.
+        // On NVIDIA the row stays NRStyle and the panel's own field is its owner.
+        select(IDC_NS_STYLE,m_opt.neuralBackend==NeuralBackend::Amd
+                                ?int(amd_lmxxf::NormalizedAmdStyle(m_amdStyle))
+                                :std::clamp(m_neuralSettings.style,0,2));
         // Two items, index = value: 0 is the 310.8.0 network and 1 the small
         // one, so unlike the pass ladder above there is no offset to get wrong.
         select(IDC_NS_MZ_NETWORK,m_mochizuki.networkModel>1?0:int(m_mochizuki.networkModel));
@@ -8310,7 +8320,27 @@ private:
             const int index=int(SendMessageW(combo,CB_GETCURSEL,0,0));
             if(index!=CB_ERR)m_mochizuki.networkModel=index==1?1u:0u;
         }
-        m_neuralSettings.style=sel(IDC_NS_STYLE,m_neuralSettings.style);
+        // Read into the place the render reads. On AMD that is the runtime's own
+        // style - the same value the menu's radio holds, and the one the job's
+        // settings document keys on - while on NVIDIA it stays the add-on's
+        // NRStyle. Writing both from this one value is what makes the panel, the
+        // menu and the render say the same thing; letting the field keep its own
+        // copy is how the row shipped reading "Natural" over a Standard frame.
+        {
+            const int asked=std::clamp(sel(IDC_NS_STYLE,std::clamp(m_neuralSettings.style,0,2)),0,2);
+            m_neuralSettings.style=m_opt.neuralBackend==NeuralBackend::Amd
+                                      ?int(amd_lmxxf::NormalizedAmdStyle(uint32_t(asked)))
+                                      :asked;
+            if(m_opt.neuralBackend==NeuralBackend::Amd){
+                // Said out loud because this is a full re-render: the style is a
+                // term of the job's settings document, so the helper relaunches
+                // and the runtime reads it before it builds the network.
+                if(m_amdStyle!=uint32_t(m_neuralSettings.style))
+                    LOG("AMD neural style set to "<<m_neuralSettings.style
+                        <<" from the neural settings panel (DLSS5_STYLE / MochizukiNrControls::style).");
+                m_amdStyle=uint32_t(m_neuralSettings.style);
+            }
+        }
         m_neuralSettings.autoMask=checked(IDC_NS_AUTOMASK);
         // The route is read before the ladder because it decides what the ladder
         // means. Under RenoDX the count is not a question the picture asks - the
@@ -8744,6 +8774,11 @@ private:
         style=amd_lmxxf::NormalizedAmdStyle(style);
         if(style==m_amdStyle){SyncFeatureMenuState();return;}
         m_amdStyle=style;
+        // The neural settings panel's Style row is this same knob (see
+        // ReadNeuralSettingControls), so its copy follows the menu's. Without it
+        // the two surfaces hold two numbers and the render picks one silently.
+        m_neuralSettings.style=int(style);
+        if(m_neuralWnd&&IsWindow(m_neuralWnd))SyncNeuralSettingControls(m_neuralWnd);
         LOG("AMD neural style set to "<<style<<" (DLSS5_STYLE; 1 is the runtime's own default).");
         SaveVideoSettings();
         if(m_liveSession){
@@ -17116,10 +17151,15 @@ static int RunRenderCommand(const render_command::Parsed& parsed,const std::vect
         job.amdSkinProtect=ReadSavedAmdSkinProtect(settings);
         job.amdMultiPassPredict=ReadSavedAmdMultiPassPredict(settings);
         job.amdMultiPassSkip=ReadSavedAmdMultiPassSkip(settings);
-        // The runtime's style, saved the same way; there is no command-line key
-        // for it (the menu is the surface), so a scripted --render uses this
-        // machine's value.
-        job.amdStyle=ReadSavedAmdStyle(settings);
+        // The runtime's style: the command line's --style when it gave one,
+        // otherwise this machine's saved value. --style used to land only in
+        // NeuralSettings.style, which on this backend reaches no pixel - the
+        // same dead-end the panel's Style row had - so a scripted export that
+        // asked for natural rendered standard. It is the panel's value and the
+        // menu's value: one knob, three surfaces.
+        job.amdStyle=command.style
+            ?amd_lmxxf::NormalizedAmdStyle(uint32_t(std::clamp(*command.style,0,2)))
+            :ReadSavedAmdStyle(settings);
         // Which runtime in the pack, from the same saved section: a batch export
         // that wants mochizuki saves the setting rather than passing a flag,
         // exactly as the style above works.

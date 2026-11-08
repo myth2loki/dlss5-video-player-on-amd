@@ -806,9 +806,23 @@ DLL 2026-10-31）。只换了 `MochizukiNrRuntime.dll`：`1,697,568 -> 1,797,920
 | `darkfate` 暗场 | 0.9701（几乎看不出） |
 | `tos` 明亮霓虹场景 | **0.9467**（抬亮、偏暖、对比降低，一眼可见） |
 
-另外面板左上那个 **Style 下拉是死控件**：把 `[AmdNeural] Style` 固定住只翻它，
+另外面板左上那个 **Style 下拉曾经是死控件**：把 `[AmdNeural] Style` 固定住只翻它，
 SSIM **1.000000** —— 它只写 `m_neuralSettings.style`，唯一效果是让缓存键失效、
 白重渲一遍。真正生效的是 `[AmdNeural] Style`（菜单那条路）→ `request.amdStyle`。
+
+> **2026-11-08 已修**：三处入口（面板 Style 下拉 / 菜单 AMD style 单选 / `--style`）
+> 现在写的是同一个 `m_amdStyle`，再经 `request.amdStyle` 落到 lmxxf 的
+> `DLSS5_STYLE` 与 Mochizuki 的 `MochizukiNrControls::style`。
+> 修之前 `--style` 也只写 `neuralSettings.style`，同样到不了像素。
+> 面板的读（`ReadNeuralSettingControls`）与显示（`SyncNeuralSettingControls`）
+> 都改成读这个值，`m_neuralSettings.style` 只是跟随它的镜像，
+> 这样 `CanonicalNeuralSettings` 里的 `style=` 不会和实际渲染不一致。
+> 验收：`--style default` vs `--style natural` 同一段 24 帧，
+> worker 日志 `style=0` / `style=1`，两段 PSNR **56.96 dB**（链路确定性，
+> 若没生效会是逐帧相同）。
+> **注意**：修前面板显示的值从未生效，所以老 profile 里
+> `[NeuralSettings] Style` 与 `[AmdNeural] Style` 可能不一致；
+> 修后以 `[AmdNeural] Style`（真正渲染的那个）为准，面板会跟着它显示。
 
 > 临时探针（已删除）把 RenoDX 按 OptiScaler 默认值点亮后：开 vs 关 SSIM 0.9722，
 > `reno_style` 0 vs 2 = 0.9839（暗场）。可见 RenoDX 本身就会改画面，想复现 OptiScaler

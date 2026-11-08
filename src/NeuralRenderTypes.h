@@ -342,7 +342,15 @@ struct RenoDxSettings {
         1.00, 0.00, 1.00, 1.00};
     // The look a fresh profile starts at and Reset returns to - the set that was
     // tuned in the player and measured: detail 1.00 (neutral), shadows 0.90,
-    // detail stability Always, two passes.
+    // detail stability Always, three passes at a 108 ms stabiliser.
+    //
+    // Baked from the profile this player was tuned on (2026-11-08), so a fresh
+    // profile and Reset land where the tuning ended instead of two rungs below
+    // it: a third pass (a later pass owns a Standard look at half strength,
+    // which is where the measured ghosting stops paying for structure) and the
+    // stabiliser window the flicker sweep settled on. A profile that already
+    // carried these as [RenoDX] deviations renders exactly the same picture -
+    // only its section becomes sparser, because those lines now equal kStart.
     // kDefault above stays the package's identity and is still the reference a
     // knob is judged against when deciding whether it is worth writing into the
     // render; this table is what the panel shows and what [RenoDX] records
@@ -371,7 +379,11 @@ struct RenoDxSettings {
         // calibration clip, and 1.45 is still the source's own 1.38 rather than
         // below it. It sits in kStart (not kDefault) so it is still written into
         // the render: kDefault is the package's identity, kStart is this look.
-        2.00, 0.00, 60.00, 2.00,
+        // Three passes and a 108 ms window: the count is the tuned one (see the
+        // per-pass note below), and 108 ms is where the stabiliser stopped
+        // buying anything on the flicker sweep - 60 ms left a visible beat
+        // between passes, 108 ms removed it and further widening only lagged.
+        2.00, 0.00, 108.00, 3.00,
         //            mvec x  mvec y  look mode chained
         1.00, 1.00, 1.00, 1.00,
         // The per-pass slots, swept on the project's calibration clip
@@ -388,12 +400,18 @@ struct RenoDxSettings {
         //     source on both, the calmest, and the least recovered;
         //   std 0.50           temporal 4.02 texture 2.23.
         // Natural at full strength is the middle of that trade-off and the one
-        // a later pass can call its own. Tone 0 follows the project's own rule
-        // for stacked passes (tone re-applied on every pass compounds), and the
-        // third and fourth run at half strength, which is where the measured
-        // ghosting stops being worth the extra structure.
+        // the second pass calls its own. Tone 0 follows the project's own rule
+        // for stacked passes (tone re-applied on every pass compounds).
+        //
+        // The third pass runs the STANDARD look at half strength, which is the
+        // tuned profile's own choice (RenoPass3Style 0 beside RenoPasses 3): a
+        // third pass that repeats Natural's grade only re-applies it, and the
+        // measured ghosting at 0.50 Standard is where the extra structure stops
+        // being worth it. The fourth slot keeps Natural at half strength - it
+        // was never reachable at three passes, so the tuned profile says nothing
+        // about it and this table does not invent an answer.
         0.00, 1.00, 1.00, 0.00,
-        0.00, 1.00, 0.50, 0.00,
+        0.00, 0.00, 0.50, 0.00,
         0.00, 1.00, 0.50, 0.00};
     // Clamp ranges, copied from the same table so a hand-edited or out-of-range
     // [RenoDX] value is pinned rather than refused - and pinned to what the
