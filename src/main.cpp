@@ -3720,6 +3720,12 @@ public:
         struct TickScope{bool& active;Clock::time_point& last;Clock::time_point start;
             ~TickScope(){active=false;last=Clock::now();}}scope{m_inTick,m_lastTickEnd,tickStart};
         TickOnce();
+        // One synchronous paint per tick, after the frame was presented. See
+        // InvalidateControls for why the paint is sent at all and why sending
+        // it on every state change cost frames at a render's publish seam.
+        // Done here rather than in a WM_PAINT handler because a playing
+        // window's posted paint otherwise never arrives.
+        if(m_controlsPaintPending){m_controlsPaintPending=false;UpdateWindow(m_hwnd);}
         const double bodyMs=std::chrono::duration<double,std::milli>(Clock::now()-tickStart).count();
         // Only while playing: a load, a seek and a settings preview all run long
         // tick bodies by design, and none of them is a dropped frame.
@@ -5099,17 +5105,34 @@ private:
     // So it says so, once, and renders what was asked for.
     bool LoadedSourceIsGeneratedFrames()const{
         if(!m_loaded||m_path.empty()||m_sourceKind!=MediaSourceKind::LocalFile)return false;
-        NeuralCacheManager cache(m_cacheRoot);
-        if(!cache.Valid())return false;
-        std::error_code error;
-        const auto generated=std::filesystem::weakly_canonical(cache.Root()/L"frame-generation",error);
-        if(error)return false;
-        const auto loaded=std::filesystem::weakly_canonical(std::filesystem::path(m_path),error);
-        if(error)return false;
-        // Compared as paths, not as text: a prefix match on the string would
-        // also accept a sibling directory whose name starts the same way.
-        const auto relative=loaded.lexically_relative(generated);
-        return !relative.empty()&&*relative.begin()!=L"..";
+        // Memoised for the loaded source. The answer costs a cache-root
+        // validation and two filesystem stats - measured 21-22 ms - and a live
+        // session asks it every time it starts the next render chunk, on the
+        // presenting thread, right beside the publish completion. The key
+        // carries both things the answer depends on, so a source swap or an
+        // adopted local copy cannot be served a stale one.
+        const std::wstring key=m_path+L"|"+m_cacheRoot.wstring();
+        if(key==m_generatedSourceMemoKey)return m_generatedSourceMemo;
+        bool answer=false;
+        {
+            NeuralCacheManager cache(m_cacheRoot);
+            if(cache.Valid()){
+                std::error_code error;
+                const auto generated=std::filesystem::weakly_canonical(cache.Root()/L"frame-generation",error);
+                if(!error){
+                    const auto loaded=std::filesystem::weakly_canonical(std::filesystem::path(m_path),error);
+                    if(!error){
+                        // Compared as paths, not as text: a prefix match on the
+                        // string would also accept a sibling directory whose
+                        // name starts the same way.
+                        const auto relative=loaded.lexically_relative(generated);
+                        answer=!relative.empty()&&*relative.begin()!=L"..";
+                    }
+                }
+            }
+        }
+        m_generatedSourceMemoKey=key;m_generatedSourceMemo=answer;
+        return answer;
     }
     // Memoised, because FrameGenerationUiNow runs on every status refresh and
     // every toolbar paint, and the answer costs a cache-root validation and two
@@ -5125,6 +5148,9 @@ private:
     }
     void InvalidateFrameGenerationCopy(){
         m_frameGenCopyChecked=false;m_frameGenCopy.reset();
+        // A settled acquisition can change the cache root's validity too, so
+        // the generated-source memo goes with the copy and the key memos.
+        m_generatedSourceMemoKey.clear();m_generatedSourceMemo=false;
         // The key memo is dropped with it. They answer the same question at two
         // depths, and a settled acquisition is the moment both answers move:
         // leaving the key memo alone is how a COMPLETED download left the player
@@ -7642,14 +7668,22 @@ private:
         // The one place every state change already funnels through, which makes
         // it the one place the tip rectangles cannot fall behind the layout.
         if(!m_hwnd)return;SyncFeatureMenuState();RefreshToolbarTips();RECT c{};GetClientRect(m_hwnd,&c);
-        if(!m_loaded){InvalidateRect(m_hwnd,nullptr,FALSE);UpdateWindow(m_hwnd);return;}
+        if(!m_loaded){InvalidateRect(m_hwnd,nullptr,FALSE);m_controlsPaintPending=true;return;}
         RECT bar{0,std::max<LONG>(0,c.bottom-ControlHeight()),c.right,c.bottom};InvalidateRect(m_hwnd,&bar,FALSE);
         // InvalidateRect marks the region and POSTS WM_PAINT. A window that is
         // also presenting video frame by frame never gets to that post: measured,
         // a toolbar button kept the colour of the state it had just left for as
         // long as the film played on. UpdateWindow sends the paint now instead of
-        // leaving it in the queue.
-        UpdateWindow(m_hwnd);
+        // leaving it in the queue - but a synchronous full-window GDI paint
+        // costs ~10 ms, and a render's publish calls this three times in one
+        // breath (the completion's state refresh twice, the next job's start
+        // once). That stacked 30 ms of repaint onto the ~95 ms the UI thread
+        // already spent at that seam and dropped 2-3 frames.
+        // Set the flag instead: RunTick sends ONE paint after the frame has
+        // been presented, at most one per tick. The next tick is ~2 ms away
+        // while playing, so the button still changes colour, and idle windows
+        // get the posted WM_PAINT as before.
+        m_controlsPaintPending=true;
     }
 
     void SetTrack(HWND h,int id,int lo,int hi,int pos){
@@ -14734,6 +14768,7 @@ private:
         if(!message->sourcePath.empty()&&message->pageUrl==m_youtubePageUrl){
             m_jobSourcePath=message->sourcePath;m_jobSourceKey=message->sourceKey;m_jobSourcePageUrl=message->pageUrl;
         }
+        const NeuralPlaybackState previous=m_neuralLifecycle.state;
         const NeuralPlaybackState next=StateForProgressPhase(message->progress.phase,m_neuralLifecycle.state);
         // The worker may still report a frame that was in flight when the user
         // paused; the pause event, not that report, decides when rendering resumes.
@@ -14742,7 +14777,25 @@ private:
         // The status line and the chips are cached text: a phase change is
         // what the warm-up line reports, so it has to reach them.
         if(m_liveSession)UpdateCachedStatus();
-        InvalidateRect(m_hwnd,nullptr,FALSE);
+        // The helper reports progress once per rendered frame (~60 a second).
+        // A full-window invalidate on each one forces a 2560x156 control-strip
+        // GDI repaint - measured 11 ms - on the presenting thread every frame.
+        // It also swallows the hover fade's small invalid rects into the same
+        // union, which is why putting the pointer on any toolbar button dropped
+        // frames the moment a neural session was live. While a video plays the
+        // status/chip helpers above already invalidate their own small rects
+        // when their text actually changes, and AnimateActivity drives the
+        // progress spinner on its timer. Off a loaded video the pre-render
+        // surface still needs a repaint, but 10 Hz is plenty for a progress
+        // bar; a phase change is shown immediately either way.
+        const auto progressNow=Clock::now();
+        const bool phaseChanged=next!=previous;
+        if(!(m_loaded&&m_playing)&&
+           (phaseChanged||m_lastNeuralProgressPaint==Clock::time_point{}||
+            progressNow-m_lastNeuralProgressPaint>=std::chrono::milliseconds(100))){
+            m_lastNeuralProgressPaint=progressNow;
+            InvalidateRect(m_hwnd,nullptr,FALSE);
+        }
     }
     // Silence budget per phase, in seconds; 0 means the phase is not watched.
     // Only phases that must keep reporting are: acquisition now reports
@@ -16288,6 +16341,12 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // Written by the tick probe in RunTick: when the loop last finished, so the
     // next entry can tell time spent outside it from time spent inside.
     Clock::time_point m_lastTickEnd{};
+    // Last full repaint requested by a neural progress message; see
+    // CompleteNeuralProgress for the 10 Hz cap.
+    Clock::time_point m_lastNeuralProgressPaint{};
+    // Set by InvalidateControls, drained once per tick after the frame is
+    // presented. A synchronous paint on every state change is ~10 ms each.
+    bool m_controlsPaintPending=false;
     // The paused frame needs presenting again: the window under it was resized
     // or repainted. Renderer-side changes answer PresentationStale instead. The
     // count is what the regression suite reads.
@@ -16308,6 +16367,10 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // which frame generation asks on every status refresh and toolbar paint.
     mutable std::optional<std::filesystem::path> m_frameGenCopy;
     mutable bool m_frameGenCopyChecked=false;
+    // Memo for LoadedSourceIsGeneratedFrames: keyed by the loaded path and the
+    // cache root, invalidated with the other source-derived memos above.
+    mutable std::wstring m_generatedSourceMemoKey;
+    mutable bool m_generatedSourceMemo=false;
     mutable HMONITOR m_monitorModeHandle=nullptr;
     mutable bool m_monitorModeValid=false;
     std::wstring m_upscalingError;
