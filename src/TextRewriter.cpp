@@ -47,6 +47,28 @@ std::string Prompt(const std::string& text, double seconds, int limit)
     return prompt;
 }
 
+// The mirror of Prompt: the same sentence, with room to unfold. The instruction
+// that matters is the one forbidding new facts - asked to "补足细节", a 4B model
+// produced a "[说话人姓名]" placeholder and a 17-character line became 108
+// characters. Only same-meaning expansion is allowed here; FillIsSafe checks the
+// numbers afterwards because the prompt alone does not hold.
+std::string ExpandPrompt(const std::string& text, int target)
+{
+    std::string prompt;
+    prompt += "你是电影配音的台词改写助手。下面这句中文配音太短，念完之后句尾会空一块。";
+    prompt += "请把它扩写到 ";
+    prompt += std::to_string(target);
+    prompt += " 个字左右（不超过 ";
+    prompt += std::to_string(target + target / 10);
+    prompt += " 个字）。要求：意思完全不变，不得新增任何事实、数字、人名、地名或结论；";
+    prompt += "只许同义展开——把概括的说法说细一点、把短语拆成短句、补「其实」「所以说」「你会发现」这类连接语；";
+    prompt += "不要重复同一句，不要分点，不要解释，不要引号或注释，只输出改写后的中文句子。\n";
+    prompt += "原句：";
+    prompt += text;
+    prompt += "\n改写：";
+    return prompt;
+}
+
 // What the model answered, cleaned: a rewrite is one line of Chinese, and
 // anything else - a preamble, a translation note, an empty string, a repeat of
 // the original - is not a rewrite and is thrown away.
@@ -104,7 +126,7 @@ Rewriter::Rewriter(subtitle_translate::Engine engine, bool enabled)
     std::error_code error;
     if (!std::filesystem::exists(server, error)) {
         LOG("Rewrite: no llama-server at " << utf8_text::FromWide(server.wstring())
-                                           << "; long lines take the old path (tempo, then a cut)");
+                                           << "; lines that miss their slot keep what they have (tempo, then a cut)");
         return;
     }
     auto impl = std::make_unique<Impl>();
@@ -119,7 +141,7 @@ Rewriter::Rewriter(subtitle_translate::Engine engine, bool enabled)
         subtitle_translate::ChatTemplateFor(utf8_text::FromWide(engine.model.filename().wstring())));
     engine_child::Child child;
     if (!engine_child::Spawn(server, arguments, impl->job.Get(), false, child, "llama-server (rewrite)")) {
-        LOG("Rewrite: the engine could not be started; long lines take the old path");
+        LOG("Rewrite: the engine could not be started; lines that miss their slot keep what they have");
         return;
     }
     impl->process = std::move(child.process);
@@ -153,12 +175,12 @@ Rewriter::Rewriter(subtitle_translate::Engine engine, bool enabled)
         if (WaitForSingleObject(impl->process.Get(), 0) == WAIT_OBJECT_0) {
             DWORD code = 1;
             GetExitCodeProcess(impl->process.Get(), &code);
-            LOG("Rewrite: llama-server exited with " << code << "; long lines take the old path");
+            LOG("Rewrite: llama-server exited with " << code << "; lines that miss their slot keep what they have");
             return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    LOG("Rewrite: llama-server never answered /health; long lines take the old path");
+    LOG("Rewrite: llama-server never answered /health; lines that miss their slot keep what they have");
 }
 
 Rewriter::~Rewriter() { delete m_impl; }
@@ -187,6 +209,43 @@ std::string Rewriter::Shorten(const std::string& text, double seconds)
         }
         LOG("Rewrite: " << text << "  ->  " << rewritten << "  (" << characters << " characters for "
                         << limit << ")");
+        return rewritten;
+    }
+    return {};
+}
+
+std::string Rewriter::Lengthen(const std::string& text, std::size_t characters)
+{
+    if (!m_impl || text.empty() || characters == 0) return {};
+    // The model is asked for a size, and a film's longest sentence is nowhere
+    // near 400 characters of Chinese; the clamp is there so a bad pace model
+    // cannot turn into an unbounded generation.
+    const int target = int(std::min<std::size_t>(characters, 400));
+    const std::string body = subtitle_translate::ChatRequestBody(ExpandPrompt(text, target), 256);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const auto answer = engine_child::HttpRequest(m_impl->connection.Get(), L"POST",
+                                                      "/v1/chat/completions", body, "application/json", 60000);
+        if (!answer || answer->status != 200) continue;
+        const auto content = subtitle_translate::JsonStringField(answer->body, "content");
+        if (!content) continue;
+        const std::string rewritten = OneLine(*content);
+        if (rewritten.empty() || rewritten == text) continue;
+        if (!dub_fit::FillIsSafe(text, rewritten, characters)) {
+            std::size_t before = 0;
+            std::size_t after = 0;
+            std::size_t commas = 0;
+            dub_fit::MeasureText(text, before, commas);
+            dub_fit::MeasureText(rewritten, after, commas);
+            LOG("Rewrite: answered " << after << " characters for a " << characters
+                                     << "-character fill of " << before
+                                     << "; keeping the original");
+            continue;
+        }
+        std::size_t filled = 0;
+        std::size_t commas = 0;
+        dub_fit::MeasureText(rewritten, filled, commas);
+        LOG("Rewrite: " << text << "  ->  " << rewritten << "  (" << filled << " characters for "
+                        << characters << ")");
         return rewritten;
     }
     return {};

@@ -184,6 +184,452 @@ inline size_t ApplySavedTranslations(std::vector<Cue>& cues, const std::vector<C
     return restored;
 }
 
+// ---- One cue per sentence ---------------------------------------------------
+//
+// Whisper cuts a sentence wherever the speaker paused, and the text stage writes
+// one cue per cut. Measured on a three-minute interview: 109 cues over 163 s, a
+// median of 1.43 s and eight characters, 34 of them four characters or less.
+// Nobody reads that, and nothing can translate it. "Until last year, this figure
+// in Britain was the highest it had ever been" / "from now on" / "temperature" /
+// "3 degrees" is one sentence the ASR took apart, and every piece was then
+// translated on its own - which is how "a professor of hydrology at the
+// University of Reading" lost its last three words to the next cue and came back
+// as "阅读大学", the university of reading (books).
+//
+// So the cues are joined back into sentences here, once, before either the
+// translation or the voice sees them. The two used to disagree: the dub stage
+// merged what it read, the subtitle track kept the fragments, and the viewer got
+// a voice that spoke whole sentences under subtitles that flashed three words at
+// a time - seen and heard as the two drifting apart.
+//
+// The rule is the one the dub stage had already measured: a cue that stops
+// mid-sentence and is followed within `gapSeconds` by the cue that goes on is one
+// line, capped at `maxSeconds` so a monologue does not become a single cue
+// nobody can read. Both numbers are the dub's own (DubFitPolicy.h), because the
+// two paths must agree: every merged cue ends where a sentence ends, and then the
+// dub has nothing left to merge, so one cue is exactly one spoken line.
+struct SentenceRules {
+    // Only ever applied to a cue that stops mid-sentence: one that ends with a
+    // full stop never takes the next one, whatever the gap. So this is "how long
+    // a pause in the middle of a sentence may be", and 0.6 is what the excerpt
+    // measured - at 0.45 "climate" / "change." stayed two cues 0.48 s apart and
+    // the viewer got 气候 on screen on its own, then 改变。 three seconds later.
+    // The alternative was worse than the long cues it buys: a longer gap merges
+    // nothing more (0.8 measured the same) and a shorter one leaves fragments.
+    double gapSeconds = 0.6;
+    double maxSeconds = 16.0;   // dub_fit::kUtteranceMaxSeconds
+    // A cue nobody can finish reading is not a subtitle. A line that lands in
+    // 0.2 s keeps the screen at least this long - but never into the next cue,
+    // which would show two lines at once.
+    double minSeconds = 1.2;
+};
+
+// Trailing punctuation, spaces and closing marks are not part of the words, so
+// "Celia," and "Celia" are the same word as far as a sentence end goes.
+inline std::string_view TrimmedTail(std::string_view text)
+{
+    const auto endsWith = [](std::string_view piece, std::string_view suffix) {
+        return piece.size() >= suffix.size() &&
+               piece.substr(piece.size() - suffix.size()) == suffix;
+    };
+    static constexpr std::string_view kMarks[] = {" ", "\t", ".", "…", "。", "！", "？", "!", "?",
+                                                  "\"", "'", "”", "’", "）", ")"};
+    for (int guard = 0; guard < 8; ++guard) {
+        bool trimmed = false;
+        for (const auto mark : kMarks) {
+            if (endsWith(text, mark)) {
+                text.remove_suffix(mark.size());
+                trimmed = true;
+                break;
+            }
+        }
+        if (!trimmed) break;
+    }
+    return text;
+}
+
+// Whether this is the end of a sentence rather than a pause in the middle of
+// one. Only the closing punctuation counts: a comma or a dash is the speaker
+// breathing, and joining across those is the whole point.
+inline bool EndsSentence(std::string_view text)
+{
+    const auto endsWith = [](std::string_view piece, std::string_view suffix) {
+        return piece.size() >= suffix.size() &&
+               piece.substr(piece.size() - suffix.size()) == suffix;
+    };
+    static constexpr std::string_view kClosers[] = {"\"", "'", ")", "]", "”", "’", "）"};
+    static constexpr std::string_view kTerminals[] = {".", "!", "?", "。", "！", "？", "…"};
+    for (int guard = 0; guard < 3; ++guard) {
+        bool trimmed = false;
+        for (const auto closer : kClosers) {
+            if (endsWith(text, closer)) {
+                text.remove_suffix(closer.size());
+                trimmed = true;
+                break;
+            }
+        }
+        if (!trimmed) break;
+        while (!text.empty() && text.back() == ' ') text.remove_suffix(1);
+    }
+    for (const auto terminal : kTerminals)
+        if (endsWith(text, terminal)) return true;
+    return false;
+}
+
+namespace detail {
+
+// The next fragment, appended the way that language writes two halves of one
+// sentence: a space between Latin words ("Celia," + "we have" -> "Celia, we
+// have"), nothing between CJK ones, where a space would be a typo. A fragment
+// that opens with its own punctuation takes no space either.
+inline void AppendFragment(std::string& into, const std::string& fragment)
+{
+    if (fragment.empty()) return;
+    bool space = !into.empty();
+    if (space) {
+        const unsigned char last = static_cast<unsigned char>(into.back());
+        const unsigned char first = static_cast<unsigned char>(fragment.front());
+        if (last >= 0x80 || first >= 0x80) {
+            space = false;  // CJK on either side: words run together
+        } else if (into.back() == ' ' || into.back() == '\t' || into.back() == '\n') {
+            space = false;
+        } else if (fragment.front() == ',' || fragment.front() == '.' || fragment.front() == '!' ||
+                   fragment.front() == '?' || fragment.front() == ';' || fragment.front() == ':' ||
+                   fragment.front() == '\'' || fragment.front() == '"' || fragment.front() == '%') {
+            space = false;  // "50" + "%" is not "50 %"
+        }
+    }
+    if (space) into += ' ';
+    into += fragment;
+}
+
+} // namespace detail
+
+// The cues of a track, one per sentence. Order is preserved; a cue that carries
+// no translation yet keeps none, and the merge never invents text: it only
+// concatenates what the track already said, and the timeline stays the union of
+// the cues that went into it.
+inline std::vector<Cue> MergeIntoSentences(std::vector<Cue> cues,
+                                           const SentenceRules& rules = {})
+{
+    // A cue whose words open the next one is the same speech written twice:
+    // whisper emits a truncated segment and then the full one over it, and both
+    // were being spoken. The longer reading keeps the earlier start.
+    for (size_t index = 0; index + 1 < cues.size();) {
+        const std::string_view first = TrimmedTail(cues[index].text);
+        const std::string_view second = TrimmedTail(cues[index + 1].text);
+        const bool opens = !first.empty() && second.size() > first.size() &&
+                           second.substr(0, first.size()) == first;
+        if (opens && cues[index + 1].start - cues[index].end <= 0.5) {
+            cues[index + 1].start = cues[index].start;
+            cues.erase(cues.begin() + std::ptrdiff_t(index));
+            continue;
+        }
+        ++index;
+    }
+
+    std::vector<Cue> merged;
+    merged.reserve(cues.size());
+    for (Cue& cue : cues) {
+        if (!merged.empty()) {
+            Cue& last = merged.back();
+            const double gap = cue.start - last.end;
+            const double span = cue.end - last.start;
+            // Only a cue that is still mid-sentence and close enough to be the
+            // same breath continues the line; a sound the ASR wrote on its own
+            // ("(laughs)") has no words to join and stays separate by its own
+            // punctuation, which is the caller's business, not this one's.
+            const bool continues = gap <= rules.gapSeconds && gap > -0.5 &&
+                                   span <= rules.maxSeconds && !EndsSentence(last.text);
+            if (continues) {
+                last.end = std::max(last.end, cue.end);
+                detail::AppendFragment(last.text, cue.text);
+                if (!cue.translation.empty()) {
+                    if (last.translation.empty()) last.translation = cue.translation;
+                    else detail::AppendFragment(last.translation, cue.translation);
+                }
+                continue;
+            }
+        }
+        merged.push_back(std::move(cue));
+    }
+    // Nothing on screen flashes: a line too short to read is held for at least
+    // `minSeconds`, or until the next cue arrives, whichever comes first. Only
+    // ever lengthened - a cue that already covers its window keeps it.
+    for (size_t index = 0; index < merged.size(); ++index) {
+        const double wanted = merged[index].start + rules.minSeconds;
+        if (merged[index].end >= wanted) continue;
+        const double beforeNext = index + 1 < merged.size()
+                                      ? merged[index + 1].start - 0.04
+                                      : wanted;
+        merged[index].end = std::max(merged[index].end, std::min(wanted, beforeNext));
+    }
+    return merged;
+}
+
+// ---- Cutting a long line for the screen --------------------------------------
+//
+// A sentence can be more than a screen holds: fifteen seconds and eighty
+// characters is three rows of Chinese with the source under them, and what the
+// viewer reads is a paragraph, not a subtitle. The voice cannot be cut - it is
+// one utterance in one window, and splitting it would mean two synthetic
+// readings with a seam between them - so the cut is made on the display side
+// only: two dialogue lines carrying the two halves of the same sentence back to
+// back.
+//
+// The halves stay one line to whoever speaks them. They meet with no gap, the
+// first does not close the sentence (the cut is after a clause mark, never after
+// a full stop), and the text stage's own merge - which the dub runs on exactly
+// these cues - joins them again, so what is spoken is the sentence that was
+// translated rather than two fragments spoken apart. That is the whole contract:
+// **split for the eye, never for the ear.**
+
+struct DisplayRules {
+    // Six seconds is the usual ceiling for one subtitle. A line that runs longer
+    // is read twice before it changes, which reads as the track being stuck.
+    double maxSeconds = 6.5;
+    // Two rows at the default 62 px on a 1080p frame, with room for the wider
+    // punctuation. Three rows of Chinese plus three of source is the case this
+    // exists to prevent.
+    std::size_t maxCharacters = 48;
+    // A half that flashes is worse than the long line it came from.
+    double minSeconds = 1.6;
+};
+
+namespace detail {
+
+inline std::size_t CodePointWidth(unsigned char lead)
+{
+    return lead < 0x80 ? 1 : (lead >> 5) == 0x6 ? 2 : (lead >> 4) == 0xE ? 3 : 4;
+}
+
+inline std::size_t CodePoints(std::string_view text)
+{
+    std::size_t count = 0;
+    for (std::size_t i = 0; i < text.size(); i += CodePointWidth(static_cast<unsigned char>(text[i])))
+        ++count;
+    return count;
+}
+
+// Where a reader accepts a break: after a comma or a semicolon, in either
+// script. Full stops are not offered - see the note above on why the two halves
+// must not look like two sentences to the stage that speaks them.
+inline bool IsClauseMark(std::string_view piece)
+{
+    return piece == "," || piece == ";" || piece == ":" || piece == "\xEF\xBC\x8C" /* ， */ ||
+           piece == "\xE3\x80\x81" /* 、 */ || piece == "\xEF\xBC\x9B" /* ； */ ||
+           piece == "\xEF\xBC\x9A" /* ： */;
+}
+
+struct ClauseCut {
+    std::size_t at = 0;          // byte offset just past the mark
+    std::size_t codepoints = 0;  // characters up to `at`
+};
+
+// Every place the line can be broken, in order.
+inline std::vector<ClauseCut> ClauseCuts(std::string_view text)
+{
+    std::vector<ClauseCut> cuts;
+    std::size_t seen = 0;
+    for (std::size_t i = 0; i < text.size();) {
+        const std::size_t width = CodePointWidth(static_cast<unsigned char>(text[i]));
+        if (i + width > text.size()) break;
+        const std::string_view piece(text.data() + i, width);
+        ++seen;
+        if (IsClauseMark(piece)) cuts.push_back(ClauseCut{i + width, seen});
+        i += width;
+    }
+    return cuts;
+}
+
+inline bool EndsWithStop(char c)
+{
+    return c == '.' || c == '!' || c == '?' || c == ';';
+}
+
+// The same break on the other language, which has no clause mark to trust: the
+// point is taken at the same fraction of the line and moved to the nearest word
+// boundary. Moved back while the first half would end on a full stop, because
+// that is exactly what the merge reads as "the sentence is over".
+inline std::size_t SourceCutNear(std::string_view text, double fraction)
+{
+    if (text.empty()) return 0;
+    const auto target = std::size_t(std::lround(fraction * double(text.size())));
+    if (target < 8 || target + 8 > text.size()) return 0;
+    std::size_t cut = 0;
+    bool found = false;
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (text[i] != ' ') continue;
+        if (!found || std::abs(double(i) - double(target)) < std::abs(double(cut) - double(target))) {
+            found = true;
+            cut = i;
+        }
+    }
+    if (!found) {
+        // No spaces at all: a CJK source, cut by character count instead.
+        std::size_t seen = 0;
+        for (std::size_t i = 0; i < text.size();) {
+            const std::size_t width = CodePointWidth(static_cast<unsigned char>(text[i]));
+            seen += width;
+            i += width;
+            if (seen >= target) return i < text.size() ? i : 0;
+        }
+        return 0;
+    }
+    for (int guard = 0; guard < 4; ++guard) {
+        std::size_t tail = cut;
+        while (tail > 0 && text[tail - 1] == ' ') --tail;
+        if (tail == 0) return 0;
+        if (!EndsWithStop(text[tail - 1])) return cut;
+        const std::size_t previous = cut > 0 ? text.rfind(' ', cut - 1) : std::string_view::npos;
+        if (previous == std::string_view::npos) return 0;
+        cut = previous;
+    }
+    return 0;
+}
+
+inline std::string_view Trimmed(std::string_view text)
+{
+    while (!text.empty() && IsSpace(text.front())) text.remove_prefix(1);
+    while (!text.empty() && IsSpace(text.back())) text.remove_suffix(1);
+    return text;
+}
+
+} // namespace detail
+
+// The screen, not the ear. A sentence the screen cannot hold in one go becomes
+// two or three dialogue lines, cut at clause marks and spread evenly over the
+// sentence's own window; a cue that already fits is left exactly as it was.
+//
+// Three lines is the limit on purpose. Beyond it the sentence is a paragraph
+// being paged rather than a subtitle, and the right answer is a shorter
+// translation - which is what the rewrite round in the text stage is for.
+//
+// The parts come back in order and meet with no gap, and none of them ends on a
+// full stop: MergeIntoSentences, which the dub runs on exactly these cues, joins
+// them straight back into the sentence that was translated. That is the whole
+// contract - **split for the eye, never for the ear** - and the test pins it.
+inline std::vector<Cue> CutOneForDisplay(const Cue& cue, const DisplayRules& rules)
+{
+    const std::string& primary = cue.translation.empty() ? cue.text : cue.translation;
+    const double span = cue.end - cue.start;
+    const double characters = double(detail::CodePoints(primary));
+    if (span <= 0.0 || characters <= 0.0) return {};
+    const double byTime = span / rules.maxSeconds;
+    const double byLength = characters / double(rules.maxCharacters);
+    const int wanted = std::min(3, int(std::ceil(std::max(byTime, byLength))));
+    if (wanted < 2) return {};
+
+    const std::vector<detail::ClauseCut> cuts = detail::ClauseCuts(primary);
+    if (cuts.empty()) return {};
+    // Fewer parts is always allowed: a line with one clause mark can only be cut
+    // in two, and two is still an improvement.
+    for (int parts = std::min<int>(wanted, int(cuts.size()) + 1); parts >= 2; --parts) {
+        // The break nearest each even share. Greedy is enough: the cuts are
+        // ordered, and every share is asked for in increasing order.
+        std::vector<std::size_t> chosen;
+        std::size_t previous = 0;
+        bool found = true;
+        for (int piece = 1; piece < parts && found; ++piece) {
+            const double target = characters * double(piece) / double(parts);
+            std::size_t best = cuts.size();
+            for (std::size_t index = 0; index < cuts.size(); ++index) {
+                if (cuts[index].codepoints <= previous) continue;
+                if (best == cuts.size() ||
+                    std::abs(double(cuts[index].codepoints) - target) <
+                        std::abs(double(cuts[best].codepoints) - target))
+                    best = index;
+            }
+            found = best != cuts.size();
+            if (found) {
+                chosen.push_back(best);
+                previous = cuts[best].codepoints;
+            }
+        }
+        if (!found || chosen.empty()) continue;
+
+        // The edges of every piece in both currencies: characters and seconds.
+        std::vector<std::size_t> edgeChar{0};
+        std::vector<std::size_t> edgeByte{0};
+        std::vector<double> edgeTime{cue.start};
+        for (const std::size_t index : chosen) {
+            edgeChar.push_back(cuts[index].codepoints);
+            edgeByte.push_back(cuts[index].at);
+            edgeTime.push_back(cue.start + span * (double(cuts[index].codepoints) / characters));
+        }
+        edgeChar.push_back(std::size_t(characters));
+        edgeByte.push_back(primary.size());
+        edgeTime.push_back(cue.end);
+
+        bool usable = true;
+        for (std::size_t piece = 0; piece + 1 < edgeChar.size() && usable; ++piece) {
+            if (edgeChar[piece + 1] - edgeChar[piece] < 3) usable = false;
+            if (edgeTime[piece + 1] - edgeTime[piece] < rules.minSeconds) usable = false;
+        }
+        if (!usable) continue;
+
+        // The source is cut at the same fractions, at word boundaries. A source
+        // that has no boundary there stops the split: repeating the whole line
+        // under the second piece is worse than one long line.
+        std::vector<std::size_t> sourceEdge{cue.translation.empty() ? cue.text.size() : 0};
+        sourceEdge.resize(edgeByte.size(), 0);
+        if (!cue.translation.empty()) {
+            for (std::size_t piece = 1; piece + 1 < edgeTime.size(); ++piece) {
+                const double fraction = (edgeTime[piece] - cue.start) / span;
+                const std::size_t at = detail::SourceCutNear(cue.text, fraction);
+                if (at == 0 || at >= cue.text.size() || at <= sourceEdge[piece - 1]) {
+                    usable = false;
+                    break;
+                }
+                sourceEdge[piece] = at;
+            }
+            sourceEdge.back() = cue.text.size();
+        }
+        if (!usable) continue;
+
+        std::vector<Cue> pieces;
+        for (std::size_t piece = 0; piece + 1 < edgeChar.size(); ++piece) {
+            Cue part = cue;
+            part.start = edgeTime[piece];
+            part.end = edgeTime[piece + 1];
+            const std::string_view spoken = detail::Trimmed(std::string_view(primary).substr(
+                edgeByte[piece], edgeByte[piece + 1] - edgeByte[piece]));
+            if (cue.translation.empty()) {
+                part.text = std::string(spoken);
+                part.translation.clear();
+            } else {
+                part.translation = std::string(spoken);
+                part.text = std::string(detail::Trimmed(std::string_view(cue.text).substr(
+                    sourceEdge[piece], sourceEdge[piece + 1] - sourceEdge[piece])));
+            }
+            if (part.text.empty() || part.translation.empty() && !cue.translation.empty()) {
+                pieces.clear();
+                break;
+            }
+            pieces.push_back(std::move(part));
+        }
+        if (pieces.size() < 2) continue;
+        return pieces;
+    }
+    return {};
+}
+
+inline std::vector<Cue> SplitForDisplay(std::vector<Cue> cues, const DisplayRules& rules = {})
+{
+    std::vector<Cue> out;
+    out.reserve(cues.size() + cues.size() / 2);
+    for (Cue& cue : cues) {
+        std::vector<Cue> pieces = CutOneForDisplay(cue, rules);
+        if (pieces.empty()) {
+            out.push_back(std::move(cue));
+        } else {
+            for (Cue& piece : pieces) out.push_back(std::move(piece));
+        }
+    }
+    return out;
+}
+
+
 // ---- Time formatting ---------------------------------------------------------
 
 // Timestamps are built from integers on purpose: snprintf with "%f" writes the
@@ -299,6 +745,98 @@ inline std::string Escape(std::string_view text)
     return out;
 }
 
+// Chinese has no spaces, and this libass does not break a space-less run: the
+// line is drawn wider than the frame and clipped off both edges (WrapStyle 0
+// only ever breaks at word boundaries). So the translation is wrapped here, at
+// the widest row the frame holds. A line with spaces is left alone - that is
+// Latin, and the renderer already breaks it correctly.
+inline bool NeedsWrapping(std::string_view text)
+{
+    bool wide = false;
+    for (const char c : text) {
+        if (c == ' ') return false;
+        if (static_cast<unsigned char>(c) >= 0x80) wide = true;
+    }
+    return wide;
+}
+
+// One row holds `usable width / font size` characters. Measured on this build:
+// forty characters of the translation style render 1878 px wide on a 1920 px
+// frame, so an advance is about 0.76 em and the frame would hold 37 of them. The
+// count here assumes a full em and so wraps a little earlier than it must - the
+// block comes out narrower than the frame allows and can never be clipped, which
+// is the failure this exists to stop (see WrapRows).
+inline int RowWidth(int frameWidth, const Layout& layout, int fontSize)
+{
+    const int usable = frameWidth - 2 * layout.marginHorizontal;
+    if (usable <= 0 || fontSize <= 0) return 0;
+    return std::max(1, usable / fontSize);
+}
+
+// Laid out rows of at most `perRow` characters, escaped, breaks marked with \N.
+// A break prefers a mark: Chinese subtitle practice puts the mark at the end of
+// a row rather than splitting a word, so the reader gets "…报道中，" / "我们看到…"
+// and not "…全球范围" / "内发生了…". When no mark sits close enough to the even
+// share, the share wins - a row of three characters is worse than a split word.
+inline std::string WrapRows(std::string_view text, int perRow)
+{
+    if (perRow <= 0 || !NeedsWrapping(text)) return Escape(text);
+    const std::size_t total = CodePoints(text);
+    if (total <= std::size_t(perRow)) return Escape(text);
+    const std::size_t rows = (total + std::size_t(perRow) - 1) / std::size_t(perRow);
+
+    // Byte offset of every code point, so the breaks can be chosen by count and
+    // applied by offset.
+    std::vector<std::size_t> offsets;
+    offsets.reserve(total + 1);
+    for (std::size_t i = 0; i < text.size();) {
+        offsets.push_back(i);
+        i += CodePointWidth(static_cast<unsigned char>(text[i]));
+    }
+    offsets.push_back(text.size());
+
+    const auto marksAt = [&](std::size_t at) {
+        if (at >= total) return false;
+        const std::size_t at_byte = offsets[at];
+        return IsClauseMark(std::string_view(text.data() + at_byte, offsets[at + 1] - at_byte)) ||
+               text[at_byte] == '.' || text[at_byte] == ';' || text[at_byte] == ':' ||
+               text[at_byte] == '!' || text[at_byte] == '?' ||
+               text.compare(at_byte, 3, "\xE3\x80\x82") == 0;  // 。
+    };
+
+    std::string out;
+    out.reserve(text.size() + rows * 2);
+    std::size_t from = 0;
+    for (std::size_t row = 1; row < rows; ++row) {
+        const std::size_t even = total * row / rows;
+        std::size_t cut = even;
+        const std::size_t slack = std::size_t(perRow) / 2;
+        const std::size_t floor = std::size_t(perRow) / 3;
+        bool marked = false;
+        for (std::size_t at = even > slack ? even - slack : 1;
+             at <= std::min(total - 1, even + slack); ++at) {
+            if (at <= from || at - from < floor || at - from > std::size_t(perRow)) continue;
+            if (row + 1 == rows && total - at > std::size_t(perRow)) continue;
+            if (!marksAt(at - 1)) continue;  // the row would end on the mark
+            if (!marked ||
+                std::abs(std::ptrdiff_t(at) - std::ptrdiff_t(even)) <
+                    std::abs(std::ptrdiff_t(cut) - std::ptrdiff_t(even))) {
+                cut = at;
+                marked = true;
+            }
+        }
+        // No usable mark: the even share, stepped back over a mark that would
+        // open the next row.
+        for (int guard = 0; guard < 3 && !marked && cut > from && marksAt(cut); ++guard) --cut;
+        if (cut <= from) continue;
+        out += Escape(std::string_view(text).substr(offsets[from], offsets[cut] - offsets[from]));
+        out += "\\N";
+        from = cut;
+    }
+    out += Escape(std::string_view(text).substr(offsets[from]));
+    return out;
+}
+
 inline void AppendStyle(std::string& out, const char* name, const char* font, int size,
                         const char* colour, int outline, int shadow, const Layout& layout)
 {
@@ -321,6 +859,10 @@ inline std::string BuildAss(const std::vector<Cue>& cues, Mode mode, const Layou
                             uint32_t width, uint32_t height)
 {
     if (mode == Mode::Off || width == 0 || height == 0) return {};
+    // How many characters of each language the frame holds in one row: a CJK
+    // character is about one em wide, and nothing else breaks it (see WrapRows).
+    const int translationPerRow = detail::RowWidth(int(width), layout, layout.translationSize);
+    const int sourcePerRow = detail::RowWidth(int(width), layout, layout.sourceSize);
     std::string body;
     for (const Cue& cue : cues) {
         const bool hasTranslation = !cue.translation.empty();
@@ -335,7 +877,7 @@ inline std::string BuildAss(const std::vector<Cue>& cues, Mode mode, const Layou
         body += ",Dual,,0,0,0,,";
         if (mode == Mode::Dual && !cue.translation.empty() && !cue.text.empty()) {
             body += "{\\rZh}";
-            body += detail::Escape(cue.translation);
+            body += detail::WrapRows(cue.translation, translationPerRow);
             body += "\\N";
             if (layout.gapSize > 0) {
                 char gap[48];
@@ -343,10 +885,11 @@ inline std::string BuildAss(const std::vector<Cue>& cues, Mode mode, const Layou
                 body += gap;
             }
             body += "{\\rSrc}";
-            body += detail::Escape(cue.text);
+            body += detail::WrapRows(cue.text, sourcePerRow);
         } else {
-            body += hasTranslation && mode != Mode::Source ? "{\\rZh}" : "{\\rSrc}";
-            body += detail::Escape(primary);
+            const bool translation = hasTranslation && mode != Mode::Source;
+            body += translation ? "{\\rZh}" : "{\\rSrc}";
+            body += detail::WrapRows(primary, translation ? translationPerRow : sourcePerRow);
         }
         body += '\n';
     }
@@ -629,11 +1172,100 @@ inline std::string MuxLanguageCode(std::string_view tag)
     return {};
 }
 
+// ---- The film's own names ---------------------------------------------------
+//
+// A translation model knows the language, not the film. "University of Reading"
+// came back as 阅读大学 - the university of reading, as in the act of reading a
+// book - because nothing in one subtitle line says that Reading is an English
+// town. Merging the cues first fixes most of the wrong translations; it cannot
+// fix this one. The sentence was complete and the model still did not know the
+// place.
+//
+// The glossary is a file, not a guess. The conversion reads a list of
+// "English=Chinese" lines from beside the media - `film.mkv` -> `film.names.txt`
+// - and every line that mentions one of those names is translated with it named.
+// That is the one part of this that cannot be inferred: a name is a fact about
+// the world, and the engine has no world.
+//
+// A model-written glossary was measured and rejected. Asked for the established
+// name, this engine answers University of Reading=牛津大学 and Dartmoor=达特茅斯
+// - it does not know the places and reaches for the famous one it does know, and
+// 牛津大学 is a different university. Asked to transliterate the same names it
+// answers 阅读大学 and 达特穆尔, and for names it does know it answers in pinyin
+// ("伦敦=lún dūn") or in Traditional characters. The two answers agree only on
+// names that are pure sound, which is exactly the case the model already gets
+// right line by line. A wrong name written into every line that mentions it is
+// worse than the literal one it replaces, so this stays the user's to supply.
+struct GlossaryEntry {
+    std::string term;
+    std::string rendering;
+};
+
+// What a glossary file holds: one "English=Chinese" per line, blank lines and
+// lines starting with '#' ignored. Anything that does not parse is dropped
+// rather than guessed at - a file that is half right is still usable, and a line
+// that is empty on one side would delete a name from a subtitle.
+inline std::vector<GlossaryEntry> ParseGlossaryFile(std::string_view text)
+{
+    std::vector<GlossaryEntry> entries;
+    size_t at = 0;
+    while (at <= text.size()) {
+        size_t eol = text.find('\n', at);
+        if (eol == std::string_view::npos) eol = text.size();
+        std::string_view line = detail::Trim(text.substr(at, eol - at));
+        at = eol + 1;
+        if (line.empty() || line.front() == '#') continue;
+        // Both "English=Chinese" and "English:Chinese", because a colon is what
+        // a person writes when they are not being told a format.
+        size_t separator = line.find('=');
+        if (separator == std::string_view::npos) separator = line.find(':');
+        if (separator == std::string_view::npos) continue;
+        const std::string_view term = detail::Trim(line.substr(0, separator));
+        std::string_view rendering = detail::Trim(line.substr(separator + 1));
+        while (!rendering.empty() && (rendering.back() == '.' || rendering.back() == '。'))
+            rendering.remove_suffix(1);
+        if (term.empty() || term.size() > 96 || rendering.empty() || rendering.size() > 96) continue;
+        bool nonAscii = false;
+        for (const char c : rendering)
+            if (static_cast<unsigned char>(c) >= 0x80) nonAscii = true;
+        if (!nonAscii) continue;  // an English term for an English term is not a glossary
+        entries.push_back({std::string(term), std::string(rendering)});
+    }
+    return entries;
+}
+
+
+// The ones this line mentions, worded the way the prompt takes them. Case is
+// ignored and nothing else is: a term matches where it appears as written.
+inline std::string RenderingsFor(std::string_view text, const std::vector<GlossaryEntry>& entries,
+                                 size_t limit = 6)
+{
+    if (entries.empty()) return {};
+    std::string lowered(text);
+    for (char& c : lowered) c = char(std::tolower(static_cast<unsigned char>(c)));
+    std::string note;
+    size_t used = 0;
+    for (const GlossaryEntry& entry : entries) {
+        if (used >= limit) break;
+        std::string needle = entry.term;
+        for (char& c : needle) c = char(std::tolower(static_cast<unsigned char>(c)));
+        if (lowered.find(needle) == std::string::npos) continue;
+        if (!note.empty()) note += "; ";
+        note += entry.term;
+        note += " = ";
+        note += entry.rendering;
+        ++used;
+    }
+    return note;
+}
+
 // Bumped when the wording below changes: it is part of the cache key, so a
 // prompt change must not read translations produced by the old one.
-inline constexpr std::string_view kPromptVersion = "t1";
+inline constexpr std::string_view kPromptVersion = "t2";
 
-inline std::string OfficialPrompt(std::string_view text, const Languages& languages = {})
+// `renderings` is the glossary note for this line, empty when it names nobody.
+inline std::string OfficialPrompt(std::string_view text, const Languages& languages = {},
+                                  std::string_view renderings = {})
 {
     std::string prompt;
     prompt.reserve(text.size() + 512);
@@ -652,8 +1284,58 @@ inline std::string OfficialPrompt(std::string_view text, const Languages& langua
     prompt += languages.targetName;
     prompt += " grammar, vocabulary, and cultural sensitivities.\nProduce only the ";
     prompt += languages.targetName;
-    prompt += " translation, without any additional explanations or commentary. Please translate "
-              "the following ";
+    prompt += " translation, without any additional explanations or commentary.";
+    if (!renderings.empty()) {
+        // Stated before the line, never inside it: a name explained in brackets
+        // in the middle of a sentence is a bracket the model then translates.
+        prompt += "\nThis line names ";
+        prompt += renderings;
+        prompt += ". Use exactly those renderings for those names.";
+    }
+    prompt += " Please translate the following ";
+    prompt += languages.sourceName;
+    prompt += " text into ";
+    prompt += languages.targetName;
+    prompt += ":\n\n\n";
+    prompt += text;
+    return prompt;
+}
+
+// The same line, asked for a size. Only asked when the first rendering cannot be
+// reached by tempo at all (dub_fit::BudgetForLine): the line would otherwise be
+// compressed to the ceiling and then cut by the mix, and a listener hears both as
+// the voice breaking rather than as a translation being too long.
+//
+// The budget is stated in characters because that is what the pace model was fit
+// on - 7.02 characters a second, and a comma costs 0.665 s of its own - so a
+// number of characters is a duration this code can predict and a model can obey.
+inline std::string ShorterPrompt(std::string_view text, const Languages& languages,
+                                 std::size_t characters, std::string_view renderings = {})
+{
+    std::string prompt;
+    prompt.reserve(text.size() + 512);
+    prompt += "You are a professional ";
+    prompt += languages.sourceName;
+    prompt += " (";
+    prompt += languages.sourceCode;
+    prompt += ") to ";
+    prompt += languages.targetName;
+    prompt += " (";
+    prompt += languages.targetCode;
+    prompt += ") translator dubbing a film.\nTranslate the line below into ";
+    prompt += languages.targetName;
+    prompt += " that can be spoken in ";
+    prompt += std::to_string(characters);
+    prompt += " characters or fewer. Keep the meaning and the tone; leave out what the line can "
+              "do without.\nProduce only the ";
+    prompt += languages.targetName;
+    prompt += " translation, without any additional explanations or commentary.";
+    if (!renderings.empty()) {
+        prompt += "\nThis line names ";
+        prompt += renderings;
+        prompt += ". Use exactly those renderings for those names.";
+    }
+    prompt += " Please translate the following ";
     prompt += languages.sourceName;
     prompt += " text into ";
     prompt += languages.targetName;

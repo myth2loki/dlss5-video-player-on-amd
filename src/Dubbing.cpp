@@ -341,7 +341,14 @@ std::string DubTextOf(const std::string& raw)
         }
         if (text.compare(i, 2, "\\N") == 0 || text.compare(i, 2, "\\n") == 0 ||
             text.compare(i, 2, "\\h") == 0) {
-            words += ' ';
+            // A wrap inside Chinese is not a space in it: the text stage breaks
+            // a long line to fit the screen, and the voice still has to read the
+            // sentence as one run of characters.
+            const bool wide = !words.empty() &&
+                              static_cast<unsigned char>(words.back()) >= 0x80 &&
+                              i + 2 < text.size() &&
+                              static_cast<unsigned char>(text[i + 2]) >= 0x80;
+            if (!wide) words += ' ';
             ++i;
             continue;
         }
@@ -542,101 +549,44 @@ bool IsSoundDescription(const std::string& text)
 // hears as the line being cut off.
 //
 // So a cue that stops mid-sentence and is followed within kUtteranceGap by the
-// cue that goes on is one line here. Only the voice joins them; the subtitle
-// track is written by the text stage and keeps its own cues.
-std::string_view TrimmedTail(std::string_view text)
-{
-    auto isTail = [](std::string_view piece, std::string_view suffix) {
-        return piece.size() >= suffix.size() &&
-               piece.substr(piece.size() - suffix.size()) == suffix;
-    };
-    // Trailing punctuation, spaces and closing marks are not part of the words.
-    static constexpr std::string_view kMarks[] = {" ", "\t", ".", "…", "。", "！", "？", "!",
-                                                  "?",  "\"", "'", "”", "’", "）", ")"};
-    for (int guard = 0; guard < 8; ++guard) {
-        bool trimmed = false;
-        for (const auto mark : kMarks) {
-            if (isTail(text, mark)) {
-                text.remove_suffix(mark.size());
-                trimmed = true;
-                break;
-            }
-        }
-        if (!trimmed) break;
-    }
-    return text;
-}
-
-bool EndsSentence(std::string_view text)
-{
-    auto isTail = [](std::string_view piece, std::string_view suffix) {
-        return piece.size() >= suffix.size() &&
-               piece.substr(piece.size() - suffix.size()) == suffix;
-    };
-    static constexpr std::string_view kClosers[] = {"\"", "'", ")", "]", "”", "’", "）"};
-    static constexpr std::string_view kTerminals[] = {".", "!", "?", "。", "！", "？", "…"};
-    for (int guard = 0; guard < 3; ++guard) {
-        bool trimmed = false;
-        for (const auto closer : kClosers) {
-            if (isTail(text, closer)) {
-                text.remove_suffix(closer.size());
-                trimmed = true;
-                break;
-            }
-        }
-        if (!trimmed) break;
-        while (!text.empty() && text.back() == ' ') text.remove_suffix(1);
-    }
-    for (const auto terminal : kTerminals)
-        if (isTail(text, terminal)) return true;
-    return false;
-}
-
-// The source's own words, which is what the merge is decided on: the translation
-// punctuates a fragment with a full stop often enough that the Chinese would
-// never join.
-std::string_view WordsOf(const Line& line)
-{
-    const std::string& words = line.source.empty() ? line.text : line.source;
-    return std::string_view(words);
-}
-
+// cue that goes on is one line - here, and in the text stage the subtitle comes
+// from, so the two cannot drift apart.
+// The rule itself is the text stage's now - subtitle_translate::MergeIntoSentences,
+// applied to the cues before anything else reads them, so the subtitle track and
+// the voice are cut the same way. This is the same call on this stage's own
+// lines: the merge is normally a no-op by now, and keeping it means a track
+// produced elsewhere (an older ASS, a release's own subtitles) is still spoken
+// one sentence at a time. `text` is what is spoken, `source` what the decision
+// is made on - the translation punctuates a fragment with a full stop often
+// enough that the Chinese would never join.
 std::vector<Line> MergeSentences(std::vector<Line> lines)
 {
-    // A cue whose words open the next one is the same speech written twice:
-    // whisper emits a truncated segment and then the full one over it, and both
-    // were being spoken. The longer reading keeps the earlier start.
-    for (size_t index = 0; index + 1 < lines.size();) {
-        const std::string_view first = TrimmedTail(WordsOf(lines[index]));
-        const std::string_view second = TrimmedTail(WordsOf(lines[index + 1]));
-        const bool opens = !first.empty() && second.size() > first.size() &&
-                           second.substr(0, first.size()) == first;
-        if (opens && lines[index + 1].start - lines[index].end <= 0.5) {
-            lines[index + 1].start = lines[index].start;
-            lines.erase(lines.begin() + std::ptrdiff_t(index));
-            continue;
-        }
-        ++index;
+    std::vector<subtitle_translate::Cue> cues;
+    cues.reserve(lines.size());
+    for (const Line& line : lines) {
+        subtitle_translate::Cue cue;
+        cue.start = line.start;
+        cue.end = line.end;
+        cue.text = line.source.empty() ? line.text : line.source;
+        cue.translation = line.source.empty() ? std::string{} : line.text;
+        cues.push_back(std::move(cue));
     }
-
+    cues = subtitle_translate::MergeIntoSentences(
+        std::move(cues), subtitle_translate::SentenceRules{dub_fit::kUtteranceGap,
+                                                           dub_fit::kUtteranceMaxSeconds});
     std::vector<Line> merged;
-    merged.reserve(lines.size());
-    for (Line& line : lines) {
-        if (!merged.empty()) {
-            Line& last = merged.back();
-            const double gap = line.start - last.end;
-            const double span = line.end - last.start;
-            const bool continues = gap <= dub_fit::kUtteranceGap && gap > -0.5 &&
-                                   span <= dub_fit::kUtteranceMaxSeconds &&
-                                   !EndsSentence(WordsOf(last));
-            if (continues) {
-                last.end = std::max(last.end, line.end);
-                last.text += line.text;
-                if (!line.source.empty()) last.source += (last.source.empty() ? "" : " ") + line.source;
-                continue;
-            }
+    merged.reserve(cues.size());
+    for (subtitle_translate::Cue& cue : cues) {
+        Line line;
+        line.start = cue.start;
+        line.end = cue.end;
+        if (cue.translation.empty()) {
+            line.text = std::move(cue.text);
+        } else {
+            line.text = std::move(cue.translation);
+            line.source = std::move(cue.text);
         }
-        merged.push_back(line);
+        merged.push_back(std::move(line));
     }
     return merged;
 }
@@ -1619,7 +1569,7 @@ Result RunDub(const Plan& plan, std::stop_token stop,
 
     // The rewrite engine, when the caller supplied one. Started here and stopped
     // with the stage: the model takes seconds to load, and only the lines that
-    // overflow their window ever ask it anything.
+    // their window cannot hold - too long, or too short - ever ask it anything.
     Rewriter rewriter(plan.rewriter, plan.rewrite);
 
     for (size_t index = 0; index < plan.lines.size(); ++index) {
@@ -1639,6 +1589,26 @@ Result RunDub(const Plan& plan, std::stop_token stop,
         // the sentence and its place.
         std::string spokenText = line.text;
         int rewrites = 0;
+        // The opposite fault, and the one heard first: a Chinese line that has
+        // said its piece in 11 s of a 15 s slot leaves the actor's mouth moving
+        // over music. Slowing covers 15% at most (kMinTempo), so a line short by
+        // more than that is asked for in more words before it is spoken - the
+        // invisible concession, and the one the subtitle does not share: the
+        // track was written before this stage ran, so this changes what is heard
+        // and never what is read.
+        if (rewriter.Ready()) {
+            const auto fill = dub_fit::FillForLine(line.start, line.end, spokenText);
+            if (fill.characters > 0) {
+                const std::string longer = rewriter.Lengthen(spokenText, fill.characters);
+                if (dub_fit::FillIsSafe(spokenText, longer, fill.characters)) {
+                    LOG("Dub: line " << index + 1 << " would speak " << fill.predicted
+                                     << " s of a " << fill.slot << " s line; filling it to "
+                                     << fill.characters << " characters");
+                    spokenText = longer;
+                    ++result.filled;
+                }
+            }
+        }
         Pcm voice;
         wchar_t tempoFlag[16];
         std::swprintf(tempoFlag, 16, L"%.2f", dub_fit::kDefaultTemperature);
@@ -1967,7 +1937,8 @@ Result RunDub(const Plan& plan, std::stop_token stop,
     result.ok = true;
     result.lines = plan.lines.size();
     LOG("Dub: " << plan.lines.size() << " lines, " << result.compressed << " by tempo, "
-                << result.rewritten << " re-worded, " << result.cut << " still cut by the mix");
+                << result.rewritten << " re-worded shorter, " << result.filled
+                << " re-worded longer, " << result.cut << " still cut by the mix");
     return result;
 }
 

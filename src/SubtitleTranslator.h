@@ -49,6 +49,10 @@ struct Job {
     std::wstring path;
     int stream = 0;
     bool external = false;
+    // The media this job belongs to, when `path` is a transcript file rather than
+    // the media itself: the glossary is looked for beside this one, and a
+    // temporary SRT deep in the cache folder has no names file beside it.
+    std::wstring source;
     // A legacy code page the file needs telling about; empty for everything
     // else (see subtitle::CharencFor).
     std::wstring charenc;
@@ -125,7 +129,16 @@ private:
     void StopServer();
     std::optional<std::string> Post(const std::string& path, const std::string& body,
                                     const std::string& contentType, int timeoutMillis);
-    std::optional<std::string> TranslateOne(const std::string& text, const Languages& languages);
+    std::optional<std::string> TranslateOne(const std::string& text, const Languages& languages,
+                                            std::string_view renderings = {});
+    // The same line asked for a size, when the first rendering cannot be spoken
+    // in the window it has (dub_fit::BudgetForLine).
+    std::optional<std::string> TranslateShorter(const std::string& text, const Languages& languages,
+                                                std::size_t characters,
+                                                std::string_view renderings = {});
+    // One question to the model, with the retry every caller needs. The answer
+    // is raw: what it means is the caller's to read.
+    std::optional<std::string> Ask(const std::string& prompt, int maxTokens);
     void SetState(State state, std::wstring notice = {});
     bool Cancelled(uint64_t generation) const;
     // The job object of the run in progress, or null. Safe to hold across a

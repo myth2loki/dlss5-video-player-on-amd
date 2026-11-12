@@ -5877,6 +5877,46 @@ void dub_fit_gives_ground_in_one_order_and_rewriting_comes_last_test()
     CHECK(std::abs(dub_fit::ShiftFor(99.0) - dub_fit::kMaxShiftForward) < 1e-9);
 }
 
+// The line is measured before it is spoken, so that a rendering too long for its
+// window is re-asked while there is still a translator to ask. Only lines tempo
+// cannot reach at all: the model misses by 0.236 s, so anything it might absorb
+// is left alone rather than re-generated.
+void dub_fit_asks_for_a_shorter_line_only_when_tempo_cannot_reach_it_test()
+{
+    // Ten Chinese characters inside a three-second window: it fits, nothing is
+    // asked.
+    const auto fits = dub_fit::BudgetForLine(10.0, 12.0, 15.0,
+                                             "\xE4\xB8\x80\xE4\xBA\x8C\xE4\xB8\x89\xE5\x9B\x9B");  // 一二三四
+    CHECK_EQ(0.0, double(fits.characters));
+    CHECK(fits.predicted < fits.reachable);
+
+    // Forty characters in a 1.3 s window with no silence after it: 6.1 s
+    // predicted against 2.1 s reachable, so the translation itself has to give.
+    std::string longLine;
+    for (int index = 0; index < 40; ++index) longLine += "\xE5\xAD\x97";  // 字
+    const auto hopeless = dub_fit::BudgetForLine(1.0, 2.3, 2.35, longLine);
+    CHECK(hopeless.characters > 0);
+    CHECK(hopeless.characters < 40);
+    CHECK(hopeless.predicted > hopeless.reachable);
+    // Aimed under what the line can afford, not at the ceiling: a rewrite that
+    // lands exactly on the cap is compressed to fit anyway.
+    CHECK(dub_fit::PredictSeconds(dub_fit::kQwen3TtsPace, hopeless.characters, 0) <
+          hopeless.reachable);
+
+    // The last line of a film has no next start; the window cap is all it gets.
+    CHECK(dub_fit::BudgetForLine(1.0, 1.2, 0.0, longLine).characters > 0);
+    // A budget never collapses to "say nothing".
+    CHECK(dub_fit::CharactersForSeconds(dub_fit::kQwen3TtsPace, 0.0, 0) >= 1);
+    // Punctuation costs its own time, so a line with a comma every other
+    // character gets fewer characters for the same seconds.
+    CHECK(dub_fit::CharactersForSeconds(dub_fit::kQwen3TtsPace, 2.0, 0.5) <
+          dub_fit::CharactersForSeconds(dub_fit::kQwen3TtsPace, 2.0, 0.0));
+    // Below a floor there is nothing worth asking: the line cannot be said in
+    // that window however it is worded, so it is left to the mix.
+    const auto hopelesslyShort = dub_fit::BudgetForLine(1.0, 1.05, 1.05, longLine);
+    CHECK_EQ(0.0, double(hopelesslyShort.characters));
+}
+
 // Slowing down is allowed, and for a reason that is easy to miss: when the
 // Chinese is shorter than the line it replaces the dub stops talking while the
 // mouth is still moving, and the original voice has already been lifted - so what
@@ -5892,6 +5932,85 @@ void dub_fit_allows_slowing_down_as_well_as_speeding_up_test()
     CHECK(std::abs(dub_fit::ClampTempo(tempo, 2.0, false) - 1.0) < 1e-9);
     // And never past what fits either way.
     CHECK(dub_fit::ClampTempo(9.0, 6.0, true) <= dub_fit::kMaxTempo);
+}
+
+// The other half of the same problem, and the half a listener reports first: a
+// line that finishes speaking before its slot ends leaves the actor's mouth
+// moving over music. Slowing covers 15% at most, so a line short by more than
+// that is asked for in more words - and a line that says far too little is left
+// alone, because growing it is inventing.
+void dub_fit_asks_for_a_longer_line_when_the_slot_would_be_left_empty_test()
+{
+    // Six seconds of slot, 26 characters of Chinese: the pace model says 4.1 s
+    // spoken, so 1.4 s of the slot would be silence - inside the band where the
+    // line says enough to be worth lengthening.
+    std::string thinText;
+    for (int index = 0; index < 26; ++index) thinText += "\xE5\xAD\x97";  // 字
+    const auto thin = dub_fit::FillForLine(10.0, 16.0, thinText);
+    CHECK(double(thin.characters) > 26.0);
+    CHECK(thin.shortfall > 0.0);
+    CHECK(thin.predicted < thin.slot);
+    CHECK(std::abs(thin.predicted - dub_fit::PredictSeconds(dub_fit::kQwen3TtsPace, 26, 0)) < 1e-9);
+    // The budget is the slot, not more: whatever comes back has to be speakable
+    // in the seconds the actor on screen used.
+    const double asked = dub_fit::PredictSeconds(dub_fit::kQwen3TtsPace, thin.characters, 0);
+    CHECK(asked <= thin.slot);
+    CHECK(asked > thin.predicted);
+
+    // A line that already reaches the target is not touched. Twenty characters
+    // over 3.4 s is 3.25 s spoken, which is past 92% of the slot.
+    std::string full;
+    for (int index = 0; index < 20; ++index) full += "\xE5\xAD\x97";  // 字
+    CHECK_EQ(0.0, double(dub_fit::FillForLine(10.0, 13.4, full).characters));
+
+    // Short by less than the pace model's own error is not worth a synthesis:
+    // nine characters over 2 s is 1.68 s spoken, a 0.16 s gap.
+    std::string nearlyText;
+    for (int index = 0; index < 9; ++index) nearlyText += "\xE5\xAD\x97";  // 字
+    const auto nearly = dub_fit::FillForLine(10.0, 12.0, nearlyText);
+    CHECK(nearly.shortfall > 0.0);
+    CHECK(nearly.shortfall < dub_fit::kFillMinSeconds);
+    CHECK_EQ(0.0, double(nearly.characters));
+
+    // Four characters in a fifteen second slot is not a short translation, it is
+    // a different sentence; a model asked to quadruple it invents.
+    const auto starved = dub_fit::FillForLine(10.0, 25.0,
+                                              "\xE6\x88\x91\xE4\xBB\xAC\xE5\x9C\xA8\xE8\xBF\x99");  // 我们在这
+    CHECK(starved.predicted < starved.slot * dub_fit::kFillInfoFloor);
+    CHECK_EQ(0.0, double(starved.characters));
+    // ...and the silence is still reported as a shortfall, so the caller can log it.
+    CHECK(starved.shortfall > 0.0);
+}
+
+// A fill is only allowed to say the same thing in more words. The Python chain
+// learned this the hard way: asked without a bound, a 4B model turned a
+// 17-character line into 108 characters and produced a "[说话人姓名]" placeholder.
+void dub_fit_refuses_a_fill_that_invents_or_overshoots_test()
+{
+    const std::string original = "\xE6\x88\x91\xE4\xBB\xAC\xE5\x9C\xA8\xE6\xB7\x98\xE5\xAE\x9D"
+                                 "\xE4\xB9\xB0\xE4\xBA\x86 3 \xE4\xBB\xB6";  // 我们在淘宝买了 3 件
+    // Longer, the same number, inside the budget: usable.
+    CHECK(dub_fit::FillIsSafe(original, "其实我们在淘宝买了 3 件东西", 20));
+    // Shorter than it started: the model rephrased instead of expanding, and the
+    // caller would only pay for a second synthesis to arrive where it began.
+    CHECK(!dub_fit::FillIsSafe(original, "在淘宝买了 3 件", 20));
+    // Past the budget by more than the fit stage can absorb with atempo.
+    std::string overshoot;
+    for (int index = 0; index < 30; ++index) overshoot += "\xE5\xAD\x97";  // 字
+    CHECK(!dub_fit::FillIsSafe(original, overshoot, 20));
+    // A number the original did not have is a fact, invented.
+    CHECK(!dub_fit::FillIsSafe(original, "其实我们在淘宝买了 3 件东西，一共 5 次", 30));
+    // Nothing is never a rewrite.
+    CHECK(!dub_fit::FillIsSafe(original, "", 20));
+
+    // Digits are compared as whole runs: 2025 does not pass for 2, 0 or 5, and a
+    // number said twice is still the same number.
+    const auto had = dub_fit::NumbersIn("2025 年 3 月，第 3 次");
+    CHECK_EQ(std::size_t(3), had.size());
+    CHECK(had[0] == "2025");
+    CHECK(had[1] == "3");
+    CHECK(had[2] == "3");
+    CHECK(dub_fit::NumbersIn("没有数字").empty());
 }
 
 // Who speaks, and the clip each voice is cloned from. Both numbers here were
@@ -16523,6 +16642,280 @@ void subtitle_translate_derives_one_language_from_the_bilingual_track_test()
     CHECK(st::SingleLanguageAss("").empty());
 }
 
+// One cue per sentence, not per whisper segment. Measured on a three-minute
+// interview: 109 cues over 163 s, a median of 1.43 s and eight characters, and
+// "University of Reading" cut in half across two of them. The whole point is
+// that the merge runs before the translation, so what is read on screen and what
+// the voice says come from the same sentence.
+void subtitle_translate_merges_cues_into_sentences_test()
+{
+    namespace st = subtitle_translate;
+    std::vector<st::Cue> cues(5);
+    cues[0].start = 1.0;
+    cues[0].end = 2.0;
+    cues[0].text = "Look, Celia,";  // a comma is the speaker breathing, not an end
+    cues[1].start = 2.1;
+    cues[1].end = 3.0;
+    cues[1].text = "we have to follow";
+    cues[2].start = 3.1;
+    cues[2].end = 4.0;
+    cues[2].text = "our passions.";
+    cues[3].start = 5.0;  // a full stop and a second of silence: a new sentence
+    cues[3].end = 6.0;
+    cues[3].text = "You have your robotics";
+    cues[4].start = 6.1;
+    cues[4].end = 6.5;
+    cues[4].text = "and I just want";
+
+    std::vector<st::Cue> merged = st::MergeIntoSentences(cues);
+    REQUIRE(merged.size() == 2);
+    CHECK_EQ(std::string("Look, Celia, we have to follow our passions."), merged[0].text);
+    CHECK_EQ(1.0, merged[0].start);  // the earliest start is kept
+    CHECK_EQ(4.0, merged[0].end);    // and the latest end
+    CHECK_EQ(std::string("You have your robotics and I just want"), merged[1].text);
+
+    // Two halves of a sentence that a breath separated by 0.43 s are one line:
+    // "When" / "did you first discover ..." came back split on the excerpt and
+    // the model then translated "When" on its own.
+    std::vector<st::Cue> breath(2);
+    breath[0].start = 0.0;
+    breath[0].end = 1.0;
+    breath[0].text = "When";
+    breath[1].start = 1.43;
+    breath[1].end = 4.0;
+    breath[1].text = "did you first discover it?";
+    CHECK_EQ(size_t{1}, st::MergeIntoSentences(breath).size());
+
+    // CJK runs together without the space Latin words need, and an English
+    // fragment that opens with its own punctuation takes none either.
+    std::vector<st::Cue> cjk(2);
+    cjk[0].end = 1.0;
+    cjk[0].text = "\xE3\x81\x82";  // あ
+    cjk[1].start = 1.1;
+    cjk[1].end = 2.0;
+    cjk[1].text = "\xE3\x81\x84";  // い
+    CHECK_EQ(std::string("\xE3\x81\x82\xE3\x81\x84"), st::MergeIntoSentences(cjk)[0].text);
+    std::vector<st::Cue> percent(2);
+    percent[0].end = 1.0;
+    percent[0].text = "50";
+    percent[1].start = 1.1;
+    percent[1].end = 2.0;
+    percent[1].text = "%";
+    CHECK_EQ(std::string("50%"), st::MergeIntoSentences(percent)[0].text);
+
+    // A monologue is capped: a line whose span has reached the cap stops taking
+    // the next fragment, so no cue becomes a paragraph nobody can read.
+    std::vector<st::Cue> longRun;
+    for (int index = 0; index < 40; ++index) {
+        st::Cue cue;
+        cue.start = index * 1.0;
+        cue.end = index * 1.0 + 1.0;
+        cue.text = "and";
+        longRun.push_back(cue);
+    }
+    const auto capped = st::MergeIntoSentences(longRun);
+    CHECK(capped.size() > 1);
+    for (const st::Cue& cue : capped) CHECK(cue.end - cue.start <= 16.0 + 1e-9);
+
+    // The same speech written twice - whisper emits a truncated segment and then
+    // the full one over it - is one cue, at the earlier start.
+    std::vector<st::Cue> twice(2);
+    twice[0].start = 1.0;
+    twice[0].end = 2.0;
+    twice[0].text = "we have to";
+    twice[1].start = 2.2;
+    twice[1].end = 3.5;
+    twice[1].text = "we have to follow";
+    const auto deduped = st::MergeIntoSentences(twice);
+    REQUIRE(deduped.size() == 1);
+    CHECK_EQ(std::string("we have to follow"), deduped[0].text);
+    CHECK_EQ(1.0, deduped[0].start);
+
+    // A line too short to read is held, but never into the next cue: two sets of
+    // words on screen at once is worse than a quick line.
+    std::vector<st::Cue> flash(2);
+    flash[0].start = 1.0;
+    flash[0].end = 1.2;
+    flash[0].text = "Welcome Hannah.";
+    flash[1].start = 1.6;
+    flash[1].end = 3.0;
+    flash[1].text = "It's lovely to be here.";
+    const auto held = st::MergeIntoSentences(flash);
+    REQUIRE(held.size() == 2);
+    // It fills the gap up to a frame before the next cue, not into it: 1.56.
+    CHECK_EQ(1.56, held[0].end);
+    std::vector<st::Cue> lonely(1);
+    lonely[0].start = 4.0;
+    lonely[0].end = 4.1;
+    lonely[0].text = "Yes.";
+    CHECK_EQ(5.2, st::MergeIntoSentences(lonely)[0].end);  // nothing to run into
+
+    // Both languages move together when a cue is joined: the dub stage reads a
+    // translated track, and a Chinese half left behind would speak half a line.
+    std::vector<st::Cue> bilingual(2);
+    bilingual[0].end = 1.0;
+    bilingual[0].text = "one";
+    bilingual[0].translation = "\xE7\x94\xB2";  // 甲
+    bilingual[1].start = 1.1;
+    bilingual[1].end = 2.0;
+    bilingual[1].text = "two";
+    bilingual[1].translation = "\xE4\xB9\x99";  // 乙
+    const auto both = st::MergeIntoSentences(bilingual);
+    REQUIRE(both.size() == 1);
+    CHECK_EQ(std::string("one two"), both[0].text);
+    CHECK_EQ(std::string("\xE7\x94\xB2\xE4\xB9\x99"), both[0].translation);
+}
+
+// A sentence longer than the screen holds is cut for the eye and kept whole for
+// the ear: the halves have to be one line again to whoever speaks them, or the
+// text stage's own merge would be undone here and the voice would break mid
+// sentence. That round trip is the contract this pins.
+void subtitle_translate_cuts_a_long_line_for_the_screen_only_test()
+{
+    namespace st = subtitle_translate;
+    const std::string clause = "这是一个测试句子，";  // 10 characters, one clause
+    std::string longLine;
+    for (int index = 0; index < 6; ++index) longLine += clause;  // 60 characters
+
+    std::vector<st::Cue> cues(1);
+    cues[0].start = 10.0;
+    cues[0].end = 25.0;  // 15 s
+    cues[0].text = "This is a test sentence, and the second one, and a third, "
+                   "and a fourth, and a fifth, and a sixth.";
+    cues[0].translation = longLine;
+
+    const auto cut = st::SplitForDisplay(cues);
+    // 15 s of 60 characters is three screens' worth (15 / 6.5), and there is a
+    // clause mark every ten characters to cut on: three even pieces, each with
+    // its own share of the window, meeting with no gap.
+    REQUIRE(cut.size() == 3);
+    CHECK_EQ(std::string(clause + clause), cut[0].translation);
+    CHECK_EQ(std::string(clause + clause), cut[1].translation);
+    CHECK_EQ(std::string(clause + clause), cut[2].translation);
+    CHECK_EQ(cut[0].end, cut[1].start);
+    CHECK_EQ(cut[1].end, cut[2].start);
+    CHECK_EQ(10.0, cut[0].start);
+    CHECK_EQ(25.0, cut[2].end);
+    // Every piece stays on screen long enough to read, and none of them can be
+    // mistaken for the end of the sentence - which is what the merge reads.
+    const auto closesSentence = [](std::string text) {
+        while (!text.empty() && (text.back() == ' ' || text.back() == '"')) text.pop_back();
+        return !text.empty() &&
+               (text.back() == '.' || text.back() == '!' || text.back() == '?');
+    };
+    for (std::size_t index = 0; index < cut.size(); ++index) {
+        CHECK(cut[index].end - cut[index].start >= 1.5);
+        // The last piece ends the sentence, and should; the others must not.
+        if (index + 1 < cut.size()) CHECK(!closesSentence(cut[index].text));
+    }
+    // The source is cut at word boundaries and nothing is lost: the pieces put
+    // back together are the line that was there.
+    CHECK_EQ(cues[0].text, cut[0].text + " " + cut[1].text + " " + cut[2].text);
+
+    // The voice reads the pieces back as one sentence: same words, same window.
+    const auto spoken = st::MergeIntoSentences(cut, st::SentenceRules{0.35, 16.0});
+    REQUIRE(spoken.size() == 1);
+    CHECK_EQ(cues[0].text, spoken[0].text);
+    CHECK_EQ(longLine, spoken[0].translation);
+    CHECK_EQ(10.0, spoken[0].start);
+    CHECK_EQ(25.0, spoken[0].end);
+
+    // A line the screen holds is left exactly as it was.
+    std::vector<st::Cue> shortLine(1);
+    shortLine[0].start = 0.0;
+    shortLine[0].end = 3.0;
+    shortLine[0].text = "Welcome Hannah.";
+    shortLine[0].translation = "欢迎你，汉娜。";
+    const auto kept = st::SplitForDisplay(shortLine);
+    REQUIRE(kept.size() == 1);
+    CHECK_EQ(shortLine[0].translation, kept[0].translation);
+    CHECK_EQ(3.0, kept[0].end);
+
+    // Long but with nowhere to break: one long line is still better than a cut
+    // in the middle of a word or a sentence.
+    std::vector<st::Cue> unbroken(1);
+    unbroken[0].end = 9.0;
+    unbroken[0].text = "and then it just kept going without any pause at all";
+    unbroken[0].translation = "然后它就一直这样持续下去没有任何停顿";
+    CHECK_EQ(size_t{1}, st::SplitForDisplay(unbroken).size());
+
+    // Chinese has no spaces, and this libass does not break a space-less run: it
+    // draws the line wider than the frame and clips it off both edges. The writer
+    // wraps it to the width the frame holds, and never leaves a mark opening a
+    // row.
+    const std::string wide = "一些科学家可能不太愿意明确指出某些极端天气事件是由气候危机引起的。您对此有何看法？";
+    const std::string wrapped = st::detail::WrapRows(wide, 28);
+    CHECK(wrapped.find("\\N") != std::string::npos);
+    CHECK_EQ(wrapped.size(), wide.size() + 2);  // one break, nothing else added
+    std::size_t from = 0;
+    int rows = 0;
+    while (from <= wrapped.size()) {
+        const std::size_t at = wrapped.find("\\N", from);
+        const std::string row = wrapped.substr(from, at == std::string::npos ? std::string::npos
+                                                                            : at - from);
+        CHECK(st::detail::CodePoints(row) <= 28);
+        // A row that opens with a mark reads as a mistake.
+        CHECK(row.rfind("，", 0) != 0);
+        CHECK(row.rfind("。", 0) != 0);
+        ++rows;
+        if (at == std::string::npos) break;
+        from = at + 2;
+    }
+    CHECK_EQ(2, rows);
+    // Latin is left to the renderer, which already breaks it at its spaces.
+    CHECK_EQ(std::string("one two three"), st::detail::WrapRows("one two three", 5));
+    // A brace is still escaped, wrapped or not.
+    CHECK(st::detail::WrapRows("{甲}", 2).find("\\{") != std::string::npos);
+}
+
+// The names file is the one part of a translation an engine cannot infer, so it
+// is read from beside the media rather than guessed at. A model-written glossary
+// was tried and rejected: asked for the established name this engine answers
+// University of Reading=牛津大学, a different university.
+void subtitle_translate_reads_the_films_names_beside_the_media_test()
+{
+    namespace st = subtitle_translate;
+    const std::string file =
+        "# a comment\n"
+        "\n"
+        "University of Reading=\xE9\x9B\xB7\xE4\xB8\x81\xE5\xA4\xA7\xE5\xAD\xA6\n"  // 雷丁大学
+        "Dartmoor: \xE8\xBE\xBE\xE7\x89\xB9\xE7\xA9\x86\xE5\xB0\x94\n"               // 达特穆尔
+        "no separator on this line\n"
+        "Name=Name\n"  // English for English is not a glossary
+        "Empty=\n";
+    const auto entries = st::ParseGlossaryFile(file);
+    REQUIRE(entries.size() == 2);
+    CHECK_EQ(std::string("University of Reading"), entries[0].term);
+    CHECK_EQ(std::string("\xE9\x9B\xB7\xE4\xB8\x81\xE5\xA4\xA7\xE5\xAD\xA6"), entries[0].rendering);
+    CHECK_EQ(std::string("Dartmoor"), entries[1].term);  // a colon works too
+    CHECK(st::ParseGlossaryFile("").empty());
+
+    // Only the names a line actually mentions are stated, and case does not
+    // decide: the model is being told which words are names, not asked to match.
+    const std::string hannah =
+        "\xE6\xB1\x89\xE5\xA8\x9C\xC2\xB7\xE5\x85\x8B\xE6\xB4\x9B\xE5\x85\x8B";  // 汉娜·克洛克
+    const std::vector<st::GlossaryEntry> glossary{{"Hannah Cloke", hannah},
+                                                  {"University of Reading",
+                                                   "\xE9\x9B\xB7\xE4\xB8\x81\xE5\xA4\xA7\xE5\xAD\xA6"},
+                                                  {"Dartmoor",
+                                                   "\xE8\xBE\xBE\xE7\x89\xB9\xE7\xA9\x86\xE5\xB0\x94"}};
+    CHECK_EQ(std::string("Hannah Cloke = ") + hannah + "; University of Reading = \xE9\x9B\xB7\xE4\xB8\x81\xE5\xA4\xA7\xE5\xAD\xA6",
+             st::RenderingsFor("My next guest is Hannah Cloke, a professor of hydrology at the "
+                               "University of Reading.",
+                               glossary));
+    CHECK_EQ(std::string("Hannah Cloke = ") + hannah, st::RenderingsFor("hannah cloke", glossary));
+    CHECK(st::RenderingsFor("Nothing here names anybody.", glossary).empty());
+    CHECK(st::RenderingsFor("Dartmoor", {}).empty());
+
+    // The renderings are stated in the instruction and never inside the line, so
+    // the model cannot translate the note itself.
+    const std::string withNames = st::OfficialPrompt("Hello.", {}, "Dartmoor = \xE8\xBE\xBE\xE7\x89\xB9\xE7\xA9\x86\xE5\xB0\x94");
+    CHECK(withNames.find("This line names Dartmoor = \xE8\xBE\xBE\xE7\x89\xB9\xE7\xA9\x86\xE5\xB0\x94. "
+                         "Use exactly those renderings for those names.") != std::string::npos);
+    CHECK(withNames.ends_with(":\n\n\nHello."));
+    CHECK(st::OfficialPrompt("Hello.").find("This line names") == std::string::npos);
+}
+
 // TranslateGemma's own template wants a structured content item carrying the two
 // language codes, which llama.cpp's OpenAI endpoint cannot express. The
 // instruction is therefore reproduced as text - copied from the template's text
@@ -17029,9 +17422,36 @@ void stage_export_mux_generated_subtitle_is_an_addition_test()
     CHECK_EQ(2, inputs(drawn));
     CHECK(!adjacent(drawn, L"-map", L"2:s:0"));
     CHECK(adjacent(drawn, L"-c:v", L"libx264"));
+    // The render declared nothing, so the picture is labelled as the capture
+    // shaders produce it rather than left untagged: BT.709, limited range.
     CHECK(adjacent(drawn, L"-vf",
-        L"ass=C\\\\:/scratch/generated.ass,pad=ceil(iw/2)*2:ceil(ih/2)*2"));
+        L"ass=C\\\\:/scratch/generated.ass,pad=ceil(iw/2)*2:ceil(ih/2)*2,"
+        L"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv"));
     CHECK(adjacent(drawn, L"-pix_fmt", L"yuv420p"));
+    CHECK(adjacent(drawn, L"-colorspace", L"bt709"));
+    CHECK(adjacent(drawn, L"-color_range", L"tv"));
+    // An 8-bit render is not handed a 10-bit profile it did not come with.
+    CHECK(drawn.end() == std::find(drawn.begin(), drawn.end(), std::wstring(L"-profile:v")));
+
+    // An HDR render keeps its own labels through the second encode. Relabelling
+    // it BT.709 is the defect this covers: the file plays washed out, and its
+    // label is confidently wrong rather than merely absent. Depth follows the
+    // render too - 10 bits squeezed into yuv420p lose their headroom before the
+    // file exists.
+    StageExportMuxRequest hdr = burned;
+    hdr.videoPixelFormat = "yuv420p10le";
+    hdr.videoColorPrimaries = "bt2020";
+    hdr.videoColorTransfer = "smpte2084";
+    hdr.videoColorSpace = "bt2020nc";
+    hdr.videoColorRange = "tv";
+    const auto graded = BuildStageExportMuxArguments(hdr, L"C:/scratch/out.mkv", "h264", source);
+    CHECK(!graded.empty());
+    CHECK(adjacent(graded, L"-vf",
+        L"ass=C\\\\:/scratch/generated.ass,pad=ceil(iw/2)*2:ceil(ih/2)*2,"
+        L"setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv"));
+    CHECK(adjacent(graded, L"-pix_fmt", L"yuv420p10le"));
+    CHECK(adjacent(graded, L"-profile:v", L"high10"));
+    CHECK(adjacent(graded, L"-colorspace", L"bt2020nc"));
 
     // The encoded video is H.264 now, so the source's sample entry would name
     // a stream that is not HEVC: the tag stays off rather than mis-tagging.
@@ -17267,7 +17687,10 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(convert_video_offers_only_languages_the_prompt_can_name_test),
     TEST_CASE(dub_fit_window_is_measured_to_the_next_line_not_to_the_lines_own_end_test),
     TEST_CASE(dub_fit_gives_ground_in_one_order_and_rewriting_comes_last_test),
+    TEST_CASE(dub_fit_asks_for_a_shorter_line_only_when_tempo_cannot_reach_it_test),
     TEST_CASE(dub_fit_allows_slowing_down_as_well_as_speeding_up_test),
+    TEST_CASE(dub_fit_asks_for_a_longer_line_when_the_slot_would_be_left_empty_test),
+    TEST_CASE(dub_fit_refuses_a_fill_that_invents_or_overshoots_test),
     TEST_CASE(dub_voice_clustering_is_calibrated_against_the_films_own_labels_test),
     TEST_CASE(dub_fit_pace_model_charges_for_punctuation_and_track_language_is_bibliographic_test),
     TEST_CASE(convert_video_frame_generation_asks_for_the_interpolator_by_name_test),
@@ -17417,6 +17840,9 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(subtitle_translate_reads_cues_out_of_srt_and_vtt_test),
     TEST_CASE(subtitle_translate_builds_one_dual_ass_track_test),
     TEST_CASE(subtitle_translate_derives_one_language_from_the_bilingual_track_test),
+    TEST_CASE(subtitle_translate_merges_cues_into_sentences_test),
+    TEST_CASE(subtitle_translate_cuts_a_long_line_for_the_screen_only_test),
+    TEST_CASE(subtitle_translate_reads_the_films_names_beside_the_media_test),
     TEST_CASE(subtitle_translate_prompt_matches_the_models_template_test),
     TEST_CASE(subtitle_translate_language_pair_follows_the_track_test),
     TEST_CASE(subtitle_translate_cleans_what_the_model_answers_test),

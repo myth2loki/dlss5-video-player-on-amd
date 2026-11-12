@@ -11,8 +11,14 @@
 // stem separator under its own vocals, the same ECAPA embedding and 0.55 cosine
 // clustering to decide who speaks, one reference clip per voice cut from the
 // vocal stem, and the backing stem under the Chinese lines so the score
-// survives. What is still not here: a rewrite round (a line the tempo cannot
-// absorb is reported and cut by the mix, not re-asked of the translator).
+// survives. The rewrite round is not here but upstream of here: a line too long
+// for the window it has is measured and re-asked of the translator while the
+// text stage still has one (dub_fit::BudgetForLine), so what reaches this stage
+// is already as short as the translation can be. A line that is still long after
+// that is given ground, and only then cut by the mix and reported.
+//
+// One cue is one line: the merge that makes a sentence a single unit runs in the
+// text stage, so this stage's own merge is normally a no-op.
 
 #include "DubFitPolicy.h"
 #include "SpeakerEmbedding.h"
@@ -87,9 +93,11 @@ struct Plan {
     std::filesystem::path stemSeparator;
     std::filesystem::path stemModel;
     // The translation engine, when the caller has one: a line that overflows its
-    // window is re-asked for in fewer words before a cut is accepted. The dense
-    // part of an exchange has more Chinese than the cues hold, and neither tempo
-    // nor queueing closes that - see TextRewriter.h.
+    // window is re-asked for in fewer words before a cut is accepted, and a line
+    // that would finish well before its window is re-asked for in more words
+    // before it is spoken. The dense part of an exchange has more Chinese than
+    // the cues hold, and the sparse part has less - neither tempo nor queueing
+    // closes either gap; see TextRewriter.h.
     subtitle_translate::Engine rewriter;
     bool rewrite{true};
     // Lay the film's music and effects under the voice, at bed level. Only the
@@ -109,6 +117,7 @@ struct Result {
     std::wstring detail;
     size_t lines{}, compressed{}, cut{};  // given ground by tempo / reported and trimmed
     size_t rewritten{};                   // lines re-asked for in fewer words
+    size_t filled{};                      // lines re-asked for in more words
 };
 
 Result RunDub(const Plan& plan, std::stop_token stop,

@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace dub_fit {
 
@@ -43,6 +44,40 @@ inline constexpr PaceModel kQwen3TtsPace{0.14246485302172732, 0.6651341975534049
 inline double PredictSeconds(const PaceModel& pace, std::size_t characters, std::size_t commas)
 {
     return pace.base + pace.perChar * double(characters) + pace.perComma * double(commas);
+}
+
+// The line's size in the pace model's terms: one character per code point, and
+// the punctuation that costs a pause on its own. Both scripts' commas count -
+// an English ',' and a Chinese '，' or '、' are the same breath in the audio.
+inline void MeasureText(std::string_view text, std::size_t& characters, std::size_t& commas)
+{
+    characters = 0;
+    commas = 0;
+    for (std::size_t i = 0; i < text.size();) {
+        const unsigned char lead = static_cast<unsigned char>(text[i]);
+        const std::size_t width = lead < 0x80 ? 1 : (lead >> 5) == 0x6 ? 2 : (lead >> 4) == 0xE ? 3 : 4;
+        if (width == 1) {
+            if (lead == ',') ++commas;
+        } else if (i + width <= text.size()) {
+            const std::string_view piece(text.data() + i, width);
+            if (piece == "\xEF\xBC\x8C" || piece == "\xE3\x80\x81") ++commas;  // ，、
+        }
+        ++characters;
+        i += width;
+    }
+}
+
+// How many characters fit in `seconds`, for a line whose punctuation runs at
+// `commaDensity` commas per character - 0.1 is one comma in ten characters, which
+// is what Chinese dialogue measures. Density rather than a count: the count
+// belongs to the line being replaced, and subtracting it in full asks the
+// translator for six characters while also asking for three commas in them.
+// Floored at one, because "translate this into zero characters" is not a question.
+inline std::size_t CharactersForSeconds(const PaceModel& pace, double seconds, double commaDensity)
+{
+    const double perCharacter = pace.perChar + pace.perComma * std::clamp(commaDensity, 0.0, 0.5);
+    const auto characters = std::size_t(std::max(0.0, seconds - pace.base) / perCharacter);
+    return std::max<std::size_t>(1, characters);
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +218,171 @@ inline Concession ConcessionFor(double natural, double window, double room)
     if (natural <= shifted) return Concession::Shift;
     if (natural <= shifted * TempoCeilingFor(window)) return Concession::Tempo;
     return Concession::Rewrite;
+}
+
+// What a translation is allowed to be, measured before anything is synthesized.
+//
+// The dub's own round works from the audio and can only give ground; this is the
+// same question asked while there is still someone to ask. A line that comes back
+// too long is not a mix problem - it is a line that will be compressed until it
+// is unintelligible or cut off by the mix, and both are heard. Asking the
+// translator for a shorter rendering is the one concession that costs nothing but
+// a minute of engine time.
+//
+// Only lines that cannot be reached at all are re-asked (IsHopelessBeforeSynthesis
+// - "condemn, never exonerate"): a line that tempo absorbs is left alone, because
+// the model misses by 0.236 s and a guess here costs a second synthesis.
+struct LineBudget {
+    double window = 0.0;
+    double reachable = 0.0;
+    double predicted = 0.0;
+    // The character budget to ask again with, or 0 when the line is fine.
+    std::size_t characters = 0;
+};
+
+// A rewrite that would have to say the line in fewer characters than this cannot
+// say it at all: it is a line too long for its window however it is worded, and
+// asking is spending a call to get something meaningless back. The mix decides
+// those, as it did before.
+inline constexpr std::size_t kMinRewriteCharacters = 8;
+
+inline LineBudget BudgetForLine(double start, double end, double nextStart,
+                                std::string_view translation, const PaceModel& pace = kQwen3TtsPace)
+{
+    LineBudget budget;
+    budget.window = WindowSeconds(start, end, nextStart);
+    const double room = nextStart > start ? std::max(0.0, nextStart - end) : 0.0;
+    budget.reachable = ReachableSeconds(budget.window, room, TempoCeilingFor(budget.window));
+    std::size_t characters = 0;
+    std::size_t commas = 0;
+    MeasureText(translation, characters, commas);
+    budget.predicted = PredictSeconds(pace, characters, commas);
+    if (!IsHopelessBeforeSynthesis(budget.predicted, budget.reachable, pace)) return budget;
+    // Aimed just under what the line can afford rather than at the ceiling: a
+    // rewrite that lands exactly on the cap is compressed to fit anyway.
+    const double density = characters > 0 ? double(commas) / double(characters) : 0.0;
+    const std::size_t asked = CharactersForSeconds(pace, budget.reachable * 0.9, density);
+    if (asked >= kMinRewriteCharacters && asked < characters) budget.characters = asked;
+    return budget;
+}
+
+// ---------------------------------------------------------------------------
+// A line too short for its slot: the other half of the same problem, and the
+// half a listener reports first. "两句之间没接上" is not a bad translation, it is
+// a Chinese line that finished saying what it had to say in 11.4 s of a 15.8 s
+// slot and left 4.4 s of music under a mouth that is still moving.
+//
+// Measured on the Python chain over one 240 s interview (yt-tools, same video
+// before and after): trailing silence summed to ~68 s of the film, the worst
+// single seam was 4.37 s, and filling it took the dub from 82.5% of the running
+// time to 93.6% - with the English leak rate staying at 0/223 windows. The
+// counterpart there is `Cue.dub_text`: the longer rendering is what the voice
+// says, the subtitle keeps the shorter translation.
+//
+// The rule is not "make every line longer". It is: a line that has almost
+// enough to say gets to say it in more words (invisible), then the fit stage may
+// slow it (faintly audible), and a line that says far too little is left alone,
+// because growing it is inventing.
+// ---------------------------------------------------------------------------
+
+// Where the voice should reach, as a share of the slot it owns. Not 1.0: the
+// pace model misses by 0.236 s, and a line aimed exactly at its slot is one the
+// fit stage then has to compress.
+inline constexpr double kFillTarget = 0.92;
+
+// Short of that target by less than this is not worth a rewrite. The model's own
+// error is 0.236 s, so spending a synthesis on a 0.2 s gap is guessing.
+inline constexpr double kFillMinSeconds = 0.35;
+
+// Below this share of its slot the line is not a short translation, it is a
+// different sentence: 4 s of English aside rendered as nine characters. Asked to
+// quadruple that, a model fills the silence with invention - measured, an
+// unrestricted "add detail" prompt turned a 17-character line into 108
+// characters and produced a "[说话人姓名]" placeholder. Those lines keep what they
+// have and the silence stays.
+inline constexpr double kFillInfoFloor = 0.55;
+
+// A rewrite may land this far past the target and still be used: the fit stage
+// absorbs 3% with atempo and nobody hears it.
+inline constexpr double kFillCapRatio = 1.10;
+
+// The digits in a line, sorted, for the one check that catches invention.
+// A lengthened line may repeat the numbers it already had; a number that was
+// not there is a fact the model made up, and no amount of "keep the meaning"
+// in the prompt prevents it - the Python chain had to add this check for the
+// same reason.
+inline std::vector<std::string> NumbersIn(std::string_view text)
+{
+    std::vector<std::string> found;
+    std::string run;
+    for (const char c : text) {
+        if (c >= '0' && c <= '9') {
+            run += c;
+            continue;
+        }
+        if (!run.empty()) {
+            found.push_back(run);
+            run.clear();
+        }
+    }
+    if (!run.empty()) found.push_back(run);
+    std::sort(found.begin(), found.end());
+    return found;
+}
+
+struct FillBudget {
+    // The seconds this line owns: its own span, not WindowSeconds. That one
+    // borrows up to 1.5 s of the silence after the cue, and slowing a line into
+    // that silence moves the voice past the mouth it belongs to. The cue
+    // boundary is where the original actor stopped, which is exactly where the
+    // Chinese should stop.
+    double slot = 0.0;
+    double predicted = 0.0;   // what the pace model says the line will take
+    double shortfall = 0.0;   // target - predicted; positive means short
+    // The character budget to ask a longer rendering for, 0 when the line should
+    // be left as it is.
+    std::size_t characters = 0;
+};
+
+inline FillBudget FillForLine(double start, double end, std::string_view translation,
+                              const PaceModel& pace = kQwen3TtsPace)
+{
+    FillBudget fill;
+    fill.slot = std::max(kWindowFloorSeconds, end - start);
+    const double target = fill.slot * kFillTarget;
+    std::size_t characters = 0;
+    std::size_t commas = 0;
+    MeasureText(translation, characters, commas);
+    fill.predicted = PredictSeconds(pace, characters, commas);
+    fill.shortfall = target - fill.predicted;
+    if (fill.shortfall <= kFillMinSeconds) return fill;
+    // Too little said to grow without inventing. Checked before the budget is
+    // computed, so a caller cannot accidentally ask anyway.
+    if (fill.predicted < fill.slot * kFillInfoFloor) return fill;
+    const double density = characters > 0 ? double(commas) / double(characters) : 0.0;
+    const std::size_t asked = CharactersForSeconds(pace, target, density);
+    if (asked > characters) fill.characters = asked;
+    return fill;
+}
+
+// What a filled line is allowed to be. Three checks, each of them a mistake the
+// Python chain made before it added them: shorter than before (the model
+// rephrased instead of expanding), past the budget (it will be compressed right
+// back), or carrying a number the original did not have (invented).
+inline bool FillIsSafe(std::string_view original, std::string_view candidate,
+                       std::size_t budget)
+{
+    if (candidate.empty()) return false;
+    std::size_t before = 0;
+    std::size_t after = 0;
+    std::size_t commas = 0;
+    MeasureText(original, before, commas);
+    MeasureText(candidate, after, commas);
+    if (after <= before) return false;
+    if (budget > 0 && double(after) > double(budget) * kFillCapRatio) return false;
+    const auto had = NumbersIn(original);
+    const auto has = NumbersIn(candidate);
+    return std::includes(had.begin(), had.end(), has.begin(), has.end());
 }
 
 // ---------------------------------------------------------------------------

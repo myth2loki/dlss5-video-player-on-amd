@@ -4207,6 +4207,9 @@ private:
             job.stream=source->stream;
             job.external=source->external;
             job.charenc=source->charenc;
+            // The film's own names live beside the file they belong to; a live
+            // transcript has no file of its own to look beside.
+            job.source=source->path;
         }
         job.identity=key;
         job.languages=TranslationLanguages();

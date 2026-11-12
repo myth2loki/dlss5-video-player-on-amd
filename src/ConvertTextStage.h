@@ -113,6 +113,10 @@ inline ConvertTextResult RunConvertVideoText(const ConvertTextPlan& plan,std::st
         job.path=plan.mediaPath;job.stream=plan.stream;job.external=false;
     }
     job.identity=plan.identity;
+    // The names file is looked for beside the media, not beside the transcript:
+    // listening writes the cues into the cache folder, and `film.names.txt` is
+    // next to `film`.
+    job.source=plan.mediaPath;
     job.languages=plan.languages;
     job.width=plan.width;job.height=plan.height;
     translator.Start(job);

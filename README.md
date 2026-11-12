@@ -387,6 +387,74 @@ downstream that needs NVIDIA's engines is struck through and marked unsupported.
 > 4, FSR 1 or CAS for the upscale, FidelityFX frame generation for the frames
 > between. [On an AMD card](#on-an-amd-card) is the place to start.
 
+### Convert video: a new file, with the words and the voice
+
+**Video → Convert video** writes a second file instead of only changing what
+the screen shows. Its rows run in one order: the speech is transcribed and
+translated first, then dubbed, then the picture stages run, then the file is
+written with both the subtitle track and the voice. The progress bar counts the
+whole film, the panel has a working Cancel, and an existing file is never
+overwritten — the new one is named `-1`, `-2`.
+
+- **Picture** — upscale (FSR 4 / FSR 1 / CAS), neural rendering, frame
+  generation 2×, a size and a frame rate.
+- **Subtitles** — *None* copies the source's own track, *A subtitle track*
+  carries the generated one beside it (ASS in Matroska, mov_text in MP4),
+  *Burned into the picture* draws it into every frame.
+- **Translate the speech** — the same whisper + llama.cpp chain the toolbar
+  button runs, so a film with no subtitles of its own can still be converted.
+- **Dub it into that language** — speaks the translated lines and carries them
+  as a second audio track, tagged `chi` and made the default; the original
+  stays first and one menu away. Choosing the dub switches the translation on,
+  because there is nothing to say without it.
+
+One cue is one sentence, in the subtitle track and in the voice alike: the
+transcript arrives cut at every pause, and the cues are joined back into
+sentences before anything is translated (`subtitle_translate::MergeIntoSentences`).
+A sentence too long for one screen is cut into two or three lines at clause
+marks, meeting with no gap and none of them ending a sentence, so it is split for
+the eye and never for the ear — the dub's own merge joins them back
+(`SplitForDisplay`). Chinese has no spaces, and the renderer does not break a
+space-less run, so the lines are wrapped by width rather than by the renderer
+(`WrapRows`).
+A film's own names are the one thing the engine cannot infer, so they come from a
+file beside it — `film.mkv` → `film.names.txt`, one `English=Chinese` per line.
+A translation too long to speak in the window it has is asked for again, shorter,
+before it is synthesized, rather than compressed until it is unintelligible — and
+one with too little to say is asked for again, longer, rather than finishing early
+and leaving the actor's mouth moving over music. Lengthening changes what is heard
+only; the subtitle keeps the shorter rendering.
+These three are measured in [the fit rules](docs/DUBBING-FIT-RULES-zh.md) §11
+(Chinese).
+
+Dubbing is the row with the most to install. Four things sit beside the player:
+
+| | file | what it is |
+| --- | --- | --- |
+| voice | `dub\runtime\llama-tts.exe` | the speech engine, one line per process |
+| voice model | `dub\models\*.gguf` + `mmproj-*.gguf` | the voice backbone and its projector |
+| who speaks | `dub\models\ecapa_voxceleb.onnx` + `dub\runtime\onnxruntime.dll` | one embedding per line, clustered |
+| backing | `dub\stems\stems-split.exe` + `dub\stems\models\*.gguf` | separates the voice from the score |
+
+Missing any of them and the row names the file that is absent instead of
+writing a silent track. The separator is what keeps the score under the new
+voice: without it the mix would cut the film's music along with its dialogue.
+The ONNX pair is optional — without it the pitch track decides who is speaking,
+which is coarser but still works.
+
+**What it costs.** A whole film dubs in about 8.8 minutes on top of the
+picture, and most of that is one `llama-tts` process per line: roughly 3.2 s of
+startup each. Seven ways to avoid it were measured and ruled out; they are
+recorded in `docs/DUBBING-FIT-RULES-zh.md` so they are not measured again.
+
+**Where it is weakest.** Each speaker's voice is cloned from a reference clip
+cut out of the separated vocal stem, and deciding *who* is speaking is the hard
+part: the embedding cannot tell two men apart on a stem with music in it, so
+the pitch track decides the sex and the rest is inherited from the nearest line.
+Expect some lines in the wrong voice — `docs/DUBBING-FIT-RULES-zh.md` says so
+rather than pretending otherwise, and one line can be re-run without redoing
+the film.
+
 ## Upstream demo and stills
 
 *NVIDIA backend — not supported in this fork. Kept because the player and its
@@ -892,7 +960,7 @@ stages.
 - The AMD backend: [integration plan and status](docs/AMD-LMXXF-INTEGRATION-PLAN-REV2-zh.md) (Chinese), [what the temporal accumulation costs and how it is measured](docs/AMD-TEMPORAL-ACCUMULATION-zh.md), and [the runtime package](third_party/lmxxf/README.md)
 - **Before changing the AMD backend**, read [the pitfalls list](docs/AMD-BACKEND-PITFALLS-zh.md) (Chinese): the shared files that may not be touched, the guide field's units and extents, the runtime config's write order, and the traps that have already cost an afternoon each
 - **Before building the dubbing stage**, read [the fitting rules](docs/DUBBING-FIT-RULES-zh.md) (Chinese): how a translated line is squeezed into the seconds its English original occupied - window definition, the order of concessions, the override table, and why the speaker test may only veto
-- **Before signing off Convert video**, read [the acceptance metrics](docs/CONVERT-QUALITY-METRICS-zh.md) (Chinese): the ten correctness checks with the commands that prove them, the throughput baselines, and the two instruments the feature still lacks
+- **Before signing off Convert video**, read [the acceptance metrics](docs/CONVERT-QUALITY-METRICS-zh.md) (Chinese): the ten correctness checks with the commands that prove them, the throughput baselines, the measured scale for "is it softer than the source" (`tools/convert-metrics/`, built by degrading a clip on purpose), and the two instruments the feature still lacks (per-pass timing, VRAM sampling)
 - **Before shipping a subtitled or dubbed file**, read [the subtitle and audio metrics](docs/SUBTITLE-AUDIO-METRICS-zh.md) (Chinese): who is allowed to read what, at what speed, for how long, plus the level, true-peak and residual-voice checks on the new track. `tools/dubbing/subtitles.py` is the generator (it writes the subtitle from the rows the voice was made from, so the two cannot disagree), `tools/dub-metrics/audit_subtitles.py` measures the file it produced, and `tools/dub-metrics/audit_translation.py` is the gate for a dropped number, negation or name
 - Hardware test records: the `VERIFICATION-*.md` files in [docs](docs/) — upstream's, on the NVIDIA backend
 - [Contributing](CONTRIBUTING.md): the checks a pull request must pass

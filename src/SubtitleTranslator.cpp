@@ -2,6 +2,8 @@
 
 #include "EngineChild.h"
 
+#include "DubFitPolicy.h"
+
 #include "KillOnCloseJob.h"
 #include "Log.h"
 #include "MediaTools.h"
@@ -238,6 +240,19 @@ void Translator::RunOnce(const Job& job, uint64_t generation)
         return;
     }
     {
+        // One cue per sentence before anything reads them, and before the
+        // resume below matches saved lines by their start time. The transcript
+        // arrives cut at every pause; translated and drawn that way it is three
+        // frames of a sentence that was one line, and the dub stage then joined
+        // them back on its own, so the voice spoke sentences under subtitles
+        // that flashed words. See MergeIntoSentences.
+        const size_t spoken = cues->size();
+        *cues = MergeIntoSentences(std::move(*cues));
+        if (cues->size() != spoken)
+            LOG("Translate: " << spoken << " cue(s) read, " << cues->size()
+                              << " sentence(s) after merging");
+    }
+    {
         std::lock_guard lock(m_mutex);
         m_status.total = int(cues->size());
         m_status.done = int(std::count_if(cues->begin(), cues->end(),
@@ -279,16 +294,41 @@ void Translator::RunOnce(const Job& job, uint64_t generation)
         return;
     }
 
+    // The film's own names, from beside the media: `film.mkv` -> `film.names.txt`.
+    // Nothing is generated here - see the note on GlossaryEntry in the policy,
+    // where a model-written glossary was measured and rejected. A line that names
+    // one of these is translated with the rendering stated, which is the only
+    // part of the translation an engine cannot infer.
+    std::vector<GlossaryEntry> glossary;
+    {
+        const std::filesystem::path media(job.source.empty() ? job.path : job.source);
+        const fs::path sidecar = media.parent_path() / (media.stem().wstring() + L".names.txt");
+        std::ifstream in(sidecar, std::ios::binary);
+        if (in) {
+            const std::string listing((std::istreambuf_iterator<char>(in)),
+                                      std::istreambuf_iterator<char>());
+            glossary = ParseGlossaryFile(listing);
+            LOG("Translate: " << glossary.size() << " name(s) from " << sidecar.string());
+        }
+        if (Cancelled(generation)) {
+            SetState(State::Cancelled);
+            return;
+        }
+    }
+
     SetState(State::Translating);
     const auto started = std::chrono::steady_clock::now();
     size_t translated = 0;
-    for (Cue& cue : *cues) {
+    size_t rewritten = 0;
+    for (size_t index = 0; index < cues->size(); ++index) {
+        Cue& cue = (*cues)[index];
         if (cue.Translated()) continue;
         if (Cancelled(generation)) {
             SetState(State::Cancelled);
             return;
         }
-        const auto answer = TranslateOne(cue.text, job.languages);
+        const std::string renderings = RenderingsFor(cue.text, glossary);
+        const auto answer = TranslateOne(cue.text, job.languages, renderings);
         if (!answer) {
             if (Cancelled(generation)) {
                 SetState(State::Cancelled);
@@ -298,6 +338,29 @@ void Translator::RunOnce(const Job& job, uint64_t generation)
             return;
         }
         cue.translation = *answer;
+        // Does this line fit the spot it has to be spoken in? Measured now, while
+        // there is still a translator to ask: a line that tempo cannot reach is
+        // otherwise compressed to the ceiling and then cut by the mix, and both
+        // are heard as the voice breaking rather than as a long translation.
+        const double nextStart =
+            index + 1 < cues->size() ? (*cues)[index + 1].start : 0.0;
+        const auto budget = dub_fit::BudgetForLine(cue.start, cue.end, nextStart, cue.translation);
+        if (budget.characters > 0 && !Cancelled(generation)) {
+            if (const auto shorter =
+                    TranslateShorter(cue.text, job.languages, budget.characters, renderings)) {
+                std::size_t before = 0;
+                std::size_t after = 0;
+                std::size_t commas = 0;
+                dub_fit::MeasureText(cue.translation, before, commas);
+                dub_fit::MeasureText(*shorter, after, commas);
+                if (after < before) {
+                    LOG("Translate: line " << index << " re-asked for " << budget.characters
+                                           << " characters (" << before << " -> " << after << ")");
+                    cue.translation = *shorter;
+                    ++rewritten;
+                }
+            }
+        }
         ++translated;
         {
             std::lock_guard lock(m_mutex);
@@ -307,8 +370,12 @@ void Translator::RunOnce(const Job& job, uint64_t generation)
         // before the last cue is answered, and each version is a whole track so
         // the overlay can swap it in without waiting.
         if (translated == kFirstPartial || translated % kPartialEvery == 0) {
-            const std::string partial =
-                BuildAss(*cues, Mode::Dual, LayoutFor(job.height), job.width, job.height);
+            // Long sentences are cut for the screen here, not in the cue list:
+            // the cue list is what the dub speaks, and a sentence is spoken
+            // whole. See SplitForDisplay.
+            const std::string partial = BuildAss(subtitle_translate::SplitForDisplay(*cues),
+                                                 Mode::Dual, LayoutFor(job.height), job.width,
+                                                 job.height);
             if (!partial.empty()) {
                 const fs::path partialPath = path.parent_path() /
                     (path.stem().string() + "." + std::to_string(translated) + ".ass");
@@ -327,7 +394,13 @@ void Translator::RunOnce(const Job& job, uint64_t generation)
         }
     }
 
-    const std::string ass = BuildAss(*cues, Mode::Dual, LayoutFor(job.height), job.width, job.height);
+    // Split for the screen only. The cue list above is what the dub reads back
+    // from this file, and its merge joins these halves again on the marks left
+    // here: no gap, and no full stop at the end of a half.
+    const std::vector<subtitle_translate::Cue> display =
+        subtitle_translate::SplitForDisplay(*cues);
+    const std::string ass =
+        BuildAss(display, Mode::Dual, LayoutFor(job.height), job.width, job.height);
     if (ass.empty()) {
         SetState(State::Failed, L"there was nothing to draw");
         return;
@@ -345,7 +418,8 @@ void Translator::RunOnce(const Job& job, uint64_t generation)
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     double coverage = 0.0;
     for (const Cue& cue : *cues) coverage = std::max(coverage, cue.end);
-    LOG("Translate: " << translated << " cue(s) in " << seconds << " s -> " << path.string()
+    LOG("Translate: " << translated << " cue(s), " << rewritten << " re-asked shorter, in "
+                      << seconds << " s -> " << path.string()
                       << " (covers up to " << coverage << " s)");
     {
         std::lock_guard lock(m_mutex);
@@ -504,18 +578,39 @@ std::optional<std::string> Translator::Post(const std::string& path, const std::
     return answer->body;
 }
 
-std::optional<std::string> Translator::TranslateOne(const std::string& text, const Languages& languages)
+std::optional<std::string> Translator::Ask(const std::string& prompt, int maxTokens)
 {
-    const std::string body = ChatRequestBody(OfficialPrompt(text, languages));
+    const std::string body = ChatRequestBody(prompt, maxTokens);
     for (int attempt = 0; attempt < 2; ++attempt) {
         const auto answer = Post("/v1/chat/completions", body, "application/json", 120000);
         if (!answer) continue;
         const auto content = JsonStringField(*answer, "content");
         if (!content) continue;
-        std::string cleaned = CleanTranslation(*content);
-        if (!cleaned.empty()) return cleaned;
+        if (!content->empty()) return *content;
     }
     return std::nullopt;
+}
+
+std::optional<std::string> Translator::TranslateOne(const std::string& text, const Languages& languages,
+                                                    std::string_view renderings)
+{
+    const auto content = Ask(OfficialPrompt(text, languages, renderings), 384);
+    if (!content) return std::nullopt;
+    std::string cleaned = CleanTranslation(*content);
+    if (cleaned.empty()) return std::nullopt;
+    return cleaned;
+}
+
+std::optional<std::string> Translator::TranslateShorter(const std::string& text,
+                                                        const Languages& languages,
+                                                        std::size_t characters,
+                                                        std::string_view renderings)
+{
+    const auto content = Ask(ShorterPrompt(text, languages, characters, renderings), 384);
+    if (!content) return std::nullopt;
+    std::string cleaned = CleanTranslation(*content);
+    if (cleaned.empty()) return std::nullopt;
+    return cleaned;
 }
 
 } // namespace subtitle_translate
