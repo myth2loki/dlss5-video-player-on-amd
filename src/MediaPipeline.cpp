@@ -1872,9 +1872,17 @@ std::optional<std::vector<MediaStreamInfo>> ListMediaStreams(const std::filesyst
     std::vector<MediaStreamInfo> streams;
     std::string pending;
     bool oversized = false;
+    // "unknown" and "reserved" are ffprobe's ways of saying the file does not
+    // declare it. Kept as empty so the mux can tell "not declared" from "bt709"
+    // - the two lead to different labels on the output.
+    const auto declared = [](std::string_view value) {
+        if (value.empty() || value == "unknown" || value == "reserved" || value == "N/A")
+            return std::string{};
+        return std::string(value);
+    };
     // ffprobe writes each stream's keys together and `index` first, so a new
     // index opens the record the following keys belong to.
-    const auto streamLine = [&streams](std::string_view line) {
+    const auto streamLine = [&streams, &declared](std::string_view line) {
         if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
         const size_t equals = line.find('=');
         if (equals == std::string_view::npos) return;
@@ -1883,17 +1891,30 @@ std::optional<std::vector<MediaStreamInfo>> ListMediaStreams(const std::filesyst
         if (key == "index") {
             uint32_t index = 0;
             const auto parsed = std::from_chars(value.data(), value.data() + value.size(), index);
-            if (parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size())
-                streams.push_back({index, {}, {}});
+            if (parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size()) {
+                streams.push_back(MediaStreamInfo{});
+                streams.back().index = index;
+            }
         } else if (!streams.empty() && key == "codec_type") {
             streams.back().type = std::string(value);
         } else if (!streams.empty() && key == "codec_name") {
             streams.back().codec = std::string(value);
+        } else if (!streams.empty() && key == "pix_fmt") {
+            streams.back().pixelFormat = declared(value);
+        } else if (!streams.empty() && key == "color_primaries") {
+            streams.back().colorPrimaries = declared(value);
+        } else if (!streams.empty() && key == "color_transfer") {
+            streams.back().colorTransfer = declared(value);
+        } else if (!streams.empty() && key == "color_space") {
+            streams.back().colorSpace = declared(value);
+        } else if (!streams.empty() && key == "color_range") {
+            streams.back().colorRange = declared(value);
         }
     };
     // A header read, as SummarizeMediaStreams' stream list is.
     const CaptureResult capture = RunCapture(ffprobe,
-        {L"-v", L"error", L"-show_entries", L"stream=index,codec_type,codec_name",
+        {L"-v", L"error", L"-show_entries", L"stream=index,codec_type,codec_name,pix_fmt,"
+         L"color_range,color_primaries,color_transfer,color_space",
          L"-of", L"default=noprint_wrappers=1:nokey=0", L"-i", media.wstring()},
         stop, std::chrono::minutes{1}, 64 * 1024,
         [&](std::string_view chunk) { ConsumeProbeLines(pending, oversized, chunk, streamLine); });
@@ -1958,10 +1979,34 @@ std::vector<std::wstring> BuildStageExportMuxArguments(const StageExportMuxReque
         // re-encode (BuildCachedExportArguments), and the pad is the even-size
         // guard that builder carries: ass does not change the size, but a
         // subtitles-only conversion renders the source itself, which may be odd.
+        //
+        // Colour has to survive that second encode. The output options keep the
+        // matrix and the range on this FFmpeg and silently drop the primaries
+        // and transfer - the render path measured that, and it is why it states
+        // all four as frame properties. The same rule applies here: `setparams`
+        // carries all four, and the output options repeat the two that land.
+        //
+        // Depth is the render's, not a constant. A 10-bit render squeezed into
+        // yuv420p loses the headroom before the file exists, so the encoder is
+        // told what it was given. The fallback when the render declares nothing
+        // is BT.709 limited range, which is what the capture shaders produce.
+        const auto declaredOr = [](const std::string& value, const char* fallback) {
+            return utf8_text::ToWide(value.empty() ? std::string(fallback) : value);
+        };
+        const std::wstring primaries = declaredOr(request.videoColorPrimaries, "bt709");
+        const std::wstring transfer = declaredOr(request.videoColorTransfer, "bt709");
+        const std::wstring space = declaredOr(request.videoColorSpace, "bt709");
+        const std::wstring range = declaredOr(request.videoColorRange, "tv");
+        const bool tenBitRender = request.videoPixelFormat.find("10") != std::string::npos;
+        const std::wstring colour =
+            L"setparams=color_primaries=" + primaries + L":color_trc=" + transfer +
+            L":colorspace=" + space + L":range=" + range;
         codecs.insert(codecs.end(), {L"-c:v", L"libx264", L"-preset", L"medium", L"-crf", L"18",
                                      L"-vf", L"ass=" + subtitle::EscapeFilterValue(request.subtitleFile.wstring())
-                                         + L",pad=ceil(iw/2)*2:ceil(ih/2)*2",
-                                     L"-pix_fmt", L"yuv420p"});
+                                         + L",pad=ceil(iw/2)*2:ceil(ih/2)*2," + colour,
+                                     L"-pix_fmt", tenBitRender ? L"yuv420p10le" : L"yuv420p"});
+        if (tenBitRender) codecs.insert(codecs.end(), {L"-profile:v", L"high10"});
+        codecs.insert(codecs.end(), {L"-colorspace", space, L"-color_range", range});
         // No -tag:v: the encoded video is H.264 now, and the source's hvc1
         // sample entry would name a stream that is not HEVC.
     } else {
@@ -2138,7 +2183,18 @@ MaterializeResult MuxStageExport(const std::filesystem::path& helperDirectory,
         if (!videoStreams || !listed)
             return {false, MaterializeError::ProcessFailed, L"The streams to carry into the export could not be listed."};
         for (const MediaStreamInfo& stream : *videoStreams)
-            if (stream.type == "video") { videoCodec = stream.codec; break; }
+            if (stream.type == "video") {
+                videoCodec = stream.codec;
+                // Read here, not inferred later: the mux states these when it
+                // has to re-encode for burned subtitles, and an HDR render
+                // relabelled as BT.709 is a file that plays washed out.
+                resolved.videoPixelFormat = stream.pixelFormat;
+                resolved.videoColorPrimaries = stream.colorPrimaries;
+                resolved.videoColorTransfer = stream.colorTransfer;
+                resolved.videoColorSpace = stream.colorSpace;
+                resolved.videoColorRange = stream.colorRange;
+                break;
+            }
         sourceStreams = *listed;
         // Of the source's own subtitles, before a range cut can set aside any
         // that Matroska cannot hold either.

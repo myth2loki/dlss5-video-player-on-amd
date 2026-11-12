@@ -503,6 +503,16 @@ struct MediaStreamInfo {
     uint32_t index{};
     std::string type;
     std::string codec;
+    // What the stream says about its own pixels. ffprobe's spelling is kept
+    // ("bt709", "smpte2084", "bt2020nc", "tv", "yuv420p10le") because the mux
+    // hands these back to FFmpeg, and both sides use the same names. Empty
+    // where the file declares nothing or answers "unknown" - which is not the
+    // same as "bt709", and is worth keeping apart from it.
+    std::string pixelFormat;
+    std::string colorPrimaries;
+    std::string colorTransfer;
+    std::string colorSpace;
+    std::string colorRange;
 };
 
 // Every stream of `media`, in file order, or nothing when ffprobe could not
@@ -555,6 +565,21 @@ struct StageExportMuxRequest {
     // The ISO 639-2/B code the dub is tagged with ("chi"), for the same
     // reason the subtitle's is.
     std::wstring dubLanguage;
+    // What the rendered video says about its own colour, read off it by
+    // MuxStageExport and stated on the output when the mux re-encodes the
+    // picture for burned subtitles. A stream copy carries its own tags, so
+    // only the burn path needs these. Empty means the render declared nothing:
+    // the capture shaders work in BT.709 limited range, so that is the honest
+    // fallback - but an HDR render (smpte2084 / bt2020nc) must not be relabelled
+    // as it, or the file plays washed out and the label is confidently wrong.
+    //
+    // `videoPixelFormat` decides the encoder's depth on the same path: a 10-bit
+    // render re-encoded as 8-bit loses its headroom before the file exists.
+    std::string videoPixelFormat;
+    std::string videoColorPrimaries;
+    std::string videoColorTransfer;
+    std::string videoColorSpace;
+    std::string videoColorRange;
 };
 
 // The FFmpeg arguments for MuxStageExport, from what the two inputs were
