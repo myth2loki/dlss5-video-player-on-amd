@@ -1,0 +1,70 @@
+{
+  "pan0p5": {
+    "kind": "pan",
+    "dy": -0.5,
+    "dx": 0.0,
+    "width": 1280,
+    "height": 520,
+    "frames": 72
+  },
+  "pan1": {
+    "kind": "pan",
+    "dy": -1.0,
+    "dx": 0.0,
+    "width": 1280,
+    "height": 520,
+    "frames": 72
+  },
+  "pan2": {
+    "kind": "pan",
+    "dy": -2.0,
+    "dx": 0.0,
+    "width": 1280,
+    "height": 520,
+    "frames": 72
+  },
+  "pan4": {
+    "kind": "pan",
+    "dy": -4.0,
+    "dx": 0.0,
+    "width": 1280,
+    "height": 520,
+    "frames": 72
+  },
+  "pan8": {
+    "kind": "pan",
+    "dy": -8.0,
+    "dx": 0.0,
+    "width": 1280,
+    "height": 520,
+    "frames": 72
+  },
+  "zoom": {
+    "kind": "zoom",
+    "scale": 1.005,
+    "width": 1280,
+    "height": 520,
+    "frames": 72
+  },
+  "layers": {
+    "kind": "layers",
+    "dx": -6.0,
+    "dy": 0,
+    "box": [
+      180,
+      340,
+      6.0
+    ],
+    "width": 1280,
+    "height": 520,
+    "frames": 72
+  },
+  "pan32": {
+    "kind": "pan",
+    "dy": -32.0,
+    "dx": 0.0,
+    "width": 1280,
+    "height": 520,
+    "frames": 72
+  }
+}

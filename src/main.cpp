@@ -10703,6 +10703,12 @@ private:
         // An HDR original decoded for an HDR display is PQ, and says so per frame.
         m_renderer->SetNextSourcePq(f.pq);
         m_renderer->SetUpscalingHistory(m_upscalingHistory);
+        // Diagnostic only: the live playback path calls the legacy RenderFrame
+        // overload, which carries no FrameIdentity. Stamp the decoded frame so
+        // DLSS5_OUTPUT_DUMP can name it in manifest.txt; the stage-2 A/B then
+        // pairs dumps with truth by frame number instead of an MSE-guessed
+        // per-process integer offset. No effect on rendered pixels.
+        m_renderer->SetNextFrameDumpIdentity(IdentityOf(f,m_historyGeneration,0,reason));
         bool ok=m_renderer->RenderFrame(f.bgra.data(),f.bgra.size(),g.guideGridRGBA32F.data(),g.guideGridRGBA32F.size()*sizeof(float),g.gridW,g.gridH,r,g.motionVectors,ms);
         const double renderMs=std::chrono::duration<double,std::milli>(Clock::now()-renderStart).count();
         m_renderMsTotal+=renderMs;

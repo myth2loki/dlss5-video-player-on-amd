@@ -21,6 +21,13 @@
 /external/nvof/*
 !/external/nvof/nvOpticalFlowCommon.h
 !/external/nvof/nvOpticalFlowD3D12.h
+# Our own glue over the FidelityFX Optical Flow sources, plus the PIX header
+# stand-in they include. Both are this repository's files, not vendor copies: the
+# SDK itself stays a cache path, so these two are what makes the integration
+# reviewable without downloading it.
+!/external/fidelityfx/
+!/external/fidelityfx/pix3.h
+!/external/fidelityfx/ffx_of_shaderblobs.cpp
 # The NVENC API header is under the same kind of file-scoped MIT notice, pinned from
 # FFmpeg's nv-codec-headers (THIRD_PARTY.md has the tag and its SHA-256).
 !/external/nvenc/
@@ -117,3 +124,12 @@ site/dist/
 
 # Speech recognition runtime + GGML model (downloaded on first use)
 /asr/
+
+# tools/flow-ab/ keeps only the scripts and truth table. Clips, dumped fields,
+# output-frame dumps and the film frame are regenerated locally (~1 GB);
+# see docs/MOTION-GUIDE-AB-zh.md.
+/tools/flow-ab/clips/
+/tools/flow-ab/runs/
+/tools/flow-ab/trash/
+/tools/flow-ab/outputs/
+/tools/flow-ab/base.png

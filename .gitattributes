@@ -6,6 +6,11 @@
 *.yaml text eol=lf
 *.ps1 text eol=crlf
 *.bat text eol=crlf
+# The A/B harness is invoked as `bash tools/flow-ab/run_arm.sh` on Windows, where
+# core.autocrlf=true would otherwise check it out with CRLF and turn every `\r`
+# into a command name. Pinned so a clone runs as written.
+*.sh text eol=lf
+*.py text eol=lf
 # tools/package_release.ps1 copies these as-is and hashes them into
 # PACKAGE_MANIFEST.txt, so their line endings cannot be left to each
 # maintainer's core.autocrlf (the *.md rule above already pins the rest of the

@@ -23,6 +23,11 @@ namespace {
 // implementation directly left those tables half-initialized - the first
 // ffxConfigure then walked a context object graph containing -1 sentinels and
 // faulted (access at 0xFFFFFFFFFFFFFFFF, inside the runtime's own code).
+// That measurement predates the search-path fix in LoadRuntime: the effect DLL
+// was not on the process search path at the time, so a half-built context is
+// not by itself proof that direct loading is unsafe. The loader is kept anyway
+// - with the path fixed it works, and there is no reason to change two things
+// at once.
 constexpr wchar_t kDllName[] = L"amd_fidelityfx_loader_dx12.dll";
 
 // Where to look, in order. The exe directory first, because a packaged player
@@ -227,6 +232,19 @@ bool FsrFrameGenBackend::LoadRuntime()
         return false;
     }
 
+    // The flag above covers the loader itself. It does NOT cover what the loader
+    // loads in turn: it resolves its effect DLLs with plain LoadLibraryA, and an
+    // inner LoadLibrary is governed by the process search path, not by the
+    // caller's flags. Measured on the shipped 4.1.1 binaries, a loader reached by
+    // absolute path while its siblings sit in that same directory answers every
+    // ffxCreateContext with 2 - FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE - including
+    // for a fabricated descriptor type, which is what shows the chain was never
+    // read: the effect DLL was simply not found. Putting the runtime's own
+    // directory on the search path makes the same chain create a context.
+    // SetDllDirectoryW inserts it after the exe directory and removes the
+    // working directory from the search, which is the safer order anyway.
+    SetDllDirectoryW(fs::path(path).parent_path().c_str());
+
     g_createContext = reinterpret_cast<PfnFfxCreateContext>(
         GetProcAddress(m_module, "ffxCreateContext"));
     g_destroyContext = reinterpret_cast<PfnFfxDestroyContext>(
@@ -303,8 +321,14 @@ bool FsrFrameGenBackend::CreateContext(ID3D12Device* device)
         m_context = nullptr;
         m_lastError = static_cast<uint32_t>(rc);
         m_lastDetail = DescribeResult("ffxCreateContext(FrameGeneration)", rc) +
-                       L". The runtime may not support this GPU, or it may be a "
-                       L"different FidelityFX version than this backend was built against.";
+                       L". 2 is FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE - the descriptor "
+                       L"chain was not recognised, which is not something a GPU can be too "
+                       L"old for. With this backend the usual cause is the opposite of what "
+                       L"the code says: the loader resolves its effect DLL with LoadLibraryA "
+                       L"and so depends on the process DLL search path. LoadRuntime puts the "
+                       L"runtime's own directory there before this call; if this line still "
+                       L"appears, amd_fidelityfx_framegeneration_dx12.dll is missing from "
+                       L"that directory.";
         return false;
     }
     return true;

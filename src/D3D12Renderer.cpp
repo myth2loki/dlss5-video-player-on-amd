@@ -25,6 +25,8 @@
 #include <chrono>
 #include <cstring>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <string>
 #include <vector>
@@ -144,6 +146,7 @@ D3D12Renderer::~D3D12Renderer() {
     // after both had gone - which is an access violation on the way out, not a leak.
     if (m_queue && m_fence && m_fenceEvent) WaitGPUForContinuedUse();
     m_nvof.Shutdown();
+    m_ffxOf.Shutdown();
     for (uint32_t i=0;i<FrameCount;++i) {
         if (m_upload[i] && m_uploadMapped[i]) m_upload[i]->Unmap(0,nullptr);
         if (m_guideUpload[i] && m_guideMapped[i]) m_guideUpload[i]->Unmap(0,nullptr);
@@ -228,8 +231,12 @@ bool D3D12Renderer::Initialize(HWND hwnd,uint32_t sourceW,uint32_t sourceH,uint3
         if(!CreateUpscalePresentResources())return false;
         LogGpuHealth("after CreateUpscalePresentResources", m_device.Get());
         if(m_upscaleOffered)
-            LOG("Playback upscale: this player's own stretch-and-sharpen will serve the SR switch at "
-                <<m_outputW<<"x"<<m_outputH<<" (no NGX on this machine).");
+            // Named a fallback, not a second thing serving the same switch: when
+            // FSR 4 comes up it is the one that runs, and a line saying this one
+            // "will serve" reads as if it were, which is how a working FSR 4 got
+            // reported as not working once already.
+            LOG("Playback upscale: this player's own stretch-and-sharpen is the fallback for the "
+                "SR switch at "<<m_outputW<<"x"<<m_outputH<<" (no NGX on this machine).");
     }
     // Playback frame generation. Its flow source is the motion guide the frame
     // already produces, so it is built once here like the upscale above and
@@ -284,6 +291,9 @@ bool D3D12Renderer::CreateDeviceAndSwapchain(HWND hwnd) {
     if(FAILED(m_adapter.As(&m_adapter3)))m_adapter3.Reset();
     if(!HR(D3D12CreateDevice(m_adapter.Get(),D3D_FEATURE_LEVEL_12_0,IID_PPV_ARGS(&m_device)),"D3D12CreateDevice"))return false;
     DXGI_ADAPTER_DESC1 ad{};m_adapter->GetDesc1(&ad);LogDeviceAdapter(ad);
+    // Kept for the motion-guide default, which is a vendor question and not a
+    // probe result; see the estimator selection in CreateVideoResources.
+    m_adapterVendorId=ad.VendorId;
     D3D12_COMMAND_QUEUE_DESC q{};q.Type=D3D12_COMMAND_LIST_TYPE_DIRECT;
     if(!HR(m_device->CreateCommandQueue(&q,IID_PPV_ARGS(&m_queue)),"CreateCommandQueue"))return false;
     if(FAILED(m_queue->GetTimestampFrequency(&m_timestampFrequency)))m_timestampFrequency=0;
@@ -1198,7 +1208,36 @@ bool D3D12Renderer::CreateVideoResources(){
     for(uint32_t i=0;i<4;++i)m_device->CreateShaderResourceView(nullptr,&fsrv,SRVCPU(NvofInputSRV+i));
     const HardwareFlowPlan flowPlan=PlanHardwareFlow(m_sourceW,m_sourceH,m_renderW,m_renderH);
     m_nvofMotionScaleX=flowPlan.motionScaleX;m_nvofMotionScaleY=flowPlan.motionScaleY;
-    if(flowPlan.attempt&&m_nvof.Initialize(m_device.Get(),flowPlan.width,flowPlan.height)){
+    // Which estimator to try, and in what order. NVOFA is a dedicated engine and
+    // wins wherever a card has one; FidelityFX is compute, so it comes up on the
+    // cards that have none - which is every AMD card, and the reason the CPU
+    // matcher was the only motion source there. DLSS_VIDEO_MOTION_FLOW exists so
+    // the three arms can be compared on the same clip without a rebuild: unset or
+    // "auto" is the order above, "nvof"/"ffx" name one estimator, "cpu" refuses
+    // both. A named arm that cannot come up falls back to the matcher rather than
+    // to the other estimator - that is what makes the A/B mean anything.
+    //
+    // The default order is read off the adapter, not off a probe that fails: the
+    // flow engine is a block of the NVIDIA driver, so on any other vendor the
+    // compute estimator IS the default motion source, and asking NVOFA first only
+    // bought a line saying nvofapi64.dll was missing - which reads like a fault in
+    // a log where it is the expected path. DLSS_VIDEO_MOTION_FLOW=nvof still asks
+    // for it explicitly, so the arm stays reachable on a card that is not
+    // expected to answer, and a failed explicit ask still falls back to the CPU
+    // matcher rather than to the other estimator.
+    wchar_t flowPreference[16]{};
+    const bool flowPreferenceSet=GetEnvironmentVariableW(L"DLSS_VIDEO_MOTION_FLOW",flowPreference,16)!=0;
+    const bool preferCpu=flowPreferenceSet&&_wcsicmp(flowPreference,L"cpu")==0;
+    m_flowOff=flowPreferenceSet&&_wcsicmp(flowPreference,L"off")==0;
+    const bool preferFfx=flowPreferenceSet&&_wcsicmp(flowPreference,L"ffx")==0;
+    const bool preferNvof=flowPreferenceSet&&_wcsicmp(flowPreference,L"nvof")==0;
+    // 0x10DE is NVIDIA. Anything else - including a vendor id nobody has taught
+    // this file yet - takes the compute estimator as the default, which is the
+    // choice that comes up rather than the one that has to fail first.
+    const bool nvofEngineExpected=m_adapterVendorId==0x10DE;
+    const bool tryNvof=(nvofEngineExpected||preferNvof)&&!preferCpu&&!preferFfx&&!m_flowOff;
+    const bool tryFfx=!preferCpu&&!preferNvof&&!m_flowOff;
+    if(flowPlan.attempt&&tryNvof&&m_nvof.Initialize(m_device.Get(),flowPlan.width,flowPlan.height)){
         fsrv.Format=DXGI_FORMAT_R16G16_SINT;m_device->CreateShaderResourceView(m_nvof.Flow(),&fsrv,SRVCPU(NvofFlowSRV));
         // A device that offered no cost surface, or only the forward direction, keeps the
         // null descriptor written above: the resolve pass binds t1 and t2 either way, and
@@ -1214,18 +1253,90 @@ bool D3D12Renderer::CreateVideoResources(){
         fsrv.Format=DXGI_FORMAT_B8G8R8A8_UNORM;
         for(uint32_t i=0;i<4;++i)m_device->CreateShaderResourceView(m_nvof.Input(i),&fsrv,SRVCPU(NvofInputSRV+i));
         m_nvofActive=true;
+        m_flowZeroMotionTest=true;
+    }else if(flowPlan.attempt&&tryFfx){
+        // The compute estimator. Its field is R16G16_SINT like NVOFA's, so the
+        // same resolve pass reads it - one vector per 8x8 block, whole pixels,
+        // forward only. The cost and back-flow slots keep the null descriptors
+        // written above, and both gates that would read them are switched off by
+        // their own constants below.
+        if(m_ffxOf.Initialize(m_device.Get(),flowPlan.width,flowPlan.height)){
+            fsrv.Format=DXGI_FORMAT_R16G16_SINT;
+            m_device->CreateShaderResourceView(m_ffxOf.Flow(),&fsrv,SRVCPU(NvofFlowSRV));
+            m_ffxOfActive=true;
+            // FidelityFX keeps its own ping-pong of luminance levels and does not
+            // hand the pair back, so the resolve pass's zero-motion test - which
+            // reads both frames at t3/t4 - has nothing to read here. Off, and said
+            // so in the log, because it changes what a static frame produces.
+            m_flowZeroMotionTest=false;
+        }
     }
     // One line per session, because a log that does not name the estimator cannot tell
     // a session that ran on 1/32-pixel hardware vectors from one that ran on a 24x24
     // CPU block match, and those are different pictures.
-    if(m_nvofActive)
+    if(m_flowOff)
+        LOG("Motion guide backend: none - DLSS_VIDEO_MOTION_FLOW asked for the control arm, so the "
+            "field is zeroed after the guide pass on the "<<m_renderW<<"x"<<m_renderH
+            <<" input; anything reading motion reads nothing moved.");
+    else if(m_nvofActive)
         LOG("Motion guide backend: NVOFA hardware flow on the decoded "<<m_sourceW<<"x"<<m_sourceH
             <<" frame, vectors scaled by "<<m_nvofMotionScaleX<<","<<m_nvofMotionScaleY
             <<" into the "<<m_renderW<<"x"<<m_renderH<<" DLSS input.");
+    else if(m_ffxOfActive)
+        LOG("Motion guide backend: FidelityFX optical flow (compute, 8x8 blocks) on the decoded "
+            <<m_sourceW<<"x"<<m_sourceH<<" frame, vectors scaled by "<<m_nvofMotionScaleX<<","
+            <<m_nvofMotionScaleY<<" into the "<<m_renderW<<"x"<<m_renderH
+            <<" DLSS input; forward field only, no cost surface, zero-motion test off"
+            <<(!flowPreferenceSet&&!nvofEngineExpected
+                   ?"; the default motion source on this adapter, whose vendor ships no flow engine."
+                   :"."));
     else
         LOG("Motion guide backend: CPU block matcher, because "
-            <<(flowPlan.attempt?"the flow engine did not come up for the decoded frame (see the NVOFA line above)":flowPlan.refusal)
+            <<(preferCpu?"DLSS_VIDEO_MOTION_FLOW asked for the CPU arm"
+                        :(flowPlan.attempt
+                              ?(preferNvof?"the NVOFA arm DLSS_VIDEO_MOTION_FLOW named did not come up for the decoded frame"
+                                          :(tryNvof?"neither flow backend came up for the decoded frame"
+                                                    :"the default FidelityFX estimator did not come up for the decoded frame"))
+                              :flowPlan.refusal))
             <<"; decoded "<<m_sourceW<<"x"<<m_sourceH<<", DLSS input "<<m_renderW<<"x"<<m_renderH<<".");
+
+    // The motion-field dump, configured once. A directory is the whole switch: no
+    // directory, no hook, and every frame below skips on one empty-string test.
+    {
+        wchar_t buffer[512]{};
+        if(GetEnvironmentVariableW(L"DLSS5_FLOW_DUMP",buffer,512)!=0&&buffer[0]!=L'\0'){
+            m_flowDumpDir=buffer;
+            wchar_t number[16]{};
+            if(GetEnvironmentVariableW(L"DLSS5_FLOW_DUMP_FROM",number,16)!=0)m_flowDumpFrom=uint32_t(_wtoi(number));
+            if(GetEnvironmentVariableW(L"DLSS5_FLOW_DUMP_COUNT",number,16)!=0)m_flowDumpCount=uint32_t(_wtoi(number));
+            if(!m_flowDumpCount)m_flowDumpCount=60;
+            LOG("Motion guide dump: "<<m_flowDumpCount<<" resolved fields from source frame "<<m_flowDumpFrom
+                <<" will be written to "<<utf8_text::FromWide(m_flowDumpDir)<<" as flow_NNNNN.rg16f. Each one costs a full GPU"
+                " drain, so this is a measurement run, not a playback configuration.");
+        }
+    }
+
+    // The output-frame dump, configured once. FROM/COUNT default to the motion-
+    // field dump's range so one run produces both files for the same frames;
+    // each has its own counter, and the output manifest records the field's
+    // index for that frame so the two can still be paired offline.
+    {
+        wchar_t buffer[512]{};
+        if(GetEnvironmentVariableW(L"DLSS5_OUTPUT_DUMP",buffer,512)!=0&&buffer[0]!=L'\0'){
+            m_outputDumpDir=buffer;
+            m_outputDumpFrom=m_flowDumpFrom;
+            m_outputDumpCount=m_flowDumpCount?m_flowDumpCount:60;
+            wchar_t number[16]{};
+            if(GetEnvironmentVariableW(L"DLSS5_OUTPUT_DUMP_FROM",number,16)!=0)m_outputDumpFrom=uint32_t(_wtoi(number));
+            if(GetEnvironmentVariableW(L"DLSS5_OUTPUT_DUMP_COUNT",number,16)!=0)m_outputDumpCount=uint32_t(_wtoi(number));
+            if(!m_outputDumpCount)m_outputDumpCount=60;
+            LOG("Output frame dump: "<<m_outputDumpCount<<" FSR 4 output frames from source frame "<<m_outputDumpFrom
+                <<" will be written to "<<utf8_text::FromWide(m_outputDumpDir)<<" as out_NNNNN.rgba16f"
+                " (linear FP16, at the SR switch's output size - the source dimensions are not yet"
+                " final here). Each one costs a full GPU drain, so this is a measurement run, not a"
+                " playback configuration.");
+        }
+    }
 
     // One depth resource, two views: D32_FLOAT DSV for real depth writes / ReShade
     // discovery and R32_FLOAT SRV for debug/NGX sampling. Passing this exact resource
@@ -1423,11 +1534,20 @@ void D3D12Renderer::CopyMappedRows(uint8_t*mapped,const D3D12_PLACED_SUBRESOURCE
 
 bool D3D12Renderer::RenderFrame(const uint8_t*bgra,size_t bytes,const float*guideGridRGBA32F,size_t guideBytes,uint32_t gridW,uint32_t gridH,bool temporalReset,bool motionGuides,float frameTimeMs){
     m_lastRenderedId={};
-    return RenderFrameInternal(bgra,bytes,guideGridRGBA32F,guideBytes,gridW,gridH,temporalReset,motionGuides,frameTimeMs,nullptr);
+    // One-shot: playback stamps the decoded frame's identity before calling us.
+    // A caller that does not (e.g. the offline probe) writes zeros into the
+    // manifest, which the A/B scripts treat as "no identity, use the old path".
+    m_dumpFrameId=m_nextDumpId;m_nextDumpId={};
+    if(!RenderFrameInternal(bgra,bytes,guideGridRGBA32F,guideBytes,gridW,gridH,temporalReset,motionGuides,frameTimeMs,nullptr))return false;
+    // After the frame's list has executed and presented, so m_upscaleSharp holds
+    // this frame's FSR 4 result. Diagnostic only: its outcome cannot fail playback.
+    DumpOutputFrame();
+    return true;
 }
 
 bool D3D12Renderer::RenderFrame(const uint8_t*bgra,size_t bytes,const FrameIdentity&frame,const GuideFrame&guide,float frameTimeMs){
     m_lastRenderedId={};
+    m_dumpFrameId=frame;m_nextDumpId={};
     if(!guide.id.SameSource(frame)){
         LOG("Rejected frame/guide identity mismatch: frame#"<<frame.frameNumber<<" pts="<<frame.pts100ns
             <<" src="<<frame.sourceGeneration<<" job="<<frame.jobId
@@ -1441,6 +1561,7 @@ bool D3D12Renderer::RenderFrame(const uint8_t*bgra,size_t bytes,const FrameIdent
     if(!RenderFrameInternal(bgra,bytes,guide.guideGridRGBA32F.data(),guide.guideGridRGBA32F.size()*sizeof(float),
         guide.gridW,guide.gridH,guide.id.reset!=HistoryReset::None,guide.motionVectors,frameTimeMs,&guide.id))return false;
     m_lastRenderedId=guide.id;
+    DumpOutputFrame();
     return true;
 }
 
@@ -1559,8 +1680,35 @@ bool D3D12Renderer::RenderFrameInternal(const uint8_t*bgra,size_t bytes,const fl
     // R and G, and skipping the engine is what keeps that true: the resolve pass below
     // does not read the guide controls, so leaving it on made the switch move the cache
     // key and change no pixel on any card where the engine comes up.
-    const bool nvofFrame=motionGuides&&m_nvofActive&&DLSSEnabled();
-    if(nvofFrame){
+    // Who reads the field, and therefore whether estimating it is worth anything:
+    // NGX on an NVIDIA path, or FSR 4's history reprojection on the one that has
+    // no NGX. The debug views read the resulting textures too, but they are not a
+    // playback configuration and do not pay for a flow pass per frame.
+    //
+    // DLSS5_FFX_OF_FORCE=1 is a build aid, not a mode: on a machine where neither
+    // consumer is in service the dispatch would otherwise never run, and a pass
+    // that has never executed proves nothing. Forcing it costs the GPU time and
+    // changes no pixel, because the motion texture it writes has no reader.
+    static const bool forceFlow=[]{wchar_t v[8]{};return GetEnvironmentVariableW(L"DLSS5_FFX_OF_FORCE",v,8)!=0&&v[0]==L'1';}();
+    const bool forced=m_ffxOfActive&&motionGuides&&forceFlow&&!(DLSSEnabled()||Fsr4GuidesInService());
+    if(forced){
+        static bool announced=false;
+        if(!announced){LOG("Motion guide: DLSS5_FFX_OF_FORCE is set; dispatching FidelityFX optical flow with no consumer bound, for a smoke test only.");announced=true;}
+        // One readback a few seconds in. FFX_OK says the seven pipelines recorded,
+        // not that they found anything: a field of zeros passes every check that
+        // does not look at the pixels, and this one does.
+        static uint32_t smokeFrames=0;
+        if(++smokeFrames==120){
+            uint32_t nonZero=0,total=0;float mean=0.0f;
+            if(m_ffxOf.CountNonZeroVectors(m_queue.Get(),&nonZero,&total,&mean))
+                LOG("Motion guide smoke: "<<nonZero<<" of "<<total<<" cells carry a non-zero vector, mean |v|="<<mean<<" px.");
+            else
+                LOG("Motion guide smoke: the flow readback failed.");
+        }
+    }
+    const bool flowFrame=motionGuides&&(DLSSEnabled()||Fsr4GuidesInService()||forced)
+                         &&(m_nvofActive||m_ffxOfActive);
+    if(flowFrame&&m_nvofActive){
         if(temporalReset)m_nvof.Reset();
         m_nvof.Capture(pre,m_decodedTexture.Get(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     }
@@ -1573,17 +1721,211 @@ bool D3D12Renderer::RenderFrameInternal(const uint8_t*bgra,size_t bytes,const fl
     // m_frameFence[slot] at a value the GPU had long passed, and the next frame reset
     // an allocator whose list could still be executing and overwrote the upload it
     // was reading.
+    // The CPU analysis grid's own motion, for the dump's manifest: a zero field
+    // whose grid was also empty is the estimator finding nothing, while a zero
+    // field over a populated grid would be the expansion losing it. Computed only
+    // on frames that are about to be dumped.
+    if(!m_flowDumpDir.empty()&&m_flowDumpWritten<m_flowDumpCount&&m_flowDumpIndex>=m_flowDumpFrom
+       &&guideGridRGBA32F&&gridW&&gridH){
+        size_t moving=0;
+        for(size_t cell=0;cell<size_t(gridW)*gridH;++cell){
+            const float*rg=guideGridRGBA32F+cell*4u;
+            if(std::abs(rg[0])>0.25f||std::abs(rg[1])>0.25f)++moving;
+        }
+        m_flowGridFill=float(moving)/float(size_t(gridW)*gridH);
+    }
     m_framePq=pqSource;
-    const bool rendered=RecordAndPresentFrame(slot,cmd,nvofFrame,temporalReset,frameTimeMs,identity);
+    const bool rendered=RecordAndPresentFrame(slot,cmd,flowFrame,temporalReset,frameTimeMs,identity);
     return SignalFrameSlot(slot)&&rendered;
 }
 
-bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandList*cmd,bool nvofFrame,bool temporalReset,float frameTimeMs,const FrameIdentity*identity){
+// One source frame's motion field, to disk.
+//
+// The resource is m_motion: RG16F at the DLSS input size, current-to-previous,
+// already carrying whatever grid the estimator uses expanded into per-pixel
+// vectors. Dumping the estimator's own buffer instead would make the arms
+// incomparable - NVOFA stores S10.5 on a 1/2/4-pixel grid, FidelityFX whole
+// pixels on 8x8 blocks, the CPU matcher a 24x24 compact grid of its own - and it
+// would skip the part of the pipeline that decides what the upscaler sees.
+//
+// m_motion is in GuideReadState when the frame ends. Its own list and fence, not
+// the frame's, because this runs at the top of the next frame: the frame's list
+// has already executed by then, so the copy is ordered after it by the queue.
+bool D3D12Renderer::DumpFlowField(bool resolved,float gridFill){
+    if(m_flowDumpDir.empty()||!m_motion)return true;
+    const uint32_t w=m_renderW,h=m_renderH;
+    if(!w||!h)return true;
+    const uint32_t rowPitch=(w*4u+D3D12_TEXTURE_DATA_PITCH_ALIGNMENT-1)
+                            /D3D12_TEXTURE_DATA_PITCH_ALIGNMENT*D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    const uint64_t bytes=uint64_t(rowPitch)*h;
+    if(!m_flowDumpStaging||m_flowDumpStagingBytes!=bytes){
+        m_flowDumpStaging.Reset();
+        D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_READBACK;heap.CreationNodeMask=1;heap.VisibleNodeMask=1;
+        D3D12_RESOURCE_DESC desc{};desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;desc.Width=bytes;
+        desc.Height=1;desc.DepthOrArraySize=1;desc.MipLevels=1;desc.SampleDesc.Count=1;
+        desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if(!HR(m_device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&m_flowDumpStaging)),
+                "Create motion-field readback"))return false;
+        m_flowDumpStaging->SetName(L"MotionFieldDump_Readback");
+        m_flowDumpStagingBytes=bytes;
+    }
+    if(!m_flowDumpAllocator&&!HR(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&m_flowDumpAllocator)),"Create motion-field dump allocator"))return false;
+    if(!m_flowDumpList){
+        if(!HR(m_device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,
+                m_flowDumpAllocator.Get(),nullptr,IID_PPV_ARGS(&m_flowDumpList)),
+                "Create motion-field dump list"))return false;
+        // A newly created list holds its allocator open, and an open allocator
+        // cannot be Reset - which is exactly the state the first frame would hit.
+        if(!HR(m_flowDumpList->Close(),"Close new motion-field dump list"))return false;
+    }
+    if(!HR(m_flowDumpAllocator->Reset(),"Reset motion-field dump allocator"))return false;
+    if(!HR(m_flowDumpList->Reset(m_flowDumpAllocator.Get(),nullptr),"Reset motion-field dump list"))return false;
+    const auto from=GuideReadState, to=D3D12_RESOURCE_STATE_COPY_SOURCE;
+    Barrier(m_flowDumpList.Get(),m_motion.Get(),from,to);
+    D3D12_TEXTURE_COPY_LOCATION dst{};dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;dst.pResource=m_flowDumpStaging.Get();
+    dst.PlacedFootprint.Footprint={DXGI_FORMAT_R16G16_FLOAT,w,h,1,rowPitch};
+    D3D12_TEXTURE_COPY_LOCATION src{};src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;src.pResource=m_motion.Get();
+    m_flowDumpList->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+    Barrier(m_flowDumpList.Get(),m_motion.Get(),to,from);
+    if(!DeviceHR(m_flowDumpList->Close(),"Close motion-field dump list"))return false;
+    {ID3D12CommandList*lists[]={m_flowDumpList.Get()};m_queue->ExecuteCommandLists(1,lists);}
+    // WaitGPU signals a fence past everything queued and waits for it, which is
+    // what makes the mapped pointer below legal. One drain per dumped frame is
+    // why the range is bounded by DLSS5_FLOW_DUMP_COUNT.
+    if(WaitGPU(4000)!=d3d12_renderer_detail::FenceWaitResult::Completed)return false;
+    void* mapped=nullptr;
+    D3D12_RANGE range{0,SIZE_T(bytes)};
+    if(!HR(m_flowDumpStaging->Map(0,&range,&mapped),"Map motion-field readback"))return false;
+    std::filesystem::path directory(m_flowDumpDir);
+    std::error_code ec;std::filesystem::create_directories(directory,ec);
+    wchar_t name[64]{};_snwprintf_s(name,64,_TRUNCATE,L"flow_%05u.rg16f",m_flowDumpIndex);
+    std::ofstream out(directory/name,std::ios::binary|std::ios::trunc);
+    bool wrote=out.good();
+    if(wrote){out.write(static_cast<const char*>(mapped),std::streamsize(bytes));wrote=out.good();}
+    out.close();
+    {D3D12_RANGE done{0,0};m_flowDumpStaging->Unmap(0,&done);}
+    if(!wrote){LOG("Motion guide dump: writing "<<utf8_text::FromWide((directory/name).wstring())<<" failed.");return true;}
+    // The manifest is what makes an offset in a raw dump mean a pixel: the size of
+    // the field, the scale that turned engine pixels into these ones, and whether
+    // the estimator actually ran for this frame - a resolve that fell back to the
+    // CPU grid writes the grid's zeros, which is a measurement of the fallback and
+    // not of the estimator.
+    std::ofstream manifest(directory/L"manifest.txt",std::ios::binary|std::ios::app);
+    manifest<<m_flowDumpIndex<<' '<<w<<' '<<h<<' '<<rowPitch<<' '<<m_sourceW<<' '<<m_sourceH
+            <<' '<<m_nvofMotionScaleX<<' '<<m_nvofMotionScaleY<<' '<<(resolved?1:0)<<' '<<gridFill<<'\n';
+    manifest.close();
+    ++m_flowDumpWritten;
+    if(m_flowDumpWritten==m_flowDumpCount)
+        LOG("Motion guide dump: wrote "<<m_flowDumpWritten<<" fields at "<<w<<"x"<<h<<" to "
+            <<utf8_text::FromWide(directory.wstring())<<"; DLSS_VIDEO_MOTION_FLOW as set decided which estimator produced them.");
+    return true;
+}
+
+bool D3D12Renderer::DumpOutputFrame(){
+    if(m_outputDumpDir.empty())return true;
+    // Count every source frame, even the ones outside the requested range or the
+    // ones no upscaler served, so out_NNNNN names stay tied to decode order.
+    const uint32_t index=m_outputDumpIndex++;
+    if(m_outputDumpWritten>=m_outputDumpCount||index<m_outputDumpFrom)return true;
+    if(m_gpuUnusable||!m_device||!m_queue||!UpscalePresentActive()||!m_upscaleSharp||!m_outputW||!m_outputH){
+        if(!m_outputDumpWarned){
+            m_outputDumpWarned=true;
+            LOG("Output frame dump: the playback upscale (FSR 4) is not serving, so there is no "
+                "output frame to read; no files will be written. Check that SuperResolution is on "
+                "and the rung grows the source.");
+        }
+        return true;
+    }
+    const uint32_t w=m_outputW,h=m_outputH;
+    const uint32_t rowPitch=(w*8u+D3D12_TEXTURE_DATA_PITCH_ALIGNMENT-1)
+                            /D3D12_TEXTURE_DATA_PITCH_ALIGNMENT*D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    const uint64_t bytes=uint64_t(rowPitch)*h;
+    if(!m_outputDumpStaging||m_outputDumpStagingBytes!=bytes){
+        m_outputDumpStaging.Reset();
+        D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_READBACK;heap.CreationNodeMask=1;heap.VisibleNodeMask=1;
+        D3D12_RESOURCE_DESC desc{};desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;desc.Width=bytes;
+        desc.Height=1;desc.DepthOrArraySize=1;desc.MipLevels=1;desc.SampleDesc.Count=1;
+        desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if(!HR(m_device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&m_outputDumpStaging)),
+                "Create output-frame readback"))return true;
+        m_outputDumpStaging->SetName(L"OutputFrameDump_Readback");
+        m_outputDumpStagingBytes=bytes;
+    }
+    if(!m_outputDumpAllocator&&!HR(m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&m_outputDumpAllocator)),"Create output-frame dump allocator"))return true;
+    if(!m_outputDumpList){
+        if(!HR(m_device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,
+                m_outputDumpAllocator.Get(),nullptr,IID_PPV_ARGS(&m_outputDumpList)),
+                "Create output-frame dump list"))return true;
+        // A newly created list holds its allocator open; close it so the first
+        // frame can Reset both (the same trap DumpFlowField documents).
+        if(!HR(m_outputDumpList->Close(),"Close new output-frame dump list"))return true;
+    }
+    if(!HR(m_outputDumpAllocator->Reset(),"Reset output-frame dump allocator"))return true;
+    if(!HR(m_outputDumpList->Reset(m_outputDumpAllocator.Get(),nullptr),"Reset output-frame dump list"))return true;
+    const auto from=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,to=D3D12_RESOURCE_STATE_COPY_SOURCE;
+    Barrier(m_outputDumpList.Get(),m_upscaleSharp.Get(),from,to);
+    D3D12_TEXTURE_COPY_LOCATION dst{};dst.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;dst.pResource=m_outputDumpStaging.Get();
+    dst.PlacedFootprint.Footprint={DXGI_FORMAT_R16G16B16A16_FLOAT,w,h,1,rowPitch};
+    D3D12_TEXTURE_COPY_LOCATION src{};src.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;src.pResource=m_upscaleSharp.Get();
+    m_outputDumpList->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+    Barrier(m_outputDumpList.Get(),m_upscaleSharp.Get(),to,from);
+    if(!DeviceHR(m_outputDumpList->Close(),"Close output-frame dump list"))return true;
+    {ID3D12CommandList*lists[]={m_outputDumpList.Get()};m_queue->ExecuteCommandLists(1,lists);}
+    // WaitGPU fences past everything queued, which is what makes the mapped
+    // pointer legal. One drain per dumped frame is why the range is bounded.
+    if(WaitGPU(4000)!=d3d12_renderer_detail::FenceWaitResult::Completed)return true;
+    void*mapped=nullptr;
+    D3D12_RANGE range{0,SIZE_T(bytes)};
+    if(!HR(m_outputDumpStaging->Map(0,&range,&mapped),"Map output-frame readback"))return true;
+    std::filesystem::path directory(m_outputDumpDir);
+    std::error_code ec;std::filesystem::create_directories(directory,ec);
+    wchar_t name[64]{};_snwprintf_s(name,64,_TRUNCATE,L"out_%05u.rgba16f",index);
+    std::ofstream out(directory/name,std::ios::binary|std::ios::trunc);
+    bool wrote=out.good();
+    if(wrote){out.write(static_cast<const char*>(mapped),std::streamsize(bytes));wrote=out.good();}
+    out.close();
+    {D3D12_RANGE done{0,0};m_outputDumpStaging->Unmap(0,&done);}
+    if(!wrote){LOG("Output frame dump: writing "<<utf8_text::FromWide((directory/name).wstring())<<" failed.");return true;}
+    // Columns: index, width, height, row pitch (bytes), the motion-field dump's
+    // counter for this same source frame, then the source-frame identity:
+    // frameNumber, pts100ns, historyGeneration, reset. The identity is what lets
+    // the stage-2 A/B pair an output frame with its truth frame by decoded frame
+    // number instead of scanning for a global integer offset in image MSE - a
+    // scan that picked a different offset per player process and could flip the
+    // sign of an arm delta (docs/MOTION-GUIDE-AB-zh.md). Dropped frames no longer
+    // shift the pairing: a missing decoded frame is simply absent from the dump.
+    // Appended at the end so older five-column readers still work.
+    std::ofstream manifest(directory/L"manifest.txt",std::ios::binary|std::ios::app);
+    manifest<<index<<' '<<w<<' '<<h<<' '<<rowPitch<<' '<<m_flowDumpIndex
+            <<' '<<m_dumpFrameId.frameNumber<<' '<<m_dumpFrameId.pts100ns
+            <<' '<<m_dumpFrameId.historyGeneration<<' '<<int(m_dumpFrameId.reset)<<'\n';
+    manifest.close();
+    ++m_outputDumpWritten;
+    if(m_outputDumpWritten==m_outputDumpCount)
+        LOG("Output frame dump: wrote "<<m_outputDumpWritten<<" FSR 4 frames at "<<w<<"x"<<h<<" to "
+            <<utf8_text::FromWide(directory.wstring())<<"; linear FP16, one GPU drain per frame.");
+    return true;
+}
+
+bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandList*cmd,bool flowFrame,bool temporalReset,float frameTimeMs,const FrameIdentity*identity){
     const bool guidesUsed=GuidesRequired();
     // False on the first frame of a stream and on every cut: there is no previous frame
     // to compare against. The compact CPU grid is already all-zero on exactly those
     // frames, so falling back to it emits the zero motion the reset needs anyway.
-    const bool nvofFlow=nvofFrame&&m_nvof.Submit(m_queue.Get());
+    // NVOFA runs on its own engine outside this queue: Submit joins it with a
+    // fence and the field is read afterwards. FidelityFX is compute, so its whole
+    // dispatch is recorded on this list and the field is already readable when
+    // the call returns - the two backends differ in when, not in what, the resolve
+    // pass below sees.
+    bool flowReady=false;
+    if(flowFrame){
+        flowReady=m_nvofActive?m_nvof.Submit(m_queue.Get())
+                              :m_ffxOf.Dispatch(cmd,m_decodedTexture.Get(),temporalReset);
+    }
 
     // Full-resolution motion for NGX: from the flow engine when it ran this frame,
     // otherwise by expanding the compact CPU analysis grid. Depth below always comes
@@ -1597,8 +1939,10 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
     D3D12_VIEWPORT gvp{0,0,float(m_renderW),float(m_renderH),0,1};D3D12_RECT gsc{0,0,LONG(m_renderW),LONG(m_renderH)};cmd->RSSetViewports(1,&gvp);cmd->RSSetScissorRects(1,&gsc);
     auto grt=RTV(FrameCount+1);cmd->OMSetRenderTargets(1,&grt,FALSE,nullptr);
     cmd->SetGraphicsRootSignature(m_rootSig.Get());cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    if(nvofFlow){
-        m_nvof.BeginRead(cmd);
+    if(flowReady){
+        // The engine's field lives outside this queue and needs its own bracketing;
+        // the compute field was written by this list and already is a shader read.
+        if(m_nvofActive)m_nvof.BeginRead(cmd);
         cmd->SetPipelineState(m_psoNvofMotion.Get());
         cmd->SetGraphicsRootDescriptorTable(RootView,SRVGPU(NvofFlowSRV));
         cmd->SetGraphicsRootDescriptorTable(RootReference,SRVGPU(NvofCostSRV));
@@ -1610,24 +1954,47 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
         // which the round-trip gate needs to find the cell a vector lands on; zero there
         // is what leaves that gate out of the pass entirely on a device that gave no
         // backward field.
-        const float cells=m_nvof.BackwardFlow()?1.0f/float(m_nvof.Grid()):0.0f;
+        // One stored unit, in engine-input pixels. NVOFA returns S10.5, a 32nd of a
+        // pixel; the FidelityFX field is a whole-pixel displacement found by integer
+        // SAD, so the same 1/32 there would shrink a real move into noise.
+        const float unit=m_nvofActive?(1.0f/32.0f):1.0f;
+        const float cells=(m_nvofActive&&m_nvof.BackwardFlow())?1.0f/float(m_nvof.Grid()):0.0f;
         // The eighth is the zero-motion test (see the shader): on for every Super
         // Resolution session, and for a neural render at the source's size when its job
         // asked (SetZeroMotionTest), because that render is cached under a key that
         // says which field it was made with.
-        const bool zeroMotionTest=m_preserveSource||m_zeroMotionTest;
-        const float resolve[8]={1.0f/32.0f,1.0f/32.0f,0.0f,0.0f,
+        const bool zeroMotionTest=m_flowZeroMotionTest&&(m_preserveSource||m_zeroMotionTest);
+        const float resolve[8]={unit,unit,0.0f,0.0f,
                                 m_nvofMotionScaleX,m_nvofMotionScaleY,cells,zeroMotionTest?1.0f:0.0f};
         cmd->SetGraphicsRoot32BitConstants(RootConstants,8,resolve,0);
-        cmd->SetGraphicsRootDescriptorTable(RootOverlay,SRVGPU(NvofInputSRV+m_nvof.CurrentInput()));
+        cmd->SetGraphicsRootDescriptorTable(RootOverlay,SRVGPU(NvofInputSRV+(m_nvofActive?m_nvof.CurrentInput():0u)));
         cmd->DrawInstanced(3,1,0,0);
-        m_nvof.EndRead(cmd);
+        if(m_nvofActive)m_nvof.EndRead(cmd);
     }else{
         cmd->SetPipelineState(m_psoExpandGuides.Get());
         cmd->SetGraphicsRootDescriptorTable(RootView,SRVGPU(5));
         cmd->DrawInstanced(3,1,0,0);
     }
+    if(m_flowOff){
+        // The control arm. Cleared rather than skipped: the guide pass that just
+        // ran wrote whatever the CPU grid held, and an un-cleared target would
+        // leave the previous arm's field in place.
+        const float zero[4]={0.0f,0.0f,0.0f,0.0f};
+        cmd->ClearRenderTargetView(RTV(FrameCount+1),zero,0,nullptr);
+    }
     Barrier(cmd,m_motion.Get(),D3D12_RESOURCE_STATE_RENDER_TARGET,GuideReadState);m_guidesInRT=false;
+    // Written out here, not at the top of the next frame: a deferred copy made
+    // "which frame is this field for" a guess, and the first attempt at this
+    // dump produced fields that belonged to a different source frame than the
+    // index in their name. One drain per requested frame; the count is bounded.
+    if(!m_flowDumpDir.empty()&&m_flowDumpWritten<m_flowDumpCount&&m_flowDumpIndex>=m_flowDumpFrom
+       &&guidesUsed){
+        // How much motion the CPU analysis grid itself carried this frame, so a
+        // zero field can be told apart from a zero grid: the first would be the
+        // expansion losing the grid, the second is the estimator finding nothing.
+        if(!DumpFlowField(flowReady,m_flowGridFill))return false;
+    }
+    ++m_flowDumpIndex;
 
     // Populate the exact depth resource passed to NGX. The resource is R32_TYPELESS,
     // viewed as D32_FLOAT while writing and R32_FLOAT while sampling/debugging.

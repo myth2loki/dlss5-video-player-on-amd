@@ -265,6 +265,71 @@ of its cells at half a pixel per frame and two per cent at one pixel, which is
 why the engine is preferred wherever it exists. D3D12 expands whichever field was
 produced to the exact DLSS render dimensions.
 
+`OpticalFlowFfx` is the same guide for cards that have no flow engine. It
+compiles FidelityFX's Optical Flow technique into the player - 8x8 blocks over a
+seven-level luma pyramid, integer-SAD search, forward field only - so nothing
+here needs a driver entry point or a vendor dll; the SDK's signed binaries do not
+export the technique. The field is `R16G16_SINT` at one vector per block, the
+same surface NVOFA writes, which is why the resolve pass above reads either
+without a branch: `FlowScale` is 1 there (whole pixels) against NVOFA's 1/32, and
+the round-trip gate stays off because the technique has no reverse field. It
+records synchronously on the frame's own list, so unlike NVOFA there is no engine
+to fence against. Its zero-motion test is off, because FidelityFX does not hand
+back the pair of frames the vector was measured on. A synthetic pan of four
+pixels per frame measures 3.99, which is what says the field is real rather than
+merely dispatched.
+
+It is also the default motion source on any adapter whose vendor ships no flow
+engine. That default is read from the adapter's PCI vendor id
+(`m_adapterVendorId`, 0x10DE being the one vendor with NVOFA) rather than from a
+probe: asking NVOFA first on AMD only produced a `NVOFA unavailable:
+nvofapi64.dll is not present in the driver install` line every session, which
+reads like a fault in a log where it is the expected path, and it left the
+default decided by a failure instead of by a choice. `DLSS_VIDEO_MOTION_FLOW=nvof`
+still asks explicitly, so the arm is reachable on a card nobody expects to
+answer, and a failed explicit ask falls back to the CPU matcher rather than
+across to the other estimator - the same rule the other named arms follow.
+
+### Scene-change output
+
+The technique also writes a 3x1 `R32_UINT` SCD surface. Slot 0 is the bit
+pattern of a float `sceneChangeValue` (3x3 tiled luma histograms, an 11-tap
+filter, three index shifts and a symmetric Jeffreys divergence; the shader's
+`CrossedSceneChangeThreshold` is 0.45), slot 1 is the last four frames' threshold
+bits, slot 2 a workgroup counter. **It is deliberately not consumed.** The
+player's own CPU cut classifier (`TemporalGuides.cpp` / `SceneCut.h`) already
+decides cuts from a motion-aligned residual plus a global luma histogram
+intersection, debounces the weak arm and exposes a sensitivity ladder; its
+verdict reaches FSR 4 as `dispatch.reset` on the same frame. Wiring the GPU
+flag in would duplicate that verdict.
+
+This was measured rather than assumed. `tools/benchmark/scd_probe.py` replays the
+divergence offline over the labelled corpus clips (`real-film-cuts` and
+`real-game-cuts`, five hard cuts confirmed frame by frame):
+
+| clip | SCD at cuts | max SCD elsewhere | fires |
+| --- | --- | --- | --- |
+| `real-film-cuts` (4 cuts) | 0.856 - 0.953 | 0.099 (muzzle flash) | 4/4, zero false positives |
+| `real-game-cuts` (1 cut) | 0.855 | 0.216 (frame after the cut) | 1/1, zero false positives |
+
+The signal is a one-frame spike and the 0.45 threshold has a wide margin - so
+"it cannot tell a cut" is not the reason. The reason is that the shipped
+classifier's histogram overlap separates the same frames just as cleanly
+(cuts <= 0.692, everything else >= 0.886) and it also has a residual arm and a
+debounce the SCD flag lacks. Beyond carrying no new information, a readback
+would need a GPU sync every frame (or arrive a frame late), and
+`description.reset` clears the SCD buffer and its histograms on every accepted
+cut, so the two detectors could not be independent in any case. Keeping the
+resource costs one 3x1 texture; the dispatch requires the binding.
+
+How the two estimators compare, on material whose motion is known exactly and on
+a real clip: [`MOTION-GUIDE-AB-zh.md`](MOTION-GUIDE-AB-zh.md). The short of it is
+that the CPU matcher declines to report translations below roughly one grid cell -
+0–2% of pixels on a 0.5 to 4 px/frame pan - while this one reports them, and that
+where this one reports it is within half a pixel. `DLSS5_FLOW_DUMP=<dir>` writes
+each frame's resolved field for that measurement; `DLSS_VIDEO_MOTION_FLOW=off` is
+its control arm.
+
 The engine is used only when the frame handed to the renderer is already the DLSS
 input size. That holds on every neural path; the runtime Super Resolution toggle,
 where the two differ, keeps the estimator. A machine without `nvofapi64.dll`, an

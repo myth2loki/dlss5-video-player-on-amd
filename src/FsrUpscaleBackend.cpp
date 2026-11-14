@@ -52,14 +52,18 @@ using fsr_up::kApiVersion;
 
 namespace {
 
-// The loader is the official entry point (see FsrFrameGenBackend.cpp: it brings
-// the implementation up with the dispatch tables its configure/dispatch call
-// need), and it is the same DLL for every effect - the effect the context asks
-// for is what selects the implementation it loads.
-constexpr wchar_t kLoaderName[] = L"amd_fidelityfx_loader_dx12.dll";
-// The implementation the loader brings up for the UPSCALE effect. Its absence
-// is a much more informative failure than "CreateContext answered 0x..." with
-// no hint that a file is missing, so it is checked up front.
+// The UPSCALE implementation, loaded directly. The loader is not used, because
+// it does not reliably find its effect DLLs: it resolves them with
+// LoadLibraryA, which follows the process search path, not the
+// LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR flag a caller used to load the loader
+// itself. When the effect is reachable the loader accepts this same chain
+// (measured 0, same device, same headers); when it is not, it answers 2 -
+// FFX_API_RETURN_ERROR_UNKNOWN_DESCTYPE - for every chain including a
+// fabricated one, which is what shows the chain is never read and the failure
+// is a missing file rather than a mismatched ABI. Loading the effect directly
+// keeps that file in hand, so no directory layout can produce the failure at
+// all. Its absence is a much more informative error than "CreateContext
+// answered 0x..." with no hint that a file is missing, so it is checked first.
 constexpr wchar_t kUpscalerName[] = L"amd_fidelityfx_upscaler_dx12.dll";
 
 std::vector<fs::path> SearchDirectories()
@@ -150,30 +154,21 @@ std::wstring FsrUpscaleBackend::RuntimeSearchDescription()
 bool FsrUpscaleBackend::RuntimePresent(std::wstring* foundPath, std::wstring* detail)
 {
     std::error_code ec;
-    std::wstring loader;
+    // First match wins, in the same search order the frame generation uses, so a
+    // player staged beside its runtime is preferred over the developer's SDK tree.
     for (const auto& directory : SearchDirectories()) {
-        if (fs::is_regular_file(directory / kLoaderName, ec)) {
-            loader = (directory / kLoaderName).wstring();
-            break;
+        const fs::path candidate = directory / kUpscalerName;
+        if (fs::is_regular_file(candidate, ec)) {
+            if (foundPath) *foundPath = candidate.wstring();
+            if (detail) detail->clear();
+            return true;
         }
     }
-    if (loader.empty()) {
-        if (detail)
-            *detail = L"no " + std::wstring(kLoaderName) + L" in: " + RuntimeSearchDescription();
-        return false;
-    }
-    // The loader without its UPSCALE implementation still loads, and then
-    // CreateContext fails with a code that says nothing about a missing file.
-    const fs::path sibling = fs::path(loader).parent_path() / kUpscalerName;
-    if (!fs::is_regular_file(sibling, ec)) {
-        if (detail)
-            *detail = std::wstring(kUpscalerName) + L" is not beside " + loader +
-                      L". Copy it from FidelityFX-SDK/Kits/FidelityFX/signedbin.";
-        return false;
-    }
-    if (foundPath) *foundPath = loader;
-    if (detail) detail->clear();
-    return true;
+    if (detail)
+        *detail = std::wstring(kUpscalerName) + L" was not found in: " +
+                  RuntimeSearchDescription() +
+                  L". It ships with FidelityFX-SDK/Kits/FidelityFX/signedbin.";
+    return false;
 }
 
 bool FsrUpscaleBackend::LoadRuntime()
@@ -258,10 +253,21 @@ bool FsrUpscaleBackend::CreateContext(ID3D12Device* device)
     if (rc != kFfxReturnOk || !m_context) {
         m_context = nullptr;
         m_lastError = static_cast<uint32_t>(rc);
+        // The code is named, not guessed at: 2 is a descriptor-type mismatch
+        // (a caller/DLL disagreement about the ABI), which reads nothing like
+        // "this GPU is too old" and used to be reported as exactly that.
+        const wchar_t* what = L"unrecognised return code";
+        switch (rc) {
+        case 1: what = L"unspecified error"; break;
+        case 2: what = L"a descriptor type the runtime does not know - the caller and "
+                        L"the DLL disagree about the ABI"; break;
+        case 3: what = L"the D3D12 runtime or the effect returned an error"; break;
+        case 5: what = L"a memory allocation failed"; break;
+        case 6: what = L"a descriptor parameter was invalid (size, resource or enum)"; break;
+        default: break;
+        }
         m_lastDetail = L"ffxCreateContext(Upscale) answered " + Hex(static_cast<uint32_t>(rc)) +
-                       L". FSR 4 needs an RX 7000/9000 series discrete GPU and Shader "
-                       L"Model 6.6 (DirectX 12 Agility SDK 1.4.9 or later); either one "
-                       L"missing looks exactly like this.";
+                       L" (" + what + L").";
         return false;
     }
     return true;

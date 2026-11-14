@@ -131,6 +131,64 @@ else()
     message(WARNING "The NVENC API header is missing from ${NVENC_SDK}. It ships with this repository, so this build will encode every neural render through the ffmpeg child - see docs/BUILDING.md.")
 endif()
 
+# FidelityFX Optical Flow as a motion guide for cards with no dedicated flow
+# engine (every AMD card). Unlike NVOFA this is a compute-shader technique, so it
+# needs no driver API and no vendor dll - only the SDK sources. The SDK itself is
+# not vendored: it is several hundred megabytes of samples and tools for four
+# translation units, so the path is a cache variable and a missing SDK costs the
+# feature, not the build. external/fidelityfx carries our own shader-blob glue
+# (the SDK's copy does not compile against the blobs it ships) and the PIX header
+# stand-in the DX12 backend includes.
+set(FFX_SDK "${CMAKE_SOURCE_DIR}/../FidelityFX-SDK" CACHE PATH "Path to the FidelityFX SDK (Kits/FidelityFX)")
+if(EXISTS "${FFX_SDK}/Kits/FidelityFX/framegeneration/fsr3/internal/ffx_opticalflow.cpp")
+    # Pinned to SDK v2.3.0. v2.4.0 deleted the fallback typedef for
+    # ffxProviderExternal from api/internal/ffx_provider.h while still using the
+    # name, so an accidental SDK upgrade fails this target with an error that
+    # looks unrelated. Say so here instead of leaving it to the compiler.
+    file(STRINGS "${FFX_SDK}/Kits/FidelityFX/api/internal/ffx_provider.h"
+         FFX_EXTERNAL_PROVIDER_FALLBACK REGEX "typedef char ffxProviderExternal")
+    if(NOT FFX_EXTERNAL_PROVIDER_FALLBACK)
+        message(FATAL_ERROR
+            "FidelityFX SDK must be tag v2.3.0: ffx_provider.h is missing the "
+            "ffxProviderExternal fallback typedef (removed in v2.4.0). "
+            "Check out v2.3.0 in ${FFX_SDK} and rebuild.")
+    endif()
+    set(FFX_OF_FOUND TRUE)
+    message(STATUS "FidelityFX SDK found at ${FFX_SDK}; compute optical flow enabled.")
+    add_library(fidelityfx_opticalflow STATIC
+        "${FFX_SDK}/Kits/FidelityFX/api/internal/ffx_message.cpp"
+        "${FFX_SDK}/Kits/FidelityFX/api/internal/ffx_object_management.cpp"
+        "${FFX_SDK}/Kits/FidelityFX/backend/dx12/ffx_dx12.cpp"
+        "${FFX_SDK}/Kits/FidelityFX/backend/dx12/ffx_backends_dx12.cpp"
+        "${FFX_SDK}/Kits/FidelityFX/framegeneration/fsr3/internal/ffx_opticalflow.cpp"
+        external/fidelityfx/ffx_of_shaderblobs.cpp)
+    target_include_directories(fidelityfx_opticalflow PUBLIC
+        "${CMAKE_SOURCE_DIR}/external/fidelityfx"
+        "${FFX_SDK}/Kits/FidelityFX/api/include"
+        # ffx_dx12.h is public: the renderer's own adapter includes it to turn its
+        # device, lists and resources into the SDK's abstractions.
+        "${FFX_SDK}/Kits/FidelityFX/backend/dx12"
+        "${FFX_SDK}/Kits/FidelityFX/framegeneration/fsr3/include")
+    # Private: the SDK's internals, needed to compile its sources and our blob
+    # glue. ffx_sc_output holds the generated permutation tables - the ones the
+    # SDK's own shaderblobs.cpp no longer matches, which is why the glue exists.
+    target_include_directories(fidelityfx_opticalflow PRIVATE
+        "${FFX_SDK}/Kits/FidelityFX/api/internal"
+        "${FFX_SDK}/Kits/FidelityFX/api/internal/gpu"
+        "${FFX_SDK}/Kits/FidelityFX/framegeneration/fsr3/include/gpu"
+        "${FFX_SDK}/Kits/FidelityFX/framegeneration/fsr3/internal"
+        "${FFX_SDK}/Kits/FidelityFX/framegeneration/fsr3/dx12/ffx_sc_output")
+    target_compile_definitions(fidelityfx_opticalflow PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    # Vendor code, compiled as vendor code: /W4 /permissive- /WX are the project's
+    # rules for its own sources, and applying them here would fail the build on
+    # warnings nobody may edit away.
+    target_compile_options(fidelityfx_opticalflow PRIVATE /W0 /WX- /permissive)
+    target_link_libraries(fidelityfx_opticalflow PUBLIC d3d12 dxgi dxguid)
+else()
+    set(FFX_OF_FOUND FALSE)
+    message(STATUS "FidelityFX SDK not found at ${FFX_SDK}; the AMD motion guide falls back to the CPU block matcher.")
+endif()
+
 # Control Flow Guard and CET shadow stacks for the three shipped binaries. The
 # compiler and linker already default to /GS, /DYNAMICBASE, /NXCOMPAT and
 # /HIGHENTROPYVA; they are spelled out so a toolset that stops defaulting them
@@ -309,8 +367,18 @@ add_library(player_render OBJECT
     src/VsrEngine.cpp src/VsrEngine.h src/VsrPolicy.h
     src/TemporalGuides.cpp src/TemporalGuides.h
     src/OpticalFlowNvof.cpp src/OpticalFlowNvof.h
+    # The compute estimator for cards with no flow engine. Compiles either way:
+    # without the SDK the class reports itself unavailable and the CPU matcher
+    # stays the motion source, which is what a fork that strips it expects.
+    src/OpticalFlowFfx.cpp src/OpticalFlowFfx.h
     src/NvencDirect.cpp src/NvencDirect.h src/NvencDirectPolicy.h src/NvencDirectMux.h
     src/RuntimePolicy.cpp src/RuntimePolicy.h)
+if(FFX_OF_FOUND)
+    # The renderer instantiates the estimator directly, so the link requirement
+    # travels with this object library to both binaries that carry it.
+    target_link_libraries(player_render PUBLIC fidelityfx_opticalflow)
+    target_compile_definitions(player_render PRIVATE DLSS_VIDEO_HAVE_FFX_OF=1)
+endif()
 add_library(player_neural OBJECT
     src/NeuralWorker.cpp src/NeuralWorker.h
     src/NeuralPreflight.cpp src/NeuralPreflight.h

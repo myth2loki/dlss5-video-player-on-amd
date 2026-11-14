@@ -103,7 +103,7 @@ does the same from the command line.
 | Input size | The runtime admits up to 1920×1080 by pixel budget. A 1440p or 4K source has to be scaled down before it reaches the runtime |
 | Processing scale | Must be 100%. The runtime returns the frame at the size it was given, so a reduction would be silently ignored; this player refuses instead. The upscaler runs after the model, on the frame it returned |
 | Passes | The ladder's first rung is the 0.44 **Small** model at 0.5x — 31 blocks, a differently trained network, single-pass by construction — and 1, 2 and 3 stack the Original 71-block one (the runtime's own F9 ladder), with switches for the later passes only: keep skin tones, predict the third pass instead of running the network, and skip the later passes' block group. Every extra pass is another full network run. 4 is NVIDIA's ladder; this runtime reads a count it does not know as Small, so the player clamps it |
-| Temporal model | Three layers, and the panel owns all three. **The runtime's own temporal mode** (**Neural settings > Temporal mode**: off, fast history, low-frequency EMA, low-frequency + detail) makes the network fuse history. It is off unless the runtime's own config file already set it — the panel migrates that value on first read rather than overwriting a hand edit — and it runs only beside the Original model at one pass: beside Small the runtime renders the Original instead, and above one pass it runs no mode at all and says so in a status line. The panel greys the control out at both of those rungs rather than handing over a pair the runtime would resolve by itself, and the key is read once when the network is built, so a change reaches the next render and a running session keeps the mode it started with. **The guides are no longer constants**: the player runs its own estimator (CPU block matching on a 128x72 grid at 720p, 160x90 at 1080p, 0.8–1.4 ms a frame, no optical flow on an AMD card) and hands the field to the runtime, which is what gives it anything to fuse. **The player's own accumulation** (**Temporal stability**, AMD default Off — every rung blends through a motion field and mochizuki's frame contract has no depth; see [Troubleshooting](docs/TROUBLESHOOTING.md#the-amd-render-looks-smeared-or-doubled-ghosting)) then blends the previous output through that same field, so it reprojects instead of smearing. FSR 4 reads the field too: see [Upscaling](#upscaling-and-frame-generation) |
+| Temporal model | Three layers, and the panel owns all three. **The runtime's own temporal mode** (**Neural settings > Temporal mode**: off, fast history, low-frequency EMA, low-frequency + detail) makes the network fuse history. It is off unless the runtime's own config file already set it — the panel migrates that value on first read rather than overwriting a hand edit — and it runs only beside the Original model at one pass: beside Small the runtime renders the Original instead, and above one pass it runs no mode at all and says so in a status line. The panel greys the control out at both of those rungs rather than handing over a pair the runtime would resolve by itself, and the key is read once when the network is built, so a change reaches the next render and a running session keeps the mode it started with. **The guides are no longer constants**: the player runs its own estimator (CPU block matching on a 128x72 grid at 720p, 160x90 at 1080p, 0.8–1.4 ms a frame; a build with the FidelityFX SDK takes the field from FidelityFX Optical Flow instead when FSR 4 is in service) and hands the field to the runtime, which is what gives it anything to fuse. **The player's own accumulation** (**Temporal stability**, AMD default Off — every rung blends through a motion field and mochizuki's frame contract has no depth; see [Troubleshooting](docs/TROUBLESHOOTING.md#the-amd-render-looks-smeared-or-doubled-ghosting)) then blends the previous output through that same field, so it reprojects instead of smearing. FSR 4 reads the field too: see [Upscaling](#upscaling-and-frame-generation) |
 | Colour | SDR. The cache capture is 8-bit with ordered dither at Standard, and 10-bit at High and Lossless — P010 out of the FP16 history slot, written as HEVC Main10 at High and FFV1 at Lossless — which needs a Temporal stability rung on, because that is where the FP16 slot comes from. HDR is not wired on this path |
 | Speed | **≈10 ms a frame at 720p and ≈21 ms at 1080p** for the neural pass alone — one pass of the Original model with the guide pair on, submit p50 on an RX 9070 XT, of which the network itself is 4.6 and 8.5 ms. That is 4.0x and 1.9x a 24 fps frame's budget before a live session's own decode, present and encode. Every job pays a cold start of **6.9–10.0 s**. [Measured speeds](#render-speed-and-the-render-ahead-window) has the numbers, what they cost, and which of them are measured rather than derived. The upscale's and the interpolation's own cost is unmeasured, and so are 900 and 4K |
 | What it needs | The `amd-neural-runtime/` package — 325 MiB as a download, 844 MiB unpacked, from this fork's [`lmxxf-<line>` release](https://github.com/myth2loki/dlss5-video-player-on-amd/releases) — beside the module directory or at the root of the checkout, or named by `DLSS5_AMD_RUNTIME_DIR`. For the two newer stages, FidelityFX's `amd_fidelityfx_loader_dx12.dll` beside the exe, with `amd_fidelityfx_upscaler_dx12.dll` and `amd_fidelityfx_framegeneration_dx12.dll` — three files, in the packaged build, that [the notices](docs/THIRD-PARTY-NOTICES.md) list |
@@ -525,7 +525,15 @@ subtitle engines need, and what each failure looks like — is in
    package has to be reachable as well, and the three FidelityFX DLLs — loader,
    upscaler, frame generation — beside the exe for the upscale and the
    interpolation: see [On an AMD card](#on-an-amd-card) and [integrating the
-   backend binaries](#integrating-the-backend-binaries-without-a-build).
+   backend binaries](#integrating-the-backend-binaries-without-a-build). Two
+   things about how they are found. FSR 4 is loaded straight from
+   `amd_fidelityfx_upscaler_dx12.dll` rather than through the loader. And the
+   loader, which frame generation still goes through, resolves its own effect
+   DLLs with `LoadLibraryA`, so it needs the directory that holds them on the
+   process DLL search path — the player adds it before creating the context. If
+   they are not reachable, the loader answers `ffxCreateContext` with `2`
+   (unknown descriptor type) for any descriptor chain, which reads like a GPU or
+   ABI problem and is neither.
 2. Run `DLSSVideoPlayer.exe`. The player is not code-signed, so Windows may
    say "Windows protected your PC": choose **More info > Run anyway**. This fork
    has no signed builds to check against, so if you did not build it yourself,
@@ -900,8 +908,23 @@ how the toggle works, not what every source will gain.
   card](#on-an-amd-card) has its own table, and the rest of this list holds for
   it unless it says otherwise.
 - **Depth is estimated from the picture**, and so is motion on cards without
-  the optical flow engine — on an AMD card there is no optical flow, so both come
-  from the player's CPU block matcher, at about 10–12 source pixels a cell.
+  the optical flow engine. The default motion source follows the adapter, not a
+  probe: NVOFA where the vendor ships the engine (NVIDIA), FidelityFX Optical
+  Flow on every other vendor, and the player's CPU block matcher (about 10–12
+  source pixels a cell) where the build carries no FidelityFX SDK (`FFX_SDK`).
+  FidelityFX is 8x8 blocks over a seven-level luma pyramid, whole-pixel vectors,
+  forward field only, run as compute on the frame's own queue; it takes over from
+  the matcher as soon as FSR 4 is the upscaler in service.
+  `DLSS_VIDEO_MOTION_FLOW=auto|nvof|ffx|cpu|off`
+  picks an arm for an A/B: unset or `auto` is the adapter default above,
+  `nvof`/`ffx` name one estimator, `cpu` refuses both and
+  uses the block matcher, and `off` is the control arm (no estimator, field zeroed
+  after the guide pass). A named arm that cannot come up falls back to the matcher
+  rather than to the other estimator, so the arms stay distinct. `nvof` is the one
+  exception to the default: naming it asks for the engine even on a vendor that
+  does not ship one, so the failed arm stays reproducible.
+  `DLSS5_FLOW_DUMP=<dir>` writes each frame's resolved field for measurement;
+  [MOTION-GUIDE-AB-zh.md](docs/MOTION-GUIDE-AB-zh.md) has the three-arm result.
   Expect some artifacts at occlusions, on small objects and past either end of
   its search range.
 - **The mochizuki runtime takes no depth.** Its frame struct in this package is

@@ -20,6 +20,7 @@
 #include "FrameIdentity.h"
 #include "NgxSession.h"
 #include "OpticalFlowNvof.h"
+#include "OpticalFlowFfx.h"
 #include "PresentScalePolicy.h"
 #include "TemporalStabilityPolicy.h"
 #include "UpscalingPolicy.h"
@@ -337,6 +338,14 @@ public:
                      const float* guideGridRGBA32F, size_t guideBytes,
                      uint32_t gridW, uint32_t gridH,
                      bool temporalReset, bool motionGuides, float frameTimeMs);
+    // Diagnostic only: stamp the source-frame identity of the frame about to be
+    // rendered so the output-frame dump can name the decoded frame it came from.
+    // The live playback path uses the legacy RenderFrame overload, which has no
+    // FrameIdentity parameter; without this the A/B has to guess an integer frame
+    // offset from image MSE (see docs/MOTION-GUIDE-AB-zh.md). Consumed once by
+    // the next RenderFrame, so a frame that forgets to set it writes zeros rather
+    // than silently reusing the previous frame's identity.
+    void SetNextFrameDumpIdentity(const FrameIdentity& id) { m_nextDumpId = id; }
     // Identity-checked entry points: the guide must have been generated for
     // exactly `frame` (same source sample, same job); otherwise the frame is
     // rejected and logged. The temporal reset comes from guide.id.reset or a
@@ -630,12 +639,20 @@ public:
     // spatial filters and never join this list: when the cascade has stepped
     // down to them, m_fsrUpscaleActive is false and the guides go back to
     // having no reader.
+    // FSR 4 in service and configured to read the real guides - the arm that
+    // makes GuidesRequired true without DLSS. Named because the flow backend asks
+    // the same question GuidesRequired does: a guide texture nothing consumes is
+    // a flow estimation nothing consumes, and that is the difference between a
+    // switch that changes the picture and one that only changes a log line.
+    bool Fsr4GuidesInService() const {
+        return m_fsr4RealGuides && m_fsrUpscaleActive && m_fsrUpscale
+            && m_fsrUpscale->Available()
+            && (m_upscaleEngineMode == UpscaleEngineMode::Auto
+                || m_upscaleEngineMode == UpscaleEngineMode::Fsr4);
+    }
     bool GuidesRequired() const {
         return DLSSEnabled() || m_debugView != DebugView::Final
-            || (m_fsr4RealGuides && m_fsrUpscaleActive && m_fsrUpscale
-                && m_fsrUpscale->Available()
-                && (m_upscaleEngineMode == UpscaleEngineMode::Auto
-                    || m_upscaleEngineMode == UpscaleEngineMode::Fsr4));
+            || Fsr4GuidesInService();
     }
     bool LastFrameUsedDLSS() const { return m_lastDLSSUsed; }
     // ---- this player's own upscale for playback (AmdUpscaleShader.h) -------
@@ -1165,7 +1182,7 @@ private:
     // passes, the NGX evaluate, the backbuffer pass and the Present. Split from
     // RenderFrameInternal at the first ExecuteCommandLists so that the caller has
     // exactly one exit after submission, which is where the slot gets published.
-    bool RecordAndPresentFrame(uint32_t slot, ID3D12GraphicsCommandList* cmd, bool nvofFrame,
+    bool RecordAndPresentFrame(uint32_t slot, ID3D12GraphicsCommandList* cmd, bool flowFrame,
                                bool temporalReset, float frameTimeMs, const FrameIdentity* identity);
     // Synchronous enqueue + resolve. Kept for the first-frame evidence loop, which must
     // read a capture back before it can decide whether to submit the same frame again.
@@ -1244,6 +1261,12 @@ private:
     Microsoft::WRL::ComPtr<IDXGIFactory6> m_factory;
     Microsoft::WRL::ComPtr<IDXGIAdapter1> m_adapter;
     Microsoft::WRL::ComPtr<IDXGIAdapter3> m_adapter3;
+    // PCI vendor of the adapter the renderer actually opened. The motion-guide
+    // default reads it: the flow engine is a block of the NVIDIA driver, so on
+    // any other vendor the compute estimator is the default rather than the
+    // fallback. 0 until CreateDeviceAndSwapchain has picked the adapter, which
+    // is before anything asks.
+    uint32_t m_adapterVendorId = 0;
     Microsoft::WRL::ComPtr<ID3D12Device> m_device;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_queue;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> m_swapchain;
@@ -1264,9 +1287,61 @@ private:
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_presentCmds[FrameCount];
     OpticalFlowNvof m_nvof;
     bool m_nvofActive = false;
+    // The compute estimator, for cards with no flow engine. Mutually exclusive
+    // with m_nvofActive: both write the motion texture through the same resolve
+    // pass, and only one of them can own it in a session.
+    OpticalFlowFfx m_ffxOf;
+    bool m_ffxOfActive = false;
+    // True when the flow field the resolve pass is about to read suppresses
+    // small vectors by comparing the pair that produced it (NVOFA keeps both
+    // inputs; FidelityFX does not expose them, so this is false there).
+    bool m_flowZeroMotionTest = false;
     // Engine-input pixels -> DLSS input pixels for the flow resolve pass, from
     // PlanHardwareFlow. Both are 1 unless this is a Super Resolution session.
     float m_nvofMotionScaleX = 1.0f, m_nvofMotionScaleY = 1.0f;
+    // Motion-field dump: a measurement hook, not a playback feature.
+    // DLSS5_FLOW_DUMP=<dir> writes the RESOLVED motion texture - the exact field
+    // the upscaler's history reprojection reads, after the estimator's own grid
+    // has been expanded into DLSS-input pixels - once per source frame, from
+    // DLSS5_FLOW_DUMP_FROM for DLSS5_FLOW_DUMP_COUNT frames, as raw RG16F plus a
+    // manifest line. Without it "which estimator is better" can only be argued
+    // from screenshots, and the two arms differ by a fraction of a pixel in
+    // places no screenshot resolves.
+    // DLSS_VIDEO_MOTION_FLOW=off: neither estimator runs and the field the
+    // upscaler receives is exactly zero. It is the control arm - what the guide
+    // is worth at all - and it is an env switch rather than the ini's
+    // [NeuralGuides] MotionVectors key because the player rewrites that key from
+    // its own state, which silently turned this arm into the CPU arm.
+    bool m_flowOff = false;
+    std::wstring m_flowDumpDir;
+    uint32_t m_flowDumpFrom = 0, m_flowDumpCount = 0, m_flowDumpWritten = 0;
+    uint32_t m_flowDumpIndex = 0;      // source frames seen, decode order
+    float m_flowGridFill = 0.0f;      // this frame's CPU-grid cells that carry motion
+    uint64_t m_flowDumpStagingBytes = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_flowDumpStaging;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_flowDumpAllocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_flowDumpList;
+    bool DumpFlowField(bool resolved, float gridFill);
+
+    // Stage-2 A/B: the FSR 4 output frame itself, in linear FP16 at the output
+    // rung. Not CaptureComposedView - RecordViewDraw binds the source-sized
+    // m_dlssColor on AMD (DLSSEnabled() is false there), so that capture does
+    // not contain the upscale. This copies m_upscaleSharp after the frame's
+    // list has executed and presented; see docs/MOTION-GUIDE-AB-zh.md.
+    // Purely diagnostic: nothing here changes a rendered pixel, and a failure
+    // to write a file is logged rather than allowed to fail playback.
+    std::wstring m_outputDumpDir;
+    uint32_t m_outputDumpFrom = 0, m_outputDumpCount = 0, m_outputDumpWritten = 0;
+    uint32_t m_outputDumpIndex = 0;   // source frames seen, decode order
+    bool m_outputDumpWarned = false;
+    uint64_t m_outputDumpStagingBytes = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_outputDumpStaging;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_outputDumpAllocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> m_outputDumpList;
+    FrameIdentity m_nextDumpId{};   // set by playback before the next RenderFrame
+    FrameIdentity m_dumpFrameId{};  // identity of the frame DumpOutputFrame reads
+    bool DumpOutputFrame();
+
     Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
     HANDLE m_fenceEvent = nullptr;
     uint64_t m_fenceValue = 0;

@@ -1,8 +1,37 @@
 # Third-Party Notices
 
-This player links no third-party libraries at build time. It can, however, load
-one vendor runtime at run time, and that runtime's licence travels with the
-distribution, as its terms require.
+Two kinds of FidelityFX code are involved, and their terms differ. The effects
+loaded at run time come from AMD's signed binaries under the SDK's binary-only
+licence. The Optical Flow technique used as a motion guide on cards with no flow
+engine is compiled from AMD's MIT-licensed sources and linked into the player, so
+that one is a build-time dependency - optional, and absent from a build that
+points `FFX_SDK` at nothing.
+
+## AMD FidelityFX Optical Flow (optional, linked at build time)
+
+- Component: `ffx_opticalflow.cpp`, `ffx_dx12.cpp`, `ffx_backends_dx12.cpp`,
+  `ffx_message.cpp` and `ffx_object_management.cpp` from the SDK's
+  `Kits/FidelityFX`, plus this repository's own shader-blob glue in
+  `external/fidelityfx/ffx_of_shaderblobs.cpp`.
+- Source: <https://github.com/GPUOpen-Libraries-AndSDKs/FidelityFX-SDK>
+  (`Kits/FidelityFX/api`, `backend/dx12`, `framegeneration/fsr3`).
+- Copyright (C) Advanced Micro Devices, Inc.
+- Licence: MIT, as stated in the header of every one of those source files. It
+  permits use, modification and redistribution provided the copyright notice and
+  permission notice travel with the copies, which this section and the file
+  headers satisfy. The binary-only terms in the SDK's `docs/license.md` govern
+  the signed dlls in `Kits/FidelityFX/signedbin`, not these sources.
+- The SDK is not vendored: it is a multi-hundred-megabyte tree of samples and
+  tools around five translation units, so `CMakeLists.txt` takes its path as the
+  `FFX_SDK` cache variable and compiles without it (the class then reports itself
+  unavailable and the CPU block matcher remains the motion source).
+- `external/fidelityfx/pix3.h` is a stand-in for the WinPixEventRuntime header
+  the SDK's DX12 backend includes. It defines the one macro that backend uses;
+  nothing links against PIX.
+- Used for: the temporal motion guide on a machine with no flow engine
+  (`src/OpticalFlowFfx.cpp`). It produces a motion field and a scene-change flag
+  and nothing else - frame generation and upscaling stay with the two effects
+  below.
 
 ## AMD FidelityFX (optional, loaded at run time)
 
