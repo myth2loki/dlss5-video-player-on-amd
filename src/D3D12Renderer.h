@@ -645,7 +645,12 @@ public:
     // a flow estimation nothing consumes, and that is the difference between a
     // switch that changes the picture and one that only changes a log line.
     bool Fsr4GuidesInService() const {
-        return m_fsr4RealGuides && m_fsrUpscaleActive && m_fsrUpscale
+        // The user's SR switch gates this too. With interpolation on and the SR
+        // switch off, the island reads the upscaler's INPUT, so FSR 4 neither
+        // dispatches nor reprojects: estimating a guide field for it would be
+        // work with no consumer, which is the exact case the note above says
+        // this predicate exists to avoid.
+        return m_dlssEnabled && m_fsr4RealGuides && m_fsrUpscaleActive && m_fsrUpscale
             && m_fsrUpscale->Available()
             && (m_upscaleEngineMode == UpscaleEngineMode::Auto
                 || m_upscaleEngineMode == UpscaleEngineMode::Fsr4);
@@ -671,28 +676,33 @@ public:
     // not an upscale and the present chain's own scaling is enough.
     bool UpscalePresentActive() const
     {
-        // C (frame generation) now sits AFTER B #1: the island's input is the
-        // CAS-sharpened output of this very chain (m_upscaleSharp, output rung).
-        // Interpolation therefore needs the SR chain to serve even when the SR
-        // switch itself is off - otherwise the island has no frame to read.
-        // The geometry is fixed at Initialize (FgInputWidth), so toggling the
-        // switch cannot resize the island out from under a live context.
-        const bool fgNeedsUpscaledInput = m_fgUsesUpscaledInput &&
-            (m_playbackFrameGen || m_debugView == DebugView::FrameGenerated);
-        return (m_dlssEnabled || fgNeedsUpscaledInput) &&
-               !m_dlss.Available() && m_upscaleOffered && m_upscaleStretch != nullptr;
+        // The SR chain answers the USER'S SR switch and nothing else. It used to
+        // carry a frame-generation term: with C placed after B #1 the island had
+        // to read this chain's output, so turning the SR switch off while
+        // interpolation was on still dispatched FSR 4 - the pill read Off while
+        // the picture was still being upscaled. The interpolation case now reads
+        // the upscaler's INPUT instead (FrameGenInputMode), so no consumer,
+        // forced or otherwise, may keep this pass alive.
+        return UpscaleUserDrivenActive();
     }
-    // The user's upscaling switch as served by the present chain, WITHOUT the
-    // frame-generation term that UpscalePresentActive adds. Playback frame
-    // generation keeps the SR chain alive to feed its island even when the
-    // upscaling switch is off; that forced chain is the frame-gen pill's
-    // concern, not the upscaling switch's, so the toolbar, the menu checkmark
-    // and the toggle decision must not read it as the upscaling switch being
-    // On (which would also stop ToggleUpscaling from turning the switch off).
-    // Mirrors the pre-refactor UpscalePresentActive gating.
+    // The user's upscaling switch as served by the present chain. The toolbar,
+    // the menu checkmark, the toggle decision and the status line all read the
+    // switch through here or through UpscalingActive in the player. Kept as a
+    // named accessor because "the chain is serving" and "the user asked for it"
+    // were once different answers and must never be different again.
     bool UpscaleUserDrivenActive() const
     {
         return m_dlssEnabled && !m_dlss.Available() && m_upscaleOffered && m_upscaleStretch != nullptr;
+    }
+    // Which texture the interpolation island's convert pass reads this frame.
+    // The latch says the SR chain was built (and the island was sized to its
+    // output rung); UpscaleUserDrivenActive says whether that chain is actually
+    // serving - the user's switch with no frame-generation term. A chain that
+    // was requested but is not serving (switch off, or resources missing) must
+    // never be read as if it held a frame. See frame_gen_input::Decide.
+    frame_gen_input::Decision FrameGenInputMode() const
+    {
+        return frame_gen_input::Decide(m_fgUsesUpscaledInput, UpscaleUserDrivenActive());
     }
     // The geometry the island runs at. Fixed once at Initialize, because the
     // FidelityFX context and the shared bridge textures cannot be resized.
@@ -1697,13 +1707,20 @@ private:
     // PSO compiled; it then serves every frame FSR 4 does not.
     bool m_easuActive = false;
 
-    // True when B #1 (the source SR chain) exists at Initialize: C then reads
-    // m_upscaleSharp at the output rung. False on NGX machines or a rung that
-    // does not grow the source, where C keeps reading m_dlssColor at render res.
-    // Latched once - the island's geometry is not allowed to change per frame.
+    // True when B #1 (the source SR chain) exists at Initialize: the island and
+    // its bridge were then sized to the OUTPUT rung. False on NGX machines or a
+    // rung that does not grow the source, where they stay at render res. Latched
+    // once - the geometry is not allowed to change under a live FFX context.
+    // It no longer says which texture C reads: that is the per-frame case in
+    // FrameGenInputMode(), which falls back to the upscaler's INPUT when the
+    // user turns the SR switch off (the island keeps its latched geometry and
+    // the convert pass resamples instead).
     bool m_fgUsesUpscaledInput = false;
-    // Once-only field-log line: the evidence that C really reads B #1's output.
+    // Field-log line: the evidence of which case is serving. Re-printed on a
+    // case change, not just once, so a log can prove that turning the SR switch
+    // off really moved interpolation off the FSR 4 chain.
     bool m_fgTopologyReported = false;
+    frame_gen_input::Mode m_fgInputMode = frame_gen_input::Mode::UpscaleInput;
 
     // Generated-frame FSR 4 upscale (context #2). RETIRED: with C after B #1
     // there is no second upscale to run. The members below stay compiled but

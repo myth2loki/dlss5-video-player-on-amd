@@ -79,3 +79,52 @@ inline bool ResetHistory(uint64_t frameId, bool temporalReset, bool resetPending
 }
 
 }  // namespace playback_frame_gen
+
+// ---- Which texture the interpolation island reads -------------------------
+//
+// C (playback frame generation) used to sit BEFORE the SR chain at render
+// resolution and read m_dlssColor - the neural frame, which is also the
+// upscaler's INPUT. The "reuse the upscaled rung" topology moved C after B #1,
+// so it reads m_upscaleSharp (the chain's OUTPUT) at the output rung instead.
+// That made the island depend on the SR chain: with interpolation on, turning
+// the SR switch off still had to dispatch FSR 4 just to produce a frame C
+// could read - the pill said Off while the upscaler kept running, and the only
+// way to really stop it was to turn interpolation off too.
+//
+// The island's bridge textures and the FidelityFX context are sized once at
+// Initialize and cannot be resized under a live context, so the third case
+// keeps that geometry and changes WHAT the convert pass reads: with the SR
+// switch off it goes back to the upscaler's INPUT (m_dlssColor) and resamples
+// it to the island's latched rung inside the convert pass itself. No FSR 4
+// dispatch, no renderer rebuild, and the source half of the cadence already
+// presents that same texture through the compositor stretch.
+//
+// `chainAtOutputRung` is the renderer's latch (m_fgUsesUpscaledInput), not a
+// live measurement: it says the SR chain was built and the island was latched
+// to its output size. `upscaleChainServing` is whether B #1 actually runs this
+// frame - the user's SR switch AND every resource it needs. It has no
+// frame-generation term, so an Off pill can never keep the chain alive. Asking
+// whether the chain SERVES rather than only whether it was requested also
+// keeps a half-built chain from being read as if it held a frame.
+namespace frame_gen_input {
+
+enum class Mode : uint8_t {
+    UpscaleInput,        // no SR chain: legacy 1:1 read at render resolution
+    UpscaleOutput,       // SR on: 1:1 read of B #1's output at the output rung
+    UpscaleInputScaled,  // SR off but the chain exists: read the INPUT, resample
+};
+
+struct Decision {
+    Mode mode{};
+    bool readsUpscaleOutput{};  // m_upscaleSharp rather than m_dlssColor
+    bool resamplesInput{};      // the source is smaller than the island's rung
+};
+
+inline constexpr Decision Decide(bool chainAtOutputRung, bool upscaleChainServing) noexcept
+{
+    if (!chainAtOutputRung) return {Mode::UpscaleInput, false, false};
+    if (upscaleChainServing) return {Mode::UpscaleOutput, true, false};
+    return {Mode::UpscaleInputScaled, false, true};
+}
+
+}  // namespace frame_gen_input

@@ -2095,8 +2095,10 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
     // do it: the present draw below samples the sharpened frame instead of the
     // source-size one, and nothing above this line learns a second geometry
     // exists.
-    // B #1 now also feeds C: UpscalePresentActive() stays true whenever the
-    // island needs its output, so this pass must run BEFORE the convert below.
+    // B #1 feeds C only while the user's SR switch is on, and it must run
+    // BEFORE the convert below. With the switch off, this pass is skipped and
+    // the convert reads the upscaler's INPUT (m_dlssColor) instead - the
+    // island no longer forces FSR 4 to run under an Off pill.
     if(UpscalePresentActive())RecordUpscalePresent(cmd);
     // Playback frame generation through the FidelityFX island. The convert
     // pass lands this frame in the shared BGRA8 input on the frame's own list;
@@ -2617,11 +2619,13 @@ bool D3D12Renderer::CreateUpscalePresentResources()
 
 bool D3D12Renderer::CreateFrameGenResources()
 {
-    // C is placed AFTER B #1: when the source SR chain was built, the island
-    // and every texture it exchanges with the renderer run at the OUTPUT rung
-    // and read m_upscaleSharp. Otherwise (NGX, or a rung that does not grow the
-    // source) they stay at render res and read m_dlssColor. Latched here before
-    // the bridge is created: the FidelityFX context cannot be resized later.
+    // C is sized AFTER B #1: when the source SR chain was built, the island and
+    // every texture it exchanges with the renderer run at the OUTPUT rung;
+    // otherwise (NGX, or a rung that does not grow the source) they stay at
+    // render res. Latched here before the bridge is created: the FidelityFX
+    // context cannot be resized later. This is GEOMETRY only - which texture C
+    // reads is a per-frame case (FrameGenInputMode), so turning the SR switch
+    // off can fall back to the upscaler's input without rebuilding anything.
     m_fgUsesUpscaledInput = m_upscaleOffered;
 
     // The playback half of the frame generation the offline converter does.
@@ -2749,12 +2753,29 @@ bool D3D12Renderer::CreateFrameGenResources()
             params[0].DescriptorTable.pDescriptorRanges = ranges;
             params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
             params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-            params[1].Constants.Num32BitValues = 2;
+            // { outW, outH, srcW, srcH }. The last two let the SR-off case
+            // resample the upscaler's input; when they equal the first two the
+            // shader keeps its original 1:1 Load path, bit for bit.
+            params[1].Constants.Num32BitValues = 4;
             params[1].Constants.ShaderRegister = 0;
+            // A static sampler costs no descriptor table slot. Only the scaled
+            // case uses it; the 1:1 cases never bind a texture through it.
+            D3D12_STATIC_SAMPLER_DESC linearSampler{};
+            linearSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            linearSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            linearSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            linearSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            linearSampler.MipLODBias = 0.0f;
+            linearSampler.MaxLOD = D3D12_FLOAT32_MAX;
+            linearSampler.ShaderRegister = 0;
+            linearSampler.RegisterSpace = 0;
+            linearSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             D3D12_VERSIONED_ROOT_SIGNATURE_DESC sig{};
             sig.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
             sig.Desc_1_1.NumParameters = 2;
             sig.Desc_1_1.pParameters = params;
+            sig.Desc_1_1.NumStaticSamplers = 1;
+            sig.Desc_1_1.pStaticSamplers = &linearSampler;
             ComPtr<ID3DBlob> serialized, sigError;
             const HRESULT sigHr = D3D12SerializeVersionedRootSignature(&sig, &serialized, &sigError);
             if (FAILED(sigHr)) {
@@ -3410,14 +3431,24 @@ bool D3D12Renderer::CreateFrameGenResources()
 void D3D12Renderer::RecordFrameGenConvert(ID3D12GraphicsCommandList* cmd)
 {
     // The convert pass alone: FP16 linear -> BGRA8 sRGB into the shared
-    // m_fgFfxInput, recorded on the caller's list and nothing else. C now follows
-    // B #1, so its source is the CAS-sharpened m_upscaleSharp at the OUTPUT rung
-    // whenever that chain exists; m_dlssColor (render res) is the fallback on
-    // NGX machines or a rung that does not grow the source. Both are FP16 linear
-    // and both are read with a compute Load, so the same shader serves either -
-    // only the source texture and the geometry change.
-    ID3D12Resource* convertSource = m_fgUsesUpscaledInput ? m_upscaleSharp.Get()
-                                                         : m_dlssColor.Get();
+    // m_fgFfxInput, recorded on the caller's list and nothing else. Three cases:
+    //   * SR on, chain exists  -> m_upscaleSharp (B #1's OUTPUT), 1:1 at the
+    //     output rung. C sits after B #1 and both cadence halves share a rung.
+    //   * SR off, chain exists -> m_dlssColor (the upscaler's INPUT), resampled
+    //     to the island's latched output rung by this very pass. FSR 4 does NOT
+    //     dispatch; the source half already presents m_dlssColor through the
+    //     compositor stretch. This is the case that used to keep FSR 4 alive
+    //     under an Off pill just to feed interpolation.
+    //   * no chain (NGX, or a rung that does not grow) -> m_dlssColor, 1:1 at
+    //     render res: the legacy topology, unchanged.
+    // The island's geometry is latched at Initialize, so the second case cannot
+    // resize it; resampling inside the convert pass (which already runs for the
+    // colour-domain conversion) is what avoids a renderer rebuild.
+    const auto input = FrameGenInputMode();
+    ID3D12Resource* convertSource = input.readsUpscaleOutput ? m_upscaleSharp.Get()
+                                                            : m_dlssColor.Get();
+    const uint32_t srcW = input.readsUpscaleOutput ? FgInputWidth() : m_renderW;
+    const uint32_t srcH = input.readsUpscaleOutput ? FgInputHeight() : m_renderH;
     if (!m_psoFgConvert || !m_fgConvertRootSig || !m_fgConvertHeap || !m_fgFfxInput ||
         !m_fgFfxOutput || !convertSource)
         return;
@@ -3440,8 +3471,10 @@ void D3D12Renderer::RecordFrameGenConvert(ID3D12GraphicsCommandList* cmd)
     // B #1 leaves its CAS output readable by a pixel shader; this pass reads it
     // with a compute Load, so it has to cross to NON_PIXEL first. It is handed
     // back below, because the source half of the doubled cadence samples the
-    // very same texture on the second command list.
-    if (m_fgUsesUpscaledInput) {
+    // very same texture on the second command list. The SR-off case never
+    // touches m_upscaleSharp: that texture is stale, and moving its state would
+    // be a barrier on a resource nobody read.
+    if (input.readsUpscaleOutput) {
         Barrier(cmd, m_upscaleSharp.Get(), m_upscaleSharpState,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         m_upscaleSharpState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -3486,28 +3519,36 @@ void D3D12Renderer::RecordFrameGenConvert(ID3D12GraphicsCommandList* cmd)
     cmd->SetComputeRootSignature(m_fgConvertRootSig.Get());
     cmd->SetPipelineState(m_psoFgConvert.Get());
     cmd->SetComputeRootDescriptorTable(0, m_fgConvertHeap->GetGPUDescriptorHandleForHeapStart());
-    const uint32_t convertConstants[2] = {FgInputWidth(), FgInputHeight()};
-    cmd->SetComputeRoot32BitConstants(1, 2, convertConstants, 0);
+    const uint32_t convertConstants[4] = {FgInputWidth(), FgInputHeight(), srcW, srcH};
+    cmd->SetComputeRoot32BitConstants(1, 4, convertConstants, 0);
     cmd->Dispatch((FgInputWidth() + frame_gen_convert::kThreadGroup - 1) / frame_gen_convert::kThreadGroup,
                   (FgInputHeight() + frame_gen_convert::kThreadGroup - 1) / frame_gen_convert::kThreadGroup, 1);
     Barrier(cmd, m_fgFfxInput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     m_fgFfxInputState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    if (m_fgUsesUpscaledInput) {
+    if (input.readsUpscaleOutput) {
         Barrier(cmd, m_upscaleSharp.Get(), m_upscaleSharpState,
                 D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         m_upscaleSharpState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     }
-    // SELF-CHECK: this line is the evidence that C really sits after B #1. A
-    // field log without it means the island is still reading the source-size
-    // frame; a log that ALSO says "generated frames are upscaled by" means the
-    // retired context #2 came back.
-    if (!m_fgTopologyReported) {
+    // SELF-CHECK: the field log must name the case that is actually serving.
+    // With the SR switch off while interpolation is on, the line to look for is
+    // "the upscaler's INPUT ... FSR 4 is not dispatched". A log that instead
+    // still says "B #1's output" means the Off pill is lying again. It is
+    // re-printed on every case change, not just once, so a toggle is provable.
+    if (!m_fgTopologyReported || m_fgInputMode != input.mode) {
         m_fgTopologyReported = true;
-        LOG("Playback frame generation: C follows B #1 - generated frames are "
-            << (m_fgUsesUpscaledInput ? "produced from the upscaled frame"
-                                     : "produced from the source-size frame") << " at "
+        m_fgInputMode = input.mode;
+        const char* source = input.readsUpscaleOutput
+            ? "B #1's output (the upscaled frame)"
+            : "the upscaler's INPUT (the source-size neural frame)";
+        LOG("Playback frame generation: the island reads " << source
+            << " at " << srcW << "x" << srcH
+            << (input.resamplesInput
+                    ? ", resampled to " : ", 1:1 at ")
             << FgInputWidth() << "x" << FgInputHeight()
+            << (input.resamplesInput ? " - FSR 4 is not dispatched (SR switch off)"
+                                     : " - SR switch on or no SR chain")
             << "; the generated-frame upscale (FSR 4 context #2) is retired.");
     }
 }
@@ -3855,9 +3896,11 @@ bool D3D12Renderer::RecordFrameGenPresentDraw(ID3D12GraphicsCommandList* cmd, ui
     ID3D12PipelineState* presentPso = BackbufferProgram(target.scaled, m_hdrOutput);
     cmd->SetPipelineState(presentPso);
     if (generated) {
-        // The generated frame was interpolated at the output rung, so it is
-        // presented as-is. The #2 upscale branch below is a retired rollback
-        // path (m_fgUpscaledReady is always false in the new topology).
+        // The generated frame was interpolated at the island's latched rung,
+        // so it is presented as-is - including the SR-off case, where the
+        // convert pass resampled the upscaler's INPUT up to that rung. The #2
+        // upscale branch below is a retired rollback path (m_fgUpscaledReady
+        // is always false in the new topology).
         if (m_fgUpscaledReady && m_fgUpscaleSharp) {
             Barrier(cmd, m_fgUpscaleSharp.Get(), m_fgUpscaleSharpState,
                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -4467,8 +4510,9 @@ bool D3D12Renderer::EngageFrameGenIsland()
     m_fgFfxIsland = true;
     LOG("Playback frame generation: AMD FidelityFX runtime engaged on its own device at "
         << FgInputWidth() << "x" << FgInputHeight() << " in BGRA8 sRGB (island mode)"
-        << (m_fgUsesUpscaledInput ? ", reading the output of super-resolution #1."
-                                 : ", reading the source-size frame."));
+        << (m_fgUsesUpscaledInput ? ", latched to the SR output rung."
+                                 : ", at the source-size rung.")
+        << " The per-frame input case is logged by the convert pass.");
     LogGpuHealth("after FFX Initialize (island engaged)", m_device.Get());
     return true;
 }

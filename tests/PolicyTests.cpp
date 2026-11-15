@@ -42,6 +42,7 @@
 #include "NetworkMediaTransaction.h"
 #include "D3D12FenceWait.h"
 #include "FrameGenerationPass.h"
+#include "FrameGenColorConvertShader.h"
 #include "NgxSession.h"
 #include "D3D12Renderer.h"
 #include "TemporalGuides.h"
@@ -3000,6 +3001,72 @@ void playback_frame_generation_policy_separates_request_from_runtime_state_test(
     CHECK(ResetHistory(12, true, false));
     CHECK(ResetHistory(12, false, true));
     CHECK(!ResetHistory(12, false, false));
+}
+
+// With interpolation on, turning the SR switch off used to leave FSR 4
+// dispatching just to produce a frame the island could read - the pill said
+// Off while the upscaler kept running. The third case reads the upscaler's
+// INPUT instead. The island's geometry is latched at Initialize, so the case
+// must also say that its source needs resampling, or the convert pass would
+// Load out of bounds on the smaller frame.
+void frame_generation_input_case_reads_upscaler_input_when_sr_is_off_test()
+{
+    using frame_gen_input::Decide;
+    using frame_gen_input::Mode;
+
+    // No SR chain (NGX, or a rung that does not grow the source): the legacy
+    // 1:1 read at render res, whatever the user's switch says.
+    const auto legacyOff = Decide(false, false);
+    CHECK(legacyOff.mode == Mode::UpscaleInput);
+    CHECK(!legacyOff.readsUpscaleOutput);
+    CHECK(!legacyOff.resamplesInput);
+    const auto legacyOn = Decide(false, true);
+    CHECK(legacyOn.mode == Mode::UpscaleInput);
+    CHECK(!legacyOn.readsUpscaleOutput);
+    CHECK(!legacyOn.resamplesInput);
+
+    // SR on, chain built at the output rung: C still follows B #1, 1:1, so
+    // both halves of the doubled cadence share a rung. Unchanged.
+    const auto afterB1 = Decide(true, true);
+    CHECK(afterB1.mode == Mode::UpscaleOutput);
+    CHECK(afterB1.readsUpscaleOutput);
+    CHECK(!afterB1.resamplesInput);
+
+    // THE CASE: SR off, chain exists, interpolation still on.
+    const auto fallback = Decide(true, false);
+    CHECK(fallback.mode == Mode::UpscaleInputScaled);
+    CHECK(!fallback.readsUpscaleOutput);
+    CHECK(fallback.resamplesInput);
+
+    // The geometry latch is not the switch, and flipping it back restores the
+    // old picture without rebuilding a renderer or a FidelityFX context.
+    CHECK(fallback.mode != afterB1.mode);
+    CHECK(Decide(true, true).mode == Mode::UpscaleOutput);
+    CHECK(Decide(true, false).mode == Mode::UpscaleInputScaled);
+}
+
+// The convert shader is compiled at renderer Initialize, not by the build: a
+// failed D3DCompile used to fall the player silently back to the matcher path
+// with one log line nobody read. Compile it here so the new resample branch
+// cannot ship broken, and pin the four-uint cbuffer the root signature feeds.
+void frame_generation_convert_shader_compiles_the_sr_off_resample_case_test()
+{
+    Microsoft::WRL::ComPtr<ID3DBlob> code,errors;
+    const HRESULT hr=D3DCompile(frame_gen_convert::kHlsl,sizeof(frame_gen_convert::kHlsl)-1,
+                                "framegen-convert",nullptr,nullptr,"main","cs_5_1",
+                                D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors);
+    if(FAILED(hr)&&errors)std::cerr<<"framegen-convert: "
+        <<static_cast<const char*>(errors->GetBufferPointer())<<'\n';
+    CHECK(SUCCEEDED(hr));
+    CHECK(code&&code->GetBufferSize()>0);
+    // {outW,outH,srcW,srcH}: drop either source dimension and the SR-off case
+    // reads a garbage constant and samples out of bounds. The static sampler
+    // must line up with the one declared in the convert root signature.
+    const std::string text(frame_gen_convert::kHlsl);
+    CHECK(text.find("uint gSrcW;")!=std::string::npos);
+    CHECK(text.find("uint gSrcH;")!=std::string::npos);
+    CHECK(text.find("SampleLevel")!=std::string::npos);
+    CHECK(text.find("SamplerState LinearClamp : register(s0)")!=std::string::npos);
 }
 
 // The pill reads DoublingEstablished, and the whole point of it is the case
@@ -17217,6 +17284,8 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(advanced_menu_contains_clear_neural_cache_and_no_removed_quality_commands_test),
     TEST_CASE(feature_menu_uses_distinct_controls_and_honest_availability_test),
     TEST_CASE(playback_frame_generation_policy_separates_request_from_runtime_state_test),
+    TEST_CASE(frame_generation_input_case_reads_upscaler_input_when_sr_is_off_test),
+    TEST_CASE(frame_generation_convert_shader_compiles_the_sr_off_resample_case_test),
     TEST_CASE(playback_frame_generation_ui_state_survives_a_reset_frame_test),
     TEST_CASE(debug_view_popup_contains_all_existing_views_and_selection_test),
     TEST_CASE(range_preview_and_comparison_menus_route_keys_and_gate_availability_test),

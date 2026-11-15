@@ -10337,11 +10337,11 @@ private:
     // the answer has to be "is the picture bigger than the source" rather than
     // "is NVIDIA in the machine".
     bool UpscalingActive()const{
-        // The user's DLSS Upscaling switch, decoupled from the present chain's
-        // frame-generation term. Playback frame generation keeps the SR chain
-        // running (renderer UpscalePresentActive) even when this switch is off;
-        // that forced chain must not make this read On, or the toolbar pill
-        // would look stuck and ToggleUpscaling could not turn the switch off.
+        // The user's DLSS Upscaling switch, and nothing the renderer does for
+        // playback frame generation. Interpolation no longer keeps the SR chain
+        // alive: with the switch off it reads the upscaler's INPUT directly, so
+        // UpscalePresentActive() and UpscaleUserDrivenActive() are both false
+        // and the pill, the status line and the toggle all agree on Off.
         // The switch is "active" when the user asked for it AND the renderer is
         // honouring it (NGX path or the player's own upscale chain).
         return m_renderer&&m_upscalingRequested&&

@@ -44,7 +44,14 @@ namespace frame_gen_convert {
 constexpr char kHlsl[] = R"hlsl(
 Texture2D<float4> Src : register(t0);
 RWTexture2D<float4> Dst : register(u0);
-cbuffer Params : register(b0) { uint gW; uint gH; };
+// Only the "SR switch off, interpolation on" case samples. The upscaler's
+// INPUT is at render resolution while the island's bridge is latched to the
+// output rung, so the convert pass resamples it here rather than running the
+// whole SR chain just to feed the island. A static sampler keeps it out of the
+// descriptor tables; the source is FP16 LINEAR, so the filter is purely
+// spatial - there is no sRGB view to decode and the CONTRACT above is unchanged.
+SamplerState LinearClamp : register(s0);
+cbuffer Params : register(b0) { uint gW; uint gH; uint gSrcW; uint gSrcH; };
 
 float3 LinearToSrgb(float3 c)
 {
@@ -62,7 +69,15 @@ void main(uint3 id : SV_DispatchThreadID)
     // `linear` is a reserved HLSL keyword (interpolation modifier) and cannot
     // name a local - the first build of this shader failed to compile on it
     // and the player silently fell back to the matcher path.
-    float3 rgb = saturate(Src[int2(id.xy)].rgb);
+    // A 1:1 read keeps the Load path bit-exact: every case that already worked
+    // (SR on at the output rung, or no SR chain at all) must not change a pixel.
+    float3 rgb;
+    if (gSrcW == gW && gSrcH == gH) {
+        rgb = saturate(Src[int2(id.xy)].rgb);
+    } else {
+        float2 uv = (float2(id.xy) + 0.5f) / float2(gW, gH);
+        rgb = saturate(Src.SampleLevel(LinearClamp, uv, 0.0f).rgb);
+    }
     Dst[int2(id.xy)] = float4(LinearToSrgb(rgb), 1.0f);
 }
 )hlsl";
