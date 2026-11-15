@@ -1,7 +1,11 @@
 # 落地方案：生成帧接入 FSR4 超分（消除插帧时的隔帧画质跳变）
 
-> 状态：**REV 2（已自审）**。本文档只描述改法与验证方法，未改动任何代码。
-> 目标读者：校验者（需要逐条对照源码事实）、实施者。
+> 状态：**已废弃（2026-11-15）。** 本方案（生成帧走独立 FSR 4 上下文 #2）已被 commit
+> `7856286` 推翻——C（插帧 island）改为在 B #1 之后、于 output rung 直接插值，
+> FSR 4 context #2 已退休（`m_fgGenUpscaleAllowed=false`，`RecordFrameGenUpscale` 不再调用）。
+> 生成帧不再需要任何独立上采样，两半 cadence 已在同一 rung。本文仅作历史记录，
+> **勿按此实施**。现行拓扑见 `docs/ARCHITECTURE.md` 与
+> `src/PlaybackFrameGenPolicy.h` 的 `frame_gen_input::Decide`。
 >
 > **REV 2 修订记录（自审发现，校验时重点看）**：
 > - R6 撤销/降级：原方案称"与现有 resize 重建路径同步"——**该路径不存在**。`CreateUpscalePresentResources` 仅在 `Initialize` 调用一次（`D3D12Renderer.cpp:227`），output rung 在渲染器生命周期内固定，现有 `m_upscaleStretch` 也不随窗口 resize 重建（窗口 resize 只动 swapchain，见 `ResizeSwapchain`）。新资源与现有资源同生命周期，**无额外 resize 风险**。

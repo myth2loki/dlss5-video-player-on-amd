@@ -75,7 +75,7 @@ kGuideState → COPY_SOURCE → 拷贝 → kGuideState
 它只影响 **worker 侧上传给神经网络的 MV**（160×68 网格）。
 **FSR4 和 FFX 帧生成用的是播放器侧全分辨率的 `m_motion`**，和这个键无关。当年差点在这上面浪费一个下午。
 
-同理：`DLSS5_FSR4_GUIDES=0`（FSR4 用恒等重投影）和 `DLSS5_FG_GEN_UPSCALE=0`（生成帧不走 FSR4）才分别对应那两级。
+同理：`DLSS5_FSR4_GUIDES=0`（FSR4 用恒等重投影）才对应第一级。`DLSS5_FG_GEN_UPSCALE` 自 commit `7856286` 起是 **no-op**——生成帧已在 output rung 插值（C 在 B #1 之后），FSR 4 context #2 已退休，已没有"生成帧超分"可关；现在读这个变量只会打一行说明日志。别再用它做 A/B 开关。
 
 ### 2.6 场尺寸会变
 

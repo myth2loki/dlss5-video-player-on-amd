@@ -1,6 +1,6 @@
 # PLAN: 生成帧 FSR1 / CAS 档同引擎改造（扩展 generated-frame upscale 到全降级链）
 
-状态：**已实施（2026-10-17，BUILD_EXIT=0）** — 落地于 `D3D12Renderer.cpp` / `D3D12Renderer.h`，与 FSR4 专项同分支 `on_amd_framegen2_fsr4` 提交。运行时验证 V1 通过（编译）；V2–V7 需在带 GPU 的本机执行 `build-fsr4.bat` 验证（沙箱不可做）。
+状态：**已废弃（2026-11-15）。** 本方案建立在 `PLAN-generated-frame-fsr4-upscale.md`（生成帧走独立 FSR 4 上下文 #2）之上，该前提已被 commit `7856286` 推翻——C 改为在 B #1 之后、于 output rung 直接插值，FSR 4 context #2 已退休，生成帧不再需要任何独立上采样（FSR4 / FSR1 / CAS 三档皆然）。本文仅作历史记录，**勿按此实施**。现行拓扑见 `docs/ARCHITECTURE.md` 与 `src/PlaybackFrameGenPolicy.h` 的 `frame_gen_input::Decide`。
 
 本计划扩展 [`PLAN-generated-frame-fsr4-upscale.md`](./PLAN-generated-frame-fsr4-upscale.md) 的成果——把"生成帧走独立 FSR4 上下文"推广到 **FSR1(EASU) 与 CAS(Catmull-Rom) 两档**，使 cadence 两帧在全部三档（fsr4 / fsr1 / cas）都同引擎同画质。源帧的三档降级链 `fsr4 → fsr1 → cas` **不被改动**，本计划只是在生成帧侧镜像同一选择。
 

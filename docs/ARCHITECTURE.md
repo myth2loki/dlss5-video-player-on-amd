@@ -275,7 +275,8 @@ without a branch: `FlowScale` is 1 there (whole pixels) against NVOFA's 1/32, an
 the round-trip gate stays off because the technique has no reverse field. It
 records synchronously on the frame's own list, so unlike NVOFA there is no engine
 to fence against. Its zero-motion test is off, because FidelityFX does not hand
-back the pair of frames the vector was measured on. A synthetic pan of four
+back the pair of frames the vector was measured on - see *One estimator or two*
+below for what binding that pair from here would cost. A synthetic pan of four
 pixels per frame measures 3.99, which is what says the field is real rather than
 merely dispatched.
 
@@ -289,6 +290,135 @@ default decided by a failure instead of by a choice. `DLSS_VIDEO_MOTION_FLOW=nvo
 still asks explicitly, so the arm is reachable on a card nobody expects to
 answer, and a failed explicit ask falls back to the CPU matcher rather than
 across to the other estimator - the same rule the other named arms follow.
+
+### One estimator or two
+
+Whatever measured it, the field that reaches the temporal upscaler is one surface
+in one format, read by one pass: `R16G16_SINT` at one vector per block, `FlowScale`
+1/32 for NVOFA against 1 for FidelityFX, and a cell pitch of zero when no reverse
+field was bound, which takes the round-trip gate out of the shader instead of
+neutralising it. `DLSS_VIDEO_MOTION_FLOW` names the arm - `nvof`, `ffx`, `cpu`, or
+`off` for the zeroed control - so any adapter can be asked for any of them without
+a rebuild. That is the whole extent to which the two estimators are unified, and it
+is deliberate: FidelityFX is the estimator every adapter can run and the default
+wherever no flow engine exists, NVOFA is NVIDIA's refinement of the same guide, and
+merging them into one implementation would spend three things that only the engine
+has on cards that do have it.
+
+Subpixel resolution is the one that cannot be bought back. NVOFA returns
+thirty-seconds of a pixel; FidelityFX stores whole ones, because its search is
+integer-SAD over an 8x8 grid. Measured against a synthetic pan the compute field is
+worth +2.7 to +3.4 dB at two to eight pixels per frame and **-2.94 dB at one**
+(`docs/MOTION-GUIDE-AB-zh.md`): a slow pan is exactly where an integer vector
+reports the wrong displacement and reprojection then costs more than it returns.
+Defaulting to the compute estimator on NVIDIA would turn a card-specific trade-off
+into every card's.
+
+The other two differences are recoverable, and were weighed rather than overlooked:
+
+- **The zero-motion test** reads the pair the field was measured on at t3/t4. The
+  player owns both frames and can bind them itself - one extra
+  `B8G8R8A8_UNORM` copy of the previous decoded frame, about 8 MB per frame at
+  1080p, and roughly twenty lines in the resolve path - which restores the gate
+  without touching the technique. It is left unwired because the test exists for
+  the engine's subpixel dither: a held frame came back with a field on 47 % of its
+  pixels, and an integer search has zero itself among its candidates, so there may
+  be nothing to gate. That expectation is untested on this arm; if the compute
+  field ever shows motion on frames that did not move, the copy above is how the
+  gate comes back.
+- **The round-trip gate** needs a reverse field, and FidelityFX estimates forward
+  only. The second direction would mean a second dispatch of the whole technique
+  per frame plus a second set of pyramid resources, for a mask whose value on real
+  clips is not established: the output-frame A/B returned `1+ / 0- / 5x0` against
+  a rule that needs four, i.e. no measurable difference, and the real-clip probe
+  found the FFX and CPU arms under one per cent of pixels apart by more than six
+  code values on the one frame it compared. Paying twice the estimator for an
+  unmeasured mask is a trade to make after a measurement, not before one.
+
+What is not negotiable either way is the CPU matcher. Depth and the scene cut come
+from it, and it is the only motion source the neural renderer has: that path reads
+a 160x66 guide grid, not this field, and handing it the flow field instead changed
+the output by +0.21 / -0.02 / +0.08 dB on three segments - one of three clearing
+the gate - for a GPU-to-CPU readback where there is an upload today.
+
+### The third motion consumer: frame generation (experiment, not shipped)
+
+> **Finished A/B, verdict: negative. The experiment code was never merged into
+> the shipping tree, so none of `DLSS5_FG_EXTERNAL_MV`, `DLSS5_FG_DUMP` or the
+> third shared surface exist in the released build.** Full pre-registered rules,
+> runs and verdicts are in `docs/FG-EXTERNAL-MV-AB-zh.md`.
+
+The playback frame generator is the one consumer that does not read either field
+above. Its `ffxDispatchDescFrameGenerationPrepareV2::motionVectors` is a real
+resource handle, but every shipped session binds a surface cleared to
+`{NaN, NaN}` and sets `FFX_FRAMEGENERATION_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS`,
+which makes the runtime derive its own motion from the colour buffers. Saying the
+SDK "does not export" its field was about *reading that estimate back*, not about
+whether an external one can be supplied: it can. The 2026-11-15 experiment
+supplied the player's FFX flow field into that handle to test whether it beats
+the runtime's self-estimate for frame generation.
+
+During the experiment the renderer re-recorded the existing flow-resolve pass
+into a third cross-device surface at the island's rung - same shader, same root
+constants, `FlowScale = 1`, every gate off, `MotionScale = fgW/sourceW`
+because the island input is a full-image resample of the decoded frame. Three
+arms ran: the shipped self-estimate, the external field with the create flag
+cleared, and the same field with the flag kept. The third arm controlled the
+flag's meaning: the local ABI header describes it as "derive motion at display
+resolution", but no SDK framegeneration header in this tree confirms that
+reading, and an unchanged result between the two external arms says the flag is
+not the switch it appears to be. The rules, the noise-floor requirement and the
+self-check lines are pre-registered in `docs/FG-EXTERNAL-MV-AB-zh.md`.
+
+Two limits are worth stating before anyone reads a verdict as a reason to ship
+it. Depth is still the constant far plane - the player has a luma proxy, not
+camera near/far planes - so even a win unifies only the motion half of the
+guides. And the offered field is whole pixels on an 8x8 grid, against a runtime
+estimate with its own occlusion handling; the slow-pan case is where the compute
+field already measures worse. With the variable unset nothing changes: no third
+texture, no extra draw, the same create flags and the same NaN guide.
+
+During the experiment `DLSS5_FG_DUMP` (since removed) wrote the **raw** island
+midpoint plus its two source frames. It had to be the raw frame: the envelope
+clamp that holds every generated pixel inside the min/max of its two sources
+would hide exactly the overshoot the comparison counts. The dump was bounded,
+one GPU drain per sampled frame, purely diagnostic.
+
+The first pre-registered run (`docs/FG-EXTERNAL-MV-AB-zh.md`, 2026-11-15) came
+back negative. On a moving window of a 1080p30 clip the external field changed
+12 of 12 generated frames by 2.5-15 % of pixels, but raised the fraction outside
+the two-source envelope from roughly 5-7 % to 7-11 %; a second independent run
+reproduced it, and same-configuration repeats changed no frames at all (0/12 and
+0/11), so that is signal and not run-to-run noise. The shipped default therefore
+stays the runtime's own estimate. One question the run did not settle: the arm
+that kept the create flag matched the arm that cleared it on 11 of 12 frames, so
+the flag is not the self-estimation switch the local ABI header describes. That
+reading remains open, and does not change the negative verdict.
+
+A second pre-registered batch (section 10 of the same document) removed the
+single-clip caveat. Six 22-second windows were cut from a 1280x720/23.976 fps
+feature and chosen by measured adjacent-frame motion rather than by eye: 2.4,
+5.0, 8.8, 12.6, 16.9 and 23.1 code values. Each window ran both arms twice, so
+the same-configuration noise floor (0/11-12 frames changed in every case) was
+printed before any arm verdict. Five windows were valid. The fastest was
+INCONCLUSIVE: two scene cuts inside its 12 sampled frames broke
+historyGeneration, a repeat reproduced the same two resets, so the window was
+discarded rather than the gate relaxed.
+
+All five valid windows returned the same verdict. The field changed the output
+in 11-12 of 12 frames (1.5-20 % of pixels) and never reduced ghosting (0
+improvements); a second independent run reproduced every segment. The overshoot
+penalty grows monotonically with motion - +0.09 pp at 2.4 code values, +1.14 at
+5.0, +1.80 at 8.8, +2.77 at 12.6, +4.75 at 16.9 - which is what a whole-pixel
+8x8 field should do when it replaces an estimate with its own occlusion and
+sub-pixel handling at increasing displacement. Keeping the create flag again
+matched the arm that cleared it (12/12 on the window that ran it), so its
+meaning is still unconfirmed.
+
+This is no longer a single-clip result, but it is still six windows of one
+movie, raw midpoints only, with depth left at the far plane. **The FFX flow field
+is not wired into frame generation: the shipped default stays the runtime's own
+estimate, and the third motion consumer remains the isolated path above.**
 
 ### Scene-change output
 
