@@ -130,15 +130,13 @@ private:
             // The live, on-screen toggle, distinct from the offline conversion
             // above. Default off; the player remembers the choice in the ini.
             {L"menu.playback_frame_generation", L"Frame Generation during playback\tCtrl+Alt+G"},
-            // Which upscaler serves the picture - one setting for the whole
-            // chain, the source frames and the generated half of the playback
-            // cadence alike. Auto is the cascade; the rest force an entry point
-            // into it. The FSR 4 row carries the tier's known property on the
-            // generated half: the second context measured darker than the
-            // source frame, a brightness strobe at the cadence rate.
+            // Which upscaler serves the SOURCE frames. Auto is the cascade; the
+            // rest force an entry point into it. The generated half is
+            // interpolated after this chain at the output rung, so the old
+            // "second context measured darker" caveat no longer applies.
             {L"menu.upscale_engine", L"Upscaled by"},
             {L"menu.upscale_engine_auto", L"Auto (FSR 4, else FSR1, else CAS)"},
-            {L"menu.upscale_engine_fsr4", L"FSR 4 (generated frames measure darker)"},
+            {L"menu.upscale_engine_fsr4", L"FSR 4"},
             {L"menu.upscale_engine_fsr1", L"FSR1"},
             {L"menu.upscale_engine_cas", L"CAS"},
             {L"playback_framegen.pill.on", L"Interpolate \u00b7 On"},

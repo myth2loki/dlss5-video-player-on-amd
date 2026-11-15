@@ -671,8 +671,33 @@ public:
     // not an upscale and the present chain's own scaling is enough.
     bool UpscalePresentActive() const
     {
+        // C (frame generation) now sits AFTER B #1: the island's input is the
+        // CAS-sharpened output of this very chain (m_upscaleSharp, output rung).
+        // Interpolation therefore needs the SR chain to serve even when the SR
+        // switch itself is off - otherwise the island has no frame to read.
+        // The geometry is fixed at Initialize (FgInputWidth), so toggling the
+        // switch cannot resize the island out from under a live context.
+        const bool fgNeedsUpscaledInput = m_fgUsesUpscaledInput &&
+            (m_playbackFrameGen || m_debugView == DebugView::FrameGenerated);
+        return (m_dlssEnabled || fgNeedsUpscaledInput) &&
+               !m_dlss.Available() && m_upscaleOffered && m_upscaleStretch != nullptr;
+    }
+    // The user's upscaling switch as served by the present chain, WITHOUT the
+    // frame-generation term that UpscalePresentActive adds. Playback frame
+    // generation keeps the SR chain alive to feed its island even when the
+    // upscaling switch is off; that forced chain is the frame-gen pill's
+    // concern, not the upscaling switch's, so the toolbar, the menu checkmark
+    // and the toggle decision must not read it as the upscaling switch being
+    // On (which would also stop ToggleUpscaling from turning the switch off).
+    // Mirrors the pre-refactor UpscalePresentActive gating.
+    bool UpscaleUserDrivenActive() const
+    {
         return m_dlssEnabled && !m_dlss.Available() && m_upscaleOffered && m_upscaleStretch != nullptr;
     }
+    // The geometry the island runs at. Fixed once at Initialize, because the
+    // FidelityFX context and the shared bridge textures cannot be resized.
+    uint32_t FgInputWidth() const { return m_fgUsesUpscaledInput ? m_outputW : m_renderW; }
+    uint32_t FgInputHeight() const { return m_fgUsesUpscaledInput ? m_outputH : m_renderH; }
     // What the toolbar and the menu ask instead of DLSSAvailable: whether this
     // machine can upscale playback at all, by either route.
     //
@@ -742,10 +767,10 @@ public:
         m_playbackFrameGen = on;
     }
     bool PlaybackFrameGeneration() const { return m_playbackFrameGen; }
-    // Which upscaler serves the picture, both halves of the cadence alike (see
-    // UpscaleEngineMode). Auto is the default: the Fsr4 -> Fsr1 -> Cas cascade
-    // the chain has always run, with the generated half deliberately off the
-    // Fsr4 tier until the second context's darkening is understood. A change
+    // Which upscaler serves the SOURCE frames (see UpscaleEngineMode). Auto is
+    // the default: the Fsr4 -> Fsr1 -> Cas cascade the chain has always run.
+    // The generated half is interpolated after this chain at the output rung,
+    // so it no longer runs an engine of its own. A change
     // is a discontinuity for the context being left. Safe to call at any time;
     // the next frame records on the new engine.
     void SetUpscaleEngineMode(UpscaleEngineMode mode)
@@ -1095,11 +1120,10 @@ private:
     // has retired, writing m_fgFfxClamped. False when the clamp resources are
     // missing - the caller presents the raw output, as before the clamp.
     bool RecordFrameGenClamp(ID3D12GraphicsCommandList* cmd);
-    // Upscales the just-clamped/interpolated generated frame through the second
-    // FSR 4 context so it matches the source frame's sharpness. Returns true
-    // (and sets nothing) on success; on the first failure latches m_fgUpscaleFailed
-    // and the caller falls back to the compositor stretch, exactly as before.
-    // Guarded at the top by m_fgUpscaleFailed and m_fsrUpscaleGenerated.
+    // RETIRED with FSR 4 context #2. C now runs after B #1 at the output rung,
+    // so the island's generated frame is already full-size and needs no second
+    // upscale. Kept (compiled, never called, gated off at creation) as the
+    // measured rollback path; see m_fgGenUpscaleAllowed.
     bool RecordFrameGenUpscale(ID3D12GraphicsCommandList* cmd);
     // One present draw into the current backbuffer. `generated` selects the
     // island's (or the matcher's) interpolated frame; otherwise the normal
@@ -1110,8 +1134,8 @@ private:
     bool WaitFgFenceValue(uint64_t value);
     // ---- Interpolate-on black-flicker localization (diagnostic) -------------
     // Reads the diagnostic environment once: DLSS5_FG_BLACK_PROBE (0 off,
-    // 1 sampled, 2 every generated frame) and DLSS5_FG_GEN_UPSCALE (0 forces
-    // the generated-frame upscale off, restoring the pre-rework fallback).
+    // 1 sampled, 2 every generated frame). DLSS5_FG_GEN_UPSCALE is retired -
+    // there is no generated-frame upscale left to turn off.
     void ReadFrameGenDiagnostics();
     // True when this generated frame owes a probe sample.
     bool FrameGenProbeDue();
@@ -1525,6 +1549,12 @@ private:
     float m_upscaleSharpness = 0.6f;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_upscaleStretch;
     Microsoft::WRL::ComPtr<ID3D12Resource> m_upscaleSharp;
+    // CAS leaves its output in PIXEL_SHADER_RESOURCE for the present draw. C
+    // now reads the same texture with a compute Load, so RecordFrameGenConvert
+    // crosses it to NON_PIXEL_SHADER_RESOURCE and hands it back; this member
+    // is the renderer's record of that state (the source chain used to rely on
+    // the implicit constant).
+    D3D12_RESOURCE_STATES m_upscaleSharpState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_upscaleRootSig;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_psoUpscaleStretch;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_psoUpscaleSharp;
@@ -1667,11 +1697,18 @@ private:
     // PSO compiled; it then serves every frame FSR 4 does not.
     bool m_easuActive = false;
 
-    // Generated-frame FSR 4 upscale. Makes the interpolated frame take the SAME
-    // upscaler as the source frame via a second, independent FSR 4 context, so
-    // the two cadence frames no longer jump in sharpness. See
-    // RecordFrameGenUpscale and docs/PLAN-generated-frame-fsr4-upscale.md.
-    // Built only when the island (BGRA8) path exists and FSR 4 is available.
+    // True when B #1 (the source SR chain) exists at Initialize: C then reads
+    // m_upscaleSharp at the output rung. False on NGX machines or a rung that
+    // does not grow the source, where C keeps reading m_dlssColor at render res.
+    // Latched once - the island's geometry is not allowed to change per frame.
+    bool m_fgUsesUpscaledInput = false;
+    // Once-only field-log line: the evidence that C really reads B #1's output.
+    bool m_fgTopologyReported = false;
+
+    // Generated-frame FSR 4 upscale (context #2). RETIRED: with C after B #1
+    // there is no second upscale to run. The members below stay compiled but
+    // are never built or dispatched, so the old topology remains a one-line
+    // rollback if a picture A/B ever rejects the new one.
     std::unique_ptr<FsrUpscaleBackend> m_fsrUpscaleGenerated;
     bool m_fgUpscaleFailed = false;   // permanent latch, mirrors m_fgFfxFailed
     bool m_fgUpscaledReady = false;   // per-frame: did this frame's generated upscale succeed
@@ -1738,7 +1775,10 @@ private:
     // being chased, which is not a default anyone should inherit. A run that
     // needs it sets DLSS5_FG_BLACK_PROBE=2.
     int m_fgProbeMode = 0;
-    bool m_fgGenUpscaleAllowed = true;
+    // The single gate for the retired #2 path: false keeps its context,
+    // textures and dispatch out of the frame entirely. DLSS5_FG_GEN_UPSCALE no
+    // longer toggles anything - there is no generated-frame upscale to disable.
+    bool m_fgGenUpscaleAllowed = false;
     bool m_fgDiagRead = false;
     uint32_t m_fgProbeFrames = 0;    // generated frames seen by the probe gate
     uint32_t m_fgPresentTrace = 0;   // doubling presents whose index was traced

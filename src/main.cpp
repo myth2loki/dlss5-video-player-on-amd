@@ -8784,7 +8784,7 @@ private:
         SaveVideoSettings();
         if(m_renderer){
             m_renderer->SetUpscalingHistory(history);
-            if(!m_playing&&UpscalingActive())if(const auto last=m_lastPlaybackFrame)RenderVideoFrame(*last,false);
+            if(!m_playing&&m_renderer&&m_renderer->UpscalePresentActive())if(const auto last=m_lastPlaybackFrame)RenderVideoFrame(*last,false);
         }
         if(m_exportStagesWnd&&IsWindow(m_exportStagesWnd))SyncExportStageControls(m_exportStagesWnd);
         SyncFeatureMenuState();
@@ -10337,7 +10337,15 @@ private:
     // the answer has to be "is the picture bigger than the source" rather than
     // "is NVIDIA in the machine".
     bool UpscalingActive()const{
-        return m_renderer&&(m_renderer->DLSSEnabled()||m_renderer->UpscalePresentActive());
+        // The user's DLSS Upscaling switch, decoupled from the present chain's
+        // frame-generation term. Playback frame generation keeps the SR chain
+        // running (renderer UpscalePresentActive) even when this switch is off;
+        // that forced chain must not make this read On, or the toolbar pill
+        // would look stuck and ToggleUpscaling could not turn the switch off.
+        // The switch is "active" when the user asked for it AND the renderer is
+        // honouring it (NGX path or the player's own upscale chain).
+        return m_renderer&&m_upscalingRequested&&
+            (m_renderer->DLSSEnabled()||m_renderer->UpscaleUserDrivenActive());
     }
     // The rung a render should aim at. Auto reads the monitor this window is on
     // rather than the source, because the source decides only whether the rung

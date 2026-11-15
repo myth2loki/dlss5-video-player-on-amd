@@ -2095,6 +2095,8 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
     // do it: the present draw below samples the sharpened frame instead of the
     // source-size one, and nothing above this line learns a second geometry
     // exists.
+    // B #1 now also feeds C: UpscalePresentActive() stays true whenever the
+    // island needs its output, so this pass must run BEFORE the convert below.
     if(UpscalePresentActive())RecordUpscalePresent(cmd);
     // Playback frame generation through the FidelityFX island. The convert
     // pass lands this frame in the shared BGRA8 input on the frame's own list;
@@ -2153,7 +2155,7 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
             // island ran and the picture is wrong".
             m_fgIslandReported=true;
             LOG("Playback frame generation: the island produced its first frame ("
-                <<m_renderW<<"x"<<m_renderH<<", interval "<<m_fgFrameTimeMs<<" ms).");
+                <<FgInputWidth()<<"x"<<FgInputHeight()<<", interval "<<m_fgFrameTimeMs<<" ms).");
         }
         if(!generated){
             m_fgFfxFailed=true;
@@ -2179,12 +2181,12 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
         // The clamp records on this same list, before the present draws on it;
         // its result decides which texture the generated present samples.
         m_fgClampRan=showGenerated&&RecordFrameGenClamp(cmd);
-        // Upscale the generated frame through FSR 4 (context #2) so it matches
-        // the source frame's sharpness. Records on this same list, before the
-        // present draws on it. On any failure m_fgUpscaledReady stays false and
-        // the present falls back to the compositor stretch, as before.
-        m_fgUpscaledReady = m_playbackFrameGen && showGenerated && !m_fgUpscaleFailed &&
-                            m_fgGenUpscaleAllowed && RecordFrameGenUpscale(cmd);
+        // C now runs AFTER B #1 at the output rung: the island's generated frame
+        // is already full-size, so there is no second upscale (context #2 is
+        // retired). The generated present samples the clamped island output
+        // directly, while the source present samples B #1's CAS output - the
+        // same picture rung on both halves of the cadence.
+        m_fgUpscaledReady = false;
         if(m_playbackFrameGen&&showGenerated&&!m_fgCadenceReported){
             // Once: the health line counts rendered source frames, not swapchain
             // presents, so this is the only place the doubled cadence is visible
@@ -2568,6 +2570,8 @@ bool D3D12Renderer::CreateUpscalePresentResources()
         }
     }
     // ---- Second FSR 4 context, for the generated (interpolated) frame -------
+    // RETIRED (C now runs after B #1). The block below is gated off with the
+    // rest of #2 by m_fgGenUpscaleAllowed; it stays as the measured rollback.
     //
     // The interpolated frame is fed through its OWN FSR 4 context so it takes
     // the same upscaler, and therefore the same sharpness, as the source frame.
@@ -2579,7 +2583,7 @@ bool D3D12Renderer::CreateUpscalePresentResources()
     // created mid-stream, not at Initialize. Guarded by m_fsrUpscaleActive so it
     // only exists where FSR 4 is actually serving; the upscale resources it
     // targets are created alongside the frame-gen resources when it does.
-    if (m_fsrUpscaleActive) {
+    if (m_fgGenUpscaleAllowed && m_fsrUpscaleActive) {
         auto generated = std::make_unique<FsrUpscaleBackend>();
         if (!generated->Initialize(m_device.Get(), m_renderW, m_renderH, m_outputW, m_outputH,
                                    DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -2613,6 +2617,13 @@ bool D3D12Renderer::CreateUpscalePresentResources()
 
 bool D3D12Renderer::CreateFrameGenResources()
 {
+    // C is placed AFTER B #1: when the source SR chain was built, the island
+    // and every texture it exchanges with the renderer run at the OUTPUT rung
+    // and read m_upscaleSharp. Otherwise (NGX, or a rung that does not grow the
+    // source) they stay at render res and read m_dlssColor. Latched here before
+    // the bridge is created: the FidelityFX context cannot be resized later.
+    m_fgUsesUpscaledInput = m_upscaleOffered;
+
     // The playback half of the frame generation the offline converter does.
     // PRIMARY path: AMD FidelityFX, the vendor's own generator - it infers
     // motion and disocclusion from the colour buffers, where the matcher
@@ -2652,8 +2663,8 @@ bool D3D12Renderer::CreateFrameGenResources()
     sharedHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC sharedTex{};
     sharedTex.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    sharedTex.Width = m_renderW;
-    sharedTex.Height = m_renderH;
+    sharedTex.Width = FgInputWidth();
+    sharedTex.Height = FgInputHeight();
     sharedTex.DepthOrArraySize = 1;
     sharedTex.MipLevels = 1;
     sharedTex.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -2805,8 +2816,8 @@ bool D3D12Renderer::CreateFrameGenResources()
                 localHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
                 D3D12_RESOURCE_DESC localTex{};
                 localTex.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-                localTex.Width = m_renderW;
-                localTex.Height = m_renderH;
+                localTex.Width = FgInputWidth();
+                localTex.Height = FgInputHeight();
                 localTex.DepthOrArraySize = 1;
                 localTex.MipLevels = 1;
                 localTex.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -3146,7 +3157,7 @@ bool D3D12Renderer::CreateFrameGenResources()
         // created separately and gated on FSR 4 itself; this block only needs
         // the source upscale to exist so the generated frame can follow the same
         // tier the source actually selected.
-        if (m_upscaleOffered) {
+        if (m_fgGenUpscaleAllowed && m_upscaleOffered) {
             // render-res FP16: the linearized generated frame (FSR 4 #2 input).
             D3D12_RESOURCE_DESC linDesc{};
             linDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -3399,13 +3410,22 @@ bool D3D12Renderer::CreateFrameGenResources()
 void D3D12Renderer::RecordFrameGenConvert(ID3D12GraphicsCommandList* cmd)
 {
     // The convert pass alone: FP16 linear -> BGRA8 sRGB into the shared
-    // m_fgFfxInput, recorded on the caller's list and nothing else. The island
-    // path ends the frame list right after this, so the pass is its own method
-    // rather than the head of RecordPlaybackFrameGen.
+    // m_fgFfxInput, recorded on the caller's list and nothing else. C now follows
+    // B #1, so its source is the CAS-sharpened m_upscaleSharp at the OUTPUT rung
+    // whenever that chain exists; m_dlssColor (render res) is the fallback on
+    // NGX machines or a rung that does not grow the source. Both are FP16 linear
+    // and both are read with a compute Load, so the same shader serves either -
+    // only the source texture and the geometry change.
+    ID3D12Resource* convertSource = m_fgUsesUpscaledInput ? m_upscaleSharp.Get()
+                                                         : m_dlssColor.Get();
     if (!m_psoFgConvert || !m_fgConvertRootSig || !m_fgConvertHeap || !m_fgFfxInput ||
-        !m_fgFfxOutput || !m_dlssColor)
+        !m_fgFfxOutput || !convertSource)
         return;
 
+    // m_colorInRT tracks m_dlssColor, not the convert pass's input texture.
+    // It must be cleared unconditionally even when C reads B #1's output, or a
+    // defensive path that left the neural frame in RENDER_TARGET would poison
+    // the next frame's EASU/Catmull-Rom draw.
     if (m_colorInRT) {
         Barrier(cmd, m_dlssColor.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, GuideReadState);
         m_colorInRT = false;
@@ -3416,6 +3436,16 @@ void D3D12Renderer::RecordFrameGenConvert(ID3D12GraphicsCommandList* cmd)
     if (m_fgFfxOutputState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
         Barrier(cmd, m_fgFfxOutput.Get(), m_fgFfxOutputState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_fgFfxOutputState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+    // B #1 leaves its CAS output readable by a pixel shader; this pass reads it
+    // with a compute Load, so it has to cross to NON_PIXEL first. It is handed
+    // back below, because the source half of the doubled cadence samples the
+    // very same texture on the second command list.
+    if (m_fgUsesUpscaledInput) {
+        Barrier(cmd, m_upscaleSharp.Get(), m_upscaleSharpState,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        m_upscaleSharpState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    }
 
     // The clamp needs this frame AND the previous one, so copy the input
     // before the dispatch below overwrites it. The copy runs on every island
@@ -3445,7 +3475,7 @@ void D3D12Renderer::RecordFrameGenConvert(ID3D12GraphicsCommandList* cmd)
     srcView.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     srcView.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     srcView.Texture2D.MipLevels = 1;
-    m_device->CreateShaderResourceView(m_dlssColor.Get(), &srcView, convertSlot(0));
+    m_device->CreateShaderResourceView(convertSource, &srcView, convertSlot(0));
     D3D12_UNORDERED_ACCESS_VIEW_DESC dstView{};
     dstView.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     dstView.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
@@ -3456,13 +3486,30 @@ void D3D12Renderer::RecordFrameGenConvert(ID3D12GraphicsCommandList* cmd)
     cmd->SetComputeRootSignature(m_fgConvertRootSig.Get());
     cmd->SetPipelineState(m_psoFgConvert.Get());
     cmd->SetComputeRootDescriptorTable(0, m_fgConvertHeap->GetGPUDescriptorHandleForHeapStart());
-    const uint32_t convertConstants[2] = {m_renderW, m_renderH};
+    const uint32_t convertConstants[2] = {FgInputWidth(), FgInputHeight()};
     cmd->SetComputeRoot32BitConstants(1, 2, convertConstants, 0);
-    cmd->Dispatch((m_renderW + frame_gen_convert::kThreadGroup - 1) / frame_gen_convert::kThreadGroup,
-                  (m_renderH + frame_gen_convert::kThreadGroup - 1) / frame_gen_convert::kThreadGroup, 1);
+    cmd->Dispatch((FgInputWidth() + frame_gen_convert::kThreadGroup - 1) / frame_gen_convert::kThreadGroup,
+                  (FgInputHeight() + frame_gen_convert::kThreadGroup - 1) / frame_gen_convert::kThreadGroup, 1);
     Barrier(cmd, m_fgFfxInput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     m_fgFfxInputState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    if (m_fgUsesUpscaledInput) {
+        Barrier(cmd, m_upscaleSharp.Get(), m_upscaleSharpState,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        m_upscaleSharpState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+    // SELF-CHECK: this line is the evidence that C really sits after B #1. A
+    // field log without it means the island is still reading the source-size
+    // frame; a log that ALSO says "generated frames are upscaled by" means the
+    // retired context #2 came back.
+    if (!m_fgTopologyReported) {
+        m_fgTopologyReported = true;
+        LOG("Playback frame generation: C follows B #1 - generated frames are "
+            << (m_fgUsesUpscaledInput ? "produced from the upscaled frame"
+                                     : "produced from the source-size frame") << " at "
+            << FgInputWidth() << "x" << FgInputHeight()
+            << "; the generated-frame upscale (FSR 4 context #2) is retired.");
+    }
 }
 
 bool D3D12Renderer::RecordFrameGenClamp(ID3D12GraphicsCommandList* cmd)
@@ -3496,10 +3543,10 @@ bool D3D12Renderer::RecordFrameGenClamp(ID3D12GraphicsCommandList* cmd)
     cmd->SetComputeRootSignature(m_fgClampRootSig.Get());
     cmd->SetPipelineState(m_psoFgClamp.Get());
     cmd->SetComputeRootDescriptorTable(0, m_fgClampHeap->GetGPUDescriptorHandleForHeapStart());
-    const uint32_t clampConstants[2] = {m_renderW, m_renderH};
+    const uint32_t clampConstants[2] = {FgInputWidth(), FgInputHeight()};
     cmd->SetComputeRoot32BitConstants(1, 2, clampConstants, 0);
-    cmd->Dispatch((m_renderW + frame_gen_clamp::kThreadGroup - 1) / frame_gen_clamp::kThreadGroup,
-                  (m_renderH + frame_gen_clamp::kThreadGroup - 1) / frame_gen_clamp::kThreadGroup, 1);
+    cmd->Dispatch((FgInputWidth() + frame_gen_clamp::kThreadGroup - 1) / frame_gen_clamp::kThreadGroup,
+                  (FgInputHeight() + frame_gen_clamp::kThreadGroup - 1) / frame_gen_clamp::kThreadGroup, 1);
     m_fgFfxClampedState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     ID3D12DescriptorHeap* srvHeaps[] = {m_srvHeap.Get()};
     cmd->SetDescriptorHeaps(1, srvHeaps);
@@ -3808,9 +3855,9 @@ bool D3D12Renderer::RecordFrameGenPresentDraw(ID3D12GraphicsCommandList* cmd, ui
     ID3D12PipelineState* presentPso = BackbufferProgram(target.scaled, m_hdrOutput);
     cmd->SetPipelineState(presentPso);
     if (generated) {
-        // Top priority: the generated frame upscaled by FSR 4 (context #2), so it
-        // matches the source frame's sharpness. Falls through to the existing
-        // branches when the upscale did not run this frame.
+        // The generated frame was interpolated at the output rung, so it is
+        // presented as-is. The #2 upscale branch below is a retired rollback
+        // path (m_fgUpscaledReady is always false in the new topology).
         if (m_fgUpscaledReady && m_fgUpscaleSharp) {
             Barrier(cmd, m_fgUpscaleSharp.Get(), m_fgUpscaleSharpState,
                     D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -4049,10 +4096,13 @@ void D3D12Renderer::ReadFrameGenDiagnostics()
     };
     const int probe = readFlag(L"DLSS5_FG_BLACK_PROBE");
     if (probe >= 0) m_fgProbeMode = probe > 2 ? 2 : probe;
-    if (readFlag(L"DLSS5_FG_GEN_UPSCALE") == 0) m_fgGenUpscaleAllowed = false;
-    if (!m_fgGenUpscaleAllowed) {
-        LOG("Playback frame generation: DLSS5_FG_GEN_UPSCALE=0 - the generated-frame "
-            "upscale is forced off; generated frames keep the compositor stretch.");
+    // RETIRED with context #2: the generated half is interpolated at the
+    // output rung and has no upscale left to disable. Reading the old variable
+    // only lets a stale field-log recipe explain itself. m_fgGenUpscaleAllowed
+    // stays false whatever the environment says.
+    if (readFlag(L"DLSS5_FG_GEN_UPSCALE") == 0) {
+        LOG("Playback frame generation: DLSS5_FG_GEN_UPSCALE=0 is a no-op - the "
+            "generated-frame upscale was removed when C moved after B #1.");
     }
     // FSR 4's temporal inputs, 0/1. On (the default) the dispatch takes the
     // playback guide estimator's real motion field and depth proxy; 0 puts the
@@ -4075,16 +4125,17 @@ void D3D12Renderer::ReadFrameGenDiagnostics()
         LOG("Playback upscale: the engine is forced to "
             << UpscaleEngineModeName(m_upscaleEngineMode)
             << " (DLSS5_UPSCALE_ENGINE); Auto would run the Fsr4 -> Fsr1 -> Cas "
-               "cascade. The source frames and the generated half of the playback "
-               "cadence both run this engine - there is no separate set for frame "
-               "generation.");
+               "cascade. Only the source frames run this engine now: the generated "
+               "half is interpolated at the output rung by C, so it needs no engine "
+               "of its own.");
     }
     if (m_fgProbeMode) {
         LOG("Playback frame generation: the black-frame probe is "
             << (m_fgProbeMode == 2 ? "sampling every generated frame"
                                    : "sampling every 30th generated frame")
             << " (DLSS5_FG_BLACK_PROBE=" << m_fgProbeMode
-            << "; DLSS5_FG_GEN_UPSCALE=0 forces the fallback for an A/B).");
+            << "; the generated-frame upscale was retired, so the probe reads the "
+               "island output directly).");
     }
 }
 
@@ -4245,7 +4296,7 @@ void D3D12Renderer::ProbeGeneratedPresent()
     const bool wantIsland = m_fgFfxOutput && RecordProbeTile(
         m_probeList.Get(), m_fgFfxOutput.Get(), m_fgFfxOutputState,
         m_probeIsland.Get(), DXGI_FORMAT_B8G8R8A8_UNORM,
-        regionSide(m_renderW, kProbeIslandCapacity), m_renderW, m_renderH, &sideIsland);
+        regionSide(FgInputWidth(), kProbeIslandCapacity), FgInputWidth(), FgInputHeight(), &sideIsland);
     if (!wantBackbuffer && !wantSharp && !wantIsland) return;
     if (!SubmitProbeAndWait()) {
         LOG("BLACK-PROBE: the probe submission or its wait failed; the probe is off "
@@ -4380,9 +4431,8 @@ void D3D12Renderer::ProbeSourcePresent()
         ProbeSrgbFromLinear(m_probeSharpMaxLinear) < (1.5f / 255.0f)) {
         LOG("BLACK-PROBE #" << m_fgProbeFrames << " VERDICT: the island output is visible "
             "but the generated-frame UPSCALE output is black - the generated-frame "
-            "upscale (the stretch tier over the island output's sRGB view, then "
-            "CAS) is the black source; "
-            "DLSS5_FG_GEN_UPSCALE=0 confirms by elimination.");
+            "upscale is the black source; context #2 has since been retired - "
+            "if this verdict appears the island output itself is black.");
         return;
     }
     LOG("BLACK-PROBE #" << m_fgProbeFrames << " VERDICT: the textures are visible but the "
@@ -4404,7 +4454,7 @@ bool D3D12Renderer::EngageFrameGenIsland()
     LUID adapterLuid{};
     if (m_adapter && SUCCEEDED(m_adapter->GetDesc1(&adapterDesc)))
         adapterLuid = adapterDesc.AdapterLuid;
-    if (!m_fgFfx->InitializeIsolated(adapterLuid, m_renderW, m_renderH,
+    if (!m_fgFfx->InitializeIsolated(adapterLuid, FgInputWidth(), FgInputHeight(),
                                      DXGI_FORMAT_B8G8R8A8_UNORM,
                                      m_fgFfxInputHandle, m_fgFfxOutputHandle,
                                      m_fgFfxFenceHandle)) {
@@ -4416,7 +4466,9 @@ bool D3D12Renderer::EngageFrameGenIsland()
     }
     m_fgFfxIsland = true;
     LOG("Playback frame generation: AMD FidelityFX runtime engaged on its own device at "
-        << m_renderW << "x" << m_renderH << " in BGRA8 sRGB (island mode).");
+        << FgInputWidth() << "x" << FgInputHeight() << " in BGRA8 sRGB (island mode)"
+        << (m_fgUsesUpscaledInput ? ", reading the output of super-resolution #1."
+                                 : ", reading the source-size frame."));
     LogGpuHealth("after FFX Initialize (island engaged)", m_device.Get());
     return true;
 }
