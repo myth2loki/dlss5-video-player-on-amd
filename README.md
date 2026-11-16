@@ -67,6 +67,7 @@ what each is doing — `DLSS Upscaling on: 2560x1440 (auto) · FSR4`, `Source
 > [What the AMD backend does, and does not do](#on-an-amd-card) ·
 > [Two runtimes in one pack](#two-runtimes-in-one-pack) ·
 > [AMD captures](#what-it-looks-like) ·
+> [the motion field](#the-motion-field-is-not-a-constant) ·
 > [integration plan and status, in Chinese](docs/AMD-LMXXF-INTEGRATION-PLAN-REV2-zh.md) ·
 > [Mochizuki integration and its measurements, in Chinese](docs/AMD-MOCHIZUKI-COEXIST-PLAN-zh.md) ·
 > [the runtime package](third_party/lmxxf/README.md)
@@ -102,8 +103,9 @@ does the same from the command line.
 | Encoder | AMD's `hevc_amf` on the GPU for the two lossy rungs — HEVC 8-bit at QP 18 for Standard, Main10 at QP 16 off the 10-bit capture for High — with libx264 kept as the fallback for an odd frame size or a machine without the encoder. Lossless is FFV1 10-bit on the CPU. `-rc qvbr` refuses to initialise on this driver, so the rungs use constant QP |
 | Input size | The runtime admits up to 1920×1080 by pixel budget. A 1440p or 4K source has to be scaled down before it reaches the runtime |
 | Processing scale | Must be 100%. The runtime returns the frame at the size it was given, so a reduction would be silently ignored; this player refuses instead. The upscaler runs after the model, on the frame it returned |
-| Passes | The ladder's first rung is the 0.44 **Small** model at 0.5x — 31 blocks, a differently trained network, single-pass by construction — and 1, 2 and 3 stack the Original 71-block one (the runtime's own F9 ladder), with switches for the later passes only: keep skin tones, predict the third pass instead of running the network, and skip the later passes' block group. Every extra pass is another full network run. 4 is NVIDIA's ladder; this runtime reads a count it does not know as Small, so the player clamps it |
-| Temporal model | Three layers, and the panel owns all three. **The runtime's own temporal mode** (**Neural settings > Temporal mode**: off, fast history, low-frequency EMA, low-frequency + detail) makes the network fuse history. It is off unless the runtime's own config file already set it — the panel migrates that value on first read rather than overwriting a hand edit — and it runs only beside the Original model at one pass: beside Small the runtime renders the Original instead, and above one pass it runs no mode at all and says so in a status line. The panel greys the control out at both of those rungs rather than handing over a pair the runtime would resolve by itself, and the key is read once when the network is built, so a change reaches the next render and a running session keeps the mode it started with. **The guides are no longer constants**: the player runs its own estimator (CPU block matching on a 128x72 grid at 720p, 160x90 at 1080p, 0.8–1.4 ms a frame; a build with the FidelityFX SDK takes the field from FidelityFX Optical Flow instead when FSR 4 is in service) and hands the field to the runtime, which is what gives it anything to fuse. **The player's own accumulation** (**Temporal stability**, AMD default Off — every rung blends through a motion field and mochizuki's frame contract has no depth; see [Troubleshooting](docs/TROUBLESHOOTING.md#the-amd-render-looks-smeared-or-doubled-ghosting)) then blends the previous output through that same field, so it reprojects instead of smearing. FSR 4 reads the field too: see [Upscaling](#upscaling-and-frame-generation) |
+| Route | **Neural settings > NR route** asks a question that comes before the ladder: **Neural passes** stacks the network, **RenoDX** runs it once and puts the runtime's own detail and grade over the result. The two are exclusive — under the RenoDX route the runtime builds its network for a single pass, so the panel greys the ladder out instead of handing over a pair it would resolve by itself. Measured on the 48-frame face clip, RenoDX carried ghosting 1.22 and still noise 1.80 against 1.29 and 1.92 for two stacked passes, for slightly more texture, at half the network time (5.2 ms against 10.1 ms a frame). **Stacking is the default**, because the shipped look is tuned on it. The route's own dialog — **RenoDX settings…**, greyed while the route is off — holds the grading knobs and each later pass's look; Apply asks before it discards values on a route that would not read them |
+| Passes | The ladder's first rung is the 0.44 **Small** model at 0.5x — 31 blocks, a differently trained network, single-pass by construction — and 1, 2 and 3 stack the Original 71-block one (the runtime's own F9 ladder), with switches for the later passes only: keep skin tones, predict the third pass instead of running the network, and skip the later passes' block group. Every extra pass is another full network run. **A later pass can carry a look of its own** instead of repeating pass 1: **Pass 2 · full look** and **Pass 3 · subtle look** under the ladder write a whole pass in one click — the third at half strength, which is where the measured ghosting stops paying for structure — and the per-pass dialog beside them edits all seven fields by hand. The look a fresh profile starts at, and what Reset returns to, is three passes at a 108 ms stabiliser with detail left neutral and shadows at 0.90: 60 ms left a visible beat between passes and raising detail as well over-corrected the picture the stabiliser had already softened. 4 is NVIDIA's ladder; this runtime reads a count it does not know as Small, so the player clamps it |
+| Temporal model | Three layers, and the panel owns all three. **The runtime's own temporal mode** (**Neural settings > Temporal mode**: off, fast history, low-frequency EMA, low-frequency + detail) makes the network fuse history. It is off unless the runtime's own config file already set it — the panel migrates that value on first read rather than overwriting a hand edit — and it runs only beside the Original model at one pass: beside Small the runtime renders the Original instead, and above one pass it runs no mode at all and says so in a status line. The panel greys the control out at both of those rungs rather than handing over a pair the runtime would resolve by itself, and the key is read once when the network is built, so a change reaches the next render and a running session keeps the mode it started with. **The guides are no longer constants**: the player runs an estimator of its own and hands the field to the runtime, which is what gives it anything to fuse. Which one follows the adapter's vendor rather than a probe — NVOFA where the vendor ships a flow engine (NVIDIA), **FidelityFX Optical Flow** on every other vendor (**the AMD default**), and CPU block matching (a 128x72 grid at 720p, 160x90 at 1080p) where the build carries no FidelityFX SDK. Both read ≈0.8 ms a frame at 720p, so the choice costs no time: it buys a field where the matcher had none. See [The motion field](#the-motion-field-is-not-a-constant). **The player's own accumulation** (**Temporal stability**, AMD default Off — every rung blends through a motion field and mochizuki's frame contract has no depth; see [Troubleshooting](docs/TROUBLESHOOTING.md#the-amd-render-looks-smeared-or-doubled-ghosting)) then blends the previous output through that same field, so it reprojects instead of smearing. FSR 4 reads the field too: see [Upscaling](#upscaling-and-frame-generation) |
 | Colour | SDR. The cache capture is 8-bit with ordered dither at Standard, and 10-bit at High and Lossless — P010 out of the FP16 history slot, written as HEVC Main10 at High and FFV1 at Lossless — which needs a Temporal stability rung on, because that is where the FP16 slot comes from. HDR is not wired on this path |
 | Speed | **≈10 ms a frame at 720p and ≈21 ms at 1080p** for the neural pass alone — one pass of the Original model with the guide pair on, submit p50 on an RX 9070 XT, of which the network itself is 4.6 and 8.5 ms. That is 4.0x and 1.9x a 24 fps frame's budget before a live session's own decode, present and encode. Every job pays a cold start of **6.9–10.0 s**. [Measured speeds](#render-speed-and-the-render-ahead-window) has the numbers, what they cost, and which of them are measured rather than derived. The upscale's and the interpolation's own cost is unmeasured, and so are 900 and 4K |
 | What it needs | The `amd-neural-runtime/` package — 325 MiB as a download, 844 MiB unpacked, from this fork's [`lmxxf-<line>` release](https://github.com/myth2loki/dlss5-video-player-on-amd/releases) — beside the module directory or at the root of the checkout, or named by `DLSS5_AMD_RUNTIME_DIR`. For the two newer stages, FidelityFX's `amd_fidelityfx_loader_dx12.dll` beside the exe, with `amd_fidelityfx_upscaler_dx12.dll` and `amd_fidelityfx_framegeneration_dx12.dll` — three files, in the packaged build, that [the notices](docs/THIRD-PARTY-NOTICES.md) list |
@@ -225,7 +227,7 @@ to end:
 | | 1280×720 | 1920×1080 |
 | --- | --- | --- |
 | Pixels | 921,600 | 2,073,600 |
-| Guide estimator, CPU | 0.8 ms | 1.4 ms |
+| Guide estimator, CPU matcher | 0.8 ms | 1.4 ms |
 | Submit p50 | **10.3 ms** | **21.4 ms** |
 | — of which the network | 4.6 ms | 8.5 ms |
 | A 24 fps frame's budget | 41.7 ms | 41.7 ms |
@@ -257,6 +259,51 @@ A live session on the last arm read 16.57 ms p50, rendered its whole 53 s tail
 replaced agree at 54.50 dB, so the bytes were the only thing lost:
 `DLSS5_AMD_GRID_GUIDES=0` and `DLSS5_AMD_DEPTH_EXPAND=0` restore either
 baseline for an A/B.
+
+### The motion field is not a constant
+
+The guide field is what gives the network anything to fuse and FSR 4 anything to
+reproject against, and the CPU block matcher used to be the only source on an AMD
+card (and is still the fallback when the build carries no FidelityFX SDK). Its
+floor is 5–6 px a frame, and below that it reports
+"nothing moved" — 0–2% of pixels — on exactly the slow pans this footage is made
+of. **FidelityFX Optical Flow** has no such floor: it is compute on the same
+card, 8×8 blocks over a seven-level luma pyramid, whole-pixel vectors, a forward
+field only, recorded on the frame's own list. Its texture goes into the same SRV
+slot NVOFA writes, so the resolve pass, FSR 4's reprojection and the depth proxy
+need no branch to tell them apart.
+
+The default follows the adapter's vendor (`VendorId`), not a probe. NVIDIA still
+asks NVOFA first; every other vendor takes the compute estimator as its own
+default instead of reaching it through a probe that is guaranteed to fail — which
+used to put `nvofapi64.dll is not present` in the log of every AMD session,
+reading like a fault where it was the expected path. **The two cost the same**:
+on a 720p→2560x1440 session with FSR 4 in service at 24 fps, guide time was
+0.780 ms for FidelityFX against 0.835 ms for the matcher, render-path p50 1.607
+against 1.636, and neither arm dropped a frame.
+
+**What the field buys.** On a synthetic pan it reads 3.99 for a 4 px/frame truth,
+so the field is real rather than merely dispatched, and real 1280×720 decode
+frames run through it with no visible ghosting. What it does *not* obviously buy
+is a better picture: the frame-paired output A/B reads "no measurable output-frame
+difference" (it counts frames better, worse or identical against the source, and
+this run scored 1 / 0 / 5 with a 0.0284 dB noise floor).
+FSR 4 does consume the field, but the gain is confined to synthetic pans
+(+2.7–3.4 dB at 2, 4 and 8 px), it is **negative at 1 px** (−2.94 dB), and on
+film it is absent. So the honest summary is: it removes a known blind spot and
+costs nothing, and the pictures a viewer watches are unchanged.
+`DLSS_VIDEO_MOTION_FLOW=auto|nvof|ffx|cpu|off` names an arm for an A/B — a named
+arm that cannot come up falls back to the matcher, never across to the other
+estimator, so the arms stay distinct. [MOTION-GUIDE-AB-zh.md](docs/MOTION-GUIDE-AB-zh.md)
+has the three-arm measurements, the decision rules that were fixed before the
+run, and the log lines a session must show.
+
+**The one thing it did not get.** Frame generation was measured as a third
+consumer of the same external field, and the answer is negative and published as
+such: [FG-EXTERNAL-MV-AB-zh.md](docs/FG-EXTERNAL-MV-AB-zh.md) ran six film clips
+under rules fixed before the run and found zero gain, with overshoot growing as
+motion grows. Frame generation keeps its own motion estimate; the player's rule
+is one estimator per consumer, never two for one.
 
 **What a chunk adds.** A chunk also pays its cold start and the
 join-and-validate step that turns its segments into a cache entry, neither of
@@ -596,9 +643,11 @@ that does.
   animation, PNG or JPEG for a photo, from the player or the command line. See
   [Save the result](#save-the-result).
 - **Tunes the model.** Change a neural setting (`Ctrl+N`) while paused and that
-  frame re-renders. On the AMD backend that dialog also carries the three
-  questions this backend adds: which model and how many passes (**Neural
-  passes** — Small at 0.5x, or one to three Original passes), whether the
+  frame re-renders. On the AMD backend that dialog also carries the questions
+  this backend adds: which route the frame takes (**NR route** — stack the
+  network, or run it once and hand the frame to the runtime's RenoDX grade),
+  which model and how many passes (**Neural passes** — Small at 0.5x, or one to
+  three Original passes, each later pass with a look of its own), whether the
   network fuses history at all (**Temporal mode**, the runtime's own key, at the
   one rung where it can run), and how much of its own output the player's
   accumulation holds on to (**Temporal stability**). ~~**DLSS > Processing
@@ -753,18 +802,49 @@ publishes its own builds only on
 re-uploads of DLSS 5 tools under other accounts have been reported carrying
 malware. This fork publishes nothing — see [Download](#download).
 
-## What's new in 0.28.2
+## What's new
 
-Upstream's release notes for the player this fork is built on. They are about
-the NVIDIA backend, which this fork does not support. This fork still publishes
-no release, but its tree carries a version: `VERSION` reads **0.29.2**, moved
-there by the AMD backend — 0.28.3 for the guide field, 0.29.0 for the ten-bit
-capture, 0.29.1 for the AMF encoder, 0.29.2 for a receipt wait this backend
-never writes — and its changes are the ones described above, in no numbered
-release.
+Upstream's release notes for the player this fork is built on are at the bottom of
+this section; they are about the NVIDIA backend, which this fork does not support.
+This fork still publishes no release, but its tree carries a version: `VERSION`
+reads **0.30.0**, moved there by the AMD backend — 0.28.3 for the guide field,
+0.29.0 for the ten-bit capture, 0.29.1 for the AMF encoder, 0.29.2 for a receipt
+wait this backend never writes, 0.30.0 for the two runtimes in one pack.
 
-**0.28.2** (2026-10-04). Neural settings now do what they say, and say what they
-do. Renders made with the default settings are reused.
+**Since 0.29.2** (2026-10-31 → 2026-11-15). What changed on the AMD backend, most
+of it in the last two weeks. None of it is in a numbered upstream release.
+
+- **Mochizuki is the default neural runtime** — a second runtime in the same pack,
+  Vulkan instead of HIP, building its network once per package (1.5 s warm) where
+  lmxxf pays 6.9–10.0 s on every job. [Two runtimes in one pack](#two-runtimes-in-one-pack).
+- **A motion field that is not a constant.** FidelityFX Optical Flow is now the
+  default guide source on every non-NVIDIA vendor, so slow pans no longer read as
+  "nothing moved". Same frame cost as the matcher; the picture a viewer watches is
+  unchanged, and the negative result for frame generation is published rather than
+  buried. [The motion field](#the-motion-field-is-not-a-constant).
+- **A route, and a look per pass.** **NR route** chooses between stacking the
+  network and letting the runtime's RenoDX layer grade a single pass; the later
+  passes each carry their own look, with a one-click **Pass 2 · full look** and
+  **Pass 3 · subtle look**. The shipped look moved to three passes, a 108 ms
+  stabiliser, neutral detail and shadows at 0.90, because the old defaults were
+  what the ghosting came from: pass 2 carried its own Cinematic grade at 1.02 on
+  top of local tone 2.0, which scored worst on every axis measured.
+- **The toolbar tells the truth about the two switches.** Turning upscaling off
+  no longer leaves `On · FSR4` on the pill: the interpolated island reads the
+  upscaler's *input* and resamples it to its own rung, so FSR 4 is not dispatched
+  behind a switch that says off, and a doubled cadence still does not alternate in
+  sharpness.
+- **Live playback stopped dropping frames in bursts**, from three separate causes
+  measured at the seams and on the presenting thread: the next segment is warmed
+  from the first frame of the current one (43/43 boundaries prefetched with a
+  2962 ms median lead, 3 dropped frames in 79 windows, against 237 in 105 when the
+  prefetch was disabled), the per-tick full-window repaints that cost 10–30 ms are
+  gone (hover over the toolbar went from 93 dropped frames to 0; WM_PAINT count
+  2110 → 33), and a boundary with no warmed file defers its open to the worker
+  instead of spawning a decoder on the thread that presents.
+
+**0.28.2** (2026-10-04, upstream). Neural settings now do what they say, and say
+what they do. Renders made with the default settings are reused.
 
 - **Apply changes the picture during neural playback** ([#15](https://github.com/2600th/dlss5-video-player/issues/15)).
   It used to restart the render and put the previous one straight back on
@@ -963,9 +1043,11 @@ how the toggle works, not what every source will gain.
 - **An upscale is an upscale, whichever engine writes it.** On the AMD backend
   FSR 4 has no jitter to work with and a constant exposure — a decoded frame is
   one fixed sample grid and has no camera — and while it does now reproject
-  against the guide estimator's motion and depth, that field is a block matcher's,
-  not a renderer's: its history can only be as good as a decoded frame and a
-  ten-pixel cell allow. FSR 1 and CAS are pure spatial filters. None of the three
+  against the guide estimator's motion and depth, that field is an estimator's,
+  not a renderer's: whole-pixel vectors at 8×8 blocks over a seven-level pyramid,
+  or a block matcher's ten-pixel cell where the SDK is absent. Its history can
+  only be as good as a decoded frame and that cell allow. FSR 1 and CAS are pure
+  spatial filters. None of the three
   invents detail the neural pass did not produce — they present that frame
   larger, with CAS adding edge acutance on the way.
 - **The two new stages cost time the neural pass did not.** On this backend both
@@ -1007,7 +1089,7 @@ stages.
 
 - [Build and test](docs/BUILDING.md), [runtime setup](docs/DLSS5_SETUP.md)
 - [Architecture](docs/ARCHITECTURE.md), [technical overview](TECHNICAL_OVERVIEW.md)
-- The AMD backend: [integration plan and status](docs/AMD-LMXXF-INTEGRATION-PLAN-REV2-zh.md) (Chinese), [what the temporal accumulation costs and how it is measured](docs/AMD-TEMPORAL-ACCUMULATION-zh.md), and [the runtime package](third_party/lmxxf/README.md)
+- The AMD backend: [integration plan and status](docs/AMD-LMXXF-INTEGRATION-PLAN-REV2-zh.md) (Chinese), [what the temporal accumulation costs and how it is measured](docs/AMD-TEMPORAL-ACCUMULATION-zh.md), [the motion field's three-arm A/B](docs/MOTION-GUIDE-AB-zh.md), [why frame generation does not read it](docs/FG-EXTERNAL-MV-AB-zh.md), and [the runtime package](third_party/lmxxf/README.md)
 - **Before changing the AMD backend**, read [the pitfalls list](docs/AMD-BACKEND-PITFALLS-zh.md) (Chinese): the shared files that may not be touched, the guide field's units and extents, the runtime config's write order, and the traps that have already cost an afternoon each
 - Hardware test records: the `VERIFICATION-*.md` files in [docs](docs/) — upstream's, on the NVIDIA backend
 - [Contributing](CONTRIBUTING.md): the checks a pull request must pass
