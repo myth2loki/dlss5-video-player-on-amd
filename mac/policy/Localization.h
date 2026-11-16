@@ -32,6 +32,13 @@ private:
         static const Map strings = {
             {L"app.title", L"DLSS 5 Video Player"},
             {L"menu.file", L"File"}, {L"menu.open", L"Open file\tCtrl+O"}, {L"menu.open_youtube", L"Open YouTube URL\u2026\tCtrl+L"}, {L"menu.exit", L"Exit"}, {L"menu.save_comparison", L"Save comparison image\u2026\tCtrl+Shift+S"},
+            // The macOS port's own rows. They sit here rather than as literals in
+            // AppMenu.cpp so the menu's text and the UI regression tests read
+            // from the same table as the Windows build's strings.
+            {L"menu.live_session", L"Keep converting while playing"},
+            {L"menu.clear_neural_cache", L"Clear converted video\u2026"},
+            {L"menu.open_cache_folder", L"Open cache folder"},
+            {L"menu.render_window", L"Render window"},
             {L"compare.save.dialog", L"Save the comparison as shown"}, {L"compare.save.saved", L"Comparison saved: "}, {L"compare.save.failed", L"The comparison image could not be saved"},
             {L"compare.save.no_render", L"no neural render"},
             {L"menu.playback", L"Playback"}, {L"menu.playpause", L"Play / Pause\tSpace   (Overlay: Ctrl+Alt+Space)"}, {L"menu.stop", L"Stop\tS"},
@@ -93,6 +100,11 @@ private:
             {L"compare.tip.mode", L"Compare mode (C)"}, {L"compare.tip.swap", L"Swap sides (X)"}, {L"compare.tip.loupe", L"Loupe (L)"}, {L"compare.tip.zoom_in", L"Zoom in (Z)"}, {L"compare.tip.zoom_out", L"Zoom out (Shift+Z)"},
             {L"compare.hint.hold", L"Hold on the picture to see the original"},
             {L"compare.hint.unavailable", L"Turn on Neural Rendering (D) to compare"}, {L"compare.tip.mode_cycle", L" (C and Shift+C step through the modes)"},
+            // Added by the macOS port for the CPU comparison views and the two
+            // rebuilt submenus. The Windows table had no "Blend" row of its own
+            // (Blend became the Mix), and no empty-list placeholder.
+            {L"menu.compare_blend", L"Blend"}, {L"menu.compare_mix", L"Mix"}, {L"menu.compare_gain", L"Difference gain"},
+            {L"menu.audio_none", L"No audio tracks"}, {L"menu.subtitles_none", L"No subtitle files found"},
             {L"compare.tag.original", L"ORIGINAL"}, {L"compare.tag.dlss", L"DLSS 5"},
             {L"compare.tag.difference", L"DIFFERENCE"}, {L"compare.tag.mix", L"MIX"}, {L"compare.tag.luma", L"LUMA"}, {L"compare.tag.color", L"COLOR"},
             {L"menu.final", L"Final image\t1"}, {L"menu.input", L"DLSS input\t2"}, {L"menu.mv", L"Motion vectors\t3"},

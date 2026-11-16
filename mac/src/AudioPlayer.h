@@ -19,21 +19,33 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 enum class AudioStartState {
     Playing,
     Paused,
 };
 
-// What the source's audio turned out to be. Empty when the file has no audio,
-// which is not an error: a video-only source plays silently.
+// What one of the source's audio streams turned out to be. `streamIndex` is the
+// index AMONG AUDIO STREAMS, which is exactly what ffmpeg's `-map 0:a:N` takes.
+// The extra fields are what AudioTrackPolicy needs to choose a default and name
+// the list: a disc rip that puts the commentary first is the reason they exist.
 struct AudioTrackInfo {
-    int streamIndex = -1;      // index among the audio streams, for -map 0:a:N
+    int streamIndex = -1;
     std::string codec;
     int channels = 0;
     int sampleRate = 0;
+    std::string language;
+    std::string title;
+    bool isDefault = false;
+    bool comment = false;
+    bool visualImpaired = false;
+    bool descriptions = false;
+    bool hearingImpaired = false;
+    std::optional<double> startSeconds;
 };
 
 class AudioPlayer {
@@ -46,10 +58,16 @@ public:
 
     // ffprobe, once per path: a seek respawns the child but the container has
     // not changed, and re-probing it would add a probe to every seek.
+    // `Probe` keeps the old one-track contract; `ProbeTracks` is what the
+    // player's Audio menu uses.
     static bool Probe(const std::string& path, AudioTrackInfo& out);
+    static bool ProbeTracks(const std::string& path, std::vector<AudioTrackInfo>& out);
 
+    // `audioIndex` is the position among audio streams. -1 asks the ported
+    // AudioTrackPolicy to choose the container's default (or the first ordinary
+    // track), which is what a viewer expects when a film carries several.
     bool Start(const std::string& videoPath, double seekSeconds = 0.0,
-               AudioStartState state = AudioStartState::Playing);
+               AudioStartState state = AudioStartState::Playing, int audioIndex = -1);
     bool Seek(double seconds);
     void Pause(bool paused);
     void SetVolume(float volume01);
@@ -75,6 +93,8 @@ public:
     bool ServiceDeviceChanges(double playerPositionSeconds = -1.0, bool playerPlaying = false);
 
     const AudioTrackInfo& Track() const { return m_track; }
+    const std::vector<AudioTrackInfo>& Tracks() const { return m_tracks; }
+    int TrackIndex() const { return m_audioIndex; }
 
 private:
     struct ReaderState;
@@ -89,6 +109,8 @@ private:
 
     std::string m_path;
     AudioTrackInfo m_track;
+    std::vector<AudioTrackInfo> m_tracks;
+    int m_audioIndex = -1;
     std::string m_probedPath;
 
     std::atomic<float> m_volume{1.0f};

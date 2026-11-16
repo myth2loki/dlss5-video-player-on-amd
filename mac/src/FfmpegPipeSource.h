@@ -83,6 +83,18 @@ public:
     // when it is behind and must catch up rather than replay.
     void DiscardBefore(int64_t number);
 
+    // Whether the child has exited and will produce no more frames.
+    //
+    // This is not "the queue is empty": a decoder that is merely behind reports
+    // empty without being finished, and a caller that confused the two would end a
+    // film the moment its pipe ran dry. SegmentPlayback needs exactly this
+    // distinction to tell a warming decoder from one at the end of its file.
+    bool Finished() const
+    {
+        std::scoped_lock lock(m_mutex);
+        return m_finished;
+    }
+
     int width() const { return m_info.width; }
     int height() const { return m_info.height; }
     double fps() const { return m_info.fps; }

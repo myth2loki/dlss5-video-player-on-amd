@@ -57,6 +57,15 @@ int main(int argc, char** argv)
     std::printf("  codec=%s  %d Hz  %d ch\n", track.codec.c_str(), track.sampleRate,
                 track.channels);
 
+    // The Audio menu is built from ALL audio streams, not just the first. A
+    // probe that reported one track would make the menu a single dead row.
+    std::vector<AudioTrackInfo> tracks;
+    Check(AudioPlayer::ProbeTracks(path, tracks), "ffprobe enumerates every audio stream");
+    Check(!tracks.empty(), "at least one audio track is listed");
+    Check(tracks.front().streamIndex == 0, "the first audio stream is 0:a:0");
+    Check(track.streamIndex >= 0 && track.streamIndex < int(tracks.size()),
+          "the default track is one of the enumerated tracks");
+
     AudioPlayer player;
     const auto started = player.Start(path, 0.0, AudioStartState::Playing);
     if (!started) {
@@ -65,6 +74,10 @@ int main(int argc, char** argv)
         return 0;
     }
     Check(player.Active(), "the sink opened");
+    Check(player.Tracks().size() == tracks.size(),
+          "Start caches the same track list the menu was built from");
+    Check(player.TrackIndex() >= 0 && player.TrackIndex() < int(player.Tracks().size()),
+          "Start records which stream is actually playing");
 
     // Audio is not instantaneous: the child has to be spawned and its first
     // frames decoded before the device has anything to consume. Measure that

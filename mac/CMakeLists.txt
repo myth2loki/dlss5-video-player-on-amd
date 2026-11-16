@@ -50,7 +50,9 @@ target_compile_options(dlss5-mac PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc
 
 # Metal and AppKit by framework rather than by hand-written linker flags, so a
 # missing framework is a configure error instead of a link error.
-target_include_directories(dlss5-mac PRIVATE src)
+# AudioPlayer.cpp now reads the ported AudioTrackPolicy.h for the default-track
+# decision; the policy headers include PlatformCompat.h, which lives in src/.
+target_include_directories(dlss5-mac PRIVATE src policy)
 
 target_link_libraries(dlss5-mac PRIVATE
     "-framework AppKit"
@@ -95,7 +97,7 @@ add_executable(dlss5-audio-tests
     src/CoreAudioSink.mm
     tests/AudioClockTests.cpp
 )
-target_include_directories(dlss5-audio-tests PRIVATE src)
+target_include_directories(dlss5-audio-tests PRIVATE src policy)
 target_compile_options(dlss5-audio-tests PRIVATE -Wall -Wextra
     $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
 target_link_libraries(dlss5-audio-tests PRIVATE
@@ -144,6 +146,16 @@ add_executable(dlss5-qt
     src/PlayerWindow.h
     src/AppMenu.cpp
     src/AppMenu.h
+    src/CompareCompositor.cpp
+    src/CompareCompositor.h
+    src/SubtitleTrack.cpp
+    src/SubtitleTrack.h
+    src/NeuralProcessor.cpp
+    src/RenderCache.cpp
+    src/RenderCache.h
+    src/SegmentPlayback.cpp
+    src/SegmentPlayback.h
+    src/NeuralProcessor.h
     src/VideoSurface.cpp
     src/VideoSurface.h
     src/TimelineWidget.cpp
@@ -194,3 +206,107 @@ target_link_libraries(dlss5-toolbar-tests PRIVATE Qt6::Widgets)
 target_compile_definitions(dlss5-toolbar-tests PRIVATE
     DISPLAYED_ICON_FONT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../assets/tabler/tabler-icons.ttf")
 add_test(NAME toolbar-render COMMAND dlss5-toolbar-tests)
+
+# The neural integration's own check: that the CLI and the weights are found, that
+# the availability logic answers correctly, and that the output path never
+# collides with an existing file. It cannot check the model's output - that is the
+# CLI's own job - but it is the part the player is responsible for getting wrong.
+add_executable(dlss5-neural-tests
+    src/NeuralProcessor.cpp
+    src/RenderCache.cpp
+    src/RenderCache.h
+    src/NeuralProcessor.h
+    tests/NeuralProcessorTests.cpp
+)
+target_include_directories(dlss5-neural-tests PRIVATE src policy)
+target_compile_options(dlss5-neural-tests PRIVATE -Wall -Wextra)
+target_link_libraries(dlss5-neural-tests PRIVATE Qt6::Core Qt6::Widgets)
+add_test(NAME neural-integration COMMAND dlss5-neural-tests)
+
+
+
+
+# The coverage arithmetic behind partial rendering. Pure functions, so this one
+# needs no window, no video and no weights: it is the part of the cache logic that
+# decides what a viewer sees and how long they wait, and it is worth checking on
+# its own.
+add_executable(dlss5-coverage-tests tests/CoverageTests.cpp)
+target_include_directories(dlss5-coverage-tests PRIVATE policy)
+target_compile_options(dlss5-coverage-tests PRIVATE -Wall -Wextra)
+add_test(NAME coverage COMMAND dlss5-coverage-tests)
+
+# The render cache's on-disk behaviour: which parts of a source have been
+# converted, and whether a reopen, a hand-deleted segment and a second source all
+# answer correctly.
+add_executable(dlss5-cache-tests
+    src/RenderCache.cpp
+    src/RenderCache.h
+    tests/RenderCacheTests.cpp
+)
+target_include_directories(dlss5-cache-tests PRIVATE src policy)
+target_compile_options(dlss5-cache-tests PRIVATE -Wall -Wextra)
+target_link_libraries(dlss5-cache-tests PRIVATE Qt6::Core)
+add_test(NAME render-cache COMMAND dlss5-cache-tests)
+
+
+# Pairing the original against the rendered segments. Runs entirely on fake
+# decoders: the cases that matter are the seams, and constructing them on purpose
+# is the only way to test them.
+add_executable(dlss5-segment-tests
+    src/SegmentPlayback.cpp
+    src/SegmentPlayback.h
+    src/FfmpegPipeSource.cpp
+    tests/SegmentPlaybackTests.cpp
+)
+target_include_directories(dlss5-segment-tests PRIVATE src policy)
+target_compile_options(dlss5-segment-tests PRIVATE -Wall -Wextra)
+target_link_libraries(dlss5-segment-tests PRIVATE Qt6::Core)
+add_test(NAME segment-playback COMMAND dlss5-segment-tests)
+
+
+# The same pairing against real ffmpeg decoders. Registered so the target cannot
+# quietly disappear from the build; without a video argument it reports a skip,
+# and `ctest -R segment-playback-live` with a video is the way to actually run it.
+add_executable(dlss5-segment-live-tests
+    src/SegmentPlayback.cpp
+    src/SegmentPlayback.h
+    src/FfmpegPipeSource.cpp
+    tests/SegmentPlaybackLiveTests.cpp
+)
+target_include_directories(dlss5-segment-live-tests PRIVATE src policy)
+target_compile_options(dlss5-segment-live-tests PRIVATE -Wall -Wextra)
+target_link_libraries(dlss5-segment-live-tests PRIVATE Qt6::Core)
+add_test(NAME segment-playback-live COMMAND dlss5-segment-live-tests)
+
+# Where a live session's next block goes. Pure arithmetic, but it is the two
+# failures the session actually had - a render that stopped after one block and
+# blocks that skipped the stretch between the render head and the playhead - so
+# it gets its own regression suite rather than being checked by eye in the UI.
+add_executable(dlss5-session-tests tests/SessionBlockTests.cpp)
+target_include_directories(dlss5-session-tests PRIVATE policy)
+target_compile_options(dlss5-session-tests PRIVATE -Wall -Wextra)
+add_test(NAME session-blocks COMMAND dlss5-session-tests)
+
+# The comparison views: pane arithmetic, the CPU Mix/Difference pass and the
+# offscreen PNG a viewer actually saves. QPainter works on a QImage without a
+# display server, so all of it is testable with QT_QPA_PLATFORM=offscreen.
+add_executable(dlss5-compare-tests
+    src/CompareCompositor.cpp
+    src/VideoSurface.cpp
+    tests/CompareComposeTests.cpp
+)
+target_include_directories(dlss5-compare-tests PRIVATE src policy)
+target_compile_options(dlss5-compare-tests PRIVATE -Wall -Wextra)
+target_link_libraries(dlss5-compare-tests PRIVATE Qt6::Widgets)
+add_test(NAME compare-views COMMAND dlss5-compare-tests)
+set_tests_properties(compare-views PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# Sidecar subtitles and the audio-track default/labels that fill the two menus.
+add_executable(dlss5-media-list-tests
+    src/SubtitleTrack.cpp
+    tests/MediaListTests.cpp
+)
+target_include_directories(dlss5-media-list-tests PRIVATE src policy)
+target_compile_options(dlss5-media-list-tests PRIVATE -Wall -Wextra)
+target_link_libraries(dlss5-media-list-tests PRIVATE Qt6::Core)
+add_test(NAME media-lists COMMAND dlss5-media-list-tests)

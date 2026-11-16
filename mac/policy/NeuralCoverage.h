@@ -131,3 +131,19 @@ inline double CoveredFraction(const std::vector<CoverageSpan>& covered, Coverage
     if (range.Empty()) return 0.0;
     return double(CoveredDuration100ns(covered, range)) / double(range.Width());
 }
+
+// 100 ns ticks per second, the unit every span here is expressed in. Named so the
+// conversion appears once rather than as a literal at every call site - the
+// Windows build passes the same number around as `10000000`, which reads as a
+// typo until you count the digits.
+inline constexpr int64_t kTicksPerSecond = 10'000'000;
+
+inline int64_t SecondsToTicks(double seconds)
+{
+    return int64_t(seconds * double(kTicksPerSecond));
+}
+
+inline double TicksToSeconds(int64_t ticks)
+{
+    return double(ticks) / double(kTicksPerSecond);
+}

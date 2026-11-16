@@ -1,5 +1,7 @@
 #include "AudioPlayer.h"
 
+#include "AudioTrackPolicy.h"
+
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
@@ -65,6 +67,32 @@ std::string FormatDouble(double value)
     return out.str();
 }
 
+// The ported Windows rule for which track to start on, applied to the probed
+// list rather than to a second ffprobe call.
+size_t DefaultAudioIndex(const std::vector<AudioTrackInfo>& tracks)
+{
+    std::vector<audio_track::Track> policy;
+    policy.reserve(tracks.size());
+    for (const AudioTrackInfo& info : tracks) {
+        audio_track::Track track;
+        track.audioIndex = info.streamIndex;
+        track.language = info.language;
+        track.title = info.title;
+        track.codec = info.codec;
+        track.channels = info.channels;
+        track.sampleRate = info.sampleRate;
+        track.startSeconds = info.startSeconds;
+        track.isDefault = info.isDefault;
+        track.comment = info.comment;
+        track.visualImpaired = info.visualImpaired;
+        track.descriptions = info.descriptions;
+        track.hearingImpaired = info.hearingImpaired;
+        policy.push_back(std::move(track));
+    }
+    const size_t chosen = audio_track::SelectDefault(policy);
+    return chosen == audio_track::kNoTrack ? 0 : chosen;
+}
+
 } // namespace
 
 struct AudioPlayer::ReaderState {
@@ -101,20 +129,23 @@ struct AudioPlayer::ReaderState {
 
 AudioPlayer::~AudioPlayer() { Stop(); }
 
-bool AudioPlayer::Probe(const std::string& path, AudioTrackInfo& out)
+bool AudioPlayer::ProbeTracks(const std::string& path, std::vector<AudioTrackInfo>& out)
 {
+    // One ffprobe call, one line per field, one block per audio stream. The
+    // disposition and tag keys are what AudioTrackPolicy needs to avoid opening
+    // a director's commentary just because the ripper listed it first.
     std::ostringstream command;
     command << kFfprobe << " -v error -select_streams a"
-            << " -show_entries stream=index,codec_name,channels,sample_rate"
+            << " -show_entries stream=index,codec_name,channels,sample_rate,start_time"
+            << ":stream_tags=language,title"
+            << ":stream_disposition=default,comment,visual_impaired,descriptions,hearing_impaired"
             << " -of default=noprint_wrappers=1 " << Quote(path);
     const std::string text = RunCapture(command.str());
     if (text.empty()) return false;
 
-    // Each stream is a block, one key per line, blocks separated by nothing -
-    // so a second "index=" starts the next one. Only the first stream is used
-    // here; the Windows player's track menu is phase 3.
-    AudioTrackInfo info;
-    bool found = false;
+    std::vector<AudioTrackInfo> tracks;
+    AudioTrackInfo current;
+    bool inBlock = false;
     std::istringstream lines(text);
     std::string line;
     while (std::getline(lines, line)) {
@@ -123,34 +154,74 @@ bool AudioPlayer::Probe(const std::string& path, AudioTrackInfo& out)
         const std::string key = line.substr(0, equals);
         const std::string value = line.substr(equals + 1);
         if (key == "index") {
-            if (found) break;
-            info.streamIndex = 0;
-            found = true;
-        } else if (key == "codec_name") {
-            info.codec = value;
-        } else if (key == "channels") {
-            info.channels = std::atoi(value.c_str());
-        } else if (key == "sample_rate") {
-            info.sampleRate = std::atoi(value.c_str());
+            // A second index starts a new stream block. ffprobe reports the
+            // GLOBAL stream index here; `-map 0:a:N` counts only audio streams,
+            // so the position in this vector is the index that matters.
+            if (inBlock) tracks.push_back(current);
+            current = AudioTrackInfo{};
+            current.streamIndex = int(tracks.size());
+            inBlock = true;
+            continue;
+        }
+        if (!inBlock) continue;
+        if (key == "codec_name") current.codec = value;
+        else if (key == "channels") current.channels = std::atoi(value.c_str());
+        else if (key == "sample_rate") current.sampleRate = std::atoi(value.c_str());
+        else if (key == "TAG:language") current.language = value;
+        else if (key == "TAG:title") current.title = value;
+        else if (key == "DISPOSITION:default") current.isDefault = value == "1";
+        else if (key == "DISPOSITION:comment") current.comment = value == "1";
+        else if (key == "DISPOSITION:visual_impaired") current.visualImpaired = value == "1";
+        else if (key == "DISPOSITION:descriptions") current.descriptions = value == "1";
+        else if (key == "DISPOSITION:hearing_impaired") current.hearingImpaired = value == "1";
+        else if (key == "start_time") {
+            char* end = nullptr;
+            const double seconds = std::strtod(value.c_str(), &end);
+            if (end != value.c_str() && std::isfinite(seconds)) current.startSeconds = seconds;
         }
     }
-    if (!found) return false;
-    out = info;
+    if (inBlock) tracks.push_back(current);
+    if (tracks.empty()) return false;
+    out = std::move(tracks);
     return true;
 }
 
-bool AudioPlayer::Start(const std::string& videoPath, double seekSeconds, AudioStartState state)
+bool AudioPlayer::Probe(const std::string& path, AudioTrackInfo& out)
+{
+    std::vector<AudioTrackInfo> tracks;
+    if (!ProbeTracks(path, tracks)) return false;
+
+    // Ordinary tracks first, the container's default among them; a commentary
+    // wins only when there is nothing else.
+    out = tracks[DefaultAudioIndex(tracks)];
+    return true;
+}
+
+bool AudioPlayer::Start(const std::string& videoPath, double seekSeconds, AudioStartState state,
+                         int audioIndex)
 {
     Stop();
 
     m_path = videoPath;
-    AudioTrackInfo track;
-    if (!Probe(videoPath, track)) {
+    // Probing is a child process and a seek respawns this one; the container
+    // has not changed, so the answer is cached per path.
+    if (m_probedPath != videoPath) {
+        if (!ProbeTracks(videoPath, m_tracks)) m_tracks.clear();
+        m_probedPath = videoPath;
+    }
+    if (m_tracks.empty()) {
         // No audio track. Not a failure: a video-only file plays silently and
         // the caller falls back to its own clock.
         m_track = {};
+        m_audioIndex = -1;
         return false;
     }
+
+    // A caller that did not name a track gets the same default Probe() picks.
+    if (audioIndex < 0 || audioIndex >= int(m_tracks.size()))
+        audioIndex = int(DefaultAudioIndex(m_tracks));
+    m_audioIndex = std::clamp(audioIndex, 0, int(m_tracks.size()) - 1);
+    AudioTrackInfo track = m_tracks[size_t(m_audioIndex)];
     m_track = track;
 
     auto reader = std::make_shared<ReaderState>();
@@ -235,7 +306,9 @@ void AudioPlayer::ReaderLoop(std::shared_ptr<ReaderState> state, double seekSeco
     args.push_back("-i");
     args.push_back(path);
     args.push_back("-map");
-    args.push_back("0:a:0?");
+    // The selected audio stream. `?` keeps a video-only file from being an
+    // error here, though Start() has already answered that case.
+    args.push_back(std::string("0:a:") + std::to_string(std::max(0, track.streamIndex)) + "?");
     args.push_back("-vn");
     args.push_back("-sn");
     args.push_back("-dn");
@@ -326,7 +399,9 @@ bool AudioPlayer::Seek(double seconds)
 {
     const bool wasPaused = Paused();
     const float volume = m_volume.load();
-    if (!Start(m_path, seconds, wasPaused ? AudioStartState::Paused : AudioStartState::Playing))
+    if (!Start(m_path, seconds,
+               wasPaused ? AudioStartState::Paused : AudioStartState::Playing,
+               m_audioIndex))
         return false;
     SetVolume(volume);
     return true;

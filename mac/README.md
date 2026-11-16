@@ -1,4 +1,4 @@
-# macOS 移植 — 阶段 1-4 完成
+# macOS 移植 — 阶段 1-5 + 对比视图 / 音轨 / 字幕
 
 这个目录不是完整的播放器，是一个**逐层验证**的移植：先证明最贵的两个不确定性
 （ffmpeg 管道能不能原样用、Metal 能不能干净地接上），再证明音频时钟能不能
@@ -51,7 +51,7 @@
 | 排除的文件 | 5 个，各有明确理由（见下） |
 | 语义验证 | RECT 右上开区间、COLORREF 0x00BBGGRR、MulDiv 四舍五入、`%ld` 往返、UTF-8 无损 |
 
-`ctest` 五项全绿。运行：`cmake -S mac -B mac/build -G Ninja && cmake --build mac/build && ctest --test-dir mac/build`
+`ctest` 14 项全绿（含 `compare-views` 的离屏 PNG 合成验证与 `media-lists` 的字幕/音轨验证）。运行：`cmake -S mac -B mac/build -G Ninja && cmake --build mac/build && ctest --test-dir mac/build`
 
 ### 界面（阶段 4）
 
@@ -61,6 +61,41 @@
 | 编译 | 零警告 |
 | 实际运行 | 2118×1046 视频正常播放，工具栏图标全部渲染，时间轴进度跟随 |
 | 状态栏 | `2118 × 1046 · 30.00 fps · audio drives the clock` |
+
+### 神经渲染缓存（阶段 5）
+
+仿 Windows 的 `NeuralCoverage` / `SynchronizedPlayback` / `LiveSessionPolicy`，
+**不再需要把整部影片转换完才有画面**：
+
+| 项 | 实现 |
+|---|---|
+| 区间渲染 | `mlxdlss --start-frame N --frames M`，两端向下取整到帧边界 |
+| 缓存 | `<cache>/<source-key>/<kind>/segments/` + `coverage.json`；key = 路径 + 大小 + 修改时间 |
+| 配对播放 | 原片解码器（借用窗口已有的）+ 片段单例解码器，按时间戳配对，片段帧号平移回源时间轴 |
+| 对比切换 | 画面左下角 `DLSS 5` / `ORIGINAL` 两个按钮，也可用 Compare 菜单或 `D` 键；暂停时重绘**同一帧** |
+| 活会话 | 一块渲完自动接下一块，块长 10/20/30/60/120 s 可选（默认 30 s），低水位、seek 重定向、开/关、片尾收尾 |
+| 缓存管理 | Neural 菜单里可清除当前影片的全部片段、打开缓存目录；渲染结果文件不存在时不记入覆盖 |
+| 2x 插帧段 | 片段自带帧率，60 fps 段能正确配对 30 fps 原片 |
+| 设置 | 块长、对比视图、音量、最近使用的 feature 存 QSettings |
+
+### 对比视图 / 音轨 / 字幕（阶段 6）
+
+| 项 | 实现 |
+|---|---|
+| 八种模式 | DLSS 5、Original、Blend、Split、Wipe、Difference、Side by side、2x2。编号沿用 Windows `ComparisonMode`，pane 布局与像素算法在 `policy/CompareCompose.h` |
+| CPU 合成 | `CompareCompositor` 只在需要时做一次全帧 Mix / Difference / Spatial，结果按参数缓存；`VideoSurface` 用 QPainter 裁剪 pane，不需要第二个图形 API |
+| 交互 | Split/Wipe 分割线可点击拖动，`C`/`Shift+C` 循环模式，`[`/`]` 调 Mix（0–200%），`Shift+[`/`Shift+]` 调 Difference 增益，`X` 交换两侧，2x2 第四格的 Mix 可选；**按住画面 150 ms 窥看原片**（`compare_gesture` 策略），松开即恢复 |
+| 保存对比图 | File ▸ Save comparison image（`Ctrl+Shift+S`），导出所见即所得的 PNG；Side by side 输出 2W×H，2x2 输出 2W×2H |
+| 音轨 | `AudioPlayer::ProbeTracks` 用一次 ffprobe 枚举全部音轨，按 `AudioTrackPolicy` 选默认（跳过评论轨），Playback ▸ Audio 可在播放中切换，ffmpeg `-map 0:a:N` 跟随 |
+| 字幕 | 自动发现同名 `.srt/.vtt/.ass/.ssa` 外挂字幕，支持 UTF-8 与 GB18030、时间偏移、HTML/ASS 标记清理；QPainter 描边绘制，Playback ▸ Subtitles 可关闭/切换/手动加载 |
+| 设置 | 模式、Mix、增益、分割线位置、Swap、亮度差、第二 Mix 全部存 QSettings |
+
+**必须说清的一件事**：本机神经渲染实测约 **0.35x 实时**（95 ms/帧 @
+2118×1046），Windows 那台是 2.3x。所以渲染永远追不上播放，播放时大部分画面
+仍是原片，缓存是在后台持续累积的；回拖、重播或下次打开时才能看到已转换的
+区间。状态栏在这种情况会提示"渲染落后于播放"。这不是 bug，是这台机器的
+算力上限，调度策略已经按它调整（块从渲染头连续推进，而不是从播放头起跳，
+否则每块都会跳过中间那一段）。
 
 **Qt6 是怎么装的（Homebrew 装不上）**：`brew install qt` 在最后一步 `disclaim`
 时调用 `sandbox-exec`，而本机策略拒绝它（`sandbox_apply: Operation not
@@ -185,31 +220,32 @@ policy 层写的是 `RECT`、`COLORREF`、`UINT`、`%ld`——这是**词汇**�
 
 ## 还没做的
 
-Qt 窗口现在能播放、能拖动时间轴、能按按钮，但它只是**骨架**。原版 `src/main.cpp`
-16257 行里的这些，一行都还没搬：
+阶段 6 之后，播放、渲染缓存、双帧配对、八种对比、音轨、外挂字幕都是可用的。
+剩下的是**需要另一条呈现路径或大量 UI** 的能力，不是播放逻辑：
 
-- **起始页**（`StartScreenPolicy.h` 已在 policy 层）：最近播放、示例视频、能力面板
-- **Compare bar**（`CompareBarPolicy.h` 已在 policy 层）：原始 / 渲染同帧对比
-- **字幕**（`SubtitleOverlay.cpp` 714 行 + `SubtitlePolicy.h` 已在 policy 层）
-- **音量滑块与气泡**（`SliderPolicy.h` 已在 policy 层）：现在只有静音开关
-- **时间轴缩略图**（`TimelinePolicy.h` 的 `ThumbnailArguments` 已在 policy 层）
-- **菜单栏**（`AppMenu.cpp` 949 行，未移植——它调 Win32 `HMENU`）
-- **六个对话框**：YouTube 输入、时间码、调整面板、快捷键表等
-- **音轨切换**：目前只播第一条音轨
-
-好消息是其中五项的判断逻辑**已经在 `mac/policy/` 里编译通过了**，剩下的是
-QPainter 绘制和 Qt 事件。
+- **对比的进阶部分**：空间蒙版（手绘遮罩）、Zoom / Loupe、
+  线性光下的 Difference（当前在 sRGB 字节上算，是近似）、Compare bar 工具条。
+  `CompareMaskPolicy.h` / `CompareViewPolicy.h` / `CompareBarPolicy.h` 的判断逻辑
+  都已在 policy 层，缺的是绘制与手势。
+- **实时插帧**：播放中把 swapchain 速率翻倍的 `PlaybackFrameGeneration`。
+  离线 2x 导出是有的，也能作为片段播放，但播放仍按源帧率走。
+- **内嵌字幕 / 位图字幕 / 语音识别与翻译**：当前只解析同名外挂文本文件；
+  `SubtitleOverlay.cpp` 的 libass 通道、PGS/VobSub 与整条翻译链未移植。
+- **起始页**：最近播放、示例视频、能力面板（`StartScreenPolicy.h` 已在 policy 层）。
+- **时间轴缩略图**（`TimelinePolicy.h` 的 `ThumbnailArguments` 已在 policy 层）。
+- **完整缓存管理器**：Windows `NeuralCacheManager` 的 SHA-256 内容校验、
+  staging/promote、quarantine、容量淘汰；mac 目前只校验文件存在与帧数。
+- **HDR 呈现 / NV12 协商 / 超分（RTX VSR、DLSS SR）**：需要 Metal 呈现路径。
 
 ### 建议的下一步
 
-1. **起始页**：`StartScreenPolicy.h` 已经有完整的 `IdleSurfaceLayout`（标题、
-   副标题、两个动作、最近瓷砖），画出来就是一个像样的落地页。
-2. **Compare bar**：`CompareBarPolicy.h` + `CompareViewPolicy.h` 都在，
-   而且这是原项目最核心的价值 —— 但需要先有渲染缓存，否则没有"渲染"可比。
-3. **字幕**：`SubtitleOverlay` 输出的已经是预乘 BGRA，`QImage` 用
-   `Format_ARGB32_Premultiplied` 直接包，叠在视频上是一行 `drawImage`。
-4. **音轨切换**：`AudioPlayer::Probe` 已经读了所有音轨，缺 UI 选择器和
-   `-map 0:a:N` 的接线。
+1. **Compare bar**：`CompareBarPolicy.h` 的分档布局已移植，把模式/Mix/增益/交换
+   从菜单挪到控制条上方，比每次开菜单直观得多。
+2. **Loupe**：`CompareViewPolicy.h` 的 `compare_loupe` 是纯函数，接进
+   `VideoSurface` 的鼠标事件即可（按住窥看已经接好）。
+3. **起始页**：`IdleSurfaceLayout`（标题、副标题、两个动作、最近瓷砖）画出来
+   就是一个像样的落地页。
+4. **时间轴缩略图**：现有 ffmpeg 管道加一路低分辨率 seek 解码即可。
 
 ### 一个值得考虑的工程问题
 
@@ -224,10 +260,11 @@ QPainter 绘制和 Qt 事件。
 
 - **不要用 AVPlayer 偷懒。** 原项目的价值在渲染缓存、seek 后原始/渲染
   混播、compare views——这些都建立在自己的帧管线上，AVPlayer 接不进去。
-- **不要现在碰神经渲染。** 它需要 AMD 的 HIP/Vulkan runtime，macOS 上
-  没有等价物（Apple GPU 走 Metal，`LmxxfNrRuntime.dll` 和
-  `MochizukiNrRuntime.dll` 都是 D3D12/HIP/Vulkan）。这一层要么等上游出
-  Metal 后端，要么自己在 CoreML 上重做一遍 —— 那是另一个项目。
+- **不要试图在 macOS 上重写神经渲染模型。** 本移植走的是同仓库的
+  `mlxdlss` CLI（离线按区间产出片段），不是把 `LmxxfNrRuntime.dll` /
+  `MochizukiNrRuntime.dll` 的 D3D12/HIP/Vulkan 后端搬过来。要实时推理得有
+  Metal/CoreML 后端，那是另一个项目；这里的价值在于缓存、配对、对比这条
+  播放链路与后端无关。
 - **不要为了"跨平台"改上游的 `src/`。** `mac/policy/` 是副本，`src/` 是
   上游。一旦开始两边同时改，就再也说不清哪边是对的。上游的修复照原样
   cherry-pick 到 `mac/policy/`，并保持"只改 include"这个约束——它现在能被
