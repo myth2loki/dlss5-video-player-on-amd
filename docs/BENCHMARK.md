@@ -1,6 +1,6 @@
 # Neural quality benchmark
 
-_Verified against 0.28.0 (4f3150a) on 2026-10-02._
+_Version stamp retired (old: 0.28.0 / 4f3150a / 2026-10-02). Current version and scope: see the repository README.md._
 
 The benchmark exists to give quality claims a repeatable test set: measured
 neural time / FPS / VRAM / flicker / OCR / face consistency / colour shift /

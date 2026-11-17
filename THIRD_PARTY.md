@@ -1,6 +1,6 @@
 # Third-party components
 
-_Verified against 0.28.0 (4f3150a) on 2026-10-02._
+_Version stamp retired (old: 0.28.0 / 4f3150a / 2026-10-02). Current version and scope: see the repository README.md._
 
 The project source is MIT-licensed, but the release interoperates with and may
 redistribute components under separate terms. No upstream endorsement is

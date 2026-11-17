@@ -1,6 +1,6 @@
 # Security
 
-_Verified against 0.28.0 (4f3150a) on 2026-10-02._
+_Version stamp retired (old: 0.28.0 / 4f3150a / 2026-10-02). Current version and scope: see the repository README.md._
 
 The player launches its package-local `ffmpeg.exe`, `ffprobe.exe`,
 `yt-dlp.exe`, and `deno.exe` helpers without a command shell. Playback falls

@@ -1,6 +1,6 @@
 # Building and testing
 
-_Verified against 0.28.0 (4f3150a) on 2026-10-02._
+_Version stamp retired (old: 0.28.0 / 4f3150a / 2026-10-02). Current version and scope: see the repository README.md._
 
 Use Windows x64, Visual Studio 2022 or newer with the **Desktop development with
 C++** workload and Windows SDK, CMake 3.24 or newer, Git and PowerShell. Run the

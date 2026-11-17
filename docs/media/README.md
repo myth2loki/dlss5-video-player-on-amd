@@ -6,7 +6,7 @@
 > upstream's and show the same player; the AMD backend's own captures are at the
 > bottom of this page.
 
-_Verified against 0.28.0 (4f3150a) on 2026-10-02._
+_Version stamp retired (old: 0.28.0 / 4f3150a / 2026-10-02). Current version and scope: see the repository README.md._
 
 [Watch the MP4](neural-comparison-demo.mp4) ·
 [Looping preview](neural-comparison-preview.webp) ·

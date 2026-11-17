@@ -1,5 +1,7 @@
 # 统一 GPU 资源调度器实现方案
 
+> **状态注记（2026-11-17）：** 本文的“P0/P1 已实现”指 GPU 资源控制面（观测/租约/准入/降级接口），默认 Observe、不强制接管；Windows 真机影子数据仍待补。ASR/翻译字幕链路不在本文范围内，见 [REALTIME-SUBTITLE-PLAN-zh.md](REALTIME-SUBTITLE-PLAN-zh.md) 的状态注记。
+
 ## 文档状态
 
 - 状态：P0/P1 已实现，待 Windows 11 + RX 9070 XT 构建验证

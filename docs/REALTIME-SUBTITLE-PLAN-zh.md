@@ -1,5 +1,7 @@
 # DLSS 5 Video Player AMD 实时字幕与统一 GPU 调度技术方案
 
+> **状态注记（2026-11-17）：** 本文是 2026-10-24 的研究设计稿，文内“尚未实现”描述的是当时分支基线，不是当前 fork 状态。当前 README 已记录 whisper.cpp / llama.cpp 字幕链；本文的分阶段目标仅作设计参考。其 §10 所依赖的 GPU 调度器 P0/P1 控制面已实现、默认 Observe，见 [GPU-SCHEDULER-DESIGN-zh.md](GPU-SCHEDULER-DESIGN-zh.md)。
+
 ## 文档状态
 
 - 状态：研究与设计阶段，尚未实现

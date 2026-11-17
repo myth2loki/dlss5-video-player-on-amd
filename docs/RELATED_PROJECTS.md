@@ -1,6 +1,6 @@
 # Related DLSS 5 neural-rendering projects
 
-_Verified against 0.28.0 (4f3150a) on 2026-10-02._
+_Version stamp retired (old: 0.28.0 / 4f3150a / 2026-10-02). Current version and scope: see the repository README.md._
 
 Every link, and every fact in "Where this player fits" and "The landscape", was
 checked on the project's public page on 2026-10-02. Star counts are that day's
