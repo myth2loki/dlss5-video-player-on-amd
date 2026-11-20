@@ -35,6 +35,9 @@ constexpr std::array kToolbarDefinitions{
     // against. Not required at narrow widths - the menu row still reaches it -
     // so a small window drops this before it drops play/pause.
     ToolbarDefinition{ToolbarAction::ToggleSubtitles, 54, 0, false},
+    // DLNA cast, beside subtitles: an icon button in group 0, optional at
+    // narrow widths (the DLNA device menu reaches it if the bar drops it).
+    ToolbarDefinition{ToolbarAction::Cast, 54, 0, false},
     ToolbarDefinition{ToolbarAction::ToggleNeuralRendering, 270, 1, true, kFeaturePillNarrowWidthDip},
     // 270 dip, the same as the neural pill beside it and for the same kind of
     // measurement: the widest arm is now a reason rather than "Unavailable".
@@ -521,6 +524,12 @@ bool IsToolbarActionEnabled(ToolbarAction action, ToolbarAvailability availabili
         // reason to disable the button for the duration of a drag.
         return availability.mediaLoaded && availability.rendererReady &&
                availability.playbackFrameGenerationAvailable;
+    case ToolbarAction::Cast:
+        // A loaded source is all that is needed: casting encodes the presented
+        // frame on its own realtime path, independent of the neural renderer.
+        // Keep it live while casting (active/working) so a second press can
+        // toggle off even mid-connect.
+        return availability.castAvailable || availability.castActive || availability.castWorking;
     case ToolbarAction::Adjustments:
     case ToolbarAction::DebugView:
         return availability.mediaLoaded && availability.rendererReady;

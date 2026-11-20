@@ -407,6 +407,10 @@ public:
     // where the old synchronous path left the GPU idle for the whole CPU stage.
     bool EnqueueEvaluatedFrameCapture();
     uint32_t PendingCaptureCount() const { return m_capturePending; }
+    // The frameNumber of the most recently evaluated frame. The DLNA cast
+    // session records this at Start as the drain base: the first captured frame
+    // it feeds must have a frameNumber >= this, or it is stale backlog.
+    uint64_t LastRenderedFrameNumber() const { return m_lastRenderedId.frameNumber; }
     // On success every byte of capture.pixels is overwritten, and the buffer is only
     // resized when it does not already hold exactly one frame. Hand back the same
     // CapturedVideoFrame each time and the per-frame allocation and its full-frame

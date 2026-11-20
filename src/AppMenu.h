@@ -42,6 +42,14 @@ inline constexpr UINT IDM_PAUSE_NEURAL_RENDER = 209;
 // upscaling rungs: CheckMenuRadioItem clears every command in the range it is
 // given, so exactly one track carries the mark. Sixteen is far past what any
 // consumer container carries and keeps the block clear of IDM_NEURAL_RENDERING.
+// DLNA cast device menu: one command per discovered device, keyed by index
+// into the DeviceMenu() snapshot, plus a refresh item. Routed in HandleCommand
+// before its switch, like the audio/subtitle track blocks. 500-599 stay unused
+// by the main menu (see the menu tests), so the block lives there.
+inline constexpr UINT IDM_CAST_DEVICE_FIRST = 500;
+inline constexpr UINT IDM_CAST_DEVICE_COUNT = 16;
+inline constexpr UINT IDM_CAST_REFRESH = 520;
+inline constexpr UINT IDM_CAST_STOP = 521;
 inline constexpr UINT IDM_AUDIO_TRACK_FIRST = 210;
 inline constexpr UINT IDM_AUDIO_TRACK_COUNT = 16;
 // Playback > Audio > Passthrough to receiver (AC-3/E-AC-3/DTS), a checkbox

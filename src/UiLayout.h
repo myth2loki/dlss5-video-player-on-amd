@@ -21,7 +21,11 @@ enum class ToolbarAction {
     // The one press that gets subtitles out of a film: it listens to the audio
     // when there is no track, translates whatever it finds, and shows the two
     // together. Beside Mute, because Mute is the sound and this is the words.
-    ToggleSubtitles, None
+    ToggleSubtitles,
+    // DLNA cast: opens the device menu; selecting the active device again
+    // stops casting. Appended before None so the sentinel stays last.
+    Cast,
+    None
 };
 
 struct ToolbarItem {
@@ -59,6 +63,12 @@ struct ToolbarAvailability {
     bool subtitlesAvailable{false};
     bool subtitlesActive{false};
     bool subtitlesWorking{false};
+    // DLNA cast is available with a loaded source; it needs no renderer (it
+    // encodes the evaluated frame on a separate realtime path).
+    bool castAvailable{false};
+    bool castActive{false};
+    bool castWorking{false};
+    float castProgress{-1.0f};
 };
 
 class YouTubeResolutionLifecycle {

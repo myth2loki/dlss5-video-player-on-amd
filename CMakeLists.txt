@@ -321,6 +321,7 @@ target_link_libraries(dlss_video_player_common INTERFACE
     d3d12 d3d11 dxgi dxguid d3dcompiler
     mfplat mfreadwrite mfuuid
     ole32 shell32 shlwapi comdlg32 comctl32 user32 gdi32 winmm dwmapi winhttp bcrypt dbghelp wintrust
+    ws2_32
     ${DLSS_NGX_LIBRARY})
 
 # How the code that ships is compiled, wherever it is compiled: Control Flow
@@ -409,6 +410,14 @@ add_library(player_app OBJECT
     src/SubtitleOverlay.cpp src/SubtitleOverlay.h src/SubtitlePolicy.h
     src/SubtitleTranslator.cpp src/SubtitleTranslator.h src/SubtitleTranslatePolicy.h
     src/SpeechToText.cpp src/SpeechToText.h src/SubtitleSpeechPolicy.h src/EngineChild.h
+    # DLNA casting: control plane (SSDP/SOAP), encoder/HTTP children, session.
+    # Policy headers are pure and unit-tested separately; these are the .cpp TUs.
+    src/CastDevicePolicy.h src/CastSoap.h src/CastHttp.h
+    src/CastDiscovery.cpp src/CastDiscovery.h
+    src/CastControl.cpp src/CastControl.h
+    src/CastEncoder.cpp src/CastEncoder.h
+    src/CastHttpServer.cpp src/CastHttpServer.h
+    src/CastSession.cpp src/CastSession.h
     src/RecentMedia.cpp src/RecentMedia.h
     src/SynchronizedPlayback.cpp src/SynchronizedPlayback.h
     src/NeuralReceipt.cpp src/NeuralReceipt.h
@@ -602,6 +611,11 @@ if(BUILD_TESTING)
     dlss_video_player_test(RuntimeLockTests tests/RuntimeLockTests.cpp)
     dlss_video_player_test(RangeSelectionTests tests/RangeSelectionTests.cpp)
     dlss_video_player_test(FrameIdentityTests tests/FrameIdentityTests.cpp)
+    # DLNA cast policy suites: pure logic (UDN identity / liveness, SOAP, the
+    # HLS file server allowlist and Range parser). No TV, socket or ffmpeg needed.
+    dlss_video_player_test(CastDevicePolicyTests tests/CastDevicePolicyTests.cpp)
+    dlss_video_player_test(CastSoapTests tests/CastSoapTests.cpp)
+    dlss_video_player_test(CastHttpServerTests tests/CastHttpServerTests.cpp)
     target_link_libraries(RuntimeLockTests PRIVATE version)
     add_test(NAME RecentMediaTests COMMAND RecentMediaTests)
     add_test(NAME RenderSettingsTests COMMAND RenderSettingsTests)
@@ -614,6 +628,9 @@ if(BUILD_TESTING)
     add_test(NAME RuntimeLockTests COMMAND RuntimeLockTests)
     add_test(NAME RangeSelectionTests COMMAND RangeSelectionTests)
     add_test(NAME FrameIdentityTests COMMAND FrameIdentityTests)
+    add_test(NAME CastDevicePolicyTests COMMAND CastDevicePolicyTests)
+    add_test(NAME CastSoapTests COMMAND CastSoapTests)
+    add_test(NAME CastHttpServerTests COMMAND CastHttpServerTests)
     dlss_video_player_test(NeuralWorkerTests tests/NeuralWorkerTests.cpp)
     add_test(NAME NeuralWorkerTests COMMAND NeuralWorkerTests)
     # The resolve pass's HLSL is compiled headlessly by this suite, which needs no device

@@ -36,6 +36,7 @@ inline const wchar_t* TipKey(ToolbarAction action)
     // No MenuKey entry: the switch runs a command of its own that no menu row
     // and no key carries, so the tip must not name one.
     case ToolbarAction::ToggleSubtitles: return L"toolbar.tip.subtitles";
+    case ToolbarAction::Cast: return L"toolbar.tip.cast";
     case ToolbarAction::ToggleNeuralRendering: return L"toolbar.tip.neural";
     case ToolbarAction::ToggleUpscaling: return L"toolbar.tip.upscaling";
     case ToolbarAction::ToggleFrameGeneration: return L"toolbar.tip.framegen";

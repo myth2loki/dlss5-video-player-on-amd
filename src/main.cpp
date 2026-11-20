@@ -40,6 +40,9 @@
 #include "TemporalSettings.h"
 #include "StrictJson.h"
 #include "AudioPlayer.h"
+#include "CastSession.h"
+#include "CastDevicePolicy.h"
+#include "CastSoap.h"
 #include "SubtitleOverlay.h"
 #include "SpeechToText.h"
 #include "SubtitleTranslator.h"
@@ -3504,7 +3507,7 @@ class PlayerApp {
 #endif
 public:
     explicit PlayerApp(AppOptions o):m_opt(std::move(o)),m_youtubeSourceQuality(YouTubeSourceQuality::Auto),m_neuralPauseEvent(CreateEventW(nullptr,TRUE,FALSE,nullptr)){}
-    ~PlayerApp(){if(m_activityTimer&&m_hwnd)KillTimer(m_hwnd,m_activityTimer);CancelExport();CancelFrameGeneration();CancelNeuralJob(false);CancelYouTubeResolution(false);SaveVideoSettings();if(m_adjustWnd)DestroyWindow(m_adjustWnd);if(m_neuralWnd)DestroyWindow(m_neuralWnd);if(m_encoderWnd)DestroyWindow(m_encoderWnd);UnregisterOverlayHotkeys();Unload(); if(m_font)DeleteObject(m_font); if(m_fontSmall)DeleteObject(m_fontSmall); if(m_fontTitle)DeleteObject(m_fontTitle); if(m_iconFont)DeleteObject(m_iconFont); if(m_neuralPauseEvent)CloseHandle(m_neuralPauseEvent);for(const auto& icon:m_thumbIcons)DestroyIcon(icon.second);}
+    ~PlayerApp(){if(m_activityTimer&&m_hwnd)KillTimer(m_hwnd,m_activityTimer);CancelExport();CancelCast();CancelFrameGeneration();CancelNeuralJob(false);CancelYouTubeResolution(false);SaveVideoSettings();if(m_adjustWnd)DestroyWindow(m_adjustWnd);if(m_neuralWnd)DestroyWindow(m_neuralWnd);if(m_encoderWnd)DestroyWindow(m_encoderWnd);UnregisterOverlayHotkeys();Unload(); if(m_font)DeleteObject(m_font); if(m_fontSmall)DeleteObject(m_fontSmall); if(m_fontTitle)DeleteObject(m_fontTitle); if(m_iconFont)DeleteObject(m_iconFont); if(m_neuralPauseEvent)CloseHandle(m_neuralPauseEvent);for(const auto& icon:m_thumbIcons)DestroyIcon(icon.second);}
 
     bool Create(HINSTANCE hi) {
         if(!m_uiResources.Load(hi))LOG("Embedded Tabler icon font unavailable; continuing with label-only controls.");
@@ -10293,7 +10296,11 @@ private:
         ShowWindow(m_viewport,SW_SHOW); Layout();
         m_renderer=MakeD3D12Renderer();
         ConfigureRendererSource();
-        if(!m_renderer->Initialize(m_renderWnd,m_decoder.Width(),m_decoder.Height(),ow,oh,guideW,guideH,m_activeQuality)||!RendererTookSourceLayout()){std::wstring e=T(L"error.renderer"),cap=T(L"app.title");MessageBoxW(m_hwnd,e.c_str(),cap.c_str(),MB_ICONERROR);m_renderer.reset();m_decoder.Close();ShowWindow(m_viewport,SW_HIDE);return false;}
+        // captureOutput=true reserves the 4-slot asynchronous readback ring the
+        // DLNA cast path drains (doc 14.2, scheme C). It stays dormant until a
+        // cast is active because EnqueueEvaluatedFrameCapture self-parks at 4
+        // pending; the cost is only the ~40 MiB of resident readback slots.
+        if(!m_renderer->Initialize(m_renderWnd,m_decoder.Width(),m_decoder.Height(),ow,oh,guideW,guideH,m_activeQuality,true)||!RendererTookSourceLayout()){std::wstring e=T(L"error.renderer"),cap=T(L"app.title");MessageBoxW(m_hwnd,e.c_str(),cap.c_str(),MB_ICONERROR);m_renderer.reset();m_decoder.Close();ShowWindow(m_viewport,SW_HIDE);return false;}
         m_renderer->SetDLSS(false);m_renderer->SetColorSettings(m_colorSettings);m_renderer->SetComparison(EffectiveComparison());
         ConfigurePlaybackFrameGeneration(m_renderer.get(),m_playbackFrameGenRequested,m_upscaleEngineMode);
         VideoFrame first; if(!m_decoder.ReadNext(first)){std::wstring e=T(L"error.frame"),cap=T(L"app.title");MessageBoxW(m_hwnd,e.c_str(),cap.c_str(),MB_ICONERROR);Unload();return false;}
@@ -10303,6 +10310,9 @@ private:
     }
 
     void Unload() {
+        // A source change invalidates the cast's audio branch and frame source;
+        // stop casting but keep the chosen device (doc 14.6).
+        m_cast.OnSourceChanged();
         m_gpuScheduler.ResetSession(++m_gpuSchedulerGeneration);
         m_gpuSchedulerHealthAt={};
         m_gpuFrameMsNext=0;m_gpuFrameMsCount=0;
@@ -10724,6 +10734,16 @@ private:
         ++m_renderMsFrames;
         if(ok){
             RememberPlaybackFrame(f);
+            // DLNA cast (doc 14.2, scheme C): the 4-slot capture ring is always
+            // enqueued but self-parks when full; while casting we drain the oldest
+            // evaluated frame and hand it to the encoder. SubmitFrame applies the
+            // drain hard check (frameNumber >= the Start-time base) so backlog
+            // frames captured before the cast began are never shown.
+            if(m_cast.Casting()&&m_renderer->PendingCaptureCount()>0){
+                if(m_renderer->ResolveOldestCapture(m_castCapture))
+                    m_cast.SubmitFrame(m_castCapture.pixels.data(),m_castCapture.width,m_castCapture.height,m_castCapture.id.frameNumber);
+            }
+            m_renderer->EnqueueEvaluatedFrameCapture();
             if(m_renderer->DLSSEnabled()&&!m_renderer->LastFrameUsedDLSS()){
                 m_renderer->SetDLSS(false);m_upscalingRequested=false;
                 m_upscalingError=L"SR failed; original scaling restored";
@@ -10972,7 +10992,7 @@ private:
         m_playStartSec=m_currentSec;m_playStart=Clock::now();m_playing=seek_policy::PlaysAfterSeek(resumeAfter,false,m_haveNext);m_guideReset=false;m_dlssReset=false;SetSeeking(false);UpdateCachedStatus();InvalidateControls();InvalidatePlaybackProgress();LOG("Seek complete actual="<<m_currentSec);return true;
     }
 
-    void SetPaused(bool pause){if(!m_loaded||m_seeking)return;if(pause==!m_playing)return;if(pause){m_currentSec=playback_timing::PausePosition(m_currentSec);m_playing=false;Audio().Pause(true);if(m_cachedPlayback)m_synchronizedPlayback.SetPaused(true);}else{if(playback_tick::ResumeRestartsWithSeek(TickNow(),m_decoder.DurationSeconds())){RequestSeek(status_note::PlayRestartSeconds(!m_decodeNotice.empty(),m_currentSec),true);return;}m_playStartSec=m_currentSec;m_playStart=Clock::now();m_playing=true;ResumeAudio();if(m_cachedPlayback)m_synchronizedPlayback.SetPaused(false);}InvalidateControls();InvalidatePlaybackProgress();}
+    void SetPaused(bool pause){if(!m_loaded||m_seeking)return;if(pause==!m_playing)return;if(pause){m_currentSec=playback_timing::PausePosition(m_currentSec);m_playing=false;Audio().Pause(true);if(m_cachedPlayback)m_synchronizedPlayback.SetPaused(true);}else{if(playback_tick::ResumeRestartsWithSeek(TickNow(),m_decoder.DurationSeconds())){RequestSeek(status_note::PlayRestartSeconds(!m_decodeNotice.empty(),m_currentSec),true);return;}m_playStartSec=m_currentSec;m_playStart=Clock::now();m_playing=true;ResumeAudio();if(m_cachedPlayback)m_synchronizedPlayback.SetPaused(false);}m_cast.SetPaused(!m_playing);InvalidateControls();InvalidatePlaybackProgress();}
     // Frame steps stop audio rather than respawning it per step. Anything that
     // started it since (a seek, a scrub) leaves it active, and then a resume
     // is only a resume.
@@ -11837,7 +11857,11 @@ private:
     IdleSurfaceLayout IdleLayout()const{return StartLayout().core;}
     std::vector<ToolbarItem> ToolbarItems()const{if(!ControlsVisible())return {};RECT c{};GetClientRect(m_hwnd,&c);return LayoutToolbar(static_cast<int>(c.right-c.left),static_cast<int>(c.bottom-c.top),ActiveWindowDpi(m_hwnd));}
     std::vector<ToolbarItem> FocusableItems()const{if(m_loaded)return ToolbarItems();const auto idle=IdleLayout();return{idle.actions.begin(),idle.actions.end()};}
-    ToolbarAvailability ToolbarState()const{return{m_loaded,m_seeking||m_seekPending,m_renderer!=nullptr,YouTubePlaybackAvailable(),m_youtubeLifecycle.IsResolving()||(NeuralJobActive()&&!JobBehindPlayback()),m_cachedPlayback&&m_havePresentedPair&&m_renderer!=nullptr,m_liveSession||LiveSessionAvailable()||StillImageRenderAvailable(),UpscalingAvailable(),FrameGenerationAvailable(),m_frameGenWorker.joinable()&&!m_frameGenCancelling,PlaybackFrameGenerationSupported(),SubtitlesAvailable(),SubtitlesActive(),SubtitlesWorking()};}
+    ToolbarAvailability ToolbarState()const{
+        const auto castStatus=m_cast.GetStatus();
+        const bool castActive=m_cast.Casting();
+        const bool castWorking=castStatus.state==cast_session::State::Connecting||castStatus.state==cast_session::State::Reconnecting||castStatus.state==cast_session::State::Scanning;
+        return{m_loaded,m_seeking||m_seekPending,m_renderer!=nullptr,YouTubePlaybackAvailable(),m_youtubeLifecycle.IsResolving()||(NeuralJobActive()&&!JobBehindPlayback()),m_cachedPlayback&&m_havePresentedPair&&m_renderer!=nullptr,m_liveSession||LiveSessionAvailable()||StillImageRenderAvailable(),UpscalingAvailable(),FrameGenerationAvailable(),m_frameGenWorker.joinable()&&!m_frameGenCancelling,PlaybackFrameGenerationSupported(),SubtitlesAvailable(),SubtitlesActive(),SubtitlesWorking(),m_loaded,castActive,castWorking,-1.0f};}
     std::optional<RECT> VolumeRect()const{if(!ControlsVisible())return std::nullopt;RECT c{};GetClientRect(m_hwnd,&c);const auto items=ToolbarItems();return LayoutVolumeSlider(static_cast<int>(c.right-c.left),static_cast<int>(c.bottom-c.top),ActiveWindowDpi(m_hwnd),items);}
     bool PtIn(const RECT&r,int x,int y)const{return x>=r.left&&x<r.right&&y>=r.top&&y<r.bottom;}
 
@@ -12196,6 +12220,21 @@ private:
                    working?L"Subtitles \u00b7 Working":active?L"Subtitles \u00b7 On":L"Subtitles \u00b7 Off",
                    enabled,active,working,progress};
         }
+        case ToolbarAction::Cast:{
+            // Reuse the Maximize glyph: casting sends the picture out to a TV.
+            const auto castStatus=m_cast.GetStatus();
+            const bool active=m_cast.Casting();
+            const bool working=castStatus.state==cast_session::State::Connecting||
+                               castStatus.state==cast_session::State::Reconnecting||
+                               castStatus.state==cast_session::State::Scanning;
+            std::wstring label;
+            if(working) label=L"Cast \u00b7 Connecting";
+            else if(active&&!castStatus.deviceName.empty())
+                label=std::wstring(L"Cast \u00b7 ")+Utf8ToWide(castStatus.deviceName);
+            else if(active) label=L"Cast \u00b7 On";
+            else label=L"Cast \u00b7 Off";
+            return{UiIcon::Maximize,label,enabled,active,working,-1.0f};
+        }
         // The unavailable arm carries the reason, not the verdict: a pill that
         // says only "Unavailable" sends a viewer looking for a broken toggle
         // when the answer is usually that their source already fills the panel.
@@ -12517,6 +12556,57 @@ private:
         DestroyMenu(menu);
         if(chosen>=1&&chosen<=modes.size())SetComparisonMode(modes[chosen-1]);
     }
+
+    // ---- DLNA cast device menu (native Win32 popup, no page / WebView) ----
+    // A2 discovery: a background scan fills the registry; the button shows the
+    // cached list instantly and only "Rescan" triggers a fresh SSDP pass.
+    void RefreshCastDevices(){
+        ShowToast(T(L"cast.scanning"));
+        m_cast.Scan(std::chrono::seconds{4});
+        m_castMenu=m_cast.DeviceMenu();
+    }
+    void ShowCastMenu(RECT button){
+        // First open with nothing cached: scan once so the menu is not empty.
+        if(m_castMenu.empty()){m_cast.Scan(std::chrono::seconds{4});m_castMenu=m_cast.DeviceMenu();}
+        HMENU menu=CreatePopupMenu();if(!menu)return;
+        const bool casting=m_cast.Casting();
+        if(casting)AppendMenuW(menu,MF_STRING,IDM_CAST_STOP,T(L"cast.stop").c_str());
+        if(m_castMenu.empty()){
+            AppendMenuW(menu,MF_STRING|MF_GRAYED,0,T(L"cast.none").c_str());
+        }else{
+            const size_t count=std::min<size_t>(m_castMenu.size(),IDM_CAST_DEVICE_COUNT);
+            for(size_t i=0;i<count;++i){
+                const auto& entry=m_castMenu[i];
+                const bool selectable=entry.dmr&&entry.online&&entry.reachable;
+                std::wstring label=Utf8ToWide(entry.displayName);
+                if(!entry.label.empty())label+=std::wstring(L" \u00b7 ")+Utf8ToWide(entry.label);
+                const bool current=casting&&m_cast.GetStatus().deviceUdn==entry.key;
+                AppendMenuW(menu,MF_STRING|(current?MF_CHECKED:0u)|(selectable?0u:MF_GRAYED),
+                            UINT_PTR(IDM_CAST_DEVICE_FIRST+i),label.c_str());
+            }
+        }
+        AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+        AppendMenuW(menu,MF_STRING,IDM_CAST_REFRESH,T(L"cast.rescan").c_str());
+        POINT anchor{button.left,button.top};ClientToScreen(m_hwnd,&anchor);
+        const UINT chosen=UINT(TrackPopupMenuEx(menu,TPM_RETURNCMD|TPM_NONOTIFY|TPM_LEFTALIGN|TPM_BOTTOMALIGN|TPM_RIGHTBUTTON,anchor.x,anchor.y,m_hwnd,nullptr));
+        DestroyMenu(menu);
+        if(chosen==IDM_CAST_REFRESH)RefreshCastDevices();
+        else if(chosen==IDM_CAST_STOP){m_cast.Stop();ShowToast(T(L"cast.stopped"));UpdateCachedStatus();}
+        else if(chosen>=IDM_CAST_DEVICE_FIRST&&chosen<IDM_CAST_DEVICE_FIRST+IDM_CAST_DEVICE_COUNT)
+            SelectCastDevice(int(chosen-IDM_CAST_DEVICE_FIRST));
+    }
+    void SelectCastDevice(int index){
+        if(index<0||size_t(index)>=m_castMenu.size())return;
+        const auto& entry=m_castMenu[size_t(index)];
+        if(!entry.dmr||!entry.online||!entry.reachable)return;
+        std::string error;
+        const uint64_t drainBase=m_renderer?m_renderer->LastRenderedFrameNumber():0;
+        const bool ok=m_cast.Start(entry.key,WideToUtf8(m_path),Position(),!m_playing,drainBase,&error);
+        if(ok)ShowToast(T(L"cast.started")+L" \u00b7 "+Utf8ToWide(entry.displayName));
+        else ShowToast(Utf8ToWide(error));
+        UpdateCachedStatus();
+    }
+    void CancelCast(){m_cast.Stop();if(m_hwnd)UpdateCachedStatus();}
     // `glyph` is drawn in the icon font ahead of the label, or alone when the label is
     // empty; a chevron after the label marks a button that opens a menu.
     void DrawCompareSegment(HDC dc,RECT r,const std::wstring& label,bool enabled,bool selected,double hover,wchar_t glyph=0,bool chevron=false,bool drawMark=true){
@@ -15338,6 +15428,15 @@ private:
         // The menu path the hint names has to be the one the menu has: the
         // cancel item lives under DLSS > Convert & export, not under File.
         if(m_exportWorker.joinable())return L"Exporting processed media \u00b7 DLSS > Convert & export > Cancel export to stop";
+        // DLNA cast owns the line while streaming so the user can always see
+        // which TV is receiving and how to stop. Kept short for DT_END_ELLIPSIS.
+        if(m_cast.Casting()){
+            const auto cs=m_cast.GetStatus();
+            std::wstring line=L"Cast \u00b7 "+(cs.deviceName.empty()?L"TV":Utf8ToWide(cs.deviceName));
+            if(cs.width&&cs.height)line+=L" \u00b7 "+std::to_wstring(cs.width)+L"\u00d7"+std::to_wstring(cs.height);
+            if(!cs.encoder.empty())line+=L" \u00b7 "+Utf8ToWide(cs.encoder);
+            return line;
+        }
         // The conversion is the one activity that owns the whole status line:
         // it is minutes long, it is the reason the picture is not changing, and
         // a percentage is the only thing that distinguishes progress from a
@@ -15568,8 +15667,9 @@ private:
         // The one-press subtitle switch. Mouse/touch hits the toolbar button,
         // which lands here; the WM_COMMAND path (IDM_SUBTITLE_TOGGLE) already
         // calls ToggleSubtitles() directly, so this case keeps the two in sync.
-        case ToolbarAction::ToggleSubtitles:ToggleSubtitles();break;
-        case ToolbarAction::ToggleNeuralRendering:ToggleNeuralRendering();break;
+    case ToolbarAction::ToggleSubtitles:ToggleSubtitles();break;
+    case ToolbarAction::Cast:ShowCastMenu(anchor);break;
+    case ToolbarAction::ToggleNeuralRendering:ToggleNeuralRendering();break;
         case ToolbarAction::ToggleUpscaling:ToggleUpscaling();break;
         // While a conversion runs this pill reads "Cancel", so it has to cancel.
         case ToolbarAction::ToggleFrameGeneration:
@@ -15883,8 +15983,8 @@ private:
             break;
         case WM_SETTINGCHANGE:ReadAnimationPreference();InvalidateRect(h,nullptr,FALSE);break;
         case WM_SHOWWINDOW:SyncActivityFeedback();break;
-        case WM_DESTROY:SaveWindowPlacement();CancelExport();DrainStageExportMessages();if(m_activityTimer){KillTimer(h,m_activityTimer);m_activityTimer=0;}StopModalTick();CancelNeuralJob(false);DrainNeuralMessages();CancelYouTubeResolution(false);DrainYouTubeCompletions();CancelSourcePrefetch();CancelUpdateCheck();CancelAddonDownload();m_running=false;PostQuitMessage(0);return 0;
-        case WM_CLOSE:CancelExport();CancelNeuralJob(false);CancelYouTubeResolution(false);CancelSourcePrefetch();CancelUpdateCheck();CancelAddonDownload();DestroyWindow(h);return 0;
+        case WM_DESTROY:SaveWindowPlacement();CancelExport();CancelCast();DrainStageExportMessages();if(m_activityTimer){KillTimer(h,m_activityTimer);m_activityTimer=0;}StopModalTick();CancelNeuralJob(false);DrainNeuralMessages();CancelYouTubeResolution(false);DrainYouTubeCompletions();CancelSourcePrefetch();CancelUpdateCheck();CancelAddonDownload();m_running=false;PostQuitMessage(0);return 0;
+        case WM_CLOSE:CancelExport();CancelCast();CancelNeuralJob(false);CancelYouTubeResolution(false);CancelSourcePrefetch();CancelUpdateCheck();CancelAddonDownload();DestroyWindow(h);return 0;
         case WM_GETMINMAXINFO:{
             auto* info=reinterpret_cast<MINMAXINFO*>(l);
             if(info){const UINT dpi=ActiveWindowDpi(h);const POINT minimum=MinimumPlayerWindowTrackSize(h,dpi);info->ptMinTrackSize.x=std::max<LONG>(info->ptMinTrackSize.x,minimum.x);info->ptMinTrackSize.y=std::max<LONG>(info->ptMinTrackSize.y,minimum.y);}
@@ -16244,7 +16344,7 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // The loaded source's cache manager; see SourceCache(). The build count is
     // what the regression suite reads to prove a paint builds none.
     mutable std::unique_ptr<NeuralCacheManager> m_sourceCache;mutable std::filesystem::path m_sourceCacheRequestedRoot;mutable uint64_t m_sourceCacheBuilds=0;
-    Clock::time_point m_playStart=Clock::now(),m_fpsWindowStart=Clock::now();double m_submitFps=0.0;uint64_t m_fpsWindowFrames=0;std::wstring m_path,m_youtubeAudioUrl,m_youtubePageUrl,m_displayTitle,m_cachedStatus,m_cachedWindowTitle,m_pendingYouTubeTitle,m_pendingNeuralTitle;YouTubeSourceQuality m_youtubeSourceQuality=YouTubeSourceQuality::P1080;MediaSourceKind m_sourceKind=MediaSourceKind::LocalFile;VideoDecoder m_decoder;VideoFrame m_next;D3D12RendererOwner m_renderer;TemporalGuideGenerator m_guides;AudioPlayer m_audio;std::unique_ptr<AudioPlayer>m_networkAudio;NetworkReadState m_networkReadState;YouTubeResolutionLifecycle m_youtubeLifecycle;std::unique_ptr<YouTubeResolver>m_youtubeResolver;CompletionRegistry<YouTubeCompletion>m_youtubeCompletions;std::jthread m_youtubeWorker;
+    Clock::time_point m_playStart=Clock::now(),m_fpsWindowStart=Clock::now();double m_submitFps=0.0;uint64_t m_fpsWindowFrames=0;std::wstring m_path,m_youtubeAudioUrl,m_youtubePageUrl,m_displayTitle,m_cachedStatus,m_cachedWindowTitle,m_pendingYouTubeTitle,m_pendingNeuralTitle;YouTubeSourceQuality m_youtubeSourceQuality=YouTubeSourceQuality::P1080;MediaSourceKind m_sourceKind=MediaSourceKind::LocalFile;VideoDecoder m_decoder;VideoFrame m_next;D3D12RendererOwner m_renderer;TemporalGuideGenerator m_guides;AudioPlayer m_audio;cast_session::Session m_cast;std::vector<cast_session::Session::MenuEntry> m_castMenu;CapturedVideoFrame m_castCapture;std::unique_ptr<AudioPlayer>m_networkAudio;NetworkReadState m_networkReadState;YouTubeResolutionLifecycle m_youtubeLifecycle;std::unique_ptr<YouTubeResolver>m_youtubeResolver;CompletionRegistry<YouTubeCompletion>m_youtubeCompletions;std::jthread m_youtubeWorker;
     // The loaded source's digest, so a second job against the same file does
     // not pay for a second full hash. Read from job threads.
     // Shared with the job thread by value, never through `this`: the neural

@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DLNA 投屏控制台</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --line: #e3e6ea; --ink: #1d2129;
+    --muted: #86909c; --accent: #165dff; --accent-w: #e8f0ff;
+    --ok: #00b42a; --ok-w: #e8ffea; --off: #c9cdd4; --danger: #f53f3f;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .bar { display: flex; gap: 10px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; }
+  button { font: inherit; cursor: pointer; border: 1px solid var(--line);
+    background: var(--card); color: var(--ink); padding: 8px 16px; border-radius: 8px;
+    transition: all .15s; }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
+  .scan-meta { color: var(--muted); font-size: 12px; margin-left: auto; }
+  .section-title { font-size: 15px; font-weight: 600; margin: 28px 0 12px; }
+  .cards { display: grid; gap: 12px; }
+  .dev { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px; display: flex; align-items: center; gap: 14px; }
+  .dev.active { border-color: var(--accent); background: var(--accent-w); }
+  .dev.offline { opacity: .62; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--off); flex: none; }
+  .dot.on { background: var(--ok); }
+  .dev-main { flex: 1; min-width: 0; }
+  .dev-name { font-weight: 600; font-size: 15px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .tag { font-size: 11px; font-weight: 400; padding: 1px 7px; border-radius: 10px; }
+  .tag-last { background: var(--accent-w); color: var(--accent); }
+  .tag-active { background: var(--ok-w); color: var(--ok); }
+  .tag-off { background: #f2f3f5; color: var(--muted); }
+  .tag-idle { background: #fff7e8; color: #d46b08; }
+  .dev-meta { color: var(--muted); font-size: 12px; margin-top: 3px;
+    font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .dev-btn { flex: none; }
+  .empty { color: var(--muted); text-align: center; padding: 40px; border: 1px dashed var(--line);
+    border-radius: 12px; }
+  .status { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }
+  .kv .k { color: var(--muted); font-size: 12px; }
+  .kv .v { font-size: 16px; font-weight: 600; margin-top: 2px; }
+  .pill { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 13px;
+    background: #f2f3f5; color: var(--muted); }
+  .pill.playing { background: var(--ok-w); color: var(--ok); }
+  .msg { margin-top: 12px; font-size: 13px; color: var(--muted); min-height: 20px; }
+  .msg.err { color: var(--danger); }
+  .src-row { display: flex; gap: 10px; margin-top: 14px; }
+  .src-row input { flex: 1; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px;
+    font: inherit; min-width: 0; }
+  .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
+    background: #1d2129; color: #fff; padding: 10px 20px; border-radius: 8px; font-size: 13px;
+    opacity: 0; transition: opacity .25s; pointer-events: none; z-index: 9; }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>DLNA 投屏控制台</h1>
+  <div class="sub">设备以 UDN 唯一标识 · 支持重新扫描与随时切换 · 国行索尼 X9500H / SMG_CAST 已验证</div>
+
+  <div class="bar">
+    <button id="scanBtn" class="primary" onclick="scan(true)">重新扫描设备</button>
+    <button id="stopBtn" onclick="stopCast()" disabled>停止投屏</button>
+    <span class="scan-meta" id="scanMeta">尚未扫描</span>
+  </div>
+
+  <div class="section-title">可投屏设备</div>
+  <div class="cards" id="devList">
+    <div class="empty">点击"重新扫描设备"发现局域网电视</div>
+  </div>
+
+  <div class="section-title">当前状态</div>
+  <div class="status">
+    <div class="grid">
+      <div class="kv"><div class="k">投屏目标</div><div class="v" id="stTarget">—</div></div>
+      <div class="kv"><div class="k">播放状态</div><div class="v"><span class="pill" id="stState">未投屏</span></div></div>
+      <div class="kv"><div class="k">播放头</div><div class="v" id="stPos">—</div></div>
+      <div class="kv"><div class="k">电视拉流</div><div class="v" id="stHits">—</div></div>
+    </div>
+    <div class="msg" id="msg"></div>
+    <div class="src-row">
+      <input id="srcInput" placeholder="片源路径（留空=彩色测试图+440Hz）">
+      <button onclick="applySource()">切换片源</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+let devices = [];
+let lastUdn = '';
+let activeUdn = '';
+
+function toast(text) {
+  const t = document.getElementById('toast');
+  t.textContent = text; t.classList.add('show');
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), 2600);
+}
+function msg(text, err) {
+  const m = document.getElementById('msg');
+  m.textContent = text; m.className = 'msg' + (err ? ' err' : '');
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  return await r.json();
+}
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function scan(force) {
+  const btn = document.getElementById('scanBtn');
+  btn.disabled = true; btn.textContent = '扫描中…';
+  try {
+    const d = await api('/api/devices' + (force ? '?refresh=1&seconds=8' : ''));
+    devices = d.devices || []; lastUdn = d.last_udn || '';
+    renderDevices();
+    if (force) toast('扫描完成，发现 ' + devices.length + ' 台设备');
+  } catch (e) {
+    msg('扫描失败: ' + e, true);
+  } finally {
+    btn.disabled = false; btn.textContent = '重新扫描设备';
+    const meta = document.getElementById('scanMeta');
+    if (devices.length) meta.textContent = '发现 ' + devices.length + ' 台 · UDN 稳定标识';
+  }
+}
+
+function renderDevices() {
+  const box = document.getElementById('devList');
+  if (!devices.length) {
+    box.innerHTML = '<div class="empty">未发现设备，请确认电视已开机且在同一局域网</div>';
+    return;
+  }
+  box.innerHTML = devices.map(dev => {
+    const on = dev.online && dev.probeOk !== false;
+    const isActive = dev.udn === activeUdn;
+    const tags = [];
+    if (isActive) tags.push('<span class="tag tag-active">投屏中</span>');
+    if (dev.isLast && !isActive) tags.push('<span class="tag tag-last">上次设备</span>');
+    if (!on) {
+      const why = dev.probeState === 'nonDmr' ? 'DIAL 非 DMR'
+        : (dev.online ? '端点无响应' : '离线');
+      tags.push('<span class="tag tag-off">' + why + '</span>');
+    } else if (dev.probeState && dev.probeState !== 'STOPPED' && dev.probeState !== 'PLAYING') {
+      tags.push('<span class="tag tag-idle">空闲可达</span>');
+    }
+    const short = (dev.udn || '').replace(/^uuid:/, '').slice(-8);
+    const btnText = !on ? '不可投' : (isActive ? '重新投屏' : '投到这台');
+    return '<div class="dev' + (isActive ? ' active' : '') + (on ? '' : ' offline') + '">' +
+      '<span class="dot' + (on ? ' on' : '') + '"></span>' +
+      '<div class="dev-main">' +
+        '<div class="dev-name">' + esc(dev.displayName || dev.friendlyName) + tags.join('') + '</div>' +
+        '<div class="dev-meta">' + esc(dev.modelName || '') + ' · ' + esc(dev.ip) + ' · ' + esc(short) + '</div>' +
+      '</div>' +
+      '<button class="dev-btn primary" ' + (on ? '' : 'disabled ') +
+        'onclick="cast(\'' + esc(dev.udn) + '\')">' + btnText + '</button>' +
+    '</div>';
+  }).join('');
+}
+
+async function cast(udn) {
+  const dev = devices.find(x => x.udn === udn);
+  msg('正在连接 ' + (dev ? (dev.displayName || dev.friendlyName) : '设备') + '…');
+  try {
+    const r = await api('/api/cast', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({udn: udn})
+    });
+    msg(r.message || (r.ok ? '已投屏' : '投屏失败'), !r.ok);
+    toast(r.message || (r.ok ? '已投屏' : '投屏失败'));
+    if (r.ok) { activeUdn = udn; renderDevices(); document.getElementById('stopBtn').disabled = false; }
+  } catch (e) { msg('投屏请求失败: ' + e, true); }
+}
+
+async function stopCast() {
+  try {
+    const r = await api('/api/stop', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    msg(r.message || '已停止'); activeUdn = ''; renderDevices();
+    document.getElementById('stopBtn').disabled = true;
+  } catch (e) { msg('停止失败: ' + e, true); }
+}
+
+async function applySource() {
+  const p = document.getElementById('srcInput').value.trim();
+  try {
+    const r = await api('/api/source', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: p})
+    });
+    toast(r.message || '片源已切换'); msg(r.message || '');
+  } catch (e) { msg('切换片源失败: ' + e, true); }
+}
+
+async function pollStatus() {
+  try {
+    const s = await api('/api/status');
+    const stTarget = document.getElementById('stTarget');
+    const stState = document.getElementById('stState');
+    const stPos = document.getElementById('stPos');
+    const stHits = document.getElementById('stHits');
+    stTarget.textContent = s.target || '—';
+    stState.textContent = s.state || (s.target ? '连接中' : '未投屏');
+    stState.className = 'pill' + (s.state === 'PLAYING' ? ' playing' : '');
+    stPos.textContent = s.pos_s != null ? (s.pos_s.toFixed(1) + ' s') : '—';
+    stHits.textContent = s.tv_http_hits ? (s.tv_http_hits + ' 次 GET') : '—';
+    if (!s.target && activeUdn) { activeUdn = ''; renderDevices(); document.getElementById('stopBtn').disabled = true; }
+  } catch (e) {}
+}
+
+(async function init() {
+  await scan(false);
+  setInterval(pollStatus, 2000);
+  setInterval(() => scan(false), 60000);
+})();
+</script>
+</body>
+</html>
