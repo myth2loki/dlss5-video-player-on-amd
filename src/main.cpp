@@ -12702,6 +12702,17 @@ private:
             castConfig.height=m_renderer->OutputH();
             LOG("Cast capture size from renderer: "<<castConfig.width<<"x"<<castConfig.height);
         }
+        // The rawvideo demuxer has no wall clock: one frame in = one frame out,
+        // timestamped at -framerate. Feeding 23.976 fps source frames into a
+        // 30 fps input makes the HLS timeline advance at only 0.8x real time;
+        // the TV drains its 24 s live window and then buffers ("loading" +
+        // tiny KB/s) every couple of minutes. Use the source rate when known
+        // so media time tracks wall time. Round 23.976 -> 24 (0.1% drift).
+        const double sourceFps=m_decoder.FrameRate();
+        if(m_decoder.FrameRateKnown() && sourceFps>=1.0 && sourceFps<=240.0){
+            m_cast.Config_().fps=static_cast<int>(sourceFps+0.5);
+            LOG("Cast encoder fps from source: "<<m_cast.Config_().fps<<" (source="<<sourceFps<<")");
+        }
         std::string error;
         const uint64_t drainBase=m_renderer?m_renderer->LastRenderedFrameNumber():0;
         const bool ok=m_cast.Start(key,WideToUtf8(m_path),Position(),!m_playing,drainBase,&error);
