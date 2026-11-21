@@ -199,17 +199,27 @@ int Discovery::Scan(std::string localIp, std::chrono::seconds listen,
     BOOL reuse = TRUE;
     setsockopt(sock.Get(), SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&reuse), sizeof(reuse));
     // Join the multicast group on the chosen local interface so replies reach us.
+    // Bind AND send on that same interface: on this machine an INADDR_ANY bind
+    // receives zero SSDP replies even though the exact same M-SEARCH sent from
+    // a socket bound to the LAN IP gets 9+ (2026-11-21, 4/4 vs 4/4). Joining a
+    // group on one interface while listening on all interfaces is also
+    // ambiguous on Windows, so keep all three on the same address.
     if (!localIp.empty()) {
         struct ip_mreq group{};
         inet_pton(AF_INET, kMulticast.data(), &group.imr_multiaddr);
         inet_pton(AF_INET, localIp.c_str(), &group.imr_interface);
         setsockopt(sock.Get(), IPPROTO_IP, IP_ADD_MEMBERSHIP,
                    reinterpret_cast<const char*>(&group), sizeof(group));
+        setsockopt(sock.Get(), IPPROTO_IP, IP_MULTICAST_IF,
+                   reinterpret_cast<const char*>(&group.imr_interface),
+                   sizeof(group.imr_interface));
     }
     sockaddr_in bindAddr{};
     bindAddr.sin_family = AF_INET;
     bindAddr.sin_port = 0; // ephemeral; replies come back to the source port
     bindAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    // inet_pton failure leaves sin_addr at zero = INADDR_ANY (the old behavior).
+    if (!localIp.empty()) inet_pton(AF_INET, localIp.c_str(), &bindAddr.sin_addr);
     if (bind(sock.Get(), reinterpret_cast<sockaddr*>(&bindAddr), sizeof(bindAddr)) != 0) {
         LOG("Cast: SSDP bind failed winerr=" << WSAGetLastError());
         return 0;
