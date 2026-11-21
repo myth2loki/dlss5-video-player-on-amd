@@ -44,12 +44,27 @@ struct Session::Impl {
     bool drained{false};
     std::atomic<bool> paused{false};
     std::atomic<bool> frameValid{false};
+    // lastFrame is written by the render thread (SubmitFrame) and read by the
+    // pause-hold thread below; guard it so the hold frame is never a torn copy.
+    mutable std::mutex frameMutex;
     std::vector<uint8_t> lastFrame;
     uint32_t lastW{0}, lastH{0};
+
+    // While paused the render loop stops, so no new frames reach the encoder.
+    // ffmpeg's rawvideo input only produces frames it is fed; without a hold
+    // feed the HLS playlist freezes while the TV still reports PLAYING. A tiny
+    // thread re-feeds the cached last frame at the encoder frame rate so the
+    // live playlist keeps advancing until playback resumes (doc 14.4/14.6).
+    std::thread holdThread;
+    std::atomic<bool> holdStop{false};
 
     std::atomic<int> retryCount{0};
     std::chrono::steady_clock::time_point lastFeedTime{};
     mutable std::mutex discoveryMutex;
+    // Set by CancelScan, polled by Scan between datagrams and probes. Lives here
+    // rather than being passed in because the UI cancels from a different thread
+    // than the one that started the scan.
+    std::atomic<bool> scanCancel{false};
 
     std::string streamUrl() const
     {
@@ -62,6 +77,48 @@ struct Session::Impl {
         std::lock_guard<std::mutex> lock(statusMutex);
         status.state = state;
         if (!detail.empty()) status.detail = std::move(detail);
+    }
+
+    // Copy the cached frame under the lock; empty when no frame has landed yet.
+    cast_encoder::Frame CachedFrame()
+    {
+        cast_encoder::Frame out;
+        std::lock_guard<std::mutex> lock(frameMutex);
+        if (!frameValid.load(std::memory_order_acquire) || lastFrame.empty()) return out;
+        out.bgra = lastFrame;
+        out.width = lastW;
+        out.height = lastH;
+        return out;
+    }
+
+    void HoldLoop()
+    {
+        // Rawvideo has no wall clock of its own: one frame in = one frame out.
+        // Feed the same cached frame at the configured fps so ffmpeg keeps
+        // writing HLS segments while the player's render loop is parked.
+        const int fps = config.fps > 0 ? config.fps : 30;
+        const auto period = std::chrono::milliseconds(1000 / fps);
+        while (!holdStop.load(std::memory_order_acquire)) {
+            cast_encoder::Frame hold = CachedFrame();
+            if (!hold.bgra.empty()) encoder.PushFrame(std::move(hold));
+            std::this_thread::sleep_for(period);
+        }
+    }
+
+    void StartHold()
+    {
+        if (holdThread.joinable()) return; // already holding
+        holdStop.store(false, std::memory_order_release);
+        holdThread = std::thread([this] { HoldLoop(); });
+    }
+
+    void StopHold()
+    {
+        // Must join before Stop() takes the encoder down, else HoldLoop would
+        // push into a stopped encoder (PushFrame returns false, but the join
+        // also guarantees no thread outlives the session).
+        holdStop.store(true, std::memory_order_release);
+        if (holdThread.joinable()) holdThread.join();
     }
 };
 
@@ -77,11 +134,38 @@ Session::~Session()
 int Session::Scan(std::chrono::seconds listen)
 {
     std::lock_guard<std::mutex> lock(m_impl->discoveryMutex);
+    m_impl->scanCancel.store(false, std::memory_order_release);
     {
         std::lock_guard<std::mutex> statusLock(m_impl->statusMutex);
         m_impl->status.state = State::Scanning;
     }
-    const int found = m_impl->discovery.Scan(cast_net::LocalLanIp(), listen);
+    const auto scanStart = std::chrono::steady_clock::now();
+    const int found = m_impl->discovery.Scan(cast_net::LocalLanIp(), listen, &m_impl->scanCancel);
+
+    // Probe what this scan actually saw. SSDP only proves a device answers
+    // multicast; whether its AVTransport endpoint is alive is a separate
+    // question. Without this step the menu's "reachable" flag is whatever the
+    // last cast left behind, so a TV that was just switched on keeps reading
+    // "offline" until someone tries to cast to it and fails.
+    //
+    // Only devices seen in THIS scan (lastSeen advanced past scanStart) and only
+    // real DMRs; a bounded count and a short timeout keep the window small.
+    static constexpr std::size_t kMaxProbesPerScan = 8;
+    std::vector<std::string> probeKeys;
+    for (const auto& device : m_impl->discovery.Registry().Snapshot()) {
+        if (!cast_device::IsDmr(device)) continue;
+        if (device.lastSeen < scanStart) continue;
+        probeKeys.push_back(cast_device::IdentityKey(device));
+        if (probeKeys.size() >= kMaxProbesPerScan) break;
+    }
+    for (const std::string& key : probeKeys) {
+        if (m_impl->scanCancel.load(std::memory_order_acquire)) break;
+        const cast_device::Device* device = m_impl->discovery.Registry().Find(key);
+        if (!device) continue;
+        const auto probe = m_impl->discovery.Probe(*device, std::chrono::milliseconds{1200});
+        m_impl->discovery.Registry().SetProbe(key, cast_device::IsReachable(probe),
+                                              cast_device::ProbeDetail(probe));
+    }
     {
         std::lock_guard<std::mutex> statusLock(m_impl->statusMutex);
         m_impl->status.state = m_impl->encoder.Running() ? State::Streaming : State::Idle;
@@ -89,10 +173,17 @@ int Session::Scan(std::chrono::seconds listen)
     return found;
 }
 
+void Session::CancelScan()
+{
+    m_impl->scanCancel.store(true, std::memory_order_release);
+}
+
 std::vector<Session::MenuEntry> Session::DeviceMenu() const
 {
     std::lock_guard<std::mutex> lock(m_impl->discoveryMutex);
-    const auto devices = m_impl->discovery.Registry().All();
+    // Snapshot, not All(): it sorts by friendly name and recomputes offline from
+    // the TTL, so the list does not reshuffle between two opens of the menu.
+    const auto devices = m_impl->discovery.Registry().Snapshot();
     std::vector<MenuEntry> out;
     out.reserve(devices.size());
     for (const auto& device : devices) {
@@ -102,11 +193,15 @@ std::vector<Session::MenuEntry> Session::DeviceMenu() const
         entry.online = m_impl->discovery.Registry().IsOnline(device);
         entry.dmr = cast_device::IsDmr(device);
         entry.reachable = device.reachable;
-        // Honest labels (14.9): DIAL-only is not a DMR; a 501 is reachable.
-        if (!entry.dmr) entry.label = "DIAL 非 DMR";
-        else if (!entry.reachable) entry.label = "离线";
-        else if (device.probeDetail == "UPnP-error-501") entry.label = "空闲可达";
-        else entry.label = device.probeDetail;
+        // A code, not a sentence (14.9): DIAL-only is not a DMR; a 501 means
+        // alive-but-idle, which is not the same thing as offline.
+        if (!entry.dmr) entry.label = DeviceLabel::DialOnly;
+        else if (!entry.reachable) entry.label = DeviceLabel::Offline;
+        else if (device.probeDetail == "UPnP-error-501") entry.label = DeviceLabel::IdleReachable;
+        else if (!device.probeDetail.empty()) {
+            entry.label = DeviceLabel::Detail;
+            entry.detail = device.probeDetail;
+        } else entry.label = DeviceLabel::None;
         out.push_back(std::move(entry));
     }
     return out;
@@ -184,6 +279,11 @@ bool Session::Start(const std::string& deviceUdn, const std::string& mediaPath,
     }
 
     // Push the URL to the DMR and play (14.9: this is the real castability test).
+    // Do NOT block here waiting for the first segment: Start() runs on the UI
+    // thread and stalls the render loop that FEEDS the encoder, so the segment
+    // would never appear (self-deadlock, verified 2026-11-21). Instead the HTTP
+    // server holds the DMR's first playlist GET until the stream is actually
+    // ready; see HlsReady in CastHttpServer.h and its wait in ServeOne.
     m_impl->control = std::make_unique<cast_net::CastControl>(device->controlURL);
     const std::string url = m_impl->streamUrl();
     const auto pushed = m_impl->control->SetUriAndPlay(url, "application/x-mpegURL", m_impl->chosenDeviceName);
@@ -220,8 +320,10 @@ void Session::SubmitFrame(const uint8_t* bgra, uint32_t width, uint32_t height, 
     if (!bgra || width == 0 || height == 0) return;
     const std::size_t bytes = static_cast<std::size_t>(width) * height * 4;
 
-    // Keep the last frame for the paused hold path (14.6).
+    // Keep the last frame for the paused hold path (14.6). The hold thread
+    // reads this under the same lock, so publish a complete frame only.
     {
+        std::lock_guard<std::mutex> lock(m_impl->frameMutex);
         m_impl->lastFrame.assign(bgra, bgra + bytes);
         m_impl->lastW = width;
         m_impl->lastH = height;
@@ -239,14 +341,18 @@ void Session::SubmitFrame(const uint8_t* bgra, uint32_t width, uint32_t height, 
 void Session::SetPaused(bool paused)
 {
     m_impl->paused.store(paused, std::memory_order_release);
-    if (!paused || !m_impl->frameValid.load(std::memory_order_acquire)) return;
-    // The render loop is stopped while paused, so re-feed the cached frame once
-    // to keep the HLS live; wall-clock timestamps keep advancing (14.4/14.6).
-    cast_encoder::Frame hold;
-    hold.bgra = m_impl->lastFrame;
-    hold.width = m_impl->lastW;
-    hold.height = m_impl->lastH;
-    m_impl->encoder.PushFrame(std::move(hold));
+    if (!m_impl->encoder.Running()) return;
+    if (paused) {
+        // The render loop stops while paused. Feed the cached frame once now
+        // for an immediate hold, then keep re-feeding it at the encoder fps so
+        // ffmpeg (rawvideo, frame-driven) never starves and HLS stays live
+        // (14.4/14.6). StartHold is idempotent across repeated pause ticks.
+        cast_encoder::Frame hold = m_impl->CachedFrame();
+        if (!hold.bgra.empty()) m_impl->encoder.PushFrame(std::move(hold));
+        m_impl->StartHold();
+    } else {
+        m_impl->StopHold();
+    }
 }
 
 void Session::OnSourceChanged()
@@ -260,6 +366,10 @@ void Session::OnSourceChanged()
 
 void Session::Stop()
 {
+    // Join the hold thread before the encoder goes away; otherwise it could
+    // push cached frames into an encoder already tearing down.
+    m_impl->StopHold();
+    m_impl->paused.store(false, std::memory_order_release);
     m_impl->httpStop.store(true, std::memory_order_release);
     m_impl->encoder.Stop();
     if (m_impl->httpThread.joinable()) m_impl->httpThread.join();

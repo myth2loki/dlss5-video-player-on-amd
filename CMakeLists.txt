@@ -593,6 +593,13 @@ if(EXISTS "${YOUTUBE_STAGED_DIR}/yt-dlp.exe" AND EXISTS "${YOUTUBE_STAGED_DIR}/d
     )
 endif()
 
+# Standalone driver for the product HLS HTTP server. Serves one fixed directory
+# so the layered DLNA verification can test product-encoded segments without
+# starting the renderer/capture path. Links the same player_app object library
+# the shipping player uses, so it exercises the shipped CastHttpServer.cpp.
+add_executable(cast_http_runner tools/verification/cast_http_runner.cpp)
+target_link_libraries(cast_http_runner PRIVATE ${PLAYER_OBJECT_LIBRARIES})
+
 if(BUILD_TESTING)
     # Every test links the player's object libraries - the objects that ship -
     # and through them the common option set, rather than compiling its own

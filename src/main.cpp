@@ -548,6 +548,8 @@ static constexpr UINT WM_MEDIA_SEEK = WM_APP + 51;
 static constexpr UINT WM_START_SCREEN = WM_APP + 52;
 // The dlssg_sm86 add-on download finished (wParam: its completion token).
 static constexpr UINT WM_FRAMEGEN_ADDON_INSTALLED = WM_APP + 53;
+// A background DLNA scan finished; the device menu cache can be rebuilt.
+static constexpr UINT WM_CAST_SCAN_DONE = WM_APP + 54;
 
 struct YouTubeUrlDialogState {
     const Localizer* localizer{};
@@ -10296,11 +10298,12 @@ private:
         ShowWindow(m_viewport,SW_SHOW); Layout();
         m_renderer=MakeD3D12Renderer();
         ConfigureRendererSource();
+        // Initialize's 9th parameter is preserveSource, the 10th is captureOutput.
         // captureOutput=true reserves the 4-slot asynchronous readback ring the
-        // DLNA cast path drains (doc 14.2, scheme C). It stays dormant until a
-        // cast is active because EnqueueEvaluatedFrameCapture self-parks at 4
-        // pending; the cost is only the ~40 MiB of resident readback slots.
-        if(!m_renderer->Initialize(m_renderWnd,m_decoder.Width(),m_decoder.Height(),ow,oh,guideW,guideH,m_activeQuality,true)||!RendererTookSourceLayout()){std::wstring e=T(L"error.renderer"),cap=T(L"app.title");MessageBoxW(m_hwnd,e.c_str(),cap.c_str(),MB_ICONERROR);m_renderer.reset();m_decoder.Close();ShowWindow(m_viewport,SW_HIDE);return false;}
+        // DLNA cast path drains (doc 14.2, scheme C, fix 11-21). It stays dormant
+        // until a cast is active because EnqueueEvaluatedFrameCapture self-parks
+        // at 4 pending; the cost is only the ~40 MiB of resident readback slots.
+        if(!m_renderer->Initialize(m_renderWnd,m_decoder.Width(),m_decoder.Height(),ow,oh,guideW,guideH,m_activeQuality,true,true)||!RendererTookSourceLayout()){std::wstring e=T(L"error.renderer"),cap=T(L"app.title");MessageBoxW(m_hwnd,e.c_str(),cap.c_str(),MB_ICONERROR);m_renderer.reset();m_decoder.Close();ShowWindow(m_viewport,SW_HIDE);return false;}
         m_renderer->SetDLSS(false);m_renderer->SetColorSettings(m_colorSettings);m_renderer->SetComparison(EffectiveComparison());
         ConfigurePlaybackFrameGeneration(m_renderer.get(),m_playbackFrameGenRequested,m_upscaleEngineMode);
         VideoFrame first; if(!m_decoder.ReadNext(first)){std::wstring e=T(L"error.frame"),cap=T(L"app.title");MessageBoxW(m_hwnd,e.c_str(),cap.c_str(),MB_ICONERROR);Unload();return false;}
@@ -10734,16 +10737,23 @@ private:
         ++m_renderMsFrames;
         if(ok){
             RememberPlaybackFrame(f);
-            // DLNA cast (doc 14.2, scheme C): the 4-slot capture ring is always
-            // enqueued but self-parks when full; while casting we drain the oldest
-            // evaluated frame and hand it to the encoder. SubmitFrame applies the
-            // drain hard check (frameNumber >= the Start-time base) so backlog
-            // frames captured before the cast began are never shown.
+            // DLNA cast (doc 14.2, scheme C, fix 11-21): the 4-slot capture ring
+            // is enqueued every frame but self-parks when full. While casting we
+            // drain the oldest captured frame and hand it to the encoder. Capture
+            // source differs by role: cast takes PresentOutput (what the viewer
+            // sees - the FSR 4/FSR 1/CAS upscale rung on AMD, DLSS output on an
+            // NVIDIA machine), the evaluation/export path keeps the default
+            // NeuralOutput. SubmitFrame applies the drain hard check (frameNumber
+            // >= the Start-time base) so backlog frames from before the cast are
+            // never shown.
             if(m_cast.Casting()&&m_renderer->PendingCaptureCount()>0){
                 if(m_renderer->ResolveOldestCapture(m_castCapture))
                     m_cast.SubmitFrame(m_castCapture.pixels.data(),m_castCapture.width,m_castCapture.height,m_castCapture.id.frameNumber);
             }
-            m_renderer->EnqueueEvaluatedFrameCapture();
+            if(m_cast.Casting())
+                m_renderer->EnqueueEvaluatedFrameCapture(CaptureSource::PresentOutput);
+            else
+                m_renderer->EnqueueEvaluatedFrameCapture();
             if(m_renderer->DLSSEnabled()&&!m_renderer->LastFrameUsedDLSS()){
                 m_renderer->SetDLSS(false);m_upscalingRequested=false;
                 m_upscalingError=L"SR failed; original scaling restored";
@@ -10794,7 +10804,9 @@ private:
             [&](HWND window){
                 m_renderer=MakeD3D12Renderer();
                 ConfigureRendererSource();
-                const bool rebuilt=m_renderer->Initialize(window,m_decoder.Width(),m_decoder.Height(),m_decoder.Width(),m_decoder.Height(),guideW,guideH,m_activeQuality)&&
+                // Keep the cast readback ring across a GPU-recovery rebuild: without
+                // the 10th parameter the new renderer silently stops feeding HLS.
+                const bool rebuilt=m_renderer->Initialize(window,m_decoder.Width(),m_decoder.Height(),m_decoder.Width(),m_decoder.Height(),guideW,guideH,m_activeQuality,false,true)&&
                     RendererTookSourceLayout();
                 if(rebuilt)ConfigurePlaybackFrameGeneration(m_renderer.get(),m_playbackFrameGenRequested,m_upscaleEngineMode);
                 return rebuilt;
@@ -12221,19 +12233,21 @@ private:
                    enabled,active,working,progress};
         }
         case ToolbarAction::Cast:{
-            // Reuse the Maximize glyph: casting sends the picture out to a TV.
+            // A cast glyph, not Maximize: the two sat next to each other and
+            // both looked like fullscreen.
             const auto castStatus=m_cast.GetStatus();
             const bool active=m_cast.Casting();
-            const bool working=castStatus.state==cast_session::State::Connecting||
-                               castStatus.state==cast_session::State::Reconnecting||
-                               castStatus.state==cast_session::State::Scanning;
+            const bool scanning=castStatus.state==cast_session::State::Scanning;
+            const bool working=scanning||castStatus.state==cast_session::State::Connecting||
+                               castStatus.state==cast_session::State::Reconnecting;
             std::wstring label;
-            if(working) label=L"Cast \u00b7 Connecting";
+            if(scanning) label=L"Cast \u00b7 Scanning";
+            else if(working) label=L"Cast \u00b7 Connecting";
             else if(active&&!castStatus.deviceName.empty())
                 label=std::wstring(L"Cast \u00b7 ")+Utf8ToWide(castStatus.deviceName);
             else if(active) label=L"Cast \u00b7 On";
             else label=L"Cast \u00b7 Off";
-            return{UiIcon::Maximize,label,enabled,active,working,-1.0f};
+            return{UiIcon::Cast,label,enabled,active,working,-1.0f};
         }
         // The unavailable arm carries the reason, not the verdict: a pill that
         // says only "Unavailable" sends a viewer looking for a broken toggle
@@ -12560,36 +12574,98 @@ private:
     // ---- DLNA cast device menu (native Win32 popup, no page / WebView) ----
     // A2 discovery: a background scan fills the registry; the button shows the
     // cached list instantly and only "Rescan" triggers a fresh SSDP pass.
-    void RefreshCastDevices(){
+    // The device caveat as words, owned by the UI rather than the backend: the
+    // session hands back a code, this turns it into the interface language.
+    std::wstring CastEntryLabel(const cast_session::Session::MenuEntry& entry){
+        using Label=cast_session::Session::DeviceLabel;
+        switch(entry.label){
+            case Label::DialOnly:return T(L"cast.label.dialOnly");
+            case Label::Offline:return T(L"cast.label.offline");
+            case Label::IdleReachable:return T(L"cast.label.idle");
+            case Label::Detail:return Utf8ToWide(entry.detail);
+            case Label::None:break;
+        }
+        return std::wstring();
+    }
+    std::wstring CastScanSummary(size_t count){
+        std::wstring text=T(L"cast.scan.done")+L" \u00b7 "+std::to_wstring(count)+L" ";
+        text+=count==1?T(L"cast.device.one"):T(L"cast.device.many");
+        return text;
+    }
+    // Scanning never runs on this thread. A synchronous SSDP listen used to
+    // freeze the window for seconds and could not even paint its own "Scanning…"
+    // toast: the toast was queued, then the UI thread blocked before returning
+    // to the message loop, so the user saw a frozen frame and no feedback.
+    void StartCastScan(){
+        bool idle=false;
+        if(!m_castScanRunning.compare_exchange_strong(idle,true))return; // already running
+        if(m_castScan.joinable())m_castScan.join();                      // reap the finished one
         ShowToast(T(L"cast.scanning"));
-        m_cast.Scan(std::chrono::seconds{4});
+        m_castScan=std::thread([this]{
+            m_cast.Scan(std::chrono::seconds{4});
+            if(m_hwnd)PostMessageW(m_hwnd,WM_CAST_SCAN_DONE,0,0);
+        });
+    }
+    void FinishCastScan(){
+        if(!m_castScanRunning.exchange(false))return; // cancelled or already handled
+        if(m_castScan.joinable())m_castScan.join();
+        m_castScanAttempted=true;
         m_castMenu=m_cast.DeviceMenu();
+        ShowToast(CastScanSummary(m_castMenu.size()));
+        UpdateCachedStatus();
+        if(m_hwnd)InvalidateRect(m_hwnd,nullptr,FALSE);
+        // A menu built while the scan was in flight says "Scanning…" and cannot
+        // update itself: TrackPopupMenuEx took a copy of the items. Close it and
+        // let the caller reopen with the list the scan just produced.
+        if(m_castMenuOpen){m_castReopen=true;EndMenu();}
+    }
+    void RefreshCastDevices(){
+        // Non-blocking: the toast is painted now, the menu refreshes when the
+        // scan reports back.
+        StartCastScan();
     }
     void ShowCastMenu(RECT button){
-        // First open with nothing cached: scan once so the menu is not empty.
-        if(m_castMenu.empty()){m_cast.Scan(std::chrono::seconds{4});m_castMenu=m_cast.DeviceMenu();}
+        // Open with whatever is cached and let a background scan fill it in;
+        // never block the click on the network. `m_castScanAttempted` keeps an
+        // empty result from re-triggering a scan on every reopen, which would
+        // otherwise loop: reopen -> empty -> scan -> reopen.
+        if(m_castMenu.empty()&&!m_castScanAttempted)StartCastScan();
+        const bool scanning=m_castScanRunning.load();
         HMENU menu=CreatePopupMenu();if(!menu)return;
         const bool casting=m_cast.Casting();
         if(casting)AppendMenuW(menu,MF_STRING,IDM_CAST_STOP,T(L"cast.stop").c_str());
         if(m_castMenu.empty()){
-            AppendMenuW(menu,MF_STRING|MF_GRAYED,0,T(L"cast.none").c_str());
+            const std::wstring placeholder=scanning?T(L"cast.scanning"):T(L"cast.none");
+            AppendMenuW(menu,MF_STRING|MF_GRAYED,0,placeholder.c_str());
         }else{
             const size_t count=std::min<size_t>(m_castMenu.size(),IDM_CAST_DEVICE_COUNT);
             for(size_t i=0;i<count;++i){
                 const auto& entry=m_castMenu[i];
                 const bool selectable=entry.dmr&&entry.online&&entry.reachable;
                 std::wstring label=Utf8ToWide(entry.displayName);
-                if(!entry.label.empty())label+=std::wstring(L" \u00b7 ")+Utf8ToWide(entry.label);
+                const std::wstring caveat=CastEntryLabel(entry);
+                if(!caveat.empty())label+=std::wstring(L" \u00b7 ")+caveat;
                 const bool current=casting&&m_cast.GetStatus().deviceUdn==entry.key;
                 AppendMenuW(menu,MF_STRING|(current?MF_CHECKED:0u)|(selectable?0u:MF_GRAYED),
                             UINT_PTR(IDM_CAST_DEVICE_FIRST+i),label.c_str());
             }
         }
         AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
-        AppendMenuW(menu,MF_STRING,IDM_CAST_REFRESH,T(L"cast.rescan").c_str());
+        // Keep the action's own words while it is busy: two rows reading
+        // "Scanning…" said nothing about which one was the action.
+        const std::wstring rescan=T(L"cast.rescan");
+        AppendMenuW(menu,MF_STRING|(scanning?MF_GRAYED:0u),IDM_CAST_REFRESH,rescan.c_str());
         POINT anchor{button.left,button.top};ClientToScreen(m_hwnd,&anchor);
+        // Tracked so a finishing scan can close and rebuild this menu; see
+        // FinishCastScan.
+        m_castMenuOpen=menu;m_castMenuAnchor=button;
         const UINT chosen=UINT(TrackPopupMenuEx(menu,TPM_RETURNCMD|TPM_NONOTIFY|TPM_LEFTALIGN|TPM_BOTTOMALIGN|TPM_RIGHTBUTTON,anchor.x,anchor.y,m_hwnd,nullptr));
+        m_castMenuOpen=nullptr;
         DestroyMenu(menu);
+        // The scan finished while this menu was open: reopen on the fresh list
+        // instead of acting on the stale one. Not a nested menu - this runs
+        // after TrackPopupMenuEx has unwound.
+        if(m_castReopen){m_castReopen=false;ShowCastMenu(m_castMenuAnchor);return;}
         if(chosen==IDM_CAST_REFRESH)RefreshCastDevices();
         else if(chosen==IDM_CAST_STOP){m_cast.Stop();ShowToast(T(L"cast.stopped"));UpdateCachedStatus();}
         else if(chosen>=IDM_CAST_DEVICE_FIRST&&chosen<IDM_CAST_DEVICE_FIRST+IDM_CAST_DEVICE_COUNT)
@@ -12597,16 +12673,49 @@ private:
     }
     void SelectCastDevice(int index){
         if(index<0||size_t(index)>=m_castMenu.size())return;
-        const auto& entry=m_castMenu[size_t(index)];
-        if(!entry.dmr||!entry.online||!entry.reachable)return;
+        // Identity first: the list is rebuilt below if a scan was in flight, and
+        // an index into the old list would then point at a different device.
+        const std::string key=m_castMenu[size_t(index)].key;
+        if(m_castScanRunning.load()){
+            // Never wait on the scan's lock from the UI thread; end it and take
+            // the fresh list instead.
+            m_cast.CancelScan();
+            if(m_castScan.joinable())m_castScan.join();
+            m_castScanRunning.store(false);
+            m_castScanAttempted=true;
+            m_castMenu=m_cast.DeviceMenu();
+        }
+        const auto found=std::find_if(m_castMenu.begin(),m_castMenu.end(),
+                                      [&key](const cast_session::Session::MenuEntry& e){return e.key==key;});
+        if(found==m_castMenu.end()||!found->dmr||!found->online||!found->reachable)return;
+        // The capture ring reads the renderer's output rung: that is the frame
+        // actually shown, and its size is the source size when SR is off or the
+        // upscale target when it is on. The encoder's -video_size must match or
+        // ffmpeg reads each frame with the wrong stride. Set it from the live
+        // renderer instead of the Config default (1920x1080).
+        if(m_renderer){
+            auto& castConfig=m_cast.Config_();
+            castConfig.width=m_renderer->OutputW();
+            castConfig.height=m_renderer->OutputH();
+            LOG("Cast capture size from renderer: "<<castConfig.width<<"x"<<castConfig.height);
+        }
         std::string error;
         const uint64_t drainBase=m_renderer?m_renderer->LastRenderedFrameNumber():0;
-        const bool ok=m_cast.Start(entry.key,WideToUtf8(m_path),Position(),!m_playing,drainBase,&error);
-        if(ok)ShowToast(T(L"cast.started")+L" \u00b7 "+Utf8ToWide(entry.displayName));
+        const bool ok=m_cast.Start(key,WideToUtf8(m_path),Position(),!m_playing,drainBase,&error);
+        if(ok)ShowToast(T(L"cast.started")+L" \u00b7 "+Utf8ToWide(found->displayName));
         else ShowToast(Utf8ToWide(error));
         UpdateCachedStatus();
     }
-    void CancelCast(){m_cast.Stop();if(m_hwnd)UpdateCachedStatus();}
+    void CancelCast(){
+        // Order matters: ask the worker to stop, then join it, and only then let
+        // Stop() take the discovery lock the worker may still be holding.
+        m_cast.CancelScan();
+        if(m_castScan.joinable())m_castScan.join();
+        m_castScanRunning.store(false);
+        m_castReopen=false; // closing the window must not reopen a menu
+        m_cast.Stop();
+        if(m_hwnd)UpdateCachedStatus();
+    }
     // `glyph` is drawn in the icon font ahead of the label, or alone when the label is
     // empty; a chevron after the label marks a button that opens a menu.
     void DrawCompareSegment(HDC dc,RECT r,const std::wstring& label,bool enabled,bool selected,double hover,wchar_t glyph=0,bool chevron=false,bool drawMark=true){
@@ -14844,7 +14953,7 @@ private:
         const auto [guideW,guideH]=TemporalGuideGenerator::AnalysisGrid(m_decoder.Width(),m_decoder.Height(),m_decoder.FrameRate());
         ShowWindow(m_viewport,SW_SHOW);Layout();m_renderer=MakeD3D12Renderer();
         ConfigureRendererSource();
-        if(!m_renderer||!m_renderer->Initialize(m_renderWnd,m_decoder.Width(),m_decoder.Height(),m_decoder.Width(),m_decoder.Height(),guideW,guideH,DefaultNeuralCarrierQuality())||!RendererTookSourceLayout()){Unload();return false;}
+        if(!m_renderer||!m_renderer->Initialize(m_renderWnd,m_decoder.Width(),m_decoder.Height(),m_decoder.Width(),m_decoder.Height(),guideW,guideH,DefaultNeuralCarrierQuality(),false,true)||!RendererTookSourceLayout()){Unload();return false;}
         m_renderer->SetDLSS(false);m_renderer->SetColorSettings(m_colorSettings);m_renderer->SetComparison(EffectiveComparison());m_activeQuality=DefaultNeuralCarrierQuality();
         ConfigurePlaybackFrameGeneration(m_renderer.get(),m_playbackFrameGenRequested,m_upscaleEngineMode);
         const ComparisonView desiredView=m_neuralRequested?ComparisonView::Neural:ComparisonView::Original;
@@ -15965,6 +16074,7 @@ private:
         case WM_MEDIA_BUTTON:HandleMediaButton(int(w));return 0;
         case WM_MEDIA_SEEK:if(m_loaded)RequestSeek(double(l)/1000.0);return 0;
         case WM_START_SCREEN:if(!m_loaded)InvalidateRect(h,nullptr,FALSE);return 0;
+        case WM_CAST_SCAN_DONE:FinishCastScan();return 0;
         case dark_mode::WM_UAHDRAWMENU:if(DrawDarkMenuBar(h,reinterpret_cast<const dark_mode::UAHMENU*>(l)))return TRUE;break;
         case dark_mode::WM_UAHDRAWMENUITEM:if(DrawDarkMenuBarItem(h,reinterpret_cast<const dark_mode::UAHDRAWMENUITEM*>(l)))return TRUE;break;
         case WM_NCPAINT:case WM_NCACTIVATE:{const LRESULT result=DefWindowProcW(h,m,w,l);PaintMenuBarSeparator(h);return result;}
@@ -16344,7 +16454,7 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // The loaded source's cache manager; see SourceCache(). The build count is
     // what the regression suite reads to prove a paint builds none.
     mutable std::unique_ptr<NeuralCacheManager> m_sourceCache;mutable std::filesystem::path m_sourceCacheRequestedRoot;mutable uint64_t m_sourceCacheBuilds=0;
-    Clock::time_point m_playStart=Clock::now(),m_fpsWindowStart=Clock::now();double m_submitFps=0.0;uint64_t m_fpsWindowFrames=0;std::wstring m_path,m_youtubeAudioUrl,m_youtubePageUrl,m_displayTitle,m_cachedStatus,m_cachedWindowTitle,m_pendingYouTubeTitle,m_pendingNeuralTitle;YouTubeSourceQuality m_youtubeSourceQuality=YouTubeSourceQuality::P1080;MediaSourceKind m_sourceKind=MediaSourceKind::LocalFile;VideoDecoder m_decoder;VideoFrame m_next;D3D12RendererOwner m_renderer;TemporalGuideGenerator m_guides;AudioPlayer m_audio;cast_session::Session m_cast;std::vector<cast_session::Session::MenuEntry> m_castMenu;CapturedVideoFrame m_castCapture;std::unique_ptr<AudioPlayer>m_networkAudio;NetworkReadState m_networkReadState;YouTubeResolutionLifecycle m_youtubeLifecycle;std::unique_ptr<YouTubeResolver>m_youtubeResolver;CompletionRegistry<YouTubeCompletion>m_youtubeCompletions;std::jthread m_youtubeWorker;
+    Clock::time_point m_playStart=Clock::now(),m_fpsWindowStart=Clock::now();double m_submitFps=0.0;uint64_t m_fpsWindowFrames=0;std::wstring m_path,m_youtubeAudioUrl,m_youtubePageUrl,m_displayTitle,m_cachedStatus,m_cachedWindowTitle,m_pendingYouTubeTitle,m_pendingNeuralTitle;YouTubeSourceQuality m_youtubeSourceQuality=YouTubeSourceQuality::P1080;MediaSourceKind m_sourceKind=MediaSourceKind::LocalFile;VideoDecoder m_decoder;VideoFrame m_next;D3D12RendererOwner m_renderer;TemporalGuideGenerator m_guides;AudioPlayer m_audio;cast_session::Session m_cast;std::vector<cast_session::Session::MenuEntry> m_castMenu;std::thread m_castScan;std::atomic<bool> m_castScanRunning{false};HMENU m_castMenuOpen=nullptr;RECT m_castMenuAnchor{};bool m_castReopen=false;bool m_castScanAttempted=false;CapturedVideoFrame m_castCapture;std::unique_ptr<AudioPlayer>m_networkAudio;NetworkReadState m_networkReadState;YouTubeResolutionLifecycle m_youtubeLifecycle;std::unique_ptr<YouTubeResolver>m_youtubeResolver;CompletionRegistry<YouTubeCompletion>m_youtubeCompletions;std::jthread m_youtubeWorker;
     // The loaded source's digest, so a second job against the same file does
     // not pay for a second full hash. Read from job threads.
     // Shared with the job thread by value, never through `this`: the neural

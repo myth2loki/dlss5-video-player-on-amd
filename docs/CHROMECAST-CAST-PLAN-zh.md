@@ -313,3 +313,135 @@ CastAppId=CC1AD845             ; Default Media Receiver
 - [ ] 失败报错但后台渲染继续，可重推
 - [ ] 切片源停推、关对话框恢复本地显示
 - [ ] 1 小时稳定性无内存增长、无卡死
+
+---
+
+## 11. 产品化实际状态更正（2026-11-21）
+
+最终落地走的是 **DLNA**（非本文档的 Chromecast 路径）。第 10 节的
+「抓帧 → 编码 → HLS → HTTP → Cast 全链路打通」**尚未完成**：
+
+- 分层验证已证明数据面 OK：产品 ffmpeg 参数（h264_amf 1080p30/8000k）
+  编码的切片，经产品 `CastHttpServer` 服务，电视全程 PLAYING
+  （`tools/verification/verify_product_hls_on_tv.py --generate` = PASS）。
+- 断点在**抓帧→喂编码器**：`main.cpp` 调 `D3D12Renderer::Initialize(...)`
+  没传第 10 参 `captureOutput=true`（第 9 参是 `preserveSource`，易混），
+  抓帧环从未创建，`SubmitFrame()` 从未被调用，编码器 stdin 无帧 →
+  HLS 目录空 → 电视拿 404「当前内容不可播放」。
+- 且现成抓帧环为神经渲染评估设计：抓 NGX `m_dlssOutput`（descriptor 1）、
+  受 `m_lastDLSSUsed` 门控；AMD 上 DLSS 不可用，最终呈现帧是
+  `m_upscaleSharp`/`m_dlssColor`。**不能只补 `true`**，要给投屏接一条
+  抓「当前呈现帧」的独立路径。
+- 详细证据/工具/命令见 `.workbuddy/memory/2026-11-21.md` 顶部 CORRECTION 与分层定位两节。
+
+---
+
+## 12. 抓帧接入方案（2026-11-21 定案，实现前）
+
+### 12.1 勘察结论：现成机制比"补一个 true"更合适
+
+RenderFrame 返回时 `m_upscaleSharp`（FP16、`m_outputW×m_outputH` = 输出 rung）
+已填好本帧 FSR 4 结果——`DumpOutputFrame()` 紧跟 RenderFrame 调用就是证据。
+AMD 路径 present 最终采样 `SRVGPU(UpscaleSRV)`（D3D12Renderer.cpp:3952-3954），
+即 `m_upscaleSharp`，**尺寸正好是投屏编码器要的 1920×1080**。
+
+现成 `EnqueueEvaluatedFrameCapture()` 的 4 槽异步环 + `m_psoCacheCapture`
+（present shader 把 FP16 SRV 转 BGRA8 写 readback）**格式完全兼容** UpscaleSRV：
+两个源都是 FP16、都是 m_outputW×m_outputH，present shader 不关心是哪张。
+所以不必另造抓帧通路，只需给现有环加"抓哪张"的选择 + 放行门控。
+
+被否决的两条路（避免再试）：
+- 复用 `EnqueueComposedViewCapture`（VSR 导出那条）：它抓窗口 backbuffer 尺寸
+  （`CurrentPresentTarget()` = 窗口大小，非 1920×1080），且要求 `target.scaled`
+  和 `DebugView::Final`，与播放器任意窗口尺寸/调试视图不兼容。
+- 只补 `Initialize(..., true, true)`：环开了但 `m_lastDLSSUsed` 在 AMD 恒 false，
+  `EnqueueEvaluatedFrameCapture` 第 2 道闸仍 return，且抓 descriptor 1（NGX 输出，
+  AMD 上无内容）→ 仍然无帧。
+
+### 12.2 改动点（三处，全部默认行为不变）
+
+1. **`D3D12Renderer.h/.cpp`**：`EnqueueEvaluatedFrameCapture` 加可选参数
+   `CaptureSource source = CaptureSource::NeuralOutput`，枚举两值：
+   - `NeuralOutput`（默认）：抓 descriptor 1，保留 `m_lastDLSSUsed` 门控，
+     **评估/离线路径逐字不变**。
+   - `PresentOutput`：抓 `UpscaleSRV`，门控改为 `UpscalePresentActive()`
+     （AMD FSR4/FSR1/CAS 在-service），不碰 m_lastDLSSUsed。
+   源切换只改 `SRVGPU(captured)` 的 descriptor 号（1 → UpscaleSRV）与门控，
+   captured 仍是 FP16 FP16→BGRA8 的同一 present shader。
+   若 `UpscalePresentActive()` 为 false（DLSS 真在用的 NVIDIA 机器），
+   PresentOutput 回退抓 descriptor 1——那正是该类机器的最终呈现帧。
+
+2. **`main.cpp`**：
+   - `Initialize(..., m_activeQuality, true, true)`：第 10 参补 `captureOutput=true`
+     （第 9 参 `preserveSource=true` 保持不变）。同时修正那句写错的注释。
+   - `RenderVideoFrame` 的送帧段：投屏时用 `EnqueueEvaluatedFrameCapture(
+     CaptureSource::PresentOutput)`；非投屏时用默认参数（评估语义不变）。
+     drain/SubmitFrame 路径不变（已有 drainBase 硬闸）。
+
+3. **`CMakeLists.txt`**：无新增源文件，不改。
+
+### 12.3 不变量 / 回归门禁
+
+- **回退链 FSR4 → FSR1 → CAS 不得破坏**：PresentOutput 只是读 UpscaleSRV，
+  不写任何 present 状态、不改任何 PSO/资源；且 AMD 新支路统一
+  `if (request.backend == Amd)` 语义（此处以 `UpscalePresentActive()` 判定）。
+- **评估抓帧逐字不变**：默认参数走原路径，离线导出 A/B 不受影响。
+- **UI 回归**：66 cases / 3160 assertions / **22 failures** 与基线逐项一致
+  （同一份测试代码 A/B）。
+- **真机验收（必须看到哪一行）**：投屏开始后 `%TEMP%\dlss5-cast-hls`
+  的 `live.m3u8` 存在、`GET /live.m3u8` 返回 **200**（不是 404）、
+  切片 `seg-*.ts` 持续增多、电视 PLAYING 且用户肉眼看到画面。
+  **netstat 连接数不算数**（404 也建立连接，11-21 已误判一次）。
+
+### 12.4 风险与降级
+
+- 若 `captureOutput=true` 的常驻 readback 环内存（~40 MiB@1080p）在意，
+  可后续改成投屏时才分配——本轮不做，先保证通路正确。
+- 若 PresentOutput 抓到的是上一帧（时序问题）：DumpOutputFrame 已证明
+  RenderFrame 返回时 m_upscaleSharp 是本帧的，风险低；真机以画面为准。
+
+### 12.5 实现更正（2026-11-21 15:44，实测推翻 12.1 的假设）
+
+**12.1 的致命假设错了**：实测诊断行
+`Cast capture diag: captureOutput=1 output=1280x720 upscaleActive=0 dlssUsed=0
+dlssEnabled=0 upscaleOffered=0 upscaleStretch=0` —— 投屏时 SR **默认没开**
+（`m_upscalingRequested` 取决于 ini，AMD 上 `SetDLSS(false)` 关闭了 NGX 开关），
+renderer 输出就是源尺寸 1280×720，`UpscaleSRV` 根本不存在（`upscaleStretch=0`）。
+按 12.2 的 `UpscalePresentActive()` 门控会直接 return，仍然无帧（实测 20 次 404）。
+而且即使抓到，源是 1280×720，编码器写死 1920×1080 = stride 不匹配。
+
+**实际实现**（偏离 12.2，以本节为准）：
+1. `CaptureSource` 保留，但 `PresentOutput` 的门控改为「只要 capture ring 在就抓」，
+   无「SR 必须开」条件。
+2. 抓帧源按 present 主路径的三档同款选择：NGX 在-service → descriptor 1；
+   `UpscalePresentActive()` → `UpscaleSRV`；都没有 → descriptor 4（`m_dlssColor`
+   解码源），并做 `GuideReadState ↔ PIXEL_SHADER_RESOURCE` 的成对 barrier。
+   三档都是 FP16，同一 present shader 转 BGRA8，源小于输出时按 output viewport 放大。
+3. `SelectCastDevice` 在 Start 前用 `m_renderer->OutputW()/OutputH()` 设置
+   `m_cast.Config_().width/height`，让 ffmpeg `-video_size` 匹配抓帧输出。
+   这是 12.2 漏掉的关键联动——编码器尺寸必须跟随 renderer，不能写死。
+4. 主 renderer 的 3 处 `Initialize` 都补第 10 参 `captureOutput=true`
+   （含 GPU 恢复重建路径，否则重建后投屏静默断流）。
+5. 诊断行做成一次性 LOG（cast 路径专属），从此「没帧」能直接从日志判根因，
+   不用再靠 netstat 猜。
+
+**验证结果**：`verify_cast_capture.py --hold 30` → 15 次探测 14 次 OK，
+m3u8 200、`seg-*.ts` 从 1 段增长到 12 段每段 2.17 MB，日志
+`Cast encoder started: h264_amf 1280x720@30`；自检 27+18+21 全绿，
+UI 回归 66/3160/22 与基线一致。电视真实画面待用户肉眼确认。
+
+### 12.6 第二根因：URL 推送早于首片落盘（"内容无法播放"）
+抓帧打通后 HLS 200 + 非空切片、电视来拉，但电视报"当前内容无法播放"。
+隔离实验：把同一批产品切片用"等就绪再推 URL"的验证器推给电视 →
+`PLAYING 20/20` + 肉眼出画面，证明切片本身没问题，差异在时序。
+
+- 根因：`Start()` 里 encoder 刚启动就推 URL，电视立即 GET `/live.m3u8`
+  撞上首片未落盘的 404，判定不可播放且不重试。
+- 修法：`CastHttpServer::ServeOne`（独立线程）对 playlist GET 等
+  `HlsReady(dir)`（m3u8 + 非空 seg，≤15s，stop-aware）。
+  **不能在 `Start()` 里等**——它是 UI 线程，sleep 会停掉渲染送帧而自锁
+  （实测 12s 全 404 + WinError 10061）。`HlsReady` 是纯函数，+5 单测。
+- 验证：`verify_cast_capture.py --hold 30` → probe 00 即 200（无 404 竞态），
+  01–14 全 OK；编译 EXIT=0，自检 32+18+21，UI 回归 66/3160/22 与基线一致。
+- 详细证据见 `.workbuddy/memory/2026-11-21.md` 16:05 追加节。
+

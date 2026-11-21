@@ -5371,14 +5371,38 @@ bool D3D12Renderer::SetDirectEncodeSurfaces(NvencSurfacePool*pool,std::vector<ui
     return true;
 }
 
-bool D3D12Renderer::EnqueueEvaluatedFrameCapture(){
+bool D3D12Renderer::EnqueueEvaluatedFrameCapture(CaptureSource source){
+    const bool presentOutput=source==CaptureSource::PresentOutput;
+    // One-shot diagnosis for the cast path: without this line a silent early
+    // return looks exactly like "the encoder broke", which cost a full round
+    // on 11-21. Every gate that can park the cast capture is named here.
+    if(presentOutput&&!m_castCaptureDiagLogged){
+        m_castCaptureDiagLogged=true;
+        LOG("Cast capture diag: captureOutput="<<m_captureOutput<<" output="<<m_outputW<<"x"<<m_outputH
+            <<" upscaleActive="<<UpscalePresentActive()<<" dlssUsed="<<m_lastDLSSUsed
+            <<" dlssEnabled="<<m_dlssEnabled<<" dlssAvailable="<<m_dlss.Available()
+            <<" upscaleOffered="<<m_upscaleOffered<<" upscaleStretch="<<(m_upscaleStretch!=nullptr)
+            <<" cacheOutput="<<(m_cacheOutput!=nullptr)<<" psoCacheCapture="<<(m_psoCacheCapture!=nullptr));
+    }
     // The readback ring only exists when Initialize was asked for it.
     if(!m_captureOutput)return false;
-    if(!m_lastDLSSUsed||!m_outputW||!m_outputH)return false;
+    if(!m_outputW||!m_outputH)return false;
+    // NeuralOutput keeps the evaluation contract byte for byte: it only ever
+    // captures a frame DLSS actually produced. PresentOutput is the DLNA cast
+    // path and must capture whatever the viewer actually sees, which is one of
+    // three rungs (chosen below): NGX DLSS output, this player's upscale rung,
+    // or the decoded source. There is no "upscale must be on" gate - casting a
+    // 720p clip with SR off is a valid case, and the encoder follows the real
+    // output size. What would be wrong is capturing nothing.
+    if(!presentOutput&&!m_lastDLSSUsed)return false;
     if(m_capturePending>=CaptureSlots)return false;
     const bool planar=d3d12_renderer_detail::CaptureFormatIsPlanar(m_captureFormat);
-    if(m_gpuUnusable||!m_cacheOutput||!m_dlssOutput||!m_queue||!m_rootSig||!m_psoCacheCapture)
+    if(m_gpuUnusable||!m_cacheOutput||!m_queue||!m_rootSig||!m_psoCacheCapture)
         return false;
+    // NeuralOutput always reads descriptor 1 (m_dlssOutput). Cast must not
+    // require it: on an AMD-only build the NGX carrier may never have produced
+    // one, yet the upscale rung is a perfectly good frame to send.
+    if(!presentOutput&&!m_dlssOutput)return false;
     if(planar&&(!m_captureLuma||!m_captureChroma||!m_psoCaptureLuma||!m_psoCaptureChroma))return false;
     const uint32_t readbackSlot=m_captureWrite;
     if(!m_cacheReadback[readbackSlot])return false;
@@ -5415,12 +5439,31 @@ bool D3D12Renderer::EnqueueEvaluatedFrameCapture(){
     // full-screen triangle below writes every texel of the plane it is drawing into, so
     // a clear in front of it is an extra full-plane write on the path whose cost is
     // proportional to the frame.
-    // What the capture reads: the neural output itself (descriptor 1), or at a
-    // temporal stability rung above Off the pass's output, recorded here so the
-    // capture below is its reader. A rung that cannot run fails the capture rather
-    // than cache an unstabilized frame under a stabilized key.
+    // What the capture reads. Evaluation keeps the neural output (descriptor 1,
+    // or a temporal-stability rung) byte for byte - a rung that cannot run fails
+    // rather than cache an unstabilized frame under a stabilized key. DLNA cast
+    // reads exactly the rung present draws, in the same order as the present
+    // switch at RecordAndPresentFrame: NGX output (1), the player's upscale
+    // rung (UpscaleSRV), or the decoded source (4). All three are FP16 and the
+    // present shader converts them to the BGRA8 cache target at the output
+    // viewport, so a source smaller than the output is upscaled on the way in.
     uint32_t captured=1u;
-    if(!RecordTemporalStability(cmd,captured))return false;
+    ID3D12Resource* sourceBarrier=nullptr;
+    if(!presentOutput){
+        if(!RecordTemporalStability(cmd,captured))return false;
+    }else if(m_lastDLSSUsed&&DLSSEnabled()){
+        captured=1u; // NGX is really serving; descriptor 1 is the shown frame.
+    }else if(UpscalePresentActive()){
+        captured=UpscaleSRV; // the FSR 4/FSR 1/CAS upscale rung.
+    }else{
+        // No upscaler: present draws the decoded source directly. It is in
+        // GuideReadState between frames; move it to pixel-SHADER state for this
+        // draw and put it back, exactly as the present path does.
+        captured=4u;
+        sourceBarrier=m_dlssColor.Get();
+        if(!sourceBarrier)return false;
+        Barrier(cmd,sourceBarrier,GuideReadState,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
     cmd->RSSetViewports(1,&viewport);cmd->RSSetScissorRects(1,&scissor);
     auto target=RTV(planar?FrameCount+3:FrameCount+2);cmd->OMSetRenderTargets(1,&target,FALSE,nullptr);
     cmd->SetGraphicsRootSignature(m_rootSig.Get());
@@ -5430,6 +5473,7 @@ bool D3D12Renderer::EnqueueEvaluatedFrameCapture(){
     // Cache frames are always the bare neural output: no comparison, no color/zoom.
     SetPresentConstants(cmd,ColorSettings{},ComparisonSettings{},false);
     cmd->DrawInstanced(3,1,0,0);
+    if(sourceBarrier)Barrier(cmd,sourceBarrier,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,GuideReadState);
     // A single set of capture targets is enough even with several captures in flight:
     // the next frame's draw into them and this frame's copy out of them are recorded on
     // the same queue, so the GPU already runs them in order.

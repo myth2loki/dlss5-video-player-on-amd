@@ -127,6 +127,16 @@ struct GuideFrame;
 //    bytes per pixel; requires even output dimensions.
 enum class CaptureFormat { Bgra, Nv12, P010 };
 
+// Which rung the asynchronous capture ring reads. NeuralOutput is the default and
+// keeps the evaluation/export semantics byte for byte: it captures descriptor 1
+// (the NGX DLSS output) and only when the last frame actually used DLSS.
+// PresentOutput is for DLNA cast: on AMD the present samples the upscale rung,
+// so it captures UpscaleSRV (m_upscaleSharp, output size) instead. On a machine
+// where DLSS is really serving it falls back to descriptor 1, which is then the
+// frame the viewer sees. Both sources are FP16 at the output size and go through
+// the same present shader into the BGRA8 cache target; no present state is changed.
+enum class CaptureSource { NeuralOutput, PresentOutput };
+
 namespace d3d12_renderer_detail {
 // Tightly packed bytes of one captured frame in `format`, which is what the capture
 // hands the encoder and what the encoder checks each frame against.
@@ -405,7 +415,7 @@ public:
     // draining the GPU. ResolveOldestCapture then waits on the oldest slot only. This
     // lets the CPU-side copy and the encoder overlap with GPU work on the next frame,
     // where the old synchronous path left the GPU idle for the whole CPU stage.
-    bool EnqueueEvaluatedFrameCapture();
+    bool EnqueueEvaluatedFrameCapture(CaptureSource source = CaptureSource::NeuralOutput);
     uint32_t PendingCaptureCount() const { return m_capturePending; }
     // The frameNumber of the most recently evaluated frame. The DLNA cast
     // session records this at Start as the drain base: the first captured frame
@@ -1853,6 +1863,8 @@ private:
     UpscalingHistory m_upscalingHistory = kDefaultUpscalingHistory;
     // True when a caller asked for the capture readback ring at Initialize.
     bool m_captureOutput=false;
+    // One-shot cast capture gate diagnosis (see EnqueueEvaluatedFrameCapture).
+    bool m_castCaptureDiagLogged=false;
     uint64_t m_framesPresented = 0;
     DebugView m_debugView = DebugView::Final;
     ColorSettings m_colorSettings{};

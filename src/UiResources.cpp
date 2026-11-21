@@ -59,6 +59,10 @@ std::wstring GlyphForIcon(UiIcon icon)
     // Past the BMP, so these two are why the return type is a string.
     case UiIcon::SubtitlesAi: return L"\U000101a4";   // subtitles-ai
     case UiIcon::SubtitlesOff: return L"\U000101a2";  // subtitles-off
+    // cast: a screen with waves leaving it. Verified present in the committed
+    // tabler-icons.ttf cmap (U+EA56, glyph 387) by reading the post and cmap
+    // tables directly, not by trusting the icon name to be in the subset.
+    case UiIcon::Cast: return L"\xea56";              // cast
     }
     return L"";
 }

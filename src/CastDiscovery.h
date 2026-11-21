@@ -11,6 +11,7 @@
 
 #include "CastDevicePolicy.h"
 
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -37,7 +38,12 @@ public:
     // Each discovered device is merged into the registry. `st` is the SSDP
     // search target; "upnp:rootdevice" finds all devices including non-DMRs,
     // which is intentional so a DIAL endpoint can be labelled honestly.
-    int Scan(std::string localIp, std::chrono::seconds listen = std::chrono::seconds{6});
+    //
+    // `cancel` (optional) is polled between datagrams and before each
+    // description fetch so a window that is closing does not wait out the full
+    // listen window. A cancelled scan keeps whatever it had already merged.
+    int Scan(std::string localIp, std::chrono::seconds listen = std::chrono::seconds{6},
+             const std::atomic<bool>* cancel = nullptr);
 
     // Fetch one description URL directly (no SSDP), e.g. a device the user
     // entered by hand or a remembered LOCATION. Returns false when the URL

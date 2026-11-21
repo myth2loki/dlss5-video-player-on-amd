@@ -68,17 +68,19 @@ bool SendAll(SOCKET s, const char* data, std::size_t size)
 }
 
 std::string HttpResponseHeader(int status, const std::string& statusText, uint64_t contentLength,
-                               bool hasRange, ByteRange range, uint64_t fileSize)
+                               bool hasRange, ByteRange range, uint64_t fileSize,
+                               std::string_view contentType = "application/octet-stream")
 {
     char buffer[512];
     std::string out;
+    const std::string type(contentType);
     const int n = std::snprintf(buffer, sizeof(buffer),
         "HTTP/1.1 %d %s\r\n"
-        "Content-Type: application/octet-stream\r\n"
+        "Content-Type: %s\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Accept-Ranges: bytes\r\n"
         "Content-Length: %llu\r\n",
-        status, statusText.c_str(), static_cast<unsigned long long>(contentLength));
+        status, statusText.c_str(), type.c_str(), static_cast<unsigned long long>(contentLength));
     if (n > 0) out.append(buffer, static_cast<std::size_t>(n));
     if (hasRange) {
         const int r = std::snprintf(buffer, sizeof(buffer), "Content-Range: bytes %llu-%llu/%llu\r\n",
@@ -90,7 +92,7 @@ std::string HttpResponseHeader(int status, const std::string& statusText, uint64
     return out;
 }
 
-void ServeOne(SOCKET client, const std::filesystem::path& directory)
+void ServeOne(SOCKET client, const std::filesystem::path& directory, const std::function<bool()>& stop)
 {
     // Read only the request line + headers, bounded. No body is expected for GET.
     std::array<char, 8192> buf{};
@@ -147,6 +149,24 @@ void ServeOne(SOCKET client, const std::filesystem::path& directory)
         }
     }
 
+    // A DMR issues its first GET the instant SetAVTransportURI returns — before
+    // the encoder has written the first segment. Serving a 404 there makes the
+    // TV declare "content not playable" and never retry, even though the same
+    // stream plays fine once written (verified 2026-11-21). Hold the playlist
+    // GET on this server thread (never the UI thread) until the first real
+    // segment exists. Bounded and stop-aware so Stop() tears down promptly.
+    if (target == "live.m3u8" && !HlsReady(directory)) {
+        // Only the DMR's first early GET needs to wait; log that one (with the
+        // outcome) and stay silent for the steady-state playlist polls.
+        LOG("Cast HTTP: early playlist GET, holding for first segment");
+        const auto readyDeadline = std::chrono::steady_clock::now() + std::chrono::seconds{15};
+        while (!HlsReady(directory) && std::chrono::steady_clock::now() < readyDeadline &&
+               !(stop && stop())) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        }
+        LOG("Cast HTTP: playlist hold done, HlsReady=" << HlsReady(directory));
+    }
+
     const std::filesystem::path filePath = directory / std::string(target);
     std::error_code ec;
     const uint64_t fileSize = static_cast<uint64_t>(std::filesystem::file_size(filePath, ec));
@@ -171,7 +191,8 @@ void ServeOne(SOCKET client, const std::filesystem::path& directory)
     const uint64_t length = hasRange ? (range.last - range.first + 1) : fileSize;
     const int status = hasRange ? 206 : 200;
     const std::string statusText = hasRange ? "Partial Content" : "OK";
-    const std::string header = HttpResponseHeader(status, statusText, length, hasRange, range, fileSize);
+    const std::string header = HttpResponseHeader(status, statusText, length, hasRange, range, fileSize,
+                                                  ContentTypeFor(target));
     if (!SendAll(client, header.data(), header.size())) return;
 
     std::ifstream file(filePath, std::ios::binary);
@@ -235,7 +256,7 @@ bool RunServer(const Settings& settings)
         Socket client(accepted);
         const DWORD blocking = 0;
         ioctlsocket(client.Get(), FIONBIO, const_cast<DWORD*>(&blocking));
-        ServeOne(client.Get(), settings.directory);
+        ServeOne(client.Get(), settings.directory, settings.stop);
     }
     return true;
 }

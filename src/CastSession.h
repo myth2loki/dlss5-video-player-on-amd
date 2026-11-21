@@ -94,10 +94,25 @@ public:
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
 
-    // --- discovery (control-plane, main thread) ---
-    // Run an SSDP scan and merge results. Returns the number of devices seen.
+    // --- discovery (control-plane, any thread) ---
+    // Run an SSDP scan, then probe every DMR it can see so the menu reports
+    // liveness rather than a stale flag. Returns the number of devices seen.
     // Safe to call from a background thread; registry access is serialized.
     int Scan(std::chrono::seconds listen = std::chrono::seconds{6});
+    // Ask a running Scan to return early. Bounded: the caller still has to join
+    // its own scan thread; this only shortens the wait.
+    void CancelScan();
+
+    // Why a device carries a caveat, kept as a code instead of a sentence so
+    // the UI owns the words. The backend must not decide the interface language.
+    enum class DeviceLabel {
+        None,           // castable, nothing to warn about
+        DialOnly,       // answers, but is a DIAL endpoint and not a DMR
+        Offline,        // did not answer, or dropped past the TTL
+        IdleReachable,  // answered a GetTransportInfo with a 501: alive, idle
+        Detail,         // backend detail worth showing verbatim (ASCII)
+    };
+
     // A snapshot for the device menu, with display names disambiguated.
     struct MenuEntry {
         std::string key;         // UDN (identity)
@@ -105,7 +120,8 @@ public:
         bool online{false};
         bool dmr{false};
         bool reachable{false};
-        std::string label;       // e.g. "DIAL 非 DMR", "UPnP-error-501"
+        DeviceLabel label{DeviceLabel::None};
+        std::string detail;      // only meaningful when label == Detail
     };
     std::vector<MenuEntry> DeviceMenu() const;
 

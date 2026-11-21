@@ -176,11 +176,13 @@ bool Discovery::FetchDescription(const std::string& location, cast_device::Devic
     return true;
 }
 
-int Discovery::Scan(std::string localIp, std::chrono::seconds listen)
+int Discovery::Scan(std::string localIp, std::chrono::seconds listen,
+                    const std::atomic<bool>* cancel)
 {
     EnsureWsa();
     if (!g_wsaOk) return 0;
     if (localIp.empty()) localIp = LocalLanIp();
+    const auto cancelled = [cancel] { return cancel && cancel->load(std::memory_order_acquire); };
 
     static constexpr std::string_view kMulticast = "239.255.255.250";
     static constexpr unsigned short kSsdpPort = 1900;
@@ -226,7 +228,7 @@ int Discovery::Scan(std::string localIp, std::chrono::seconds listen)
     std::vector<std::string> locations;
     const auto deadline = std::chrono::steady_clock::now() + listen;
     char buffer[8192];
-    while (std::chrono::steady_clock::now() < deadline) {
+    while (std::chrono::steady_clock::now() < deadline && !cancelled()) {
         sockaddr_in from{};
         int fromLen = sizeof(from);
         const int got = recvfrom(sock.Get(), buffer, sizeof(buffer), 0,
@@ -266,6 +268,7 @@ int Discovery::Scan(std::string localIp, std::chrono::seconds listen)
 
     int added = 0;
     for (const std::string& location : locations) {
+        if (cancelled()) break;
         cast_device::Device device;
         if (!FetchDescription(location, device)) continue;
         const std::size_t before = m_registry.Size();

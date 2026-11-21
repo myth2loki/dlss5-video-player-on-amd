@@ -31,6 +31,12 @@ enum class UiIcon {
     // tabler-icons.ttf cmap (U+101A4 / U+101A2).
     SubtitlesAi,
     SubtitlesOff,
+    // Sending the picture to another screen. Distinct from Maximize on purpose:
+    // a cast button drawn as the fullscreen glyph says the wrong thing, and the
+    // two live one button apart in the same toolbar run. Verified present in the
+    // committed tabler-icons.ttf cmap (U+EA56, glyph 387); the crossed-out
+    // variant cast-off is U+F0C9 if an "off" arm is ever wanted.
+    Cast,
 };
 
 namespace ui_palette {

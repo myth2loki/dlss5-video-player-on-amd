@@ -17,6 +17,7 @@
 // unit-tested in CastHttpServerTests.cpp. RunServer is the Winsock loop the
 // headless child process calls; it returns when `stop` is set or on fatal error.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -43,6 +44,44 @@ inline bool IsAllowedName(std::string_view target)
     if (digits.empty()) return false;
     for (char c : digits) if (c < '0' || c > '9') return false;
     return true;
+}
+
+// DLNA DMRs choose an HLS demuxer from the HTTP Content-Type. Serving every
+// file as application/octet-stream makes them refuse the clip with "content
+// not playable" even though the SOAP control and every GET succeed. The
+// Python POC the TV actually played used mimetypes.guess_type(); match it.
+inline std::string_view ContentTypeFor(std::string_view target)
+{
+    auto endsWith = [&](std::string_view suffix) {
+        if (target.size() < suffix.size()) return false;
+        auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; };
+        return std::equal(suffix.rbegin(), suffix.rend(), target.rbegin(),
+                          [&](char a, char b) { return lower(a) == lower(b); });
+    };
+    if (endsWith(".m3u8")) return "application/vnd.apple.mpegurl";
+    if (endsWith(".ts")) return "video/mp2t";
+    return "application/octet-stream";
+}
+
+// A DMR issues its first GET the instant SetAVTransportURI returns. If the
+// playlist or the first segment is not on disk yet, that GET is a 404 and the
+// TV declares "content not playable" without ever retrying — even though the
+// very same segments play fine once they exist. Start() gates the URL push on
+// this predicate (with a bounded wait so a broken encoder cannot hang UI).
+// Side-effect-free so the exact rule is unit-tested in CastHttpServerTests.
+inline bool HlsReady(const std::filesystem::path& dir)
+{
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(dir / "live.m3u8", ec) || ec) return false;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) return false;
+        const std::string name = entry.path().filename().string();
+        if (name == "live.m3u8" || !IsAllowedName(name)) continue; // segments only
+        std::error_code sizeEc;
+        const auto size = entry.file_size(sizeEc);
+        if (!sizeEc && size > 0) return true;
+    }
+    return false;
 }
 
 struct ByteRange {

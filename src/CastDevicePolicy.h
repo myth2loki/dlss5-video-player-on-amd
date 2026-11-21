@@ -146,11 +146,23 @@ public:
     {
         auto it = m_devices.find(key);
         return it == m_devices.end() ? nullptr : &it->second;
-    }
-    const Device* Find(const std::string& key) const
+    }    const Device* Find(const std::string& key) const
     {
         auto it = m_devices.find(key);
         return it == m_devices.end() ? nullptr : &it->second;
+    }
+
+    // Record a liveness probe for an already-known device. Kept apart from
+    // Upsert on purpose: a description refresh proves a device answered SSDP,
+    // which says nothing about whether its AVTransport endpoint is alive, and
+    // letting Upsert imply that is how a menu ends up claiming a powered-off
+    // TV is ready to cast.
+    void SetProbe(const std::string& key, bool reachable, std::string detail)
+    {
+        auto it = m_devices.find(key);
+        if (it == m_devices.end()) return;
+        it->second.reachable = reachable;
+        it->second.probeDetail = std::move(detail);
     }
 
     bool IsOnline(const Device& device,
