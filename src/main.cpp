@@ -10489,8 +10489,11 @@ private:
             const auto [gw,gh]=TemporalGuideGenerator::AnalysisGrid(m_decoder.Width(),m_decoder.Height(),m_decoder.FrameRate());
             ConfigureRendererSource(candidate->renderer.get());
             candidate->renderer->SetUpscaleSharpness(m_upscaleSharpness);
+            // The 10th arg keeps the capture ring alive across the upscale
+            // swap: this candidate becomes the active renderer, and a cast
+            // started while upscaling is on must still have frames to read.
             if(candidate->renderer->Initialize(candidate->window,m_decoder.Width(),m_decoder.Height(),
-                size.width,size.height,gw,gh,NVSDK_NGX_PerfQuality_Value_MaxQuality,true)&&
+                size.width,size.height,gw,gh,NVSDK_NGX_PerfQuality_Value_MaxQuality,true,true)&&
                 RendererTookSourceLayout(candidate->renderer.get())&&
                 // NGX where the machine has it, this player's own filter
                 // everywhere else: the candidate is ready when either engine can
@@ -15271,7 +15274,10 @@ private:
         candidate->renderer->SetSourceColor(completion.decoder->DecodedColor());
         candidate->renderer->SetPresentFollowsWindow(true);
         candidate->renderer->SetHdrOutputAllowed(true);
-        if(!candidate->renderer->Initialize(candidate->window,completion.configuration.decodeWidth,completion.configuration.decodeHeight,completion.configuration.outputWidth,completion.configuration.outputHeight,completion.configuration.guideWidth,completion.configuration.guideHeight,quality))return{};
+        // preserveSource=false for a fresh YouTube source; captureOutput=true
+        // so a cast survives this renderer replacing the active one (same as
+        // the upscale swap) - otherwise the new renderer has no readback ring.
+        if(!candidate->renderer->Initialize(candidate->window,completion.configuration.decodeWidth,completion.configuration.decodeHeight,completion.configuration.outputWidth,completion.configuration.outputHeight,completion.configuration.guideWidth,completion.configuration.guideHeight,quality,false,true))return{};
         if(candidate->renderer->ActiveSourceLayout()!=completion.decoder->PixelLayout()){
             LOG("Prepared renderer refused the decoder's "
                 <<(completion.decoder->PixelLayout()==VideoPixelLayout::Nv12?"NV12":"BGRA")

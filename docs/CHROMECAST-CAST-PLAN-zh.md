@@ -445,3 +445,48 @@ UI 回归 66/3160/22 与基线一致。电视真实画面待用户肉眼确认�
   01–14 全 OK；编译 EXIT=0，自检 32+18+21，UI 回归 66/3160/22 与基线一致。
 - 详细证据见 `.workbuddy/memory/2026-11-21.md` 16:05 追加节。
 
+### 12.7 功能开关重建 renderer 的抓帧环隐患（2026-11-21 下午）
+
+**症状**：播放中开超分再投屏，电视拿不到画面。日志铁证：
+```
+不开超分  Cast capture diag: captureOutput=1 output=1280x720  upscaleActive=0   → HlsReady=1
+开超分    Cast capture diag: captureOutput=0 output=2560x1440 upscaleActive=1   → HlsReady=0（HLS 空）
+```
+
+- **根因**：开超分走 `EnableUpscaling()` → 建候选 renderer → `m_renderer=std::move(candidate)`
+  替换活动 renderer。候选的 `Initialize` 只传 9 参，**第 10 参 `captureOutput` 默认 false**
+  → 新活动 renderer 的抓帧环没开 → `EnqueueEvaluatedFrameCapture` 首行 `if(!m_captureOutput)return false`
+  → 无帧喂编码器。这是「能选但什么也不做」的又一例：参数存在但没接线。
+- **同类隐患**：YouTube 切分辨率的候选 `Initialize` 也缺第 10 参。
+
+**修复**（`src/main.cpp` 两处，各补第 10 参 `true`）：
+- `EnableUpscaling()` 候选：`Initialize(..., MaxQuality, true, true)`（第 9 参 preserveSource 原值不动）
+- `CreateRendererCandidate()`（YouTube）：`Initialize(..., quality, false, true)`
+
+不能用 `m_cast.Casting()` 做门控——用户是「先开超分再投屏」，那一刻 `Casting()` 还是 false，
+会漏掉这个场景。修后 5 处 renderer `Initialize`（10306/10495/10812/14959/15280）全部带
+`captureOutput=true`。
+
+**为什么不能只补参数就想当然**：抓帧选源三档是 NGX descriptor 1 / UpscaleSRV / 源 descriptor 4，
+与 present switch（2311–2315）顺序一致。AMD 上 NGX 不可用（`m_lastDLSSUsed`/`DLSSEnabled` 恒 false），
+实际走 UpscaleSRV（FSR4 超分 rung）——投屏抓的就是观众看到的那一档，所以补参后选源天然正确，
+无需改抓帧逻辑。
+
+**扩展排查：神经渲染与插帧是否也破坏投屏 → 都没有（真机实测 PASS）**：
+- 静态：这两个开关**都不重建 renderer**（`ToggleNeuralRendering`→`StartLiveNeuralSession`
+  在现有 renderer 上 attach；`TogglePlaybackFrameGeneration`→`SetPlaybackFrameGeneration` 只改标志），
+  不会重现候选漏参 bug。
+- 工具 `tools/verification/verify_cast_features.py`（`--feature neural|framegen`）：ini 预置功能开
+  （避免触发时机问题）；功能必须在日志实证激活（`neural=live` / `framegen=on`）否则 INCONCLUSIVE；
+  判据 = `captureOutput=1` + `HlsReady=1` + 切片增长 + DMR PLAYING + 无 start failure。
+- 结果：插帧（与超分同时开）`framegen=on` 全程、切片 2→11、TV 15/15 PLAYING；
+  神经渲染（live session）`neural=live` 全程、切片 1→13、TV 15/15 PLAYING。均 ALL=PASS。
+- 两次方法论教训：① 功能类验证必须先确认功能真激活——`verify_cast_with_upscale.py` 首轮
+  `upscaleActive=0` 说明 WM_COMMAND 发了但功能没开，那轮验的不是超分态；② DMR 状态单次采样会撞
+  瞬时缓冲态（神经渲染首跑一次 `PAUSED_PLAYBACK`，恰逢 `re-anchoring`，重跑 15/15 PLAYING），
+  状态判据要多次采样；③ 环境偶发（探活 `no-response`、瞬时缓冲）判 INCONCLUSIVE 而非 FAIL。
+
+**验证总账**：编译 EXIT=0；cast 自检 32+18+21 全绿；端到端 `verify_cast_capture.py` ALL=PASS；
+UI 停止 `verify_cast_stop.py` ALL=PASS（DMR 自报 PLAYING→STOPPED）；暂停 `verify_cast_pause.py`
+修复前后切片 `6,6,6,6,6,6` → `7,8,9,10,11,12`。
+
