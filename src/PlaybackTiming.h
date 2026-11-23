@@ -147,7 +147,34 @@ inline double PredictRenderMs(const RenderPaceProfile& profile, uint32_t width, 
             const double intercept = (sumY - slope * sumX) / double(count);
             // A line that goes down with resolution is measurement noise, not a
             // model; fall through to the conservative single-sample rule.
-            if (slope > 0.0) return std::max(0.0, intercept) + slope * megapixels;
+            if (slope > 0.0) {
+                const double fitted = std::max(0.0, intercept) + slope * megapixels;
+                // Extrapolating a least-squares line fitted over a narrow band
+                // of small geometries is unsafe: two nearby samples with a few
+                // ms of measurement noise produce an arbitrarily steep slope
+                // once the intercept is clamped to zero. A real session then
+                // measured 29.8 ms/frame at 1920x864 that such a fit called
+                // 53.4 ms (18.7 fps vs 33.5 fps), which raised the "cannot keep
+                // up" warning on a card running at 1.4x realtime. The marginal
+                // per-pixel cost cannot exceed the most expensive measured
+                // geometry's whole-frame cost per pixel: fixed overhead only
+                // raises a small sample's ratio, it never lowers it. Cap an
+                // *outward* extrapolation at that rate, so a noisy fit cannot
+                // invent a cost no sample supports. Interpolation, exact hits
+                // and the single-sample rule (Ada's 4K warning) are untouched.
+                double maxMeasuredPerMp = 0.0;
+                bool extrapolating = false;
+                for (const RenderPaceSample& sample : profile.samples) {
+                    if (!(sample.msPerFrame > 0.0)) continue;
+                    const double sampleMp = Megapixels(sample.width, sample.height);
+                    if (!(sampleMp > 0.0)) continue;
+                    maxMeasuredPerMp = std::max(maxMeasuredPerMp, sample.msPerFrame / sampleMp);
+                    if (megapixels > sampleMp) extrapolating = true;
+                }
+                if (extrapolating && maxMeasuredPerMp > 0.0)
+                    return std::min(fitted, maxMeasuredPerMp * megapixels);
+                return fitted;
+            }
         }
     }
     if (single) {

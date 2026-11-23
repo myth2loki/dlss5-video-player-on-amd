@@ -5323,6 +5323,53 @@ void ada_render_pace_prior_forecasts_both_ends_of_the_measured_bracket_test()
     CHECK(!playback_timing::ForecastLiveRender(3840, 2160, 30.0, measured1080p, ada).keepsUp);
 }
 
+// A least-squares line fitted through a narrow band of small geometries can
+// have a slope far steeper than any sample supports once its negative
+// intercept is clamped to zero. Extrapolating that line outward then invents
+// a cost the card never measured. This is the exact profile from the RX 9070
+// XT warning on 2026-11-21: two 720p-and-smaller samples forecast 53.43 ms
+// (18.7 fps, 0.78x) at 1920x864, where the card actually rendered 29.82 ms
+// (33.5 fps, 1.40x). The outward forecast must be capped at the dearest
+// measured geometry's whole-frame cost per pixel, so a real fast card is not
+// warned off a session it keeps up with.
+void render_pace_outward_extrapolation_is_capped_by_measured_per_pixel_cost_test()
+{
+    playback_timing::RenderPaceProfile smallGeometries;
+    smallGeometries.Record({1280, 534, 13.355539});
+    smallGeometries.Record({1280, 720, 21.023860});
+
+    const double targetMp = playback_timing::Megapixels(1920, 864);
+    const double dearestPerMp = std::max(13.355539 / playback_timing::Megapixels(1280, 534),
+                                         21.023860 / playback_timing::Megapixels(1280, 720));
+    const double extrapolated = playback_timing::PredictRenderMs(smallGeometries, 1920, 864, 0.0);
+
+    // The fit alone would say ~53 ms; the cap holds it to the ~38 ms the
+    // samples actually support, and that keeps the 24 fps session followable.
+    CHECK(extrapolated <= dearestPerMp * targetMp + 1e-9);
+    CHECK(extrapolated < 53.0);
+    CHECK(playback_timing::ForecastLiveRender(1920, 864, 24.0, smallGeometries, 0.0).keepsUp);
+
+    // Interpolation between the measured geometries must keep the fitted
+    // value: the cap is for outward extrapolation only, not every prediction.
+    const double inside = playback_timing::PredictRenderMs(smallGeometries, 1280, 600, 0.0);
+    CHECK(inside > 0.0);
+    CHECK(inside < dearestPerMp * playback_timing::Megapixels(1280, 600) + 1e-9);
+
+    // A genuinely slow card is still refused: two large, expensive samples
+    // extrapolated to an even larger 4K frame remain over budget after the
+    // cap, because each sample's own cost per pixel already misses it.
+    playback_timing::RenderPaceProfile slowCard;
+    slowCard.Record({1920, 1080, 40.0});
+    slowCard.Record({2560, 1440, 62.0});
+    CHECK(!playback_timing::ForecastLiveRender(3840, 2160, 30.0, slowCard, 0.0).keepsUp);
+
+    // An exact-hit sample still wins outright and is never capped by others.
+    playback_timing::RenderPaceProfile withExact;
+    withExact = smallGeometries;
+    withExact.Record({1920, 864, 29.8172});
+    CHECK_EQ(29.8172, playback_timing::PredictRenderMs(withExact, 1920, 864, 0.0));
+}
+
 // The panel is half of every answer here, which is what separates this policy
 // from "double anything under 45 fps". Each row below is a case where a
 // source-only rule and this one disagree, or where a plausible refactor would
@@ -17420,6 +17467,7 @@ constexpr test_support::TestCase kCases[] = {
     TEST_CASE(neural_addon_is_gated_by_the_driver_floor_not_by_the_generation_test),
     TEST_CASE(render_pace_prior_zero_means_unmeasured_not_unsupported_test),
     TEST_CASE(ada_render_pace_prior_forecasts_both_ends_of_the_measured_bracket_test),
+    TEST_CASE(render_pace_outward_extrapolation_is_capped_by_measured_per_pixel_cost_test),
     TEST_CASE(frame_generation_plan_follows_the_panel_not_just_the_source_test),
     TEST_CASE(frame_generation_reaches_every_multiplier_the_verified_ceiling_admits_test),
     TEST_CASE(frame_generation_menu_follows_the_measured_runtime_cap_test),
