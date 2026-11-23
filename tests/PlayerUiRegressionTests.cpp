@@ -1241,6 +1241,34 @@ struct PlayerAppTestAccess {
         CHECK(Contains(L"Verifying cache; no re-encoding"));
         CHECK(!Contains(L"Preparing encoder\u2026"));
 
+        // The same phase on the prepare an open starts behind the picture gets
+        // the small status line, not the full-window panel over the film.
+        const bool behindBefore = app.JobBehindPlayback();
+        CHECK(app.NeuralJobActive());
+        // A prepare behind the picture means the picture is loaded; the panel
+        // case above is the no-media case, so set that up and restore it after.
+        const bool loadedBefore = app.m_loaded;
+        app.m_loaded = true;
+        app.m_renderer = MakeD3D12Renderer();
+        app.m_prepareBehindMedia = true;
+        app.UpdateCachedStatus();
+        drawnText.clear();
+        CHECK(app.JobBehindPlayback());
+        app.RenderUi(dc, RECT{0, 0, 800, 600});
+        // Neither the panel's phase line nor its title is over the picture;
+        // the status line carries the single short note instead.
+        CHECK(!Contains(L"Verifying cache; no re-encoding"));
+        CHECK(!Contains(L"Preparing playback"));
+        CHECK(app.BuildStatusText().find(L"Checking saved video") != std::wstring::npos);
+        app.m_prepareBehindMedia = false;
+        app.UpdateCachedStatus();
+        CHECK_EQ(behindBefore, app.JobBehindPlayback());
+        app.m_loaded = loadedBefore;
+        app.m_renderer.reset();
+        drawnText.clear();
+        app.RenderUi(dc, RECT{0, 0, 800, 600});
+        CHECK(Contains(L"Verifying cache; no re-encoding"));
+
         // Pausing holds the lifecycle and the spinner until the user resumes,
         // even when the helper still reports a frame that was already in
         // flight; Space drives the same path while a job is active.
@@ -4013,6 +4041,17 @@ struct PlayerAppTestAccess {
         CHECK(!app.NeuralJobActive());
         CHECK(!app.m_previewJob && !app.m_previewQueued);
         CHECK(!IsWindowVisible(app.m_bufferWnd));
+
+        // The open-time prepare hides the same panel. Its flag must die with
+        // the job: a cancel must not leave a later full-window render hidden.
+        app.m_prepareBehindMedia = true;
+        app.m_neuralLifecycle.Begin();
+        app.m_neuralWorker = std::jthread([] {});
+        CHECK(app.JobBehindPlayback());
+        app.CancelNeuralJob(false);
+        CHECK(!app.NeuralJobActive());
+        CHECK(!app.m_prepareBehindMedia);
+        CHECK(!app.JobBehindPlayback());
 
         DestroyWindow(app.m_bufferWnd); app.m_bufferWnd = nullptr;
         DestroyWindow(app.m_renderWnd); app.m_renderWnd = nullptr;

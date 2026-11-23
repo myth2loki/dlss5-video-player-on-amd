@@ -3919,7 +3919,7 @@ private:
     bool ActivityBusy()const{return NeuralJobActive()||m_youtubeLifecycle.IsResolving()||m_stageExport.running||SubtitlesWorking();}
     // A job that renders behind the loaded media: the player keeps the window,
     // and only its own panel and lanes report progress.
-    bool JobBehindPlayback()const{return m_liveSession||m_previewJob;}
+    bool JobBehindPlayback()const{return m_liveSession||m_previewJob||m_prepareBehindMedia;}
 
     void UpdateRecentMenu(){
         if(!m_hwnd||!m_recent)return;
@@ -14821,6 +14821,10 @@ private:
             else if(message.message==WM_NEURAL_COMPLETE)cancelledCompletion=m_neuralCompletions.Take(static_cast<uint64_t>(message.wParam));
         }}
         m_neuralProgressMessages.Clear();m_neuralCompletions.Clear();m_neuralLifecycle.Invalidate();
+        // behindPlayback above was read before this: the prepare's original is
+        // already on screen, so a cancel must not reload it. Drop the flag once
+        // that decision is made, or the next job would inherit "behind".
+        m_prepareBehindMedia=false;
         // A dropped preview has nothing to present: the paused frame stays as
         // it is, the panel comes down, and the next settings change starts a
         // fresh one. Left set, these kept the panel up and refused every
@@ -14853,6 +14857,9 @@ private:
         CancelNeuralJob(false);
         if(kind==NeuralJobKind::Offline&&!keepsLoadedMedia)Unload();
         const uint64_t generation=m_neuralLifecycle.Begin();m_neuralProgress={};m_neuralProgress.phase=NeuralRenderPhase::CheckingCache;m_pendingNeuralTitle=DisplayTitleForSource(sourceKind,displayTitle);m_neuralSourceWidth=0;m_neuralSourceHeight=0;if(m_neuralPauseEvent)ResetEvent(m_neuralPauseEvent);
+        // Set with the lifecycle, not at Load's call site: every start goes
+        // through here, so no prepare can put the big panel over the picture.
+        m_prepareBehindMedia=keepsLoadedMedia;
         SyncSourceActionAvailability();InvalidateRect(m_hwnd,nullptr,FALSE);
         try{
             // What the job reads, captured here: the job thread never touches
@@ -14914,7 +14921,7 @@ private:
                     // there kept the spinner on and every render action greyed
                     // out for the rest of the file, with nothing to say why.
                     LOG("Active neural session could not create the segment directory "<<WideToUtf8(job.liveDirectory.wstring())<<": "<<ec.message());
-                    m_neuralLifecycle.Invalidate();m_neuralProgress={};m_pendingNeuralTitle.clear();
+                    m_neuralLifecycle.Invalidate();m_neuralProgress={};m_pendingNeuralTitle.clear();m_prepareBehindMedia=false;
                     m_neuralNotice=T(L"neural.live.directory_failed");
                     SyncSourceActionAvailability();UpdateCachedStatus();InvalidateRect(m_hwnd,nullptr,FALSE);
                     return false;
@@ -14942,7 +14949,7 @@ private:
             job.coldStart=m_coldStart;
             job.sourceDigestMemo=m_sourceDigestMemo;
             m_neuralWorker=std::jthread([job=std::move(job)](std::stop_token stop){NeuralJobRun(job,std::move(stop)).Run();});
-        }catch(const std::system_error&){m_neuralLifecycle.Invalidate();SyncSourceActionAvailability();const std::wstring message=L"The neural pre-render worker could not start.";MessageBoxW(m_hwnd,message.c_str(),T(L"app.title").c_str(),MB_OK|MB_ICONERROR);return false;}
+        }catch(const std::system_error&){m_neuralLifecycle.Invalidate();m_prepareBehindMedia=false;SyncSourceActionAvailability();const std::wstring message=L"The neural pre-render worker could not start.";MessageBoxW(m_hwnd,message.c_str(),T(L"app.title").c_str(),MB_OK|MB_ICONERROR);return false;}
         return true;
     }
     bool LoadCachedPlayback(const NeuralJobCompletion& completion){
@@ -15126,7 +15133,7 @@ private:
         return _wcsicmp(opened.c_str(),rendered.c_str())==0;
     }
     void HandleNeuralCompletion(const std::unique_ptr<NeuralJobCompletion>& completion){
-        if(m_neuralWorker.joinable()){m_neuralWorker.join();m_neuralWorker=std::jthread{};}m_neuralProgressMessages.Clear();m_pendingNeuralTitle.clear();m_neuralCancelBounds={};
+        if(m_neuralWorker.joinable()){m_neuralWorker.join();m_neuralWorker=std::jthread{};}m_neuralProgressMessages.Clear();m_pendingNeuralTitle.clear();m_neuralCancelBounds={};m_prepareBehindMedia=false;
         m_gpuWorkerLocalVramMiB=completion->result.timing.postJobLocalVramMiB;
         m_gpuWorkerPeakLocalVramMiB=std::max(
             m_gpuWorkerPeakLocalVramMiB,completion->result.timing.peakLocalVramMiB);
@@ -15533,6 +15540,10 @@ private:
     // notice the other one dropped without saying so.
     std::vector<std::wstring> StatusNotices()const{
         std::vector<std::wstring> notices;
+        // The open-time prepare no longer owns the window, but it is still
+        // work: one short line says the saved video is being checked while the
+        // original keeps playing, instead of a full-window bar over the film.
+        if(m_prepareBehindMedia&&NeuralJobActive())notices.push_back(T(L"neural.phase.cache"));
         if(m_addonWorker.joinable())notices.push_back(T(L"framegen.addon.downloading"));
         if(!m_cacheNotice.empty())notices.push_back(m_cacheNotice);
         const std::wstring dropped=m_dropNote.Visible(m_loaded,m_path);
@@ -16925,6 +16936,10 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     uint32_t m_liveJobSerial=0;
     // Debounced re-render of the paused frame after a neural settings change.
     bool m_previewJob=false,m_previewShown=false,m_previewQueued=false;
+    // The open-time prepare (Load's keepsLoadedMedia job) identifies the source
+    // behind the picture the player already put on screen. It is a job behind
+    // playback too: it gets the small status line, never the full-window panel.
+    bool m_prepareBehindMedia=false;
     NeuralRenderRange m_previewRange{};
     UINT_PTR m_previewTimer=0;
     std::filesystem::path m_liveDirectory;
