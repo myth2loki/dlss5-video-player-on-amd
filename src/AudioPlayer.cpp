@@ -320,7 +320,9 @@ bool AudioPlayer::Start(const std::wstring& videoPath, double seekSeconds, Audio
         if(!bitstream&&!reader->renderer->Open()){const bool noEndpoint=reader->renderer->NoEndpoint();reader->renderer.reset();LOG("Audio: the render endpoint could not be opened.");AwaitEndpoint(noEndpoint);return false;}
         format=reader->renderer->CurrentFormat();
         reader->sampleRate=format.sampleRate;
-        reader->renderer->SetVolume(m_volume);
+        // A seek or an endpoint change can restart the renderer mid-cast; keep
+        // the local endpoint muted so audio never leaks out during a cast.
+        reader->renderer->SetVolume(m_castLocalMute ? 0.0f : m_volume);
         // Started only when playing: a paused stream that was started would
         // run the endpoint dry and advance its clock over silence.
         if(!reader->paused&&!reader->renderer->Start()){LOG("Audio: the endpoint refused to start.");AwaitEndpoint(false);return false;}
@@ -748,10 +750,21 @@ void AudioPlayer::Pause(bool paused) {
         LOG("Audio: pause/resume was refused by the endpoint.");
 }
 
+void AudioPlayer::ApplyVolume() {
+    const auto state=m_reader;if(!state||!state->renderer)return;
+    state->renderer->SetVolume(m_castLocalMute ? 0.0f : m_volume);
+}
+
 void AudioPlayer::SetVolume(float volume01) {
     m_volume = std::clamp(volume01, 0.0f, 1.0f);
-    const auto state=m_reader;if(!state||!state->renderer)return;
-    state->renderer->SetVolume(m_volume);
+    ApplyVolume();
+}
+
+void AudioPlayer::SetCastLocalMute(bool on) {
+    if(m_castLocalMute==on)return;
+    m_castLocalMute=on;
+    ApplyVolume();
+    LOG("Cast: local audio "<<(on?"muted":"unmuted")<<" (cast-local mute, user volume untouched)");
 }
 
 bool AudioPlayer::DeliverDefaultEndpointChange(const std::wstring& newDeviceId) {

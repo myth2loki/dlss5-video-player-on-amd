@@ -6088,6 +6088,10 @@ private:
     }
     AudioPlayer& Audio(){return m_networkAudio?*m_networkAudio:m_audio;}
     const AudioPlayer& Audio()const{return m_networkAudio?*m_networkAudio:m_audio;}
+    // A cast silences the local endpoint without touching the user's own mute
+    // choice (m_muted, persisted to INI). The UI shows what is actually audible:
+    // either the user muted it or the cast is holding it silent.
+    bool LocalSilenced()const{return m_muted||Audio().CastLocalMute();}
     // How often playback says how it is doing. A session can currently drop two
     // frames in three for minutes and write NOTHING: m_submitFps and
     // m_droppedFrames reach the status bar and stop there, so a report of
@@ -10314,8 +10318,12 @@ private:
 
     void Unload() {
         // A source change invalidates the cast's audio branch and frame source;
-        // stop casting but keep the chosen device (doc 14.6).
+        // stop casting but keep the chosen device (doc 14.6). Restore local
+        // audio here too: OnSourceChanged stops the session without going
+        // through CancelCast/the menu stop path.
         m_cast.OnSourceChanged();
+        m_audio.SetCastLocalMute(false);
+        if(m_networkAudio)m_networkAudio->SetCastLocalMute(false);
         m_gpuScheduler.ResetSession(++m_gpuSchedulerGeneration);
         m_gpuSchedulerHealthAt={};
         m_gpuFrameMsNext=0;m_gpuFrameMsCount=0;
@@ -12100,7 +12108,7 @@ private:
     slider::Geometry VolumeSliderGeometry(const RECT& area,Clock::time_point now)const{
         RECT c{};GetClientRect(m_hwnd,&c);
         const RECT bounds{area.left-Dip(24),c.bottom-ControlHeight(),c.right-Dip(16),c.bottom};
-        return slider::Layout(area,m_muted?0.0:double(m_volume),0.0,m_volumeHot.Level(now),ActiveWindowDpi(m_hwnd),bounds);
+        return slider::Layout(area,LocalSilenced()?0.0:double(m_volume),0.0,m_volumeHot.Level(now),ActiveWindowDpi(m_hwnd),bounds);
     }
     // The value over the knob while it is dragged. It fades by mixing toward
     // the surface under it: GDI has no alpha, and the strip is one flat colour.
@@ -12221,7 +12229,7 @@ private:
             return{UiIcon::Sparkles,label,enabled,active,m_previewJob!=0||NeuralJobActive()};}
         case ToolbarAction::Stop:return{UiIcon::Stop,L"Stop",enabled,false};
         case ToolbarAction::Forward10:return{UiIcon::FastForward,L"10s",enabled,false};
-        case ToolbarAction::Mute:return{m_muted?UiIcon::VolumeOff:UiIcon::Volume,m_muted?L"Sound":L"Mute",enabled,m_muted};
+        case ToolbarAction::Mute:return{LocalSilenced()?UiIcon::VolumeOff:UiIcon::Volume,LocalSilenced()?L"Sound":L"Mute",enabled,LocalSilenced()};
         case ToolbarAction::ToggleSubtitles:{
             // The switch says "working" for the whole wait and only turns "on"
             // when the TRANSLATED track is on screen. Going on at the first line
@@ -12670,7 +12678,7 @@ private:
         // after TrackPopupMenuEx has unwound.
         if(m_castReopen){m_castReopen=false;ShowCastMenu(m_castMenuAnchor);return;}
         if(chosen==IDM_CAST_REFRESH)RefreshCastDevices();
-        else if(chosen==IDM_CAST_STOP){m_cast.Stop();ShowToast(T(L"cast.stopped"));UpdateCachedStatus();}
+        else if(chosen==IDM_CAST_STOP){m_cast.Stop();Audio().SetCastLocalMute(false);ShowToast(T(L"cast.stopped"));UpdateCachedStatus();}
         else if(chosen>=IDM_CAST_DEVICE_FIRST&&chosen<IDM_CAST_DEVICE_FIRST+IDM_CAST_DEVICE_COUNT)
             SelectCastDevice(int(chosen-IDM_CAST_DEVICE_FIRST));
     }
@@ -12716,6 +12724,10 @@ private:
         std::string error;
         const uint64_t drainBase=m_renderer?m_renderer->LastRenderedFrameNumber():0;
         const bool ok=m_cast.Start(key,WideToUtf8(m_path),Position(),!m_playing,drainBase,&error);
+        // The TV plays the stream's own audio; silence the local endpoint for
+        // the duration of the cast. Only on success: a failed Start may still
+        // have torn an earlier session down, and must leave local sound on.
+        Audio().SetCastLocalMute(ok);
         if(ok)ShowToast(T(L"cast.started")+L" \u00b7 "+Utf8ToWide(found->displayName));
         else ShowToast(Utf8ToWide(error));
         UpdateCachedStatus();
@@ -12728,6 +12740,7 @@ private:
         m_castScanRunning.store(false);
         m_castReopen=false; // closing the window must not reopen a menu
         m_cast.Stop();
+        Audio().SetCastLocalMute(false);
         if(m_hwnd)UpdateCachedStatus();
     }
     // `glyph` is drawn in the icon font ahead of the label, or alone when the label is
@@ -13138,7 +13151,7 @@ private:
             DrawTextW(dc,m_cachedStatus.c_str(),-1,&sr,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
         }
         PaintToast(dc,RECT{statusRow.text.left-Dip(2),statusRow.text.top,statusRow.text.right,statusRow.text.bottom});
-        if(volumeRect){const RECT& vr=*volumeRect;std::wstring vol=m_muted?T(L"status.muted"):(T(L"status.volume")+L" "+std::to_wstring(int(m_volume*100))+L"%");RECT label{vr.right+Dip(8),vr.top,std::max<LONG>(vr.right+Dip(8),c.right-Dip(16)),vr.bottom};DrawTextW(dc,vol.c_str(),int(vol.size()),&label,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);}SelectObject(dc,of);
+        if(volumeRect){const RECT& vr=*volumeRect;std::wstring vol=LocalSilenced()?T(L"status.muted"):(T(L"status.volume")+L" "+std::to_wstring(int(m_volume*100))+L"%");RECT label{vr.right+Dip(8),vr.top,std::max<LONG>(vr.right+Dip(8),c.right-Dip(16)),vr.bottom};DrawTextW(dc,vol.c_str(),int(vol.size()),&label,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_NOPREFIX);}SelectObject(dc,of);
     }
 
     void Paint(){

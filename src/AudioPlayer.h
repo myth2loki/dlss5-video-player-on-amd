@@ -62,6 +62,11 @@ public:
     void Pause(bool paused);
     void SetVolume(float volume01);
     float Volume() const { return m_volume; }
+    // Casting: silence the local endpoint while the TV plays the stream's own
+    // audio. Kept separate from m_volume/mute so a seek or a restarted stream
+    // cannot lift it, and so the user's own volume choice is never overwritten.
+    void SetCastLocalMute(bool on);
+    bool CastLocalMute() const { return m_castLocalMute; }
     void Stop();
     bool Active() const;
     bool Paused() const;
@@ -197,6 +202,10 @@ private:
     double m_seekBaseSec = 0.0;
     double m_leadingSilenceSec = 0.0;
     float m_volume = 1.0f;
+    // Local endpoint mute while casting; orthogonal to m_volume. Applied in
+    // ApplyVolume(), the single place that pushes volume to the renderer.
+    bool m_castLocalMute = false;
+    void ApplyVolume();
     bool m_passthroughEnabled = false;
     audio_passthrough::Status m_passthroughStatus;
     audio_passthrough::DisplayChangeReopen m_displayReopen;
