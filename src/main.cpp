@@ -665,6 +665,17 @@ static void ApplyDarkTitleBar(HWND window)
     BOOL dark=TRUE;DwmSetWindowAttribute(window,20,&dark,sizeof(dark));
 }
 
+// A borderless window still gets Windows 11's rounded corners while
+// DWMWA_WINDOW_CORNER_PREFERENCE is ROUND (2). In fullscreen that is wrong: the
+// rounded edge exposes the desktop behind the player, which on a light desktop
+// reads as a white frame around the picture. A fullscreen surface is a plain
+// rectangle - DONOTROUND (1) - and the corners come back when we leave.
+static void SetFullscreenCorners(HWND window,bool fullscreen)
+{
+    DWORD preference=fullscreen?1:2; // 1=DWMWCP_DONOTROUND, 2=DWMWCP_ROUND
+    DwmSetWindowAttribute(window,33,&preference,sizeof(preference));
+}
+
 static HBRUSH DarkDialogBrush(){static const HBRUSH brush=CreateSolidBrush(dark_mode::DialogBackground);return brush;}
 static HBRUSH DarkFieldBrush(){static const HBRUSH brush=CreateSolidBrush(dark_mode::FieldBackground);return brush;}
 
@@ -16076,11 +16087,13 @@ private:
             SetMenu(m_hwnd,nullptr);
             MONITORINFO mi{sizeof(mi)};GetMonitorInfoW(MonitorFromWindow(m_hwnd,MONITOR_DEFAULTTONEAREST),&mi);
             SetWindowLongW(m_hwnd,GWL_STYLE,m_savedStyle&~(WS_CAPTION|WS_THICKFRAME|WS_MINIMIZEBOX|WS_MAXIMIZEBOX|WS_SYSMENU));
+            SetFullscreenCorners(m_hwnd,true);
             SetWindowPos(m_hwnd,HWND_TOP,mi.rcMonitor.left,mi.rcMonitor.top,mi.rcMonitor.right-mi.rcMonitor.left,mi.rcMonitor.bottom-mi.rcMonitor.top,SWP_FRAMECHANGED|SWP_NOACTIVATE);
         }else{
             m_fullscreen=false;m_fullscreenControlsHidden=false;m_fullscreenKeyboardFocus=false;
             StopFullscreenTimer();RestoreFullscreenMenu();m_fullscreenMenu=nullptr;
             SetWindowLongW(m_hwnd,GWL_STYLE,m_savedStyle);
+            SetFullscreenCorners(m_hwnd,false);
             SetWindowPos(m_hwnd,nullptr,m_savedRect.left,m_savedRect.top,m_savedRect.right-m_savedRect.left,m_savedRect.bottom-m_savedRect.top,SWP_NOZORDER|SWP_FRAMECHANGED|SWP_NOACTIVATE);
         }
         Layout();InvalidateRect(m_hwnd,nullptr,FALSE);
