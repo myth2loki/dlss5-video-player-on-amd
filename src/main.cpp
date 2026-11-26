@@ -32,6 +32,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <deque>
 #include <system_error>
 #include "VideoDecoder.h"
 #include "PlatformPaths.h"
@@ -550,6 +551,11 @@ static constexpr UINT WM_START_SCREEN = WM_APP + 52;
 static constexpr UINT WM_FRAMEGEN_ADDON_INSTALLED = WM_APP + 53;
 // A background DLNA scan finished; the device menu cache can be rebuilt.
 static constexpr UINT WM_CAST_SCAN_DONE = WM_APP + 54;
+// A live job's cache publication finished on the background publish thread.
+// Its render already posted WM_NEURAL_COMPLETE when the helper returned, so
+// the next hole could start while this ran. The two are distinct: only this
+// one carries the published neuralPath, and it never touches the lifecycle.
+static constexpr UINT WM_NEURAL_PUBLISHED = WM_APP + 55;
 
 struct YouTubeUrlDialogState {
     const Localizer* localizer{};
@@ -1313,6 +1319,30 @@ struct NeuralJobCompletion {
     GuideControls guides;
     TemporalSettings temporal;
     std::filesystem::path receiptPath;
+    // Set on a live render completion whose cache entry is still being
+    // published on the background thread. The neuralPath arrives later in a
+    // NeuralPublishCompletion; a consumer that needs it must wait for that.
+    bool publishPending{};
+};
+
+// What a live job's background publication hands back after its render
+// already completed. The render completion carries no neuralPath (the entry
+// does not exist yet); this one carries only what the UI needs to offer
+// "Save converted video" and to name the receipt. It deliberately has no
+// `result` or lifecycle meaning: playback has been running on the job's
+// segments since the render completion, and a failed publication does not
+// take rendered picture away (see CompleteLiveNeuralJob's coverage-first
+// rule).
+struct NeuralPublishCompletion {
+    uint64_t generation{};
+    uint64_t runId{};
+    bool published{};
+    std::filesystem::path neuralPath;
+    std::filesystem::path receiptPath;
+    std::wstring detail;
+    // The render's own range, so the UI can apply ExportableEntry: an entry
+    // is only the film when one job covered the whole session range.
+    NeuralRenderRange range;
 };
 
 // One cold start, shared by the job thread that measures the stack and the UI
@@ -2764,6 +2794,9 @@ struct NeuralJobInputs {
     std::filesystem::path moduleDirectory;
     CompletionRegistry<NeuralProgressMessage>* progressMessages{};
     CompletionRegistry<NeuralJobCompletion>* completions{};
+    // Only live jobs use this: the entry path is delivered separately from
+    // the render completion, on the publish thread.
+    CompletionRegistry<NeuralPublishCompletion>* publishCompletions{};
     std::string reuseSourceKey;
     std::filesystem::path cacheRoot;
     double expectedDurationSeconds{};
@@ -2840,32 +2873,90 @@ struct NeuralJobInputs {
     std::shared_ptr<SharedSourceDigest> sourceDigestMemo;
 };
 
-// One neural job on its own thread, as named steps: find the local source,
-// identify it and the runtime, answer from the cache when it can, prove the
-// runtime, render, and publish. Each step returns false when the job is over,
-// with `completion_` saying why; Run posts the completion either way. The
-// steps share what the earlier ones established through the members below,
-// in the order they are set.
-class NeuralJobRun {
+// One neural job, as named steps: find the local source, identify it and the
+// runtime, answer from the cache when it can, prove the runtime, render, and
+// publish. Each step returns false when the job is over, with `completion_`
+// saying why.
+//
+// A live job's render and publish are two deliveries. Run() ends at Render:
+// it releases the runtime lease, posts the render completion (which carries
+// no neuralPath), and hands `this` to a background publish thread through
+// `handoff`. The next hole can start while Publish runs there. Publish posts
+// WM_NEURAL_PUBLISHED separately; only that message carries the entry path.
+// An offline job keeps the old single delivery - its completion needs the
+// neuralPath to load cached playback - so `handoff` stays null and Run()
+// publishes inline exactly as before.
+class NeuralJobRun:public std::enable_shared_from_this<NeuralJobRun> {
 public:
-    NeuralJobRun(const NeuralJobInputs& in,std::stop_token stop):in_(in),stop_(std::move(stop)),cache_(in.cacheRoot){}
+    // Set by the caller for live jobs only: a sink that takes ownership of
+    // this object on the publish thread. Null means publish inline.
+    std::function<void(std::shared_ptr<NeuralJobRun>)> handoff;
+    // in_ is OWNED, not a reference. A live job hands `this` to the publish
+    // thread, and the render worker's lambda - which owned the caller's
+    // NeuralJobInputs - is destroyed as soon as Run() returns. Holding a
+    // reference left Publish() reading a freed object: 0xC0000005 on the
+    // second job, or a silently skipped ReplaceRun when the stale shared_ptr
+    // happened to read as null.
+    NeuralJobRun(const NeuralJobInputs& in,std::stop_token stop):in_(in),stop_(std::move(stop)),cache_(in_.cacheRoot){}
     NeuralJobRun(const NeuralJobRun&)=delete;
     NeuralJobRun& operator=(const NeuralJobRun&)=delete;
 
     void Run(){
         completion_=std::make_unique<NeuralJobCompletion>();completion_->generation=in_.generation;completion_->displayTitle=in_.displayTitle;completion_->pageUrl=in_.pageUrl;completion_->sourceKind=in_.sourceKind;completion_->sourceQuality=in_.sourceQuality;
+        const bool rendered=cache_.Valid()&&ResolveSource()&&IdentifySource()&&PrepareRuntime()&&AnswerFromCache()&&ClearPreflight()&&Render();
         if(!cache_.Valid())completion_->result.detail=in_.cacheFailureText.DescribeRoot(cache_.LastFailure());
-        else{
-            if(ResolveSource()&&IdentifySource()&&PrepareRuntime()&&AnswerFromCache()&&ClearPreflight()&&Render())Publish();
-            // What the steps held ends here, as it did at the end of the
-            // block they were written in: the runtime lease is released
-            // before the completion can start the next job.
-            lease_.reset();
+        // The NVIDIA settings re-check used to live at the top of Publish,
+        // after the lease was gone. With a second job able to start as soon as
+        // this one reports done, that file can now change between Render and
+        // Publish. Take the verdict here, while the lease is still held and
+        // the helper has just returned, and carry it into Publish instead.
+        if(rendered&&in_.backend==NeuralBackend::Nvidia){
+            const auto finalSettings=ReadNeuralAddonSettingsSnapshot(runtimeDirectory_/L"ReShade.ini");
+            settingsUnchangedDuringRender_=finalSettings&&*finalSettings==*settingsSnapshot_;
         }
-        // A cache hit, a refusal or a prepared open never reached a
-        // helper, so this is where the player's own work ends.
+        // Release the runtime before completion: the UI may start the next
+        // job as soon as it sees WM_NEURAL_COMPLETE, and that job needs the
+        // lease to write the same INI.
+        lease_.reset();
         in_.coldStart->MarkIfAbsent(NeuralColdStartPhase::Request);
+        if(rendered&&handoff){
+            // Live: hand the whole job to the publish thread. ReplyPending
+            // marks the render completion so the UI knows the entry path will
+            // arrive later; playback continues from the segments already in
+            // the index. The UI gets a COPY - Publish() keeps writing into
+            // completion_ on the publish thread (neuralPath, receipt, verdict)
+            // and must not touch the object Registry now owns. Register first,
+            // then hand off, so a fast publisher can never post its result
+            // before the render completion is queued.
+            completion_->publishPending=true;
+            auto renderReply=std::make_unique<NeuralJobCompletion>(*completion_);
+            in_.completions->RegisterAndPost(std::move(renderReply),[&](uint64_t token){return PostMessageW(in_.target,WM_NEURAL_COMPLETE,static_cast<WPARAM>(token),0)!=FALSE;});
+            handoff(shared_from_this());
+            return;
+        }
+        if(rendered)Publish();
         in_.completions->RegisterAndPost(std::move(completion_),[&](uint64_t token){return PostMessageW(in_.target,WM_NEURAL_COMPLETE,static_cast<WPARAM>(token),0)!=FALSE;});
+    }
+
+    // The publish thread's own stop source: a render worker that handed this
+    // job off has already ended, so its token can no longer be signalled.
+    // Set by the queue before Publish; PublishStop() ORs the two so a cancel
+    // that arrived before handoff is still honoured.
+    void SetPublishStop(std::stop_token stop){publishStop_=std::move(stop);}
+    std::stop_token PublishStop()const{return publishStop_.stop_requested()?publishStop_:stop_;}
+
+    // Called on the background publish thread for a live job. Posts only a
+    // NeuralPublishCompletion: the render already reported success and the
+    // lifecycle was moved to Ready by its completion, so nothing here may
+    // transition state again.
+    void PublishInBackground(){
+        Publish();
+        auto result=std::make_unique<NeuralPublishCompletion>();
+        result->generation=in_.generation;result->runId=in_.liveRunId;result->range=in_.range;
+        result->published=completion_->result.ok&&!completion_->neuralPath.empty();
+        result->neuralPath=completion_->neuralPath;result->receiptPath=completion_->receiptPath;
+        result->detail=completion_->result.detail;
+        in_.publishCompletions->RegisterAndPost(std::move(result),[&](uint64_t token){return PostMessageW(in_.target,WM_NEURAL_PUBLISHED,static_cast<WPARAM>(token),0)!=FALSE;});
     }
 
 private:
@@ -3375,9 +3466,11 @@ private:
         // by timestamp, so a run that filled a hole behind an earlier region is
         // not the tail of the index, and a positional slice would take the wrong
         // files. The scan stays in timeline order, which is what a join needs.
-        // The next hole cannot start until this returns, so the phases
-        // are timed: one driven session sat 18 s between a finished
-        // render and the next one with the GPU idle and a hole left.
+        // Phases are timed so the log can tell a slow concat from a slow
+        // promote. A live job's next hole no longer waits on this: it starts
+        // when the render completion is posted, and this runs on the publish
+        // thread. An 18 s tail here used to idle the GPU; it now only delays
+        // this entry's Save offer, not the next render.
         const auto publishStart=std::chrono::steady_clock::now();
         const auto msSince=[](std::chrono::steady_clock::time_point from){
             return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-from).count();};
@@ -3387,7 +3480,7 @@ private:
         // is handed, so its report is the file's frame count and its length -
         // what a second process used to read the whole block back to learn.
         ProgressReport joined{};
-        if(liveIndex&&(parts.empty()||ConcatenateMedia(moduleDirectory,parts,*staging_/L"neural.mkv",stop_,&joined)!=EncodeError::None)){
+        if(liveIndex&&(parts.empty()||ConcatenateMedia(moduleDirectory,parts,*staging_/L"neural.mkv",PublishStop(),&joined)!=EncodeError::None)){
             cache_.MarkInvalid(*staging_);completion_->result.ok=false;
             completion_->result.detail=L"The rendered segments could not be joined into a cache entry.";return false;
         }
@@ -3401,15 +3494,15 @@ private:
             cache_.MarkInvalid(*staging_);completion_->result.ok=false;
             completion_->result.detail=L"The joined neural video does not hold the frames the render produced.";return false;
         }
-        // The NVIDIA path re-reads the INI it wrote before the render: the helper
-        // is a separate process that rewrites that file as it loads, so the file
-        // is the only thing that says what the job actually ran with. An AMD job
-        // writes no such file - its configuration travels in the request - so
-        // there is nothing to re-read and the document PrepareRuntime hashed is
-        // still the truth about it. Reading a ReShade.ini that this backend never
-        // wrote would fail every publish instead, which is what it did.
-        if(in_.backend==NeuralBackend::Nvidia){
-            const auto finalSettings=ReadNeuralAddonSettingsSnapshot(runtimeDirectory_/L"ReShade.ini");if(!finalSettings||*finalSettings!=*settingsSnapshot_){cache_.MarkInvalid(*staging_);completion_->result.ok=false;completion_->result.detail=L"Neural settings changed during rendering. Try the render again.";return false;}
+        // The NVIDIA path verifies the INI the helper actually ran with. The
+        // snapshot was taken in Run() at the end of Render, while the runtime
+        // lease was still held - the only moment no later job could have
+        // rewritten it. Re-reading here would race the next live hole, which
+        // now starts as soon as the render completion is posted. An AMD job
+        // writes no such file: its configuration travels in the request, and
+        // the document PrepareRuntime hashed stays the truth about it.
+        if(in_.backend==NeuralBackend::Nvidia&&!settingsUnchangedDuringRender_){
+            cache_.MarkInvalid(*staging_);completion_->result.ok=false;completion_->result.detail=L"Neural settings changed during rendering. Try the render again.";return false;
         }
         const std::string receiptJson=BuildNeuralRenderReceiptJson(*receipt_);const auto receiptDigest=Sha256Bytes(receiptJson);
         {std::ofstream receiptFile(*staging_/L"receipt.json",std::ios::binary|std::ios::trunc);receiptFile.write(receiptJson.data(),static_cast<std::streamsize>(receiptJson.size()));if(!receiptFile||!receiptDigest){cache_.MarkInvalid(*staging_);completion_->result.ok=false;completion_->result.detail=L"The neural render receipt could not be staged.";return false;}}
@@ -3422,11 +3515,11 @@ private:
         // decode only said "the last frame parsed". An offline render has no such
         // count: its published file is the encoder's own output, written once per
         // job and never on a block boundary, so it keeps the full validation.
-        ProbeResult probe=ProbeMedia(moduleDirectory,*staging_/L"neural.mkv",stop_,
+        ProbeResult probe=ProbeMedia(moduleDirectory,*staging_/L"neural.mkv",PublishStop(),
             liveIndex?MediaProbeMode::CachedMetadata:MediaProbeMode::FullValidation);
         if(liveIndex&&probe.ok)probe.frameCount=joined.frames;
         const double probeMs=msSince(probeStart);
-        if(stop_.stop_requested()){cache_.MarkInvalid(*staging_);completion_->result.cancelled=true;completion_->result.ok=false;completion_->result.detail=L"Neural render was cancelled.";return false;}
+        if(PublishStop().stop_requested()){cache_.MarkInvalid(*staging_);completion_->result.cancelled=true;completion_->result.ok=false;completion_->result.detail=L"Neural render was cancelled.";return false;}
         NeuralCacheManifest manifest{};manifest.sourceDigest=*sourceDigest_;manifest.runtimeDigest=*runtimeDigest_;manifest.encoder=neural_job::CacheEncoderName(completion_->result.encoder);manifest.width=width_;manifest.height=height_;manifest.frameCount=completion_->result.frameCount;manifest.duration100ns=completion_->result.duration100ns;manifest.nativeEvaluations=completion_->result.nativeEvaluations;manifest.verifiedNeuralFrames=completion_->result.verifiedNeuralFrames;manifest.observedFeature18Evaluations=completion_->result.evidence.highestObservedEvaluation;manifest.feature18Created=completion_->result.evidence.feature18Created;manifest.feature18ArmedBeforeCapture=completion_->result.feature18ArmedBeforeCapture;manifest.upscaling=false;
         // Which backend vouches for this entry. The three feature-18 columns
         // above are the negative on the AMD one because it loads no add-on, and
@@ -3474,8 +3567,9 @@ private:
         return true;
     }
 
-    const NeuralJobInputs& in_;
+    NeuralJobInputs in_;  // owned snapshot - see the constructor
     std::stop_token stop_;
+    std::stop_token publishStop_;
     NeuralCacheManager cache_;
     std::unique_ptr<NeuralJobCompletion> completion_;
     // What every progress post carries: the geometry once the source is
@@ -3503,6 +3597,10 @@ private:
     std::wstring runtimeLockNote_;
     std::optional<NeuralRuntimeLease> lease_;
     std::optional<std::string> settingsSnapshot_,settingsDigest_;
+    // Taken at the end of Render, under the runtime lease, for the NVIDIA
+    // settings-changed check in Publish. Default true so a job that never
+    // reached Render (or an AMD job) is not failed by an unset verdict.
+    bool settingsUnchangedDuringRender_{true};
     // AnswerFromCache
     NeuralCacheIdentity identity_{};
     std::string renderKey_;
@@ -3520,7 +3618,7 @@ class PlayerApp {
 #endif
 public:
     explicit PlayerApp(AppOptions o):m_opt(std::move(o)),m_youtubeSourceQuality(YouTubeSourceQuality::Auto),m_neuralPauseEvent(CreateEventW(nullptr,TRUE,FALSE,nullptr)){}
-    ~PlayerApp(){if(m_activityTimer&&m_hwnd)KillTimer(m_hwnd,m_activityTimer);CancelExport();CancelCast();CancelFrameGeneration();CancelNeuralJob(false);CancelYouTubeResolution(false);SaveVideoSettings();if(m_adjustWnd)DestroyWindow(m_adjustWnd);if(m_neuralWnd)DestroyWindow(m_neuralWnd);if(m_encoderWnd)DestroyWindow(m_encoderWnd);UnregisterOverlayHotkeys();Unload(); if(m_font)DeleteObject(m_font); if(m_fontSmall)DeleteObject(m_fontSmall); if(m_fontTitle)DeleteObject(m_fontTitle); if(m_iconFont)DeleteObject(m_iconFont); if(m_neuralPauseEvent)CloseHandle(m_neuralPauseEvent);for(const auto& icon:m_thumbIcons)DestroyIcon(icon.second);}
+    ~PlayerApp(){if(m_activityTimer&&m_hwnd)KillTimer(m_hwnd,m_activityTimer);CancelExport();CancelCast();CancelFrameGeneration();CancelNeuralJob(false);StopNeuralPublishWorker();CancelYouTubeResolution(false);SaveVideoSettings();if(m_adjustWnd)DestroyWindow(m_adjustWnd);if(m_neuralWnd)DestroyWindow(m_neuralWnd);if(m_encoderWnd)DestroyWindow(m_encoderWnd);UnregisterOverlayHotkeys();Unload(); if(m_font)DeleteObject(m_font); if(m_fontSmall)DeleteObject(m_fontSmall); if(m_fontTitle)DeleteObject(m_fontTitle); if(m_iconFont)DeleteObject(m_iconFont); if(m_neuralPauseEvent)CloseHandle(m_neuralPauseEvent);for(const auto& icon:m_thumbIcons)DestroyIcon(icon.second);}
 
     bool Create(HINSTANCE hi) {
         if(!m_uiResources.Load(hi))LOG("Embedded Tabler icon font unavailable; continuing with label-only controls.");
@@ -3599,6 +3697,7 @@ public:
         UpdateFontsForDpi(ActiveWindowDpi(m_hwnd));
         DragAcceptFiles(m_hwnd,TRUE); DragAcceptFiles(m_renderWnd,TRUE); ShowWindow(m_viewport,SW_HIDE); Layout(); UpdateTitle();
         StartCacheEviction();
+        StartNeuralPublishWorker();
         if(!m_opt.file.empty()){if(IsSupportedYouTubeUrl(m_opt.file))StartYouTubeResolution(m_opt.file,L"",m_youtubeSourceQuality);else Load(m_opt.file);} // No startup file picker: the player opens idle by default.
         SyncStartScreen();
         return true;
@@ -3634,6 +3733,37 @@ public:
     // they were destroyed (P1.33). The five-second wait between the two
     // model-store reads is where most of its time goes, so a stop cuts it
     // short and the pass ends without judging anything.
+    // One serial publisher for live jobs. The queue is drained FIFO so two
+    // entries never race the shared cache-root lock or the final rename, and
+    // every publish posts its own WM_NEURAL_PUBLISHED to the UI thread.
+    void StartNeuralPublishWorker(){
+        if(m_neuralPublishWorker.joinable())return;
+        m_neuralPublishWorker=std::jthread([this](std::stop_token stop){
+            for(;;){
+                auto job=m_neuralPublishQueue->Pop(stop);
+                if(!job)return;
+                job->SetPublishStop(m_neuralPublishQueue->stop.get_token());
+                job->PublishInBackground();
+            }
+        });
+    }
+    // Stops the publisher before any object it touches (the index, the cache
+    // registry) goes away. Queued jobs are dropped: their render completed and
+    // their segments are already playable, so an exit only loses the derived
+    // cache entry, which the next session can rebuild. A job already in
+    // Publish sees stop_ requested below and bails at its own checkpoints.
+    void StopNeuralPublishWorker(){
+        if(m_neuralPublishWorker.joinable()){
+            m_neuralPublishQueue->stop.request_stop();
+            m_neuralPublishWorker.request_stop();
+            m_neuralPublishQueue->wake.notify_all();
+            m_neuralPublishWorker.join();
+            m_neuralPublishWorker=std::jthread{};
+        }
+        {std::lock_guard lock(m_neuralPublishQueue->mutex);m_neuralPublishQueue->jobs.clear();}
+        m_neuralPublishCompletions.Clear();
+    }
+
     void StartCacheEviction(){
         if(m_cacheRoot.empty())return;
         m_cacheEviction=std::jthread([root=m_cacheRoot,driverVersion=m_opt.detectedGpu.driverVersion,moduleDirectory=ExecutableDirectory()](std::stop_token stop){
@@ -14792,7 +14922,7 @@ private:
         while(PeekMessageW(&message,m_hwnd,WM_STAGE_EXPORT_PROGRESS,WM_STAGE_EXPORT_PROGRESS,PM_REMOVE))
             delete reinterpret_cast<StageExportProgress*>(message.lParam);
     }
-    void DrainNeuralMessages(){m_neuralProgressMessages.Clear();m_neuralCompletions.Clear();if(!m_hwnd)return;MSG message{};while(PeekMessageW(&message,m_hwnd,WM_NEURAL_PROGRESS,WM_NEURAL_COMPLETE,PM_REMOVE)){};}
+    void DrainNeuralMessages(){m_neuralProgressMessages.Clear();m_neuralCompletions.Clear();m_neuralPublishCompletions.Clear();if(!m_hwnd)return;MSG message{};while(PeekMessageW(&message,m_hwnd,WM_NEURAL_PROGRESS,WM_NEURAL_COMPLETE,PM_REMOVE)){}while(PeekMessageW(&message,m_hwnd,WM_NEURAL_PUBLISHED,WM_NEURAL_PUBLISHED,PM_REMOVE)){}}
     // One line per render, in the same terse register as the receipt summary,
     // so a user's log carries the whole breakdown without the receipt file.
     void ReportNeuralColdStart(){
@@ -14844,7 +14974,12 @@ private:
             if(message.message==WM_NEURAL_PROGRESS)m_neuralProgressMessages.Remove(static_cast<uint64_t>(message.wParam));
             else if(message.message==WM_NEURAL_COMPLETE)cancelledCompletion=m_neuralCompletions.Take(static_cast<uint64_t>(message.wParam));
         }}
-        m_neuralProgressMessages.Clear();m_neuralCompletions.Clear();m_neuralLifecycle.Invalidate();
+        // A live job can have handed its publish to the background thread
+        // before this cancel. Its render completion is dropped below, so its
+        // publish result has no consumer either; leave the entry on disk
+        // (it is a valid cache item) but clear the pending message.
+        if(m_hwnd){MSG message{};while(PeekMessageW(&message,m_hwnd,WM_NEURAL_PUBLISHED,WM_NEURAL_PUBLISHED,PM_REMOVE)){}}
+        m_neuralProgressMessages.Clear();m_neuralCompletions.Clear();m_neuralPublishCompletions.Clear();m_neuralLifecycle.Invalidate();
         // behindPlayback above was read before this: the prepare's original is
         // already on screen, so a cancel must not reload it. Drop the flag once
         // that decision is made, or the next job would inherit "behind".
@@ -14927,7 +15062,7 @@ private:
             // The background acquisition of this very source, when one is in
             // flight: the job waits for it rather than downloading again.
             job.prefetch=(sourceKind==MediaSourceKind::YouTube&&!pageUrl.empty()&&pageUrl==m_prefetchPageUrl)?m_prefetchState:nullptr;
-            job.progressMessages=&m_neuralProgressMessages;job.completions=&m_neuralCompletions;
+            job.progressMessages=&m_neuralProgressMessages;job.completions=&m_neuralCompletions;job.publishCompletions=&m_neuralPublishCompletions;
             // An active session renders into its own directory of segment files;
             // the cache entry is the concatenation published when the job ends.
             // A resumed or retargeted session keeps every earlier job's files, so
@@ -14972,7 +15107,14 @@ private:
             m_coldStart=std::make_shared<NeuralColdStartRecord>();
             job.coldStart=m_coldStart;
             job.sourceDigestMemo=m_sourceDigestMemo;
-            m_neuralWorker=std::jthread([job=std::move(job)](std::stop_token stop){NeuralJobRun(job,std::move(stop)).Run();});
+            const bool backgroundPublish=(kind==NeuralJobKind::Live);
+            auto publishQueue=m_neuralPublishQueue;
+            m_neuralWorker=std::jthread([job=std::move(job),backgroundPublish,publishQueue](std::stop_token stop){
+                auto run=std::make_shared<NeuralJobRun>(job,std::move(stop));
+                if(backgroundPublish)
+                    run->handoff=[publishQueue](std::shared_ptr<NeuralJobRun> finished){publishQueue->Push(std::move(finished));};
+                run->Run();
+            });
         }catch(const std::system_error&){m_neuralLifecycle.Invalidate();m_prepareBehindMedia=false;SyncSourceActionAvailability();const std::wstring message=L"The neural pre-render worker could not start.";MessageBoxW(m_hwnd,message.c_str(),T(L"app.title").c_str(),MB_OK|MB_ICONERROR);return false;}
         return true;
     }
@@ -15136,6 +15278,48 @@ private:
         if(m_coldStart)m_coldStart->Ready();
         HandleNeuralCompletion(completion);
         ReportNeuralColdStart();
+    }
+    // The second half of a live job, from the publish thread. Playback has
+    // been running on the job's segments since WM_NEURAL_COMPLETE, and the
+    // render completion already moved the lifecycle to Ready. So this only
+    // fills in the published entry for Save and the receipt, and reports a
+    // publish that failed. It never re-runs CompleteLiveNeuralJob: doing that
+    // would re-decide coverage and speak for a job the session has moved on
+    // from. A result whose generation was invalidated by a later job is
+    // ignored - its entry stays a valid cache item, just not this film's
+    // Save offer.
+    void CompleteNeuralPublish(uint64_t token){
+        auto published=m_neuralPublishCompletions.Take(token);
+        if(!published)return;
+        if(!published->published){
+            LOG("Active neural session job "<<published->generation<<" published no cache entry: "<<WideToUtf8(published->detail)<<"; its rendered segments keep playing.");
+            return;
+        }
+        if(!m_liveSession){
+            LOG("Neural publish for job "<<published->generation<<" arrived after the session closed; the entry stays in the cache.");
+            return;
+        }
+        // Do NOT require generation equality here: by the time publication
+        // finishes the next hole has begun and Begin() has advanced the
+        // generation. This message is only the Save entry for a run whose
+        // segments are already playing; a later job's completion cannot
+        // supersede it. The exportability test below still scopes it to the
+        // session's range, so a stale entry is never offered as this film.
+        // The index itself is the authority on whether the run is still ours.
+        if(!m_liveSegments||m_liveSegments->Count()==0){
+            LOG("Neural publish for job "<<published->generation<<" arrived with no live coverage left; the entry stays in the cache.");
+            return;
+        }
+        // The same exportability test CompleteLiveNeuralJob applies to a
+        // completion that carried the entry inline.
+        if(m_liveWindowSeconds<=0.0 &&
+           live_session::ExportableEntry(LiveCoverage(),CoverageSpan{m_liveRange.start100ns,m_liveRange.end100ns},
+                                         CoverageSpan{published->range.start100ns,published->range.end100ns},LiveFrame100ns())){
+            m_neuralPath=published->neuralPath;
+            m_cachedReceiptPath=published->receiptPath;
+        }
+        LOG("Active neural session job "<<published->generation<<" published its cache entry in the background; save="<<(!m_neuralPath.empty())<<" entry="<<WideToUtf8(published->neuralPath.wstring())<<".");
+        SyncFeatureMenuState();SyncSourceActionAvailability();UpdateCachedStatus();InvalidateControls();
     }
     // The original of the job's own source is what is on screen: the prepare an
     // open now runs behind the picture (Load, keepsLoadedMedia). Such a job has
@@ -16106,6 +16290,7 @@ private:
         case WM_YOUTUBE_RESOLVED:CompleteYouTubeResolution(static_cast<uint64_t>(w));return 0;
         case WM_NEURAL_PROGRESS:CompleteNeuralProgress(static_cast<uint64_t>(w));return 0;
         case WM_NEURAL_COMPLETE:CompleteNeuralJob(static_cast<uint64_t>(w));return 0;
+        case WM_NEURAL_PUBLISHED:CompleteNeuralPublish(static_cast<uint64_t>(w));return 0;
         case WM_STAGE_EXPORT_PROGRESS:{
             std::unique_ptr<StageExportProgress> update(reinterpret_cast<StageExportProgress*>(l));
             if(update){
@@ -16147,8 +16332,8 @@ private:
             break;
         case WM_SETTINGCHANGE:ReadAnimationPreference();InvalidateRect(h,nullptr,FALSE);break;
         case WM_SHOWWINDOW:SyncActivityFeedback();break;
-        case WM_DESTROY:SaveWindowPlacement();CancelExport();CancelCast();DrainStageExportMessages();if(m_activityTimer){KillTimer(h,m_activityTimer);m_activityTimer=0;}StopModalTick();CancelNeuralJob(false);DrainNeuralMessages();CancelYouTubeResolution(false);DrainYouTubeCompletions();CancelSourcePrefetch();CancelUpdateCheck();CancelAddonDownload();m_running=false;PostQuitMessage(0);return 0;
-        case WM_CLOSE:CancelExport();CancelCast();CancelNeuralJob(false);CancelYouTubeResolution(false);CancelSourcePrefetch();CancelUpdateCheck();CancelAddonDownload();DestroyWindow(h);return 0;
+        case WM_DESTROY:SaveWindowPlacement();CancelExport();CancelCast();DrainStageExportMessages();if(m_activityTimer){KillTimer(h,m_activityTimer);m_activityTimer=0;}StopModalTick();CancelNeuralJob(false);StopNeuralPublishWorker();DrainNeuralMessages();CancelYouTubeResolution(false);DrainYouTubeCompletions();CancelSourcePrefetch();CancelUpdateCheck();CancelAddonDownload();m_running=false;PostQuitMessage(0);return 0;
+        case WM_CLOSE:CancelExport();CancelCast();CancelNeuralJob(false);StopNeuralPublishWorker();CancelYouTubeResolution(false);CancelSourcePrefetch();CancelUpdateCheck();CancelAddonDownload();DestroyWindow(h);return 0;
         case WM_GETMINMAXINFO:{
             auto* info=reinterpret_cast<MINMAXINFO*>(l);
             if(info){const UINT dpi=ActiveWindowDpi(h);const POINT minimum=MinimumPlayerWindowTrackSize(h,dpi);info->ptMinTrackSize.x=std::max<LONG>(info->ptMinTrackSize.x,minimum.x);info->ptMinTrackSize.y=std::max<LONG>(info->ptMinTrackSize.y,minimum.y);}
@@ -16524,6 +16709,38 @@ case IDM_EXPORT_STAGES:if(m_exportWorker.joinable())CancelExport();else ShowExpo
     // A worker a live retarget asked to stop, until its completion arrives.
     // Declared after m_residentHelper for the reason m_neuralWorker is.
     std::jthread m_retiringNeuralWorker;uint64_t m_retiringNeuralGeneration=0;
+    // Live jobs publish their cache entry here, off the render thread: a
+    // second helper job can start while concat/probe/promote run. One thread
+    // and a FIFO keep publication serial, because the cache root lock and the
+    // rename it ends in are shared by every entry in this process. Declared
+    // after m_neuralWorker: the render thread hands work to it, and it is
+    // stopped before the render worker on the way out.
+    struct NeuralPublishQueue {
+        std::mutex mutex;
+        std::condition_variable_any wake;
+        std::deque<std::shared_ptr<NeuralJobRun>> jobs;
+        std::stop_source stop;
+        void Push(std::shared_ptr<NeuralJobRun> job){
+            {std::lock_guard lock(mutex);jobs.push_back(std::move(job));}
+            wake.notify_all();
+        }
+        // Pop with the queue's own stop token; returns null when stopping.
+        std::shared_ptr<NeuralJobRun> Pop(std::stop_token threadStop){
+            std::unique_lock lock(mutex);
+            wake.wait(lock,threadStop,[this]{return !jobs.empty();});
+            // On shutdown drop queued work rather than publishing it: an exit
+            // must not wait out an 18 s concat tail. The segments are already
+            // on disk and the entry can be rebuilt; Stop clears the queue.
+            if(threadStop.stop_requested())return {};
+            auto job=std::move(jobs.front());jobs.pop_front();return job;
+        }
+        size_t Size(){std::lock_guard lock(mutex);return jobs.size();}
+    };
+    // Shared with render workers by value: a render thread hands its finished
+    // job here without touching PlayerApp, which owns the shared pointer.
+    std::shared_ptr<NeuralPublishQueue> m_neuralPublishQueue=std::make_shared<NeuralPublishQueue>();
+    std::jthread m_neuralPublishWorker;
+    CompletionRegistry<NeuralPublishCompletion>m_neuralPublishCompletions;
     // Progress-watchdog state: the last progress the job reported and when it
     // moved, so a phase that stops reporting can be told from a slow one.
     Clock::time_point m_neuralProgressAt{};NeuralRenderPhase m_watchedPhase{};uint64_t m_watchedFrames=0,m_watchedBytes=0;

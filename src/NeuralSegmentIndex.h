@@ -289,6 +289,19 @@ public:
         return segments_[index];
     }
 
+    // One locked snapshot of a run's paths. A background publisher takes this
+    // instead of walking Count()+At(): with a second job appending segments the
+    // index can grow between those two calls, which would leave the joined file
+    // holding a different set than the frame count it is checked against.
+    std::vector<std::filesystem::path> PathsOfRun(uint64_t runId) const
+    {
+        const std::lock_guard lock(mutex_);
+        std::vector<std::filesystem::path> paths;
+        for (const NeuralSegment& segment : segments_)
+            if (segment.runId == runId) paths.push_back(segment.path);
+        return paths;
+    }
+
     std::optional<NeuralSegment> Containing(int64_t timestamp100ns) const
     {
         const std::lock_guard lock(mutex_);

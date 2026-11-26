@@ -104,11 +104,9 @@ inline const char* CacheEncoderName(EncoderKind encoder)
 // tail of the index, and a positional slice would take the wrong files.
 inline std::vector<std::filesystem::path> SegmentsOfRun(const NeuralSegmentIndex& index, uint64_t runId)
 {
-    std::vector<std::filesystem::path> parts;
-    for (size_t position = 0; position < index.Count(); ++position)
-        if (const auto segment = index.At(position); segment && segment->runId == runId)
-            parts.push_back(segment->path);
-    return parts;
+    // A single locked snapshot: publication can now run on a background thread
+    // while the next job appends segments to this same index.
+    return index.PathsOfRun(runId);
 }
 
 // The published file is the render the helper reported: its geometry, its
