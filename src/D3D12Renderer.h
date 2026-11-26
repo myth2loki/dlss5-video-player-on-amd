@@ -1220,7 +1220,7 @@ private:
     void LatchGpuUnusable(d3d12_renderer_detail::FenceWaitResult result, HRESULT reason);
     // Presents the current backbuffer and accounts the time; a failure is logged
     // as `what` and classified like any other call on the device.
-    bool PresentSwapchain(const char* what);
+    bool PresentSwapchain(const char* what, UINT syncInterval = 0);
     bool RenderFrameInternal(const uint8_t* bgra, size_t bytes,
                              const float* guideGridRGBA32F, size_t guideBytes,
                              uint32_t gridW, uint32_t gridH,
@@ -1652,6 +1652,8 @@ private:
     bool m_fgIslandReported = false;
     // Set when the cadence double-present has been logged, once.
     bool m_fgCadenceReported = false;
+    // Set when the vsync-held generated frame has been logged, once.
+    bool m_fgVsyncPaceReported = false;
     // FidelityFX runs in the reference's validated colour domain - BGRA8 sRGB -
     // not the chain's FP16 linear light. m_fgFfxInput is the converted frame
     // (this chain -> the runtime), m_fgFfxOutput the generated frame back, via

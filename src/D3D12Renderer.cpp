@@ -29,6 +29,7 @@
 #include <fstream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ParallelFor.h"
@@ -36,6 +37,19 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
+
+// The cadence needs to know whether the display can show two refreshes inside
+// one source frame interval before it holds the generated frame. ENUM_CURRENT_
+// SETTINGS is the same source the status path uses in main.cpp; querying it
+// here avoids threading a monitor handle into the renderer for one number.
+double FgDisplayRefreshHz()
+{
+    DEVMODEW mode{};
+    mode.dmSize = sizeof(mode);
+    if (!EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) ||
+        mode.dmDisplayFrequency <= 1) return 0.0;
+    return double(mode.dmDisplayFrequency);
+}
 
 // Full-frame memory passes are bandwidth bound, so they are split only once they are
 // large enough that the dispatch pays for itself. Roughly a quarter of a 1080p frame.
@@ -2218,7 +2232,41 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
             // list's writes without waiting on the frame's own fence.
             TraceCadencePresent(true);
             if(probeDue)ProbeGeneratedPresent();
-            if(!PresentSwapchain("Present generated frame")) return false;
+            // Hold the generated midpoint for half a source interval. Both
+            // presents used to be submitted in the same CPU tick (measured
+            // 0.3 ms apart) with Present(0), so the source replaced the
+            // generated backbuffer before the next vsync and the screen still
+            // updated at source rate. Half an interval also spaces the pair
+            // evenly: the midpoint belongs between two source frames, not
+            // flashed immediately before the current one. Only do this when
+            // the display can fit two refreshes inside one source interval -
+            // 24/30 fps on 60 Hz is fine, 60 fps on 60 Hz keeps the old
+            // single-scanout cadence.
+            const double sourceHz = m_fgFrameTimeMs > 0.0f
+                                        ? 1000.0 / double(m_fgFrameTimeMs) : 0.0;
+            const double refreshHz = FgDisplayRefreshHz();
+            const bool holdGenerated = sourceHz > 0.0 &&
+                refreshHz >= 2.0 * sourceHz * 0.95;
+            const auto generatedAt = std::chrono::steady_clock::now();
+            if(holdGenerated && !m_fgVsyncPaceReported){
+                m_fgVsyncPaceReported=true;
+                LOG("Playback frame generation: generated frame held for "
+                    <<0.5*m_fgFrameTimeMs<<" ms ("
+                    <<sourceHz<<" fps source, "<<refreshHz<<" Hz display).");
+            }
+            if(!PresentSwapchain("Present generated frame",holdGenerated?1u:0u)) return false;
+            if(holdGenerated){
+                // Present(syncInterval=1) only queues the flip for the next
+                // refresh; wait for that refresh so the generated frame is
+                // actually scanned out before the source can supersede it.
+                ComPtr<IDXGIOutput> fgOutput;
+                if(SUCCEEDED(m_swapchain->GetContainingOutput(&fgOutput)) && fgOutput)
+                    fgOutput->WaitForVBlank();
+                const auto target = generatedAt + std::chrono::microseconds(
+                    int64_t(500.0 * double(m_fgFrameTimeMs)));
+                if(std::chrono::steady_clock::now() < target)
+                    std::this_thread::sleep_until(target);
+            }
             auto* present=m_presentCmds[slot].Get();
             if(!DeviceHR(present->Reset(m_presentAllocators[slot].Get(),nullptr),"Reset source present list")) return false;
             ID3D12DescriptorHeap*ph[]={m_srvHeap.Get()};present->SetDescriptorHeaps(1,ph);
@@ -4201,7 +4249,10 @@ void D3D12Renderer::TraceCadencePresent(bool generated)
     }
     LOG("BLACK-PROBE: cadence present #" << m_fgPresentTrace << " ("
         << (generated ? "generated" : "source") << ") -> backbuffer "
-        << m_swapchain->GetCurrentBackBufferIndex() << ".");
+        << m_swapchain->GetCurrentBackBufferIndex()
+        << " t_us=" << std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count()
+        << " FG-TIMING-PROBE");
 }
 
 bool D3D12Renderer::EnsureFrameGenProbeResources()
@@ -6290,12 +6341,13 @@ void D3D12Renderer::LatchGpuUnusable(d3d12_renderer_detail::FenceWaitResult resu
             LOG("DRED page fault: recently freed \""<<(node->ObjectNameA?node->ObjectNameA:"")<<"\" type "<<int(node->AllocationType));
     }
 }
-bool D3D12Renderer::PresentSwapchain(const char*what){
+bool D3D12Renderer::PresentSwapchain(const char*what, UINT syncInterval){
     // A VSR size still settling leaves the present stale, so a paused player presents
     // again until the size is made and the picture is VSR's.
     m_presentStale=m_vsrSizeHeld;
     const auto presented=std::chrono::steady_clock::now();
-    const HRESULT hr=m_swapchain->Present(0,m_allowTearing?DXGI_PRESENT_ALLOW_TEARING:0);
+    const UINT flags = syncInterval == 0 && m_allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+    const HRESULT hr=m_swapchain->Present(syncInterval,flags);
     m_presentNanos+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now()-presented).count());
     return DeviceHR(hr,what);
