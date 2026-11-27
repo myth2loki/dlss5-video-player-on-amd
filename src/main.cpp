@@ -4009,12 +4009,41 @@ public:
     // so a due frame is never missed by more than that, and far above the
     // ~0 ms the loop was effectively using.
     void WaitForNextTick(){
+        // A cadence pair's source present is owed by this loop. Waiting for it
+        // here rather than inside the renderer is what keeps a hover repaint
+        // from costing a frame: the wait pumps messages in 1-3 ms slices, so a
+        // tooltip fading in or a button lighting up is painted inside the half
+        // interval the pair is spaced by instead of queueing behind a sleep.
+        if(m_renderer&&m_renderer->DeferredPresentPending()){ServiceDeferredPresent();return;}
         const DWORD sleepMs=TickSleepMs();
         m_tickSleeper.SleepMs(int(sleepMs?sleepMs:2u));
     }
 
 
 private:
+    // The message pump for the half interval a cadence pair is spaced by. Short
+    // slices, not one wait to the due time: a repaint that starts near the end
+    // still has to finish before the source frame's Present, and a paused or
+    // seeked player changes state from these messages, which is why the loop
+    // re-reads RemainMs() every pass and flushes as soon as it is due.
+    void ServiceDeferredPresent(){
+        while(m_renderer&&m_renderer->DeferredPresentPending()){
+            const double remain=m_renderer->DeferredPresentRemainMs();
+            if(remain<=0.0)break;
+            MSG message{};
+            bool quit=false;
+            while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
+                if(message.message==WM_QUIT){quit=true;break;}
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            if(quit){PostQuitMessage(static_cast<int>(message.wParam));break;}
+            m_tickSleeper.SleepMs(remain>3.0?3:1);
+        }
+        if(m_renderer&&m_renderer->DeferredPresentPending())
+            m_renderer->FlushDeferredPresent();
+    }
+
     static constexpr UINT_PTR kActivityTimerId=0xD155;
     static constexpr UINT_PTR kFullscreenTimerId=0xD156;
     static constexpr UINT_PTR kPreviewTimerId=0xD157;

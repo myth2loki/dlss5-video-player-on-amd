@@ -1926,6 +1926,13 @@ bool D3D12Renderer::DumpOutputFrame(){
 }
 
 bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandList*cmd,bool flowFrame,bool temporalReset,float frameTimeMs,const FrameIdentity*identity){
+    // A cadence pair whose source Present the message loop has not made yet must
+    // be completed before this frame touches the backbuffer: DXGI hands back the
+    // same buffer until that Present happens, so writing here would replace the
+    // source frame with this one and lose the pair entirely. The message loop
+    // flushes on time in the ordinary case; this is the backstop for a caller
+    // that got here first.
+    if(m_fgDeferredPending&&!FlushDeferredPresent())return false;
     const bool guidesUsed=GuidesRequired();
     // False on the first frame of a stream and on every cut: there is no previous frame
     // to compare against. The compact CPU grid is already all-zero on exactly those
@@ -2255,17 +2262,26 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
                     <<sourceHz<<" fps source, "<<refreshHz<<" Hz display).");
             }
             if(!PresentSwapchain("Present generated frame",holdGenerated?1u:0u)) return false;
+            // The hold belongs to the caller. Present(syncInterval=1) queues the
+            // generated flip for the next refresh; the source frame's Present
+            // must not happen until half a source interval has passed, or the
+            // source replaces the generated backbuffer before it is ever
+            // scanned out. Sleeping here did exactly that wait, but it also
+            // stopped the message pump for 20.8 ms at 24 fps - long enough that
+            // a hover repaint (a tooltip fading in, a button lighting up) no
+            // longer fit the frame budget once the neural pass had taken its
+            // share, which is the "hovering a button drops frames" report.
+            // Recording the due time instead lets the message loop pump while
+            // it waits; PlayerApp::WaitForNextTick does so and then flushes.
+            // No WaitForVBlank either: the wait is half an interval and the
+            // branch only runs when the display fits two refreshes in one, so
+            // the generated frame's refresh is well inside it.
+            const auto deferAt=generatedAt+std::chrono::microseconds(
+                int64_t(1000.0*std::min(0.5*double(m_fgFrameTimeMs),40.0)));
             if(holdGenerated){
-                // Present(syncInterval=1) only queues the flip for the next
-                // refresh; wait for that refresh so the generated frame is
-                // actually scanned out before the source can supersede it.
-                ComPtr<IDXGIOutput> fgOutput;
-                if(SUCCEEDED(m_swapchain->GetContainingOutput(&fgOutput)) && fgOutput)
-                    fgOutput->WaitForVBlank();
-                const auto target = generatedAt + std::chrono::microseconds(
-                    int64_t(500.0 * double(m_fgFrameTimeMs)));
-                if(std::chrono::steady_clock::now() < target)
-                    std::this_thread::sleep_until(target);
+                m_fgDeferredPending=true;
+                m_fgDeferredDoubling=m_playbackFrameGen&&showGenerated;
+                m_fgDeferredAt=deferAt;
             }
             auto* present=m_presentCmds[slot].Get();
             if(!DeviceHR(present->Reset(m_presentAllocators[slot].Get(),nullptr),"Reset source present list")) return false;
@@ -2273,6 +2289,15 @@ bool D3D12Renderer::RecordAndPresentFrame(uint32_t slot,ID3D12GraphicsCommandLis
             if(!RecordFrameGenPresentDraw(present,slot,false)) return false;
             if(!DeviceHR(present->Close(),"Close source present list")) return false;
             {ID3D12CommandList*ls[]={present};m_queue->ExecuteCommandLists(1,ls);}
+            // The probe and the cadence trace belong to the moment the present
+            // happens, not to when its list was queued: a deferred source
+            // present that was traced here would report 0.3 ms after the
+            // generated one and measure the old bug, not the fix. Both move to
+            // FlushDeferredPresent with the Present itself.
+            if(holdGenerated){
+                m_fgDeferredProbe=probeDue;
+                return true;
+            }
             TraceCadencePresent(false);
             if(probeDue)ProbeSourcePresent();
             const bool presented=PresentSwapchain("Present source frame");
@@ -6351,6 +6376,30 @@ bool D3D12Renderer::PresentSwapchain(const char*what, UINT syncInterval){
     m_presentNanos+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now()-presented).count());
     return DeviceHR(hr,what);
+}
+double D3D12Renderer::DeferredPresentRemainMs() const{
+    if(!m_fgDeferredPending)return 0.0;
+    const auto now=std::chrono::steady_clock::now();
+    if(now>=m_fgDeferredAt)return 0.0;
+    return std::chrono::duration<double,std::milli>(m_fgDeferredAt-now).count();
+}
+// The second half of a cadence pair. The source frame's list has been on the
+// queue since the frame was recorded - only the Present was held back - so this
+// is the same call RecordAndPresentFrame used to make inline, just later and
+// with the doubling flags published here instead. Called from the message loop
+// once DeferredPresentRemainMs() has run out, and from the top of the next frame
+// as a backstop: an outstanding present means the backbuffer still shows the
+// source frame, and the next frame's backbuffer would be that same buffer.
+bool D3D12Renderer::FlushDeferredPresent(){
+    if(!m_fgDeferredPending)return true;
+    m_fgDeferredPending=false;
+    TraceCadencePresent(false);
+    if(m_fgDeferredProbe){ProbeSourcePresent();m_fgDeferredProbe=false;}
+    const bool presented=PresentSwapchain("Present source frame");
+    m_fgDoublingActive=m_fgDeferredDoubling&&m_playbackFrameGen&&presented;
+    if(m_fgDoublingActive)m_fgDoublingEstablished=true;
+    m_fgDeferredDoubling=false;
+    return presented;
 }
 bool D3D12Renderer::WaitForFenceValue(uint64_t value,uint64_t* stageWaitNanos){
     if(!value)return true;

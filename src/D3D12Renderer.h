@@ -5,6 +5,7 @@
 #include <dxgi1_6.h>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -930,6 +931,22 @@ public:
     // presents only then, instead of re-presenting the same image at 60 Hz.
     bool PresentationStale() const { return m_presentStale; }
 
+    // Playback frame generation submits the generated midpoint and the source
+    // frame as a pair, and the pair has to be spaced by half a source interval
+    // or the screen still updates at source rate. Waiting that interval inside
+    // RecordAndPresentFrame stopped the message pump for 20.8 ms at 24 fps,
+    // which is why a hover repaint - a tooltip fading in, a button lighting -
+    // cost a dropped frame once the neural pass had taken the rest of the
+    // budget. The renderer therefore queues the generated present, records when
+    // the source present is due, and leaves the wait to the message loop:
+    // DeferredPresentPending() says one is outstanding, DeferredPresentRemainMs()
+    // says how long is left, and FlushDeferredPresent() does the Present.
+    // While one is outstanding the backbuffer still holds the source frame, so
+    // the next RenderFrame flushes first rather than overwriting it.
+    bool DeferredPresentPending() const { return m_fgDeferredPending; }
+    double DeferredPresentRemainMs() const;
+    bool FlushDeferredPresent();
+
     d3d12_renderer_detail::FenceWaitResult LastFenceWaitResult() const { return m_lastFenceWaitResult; }
     bool GpuUnusable() const { return m_gpuUnusable; }
     // How many renderers this process has retained rather than destroyed,
@@ -1702,6 +1719,15 @@ private:
     // playback_frame_gen::DoublingEstablished about why a pill painted from
     // m_fgDoublingActive strobed.
     bool m_fgDoublingEstablished = false;
+    // The source half of a cadence pair whose Present the message loop owes:
+    // its command list is already on the queue, only PresentSwapchain is left.
+    // m_fgDeferredAt is when that Present becomes correct (half a source
+    // interval after the generated present), and m_fgDeferredDoubling is the
+    // m_fgDoublingActive the flush publishes once the source frame lands.
+    bool m_fgDeferredPending = false;
+    bool m_fgDeferredDoubling = false;
+    bool m_fgDeferredProbe = false;
+    std::chrono::steady_clock::time_point m_fgDeferredAt{};
     // The interval the current frame arrived with (RenderFrame's argument),
     // remembered so the generation record can pass it to FidelityFX.
     float m_fgFrameTimeMs = 0.0f;
