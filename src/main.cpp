@@ -5080,7 +5080,13 @@ private:
         }
         const double clock=subtitle::SubtitleClock(Position(),m_subtitleDelayMs);
         SubtitleOverlay::Canvas canvas;
-        canvas.width=m_renderer->BackbufferW();canvas.height=m_renderer->BackbufferH();
+        // The part of the picture the window shows, not the whole backbuffer: Fill and a
+        // cropped 1:1 view put a window taller than the video area behind the control
+        // strip, and a canvas of the window's size laid the text's last lines under that
+        // strip (reported 2026-11-27 as "the subtitles are covered").
+        const RECT band=m_renderer->SubtitleCanvasRect();
+        canvas.width=uint32_t(std::max<LONG>(1,band.right-band.left));
+        canvas.height=uint32_t(std::max<LONG>(1,band.bottom-band.top));
         canvas.videoWidth=m_decoder.Width();canvas.videoHeight=m_decoder.Height();
         canvas.rate=subtitle::CanvasRate(m_decoder.FrameRate());canvas.duration=m_decoder.DurationSeconds();
         const SubtitleOverlay::Source* shown=m_subtitles.CurrentSource();
@@ -7095,6 +7101,11 @@ private:
         effective.zoomScale=compare_zoom::ScaleForStep(m_zoomStep,outputW,viewW);
         if(effective.zoomScale<=1.0f){effective.zoomCenterX=0.5f;effective.zoomCenterY=0.5f;}
         effective.loupe=false;
+        // Set before the early return below: the visible part of the picture is not a
+        // comparison fact. The subtitle canvas is cut to it, and a build with Neural
+        // Rendering off - where nothing can be compared - was the one case where the
+        // canvas stayed the whole window and the text's bottom edge went with Fill.
+        effective.visible=m_visiblePicture;
         if(!ComparisonModesAvailable()){effective.mode=ComparisonMode::Neural;effective.strength=1.0f;effective.againstVsr=false;return effective;}
         // RTX VSR remembered from a machine or build that had it reads as DLSS 5 here,
         // without forgetting the choice.
@@ -7102,7 +7113,6 @@ private:
         if(!VsrUsable())effective.againstVsr=false;
         if(m_peekOriginal)effective.mode=ComparisonMode::Original;
         effective.labelFade=float(m_tagFade.Level(Clock::now()));
-        effective.visible=m_visiblePicture;
         effective.mask=!m_maskFeathered.pixels.empty();effective.maskInvert=m_maskInvert;
         // The loupe exists while the pointer is over the picture. Backbuffer pixels are
         // the render window's client pixels, because the backbuffers follow it.
@@ -7634,7 +7644,66 @@ private:
         return 0;
     }
     // View > Fit, Fill and 1:1 pixels; A and the toolbar pill flip between the first two.
-    void SetAspect(bool fill,bool onePixel){m_fill=fill;m_onePixel=onePixel;Layout();SyncFeatureMenuState();InvalidateControls();}
+    //
+    // Choosing a framing is a request to see the picture that way, so it also ends a
+    // zoom: the step is persisted, and 1:1 of a 1440p render in a 900p window is a
+    // 1.6x magnification, which leaves the picture centre-cropped over the answer the
+    // viewer just asked for. Pressing Fit and watching the picture stay magnified read
+    // as the button doing nothing (reported 2026-11-27), and the same press when the
+    // mode was already Fit has to work too - that is the gesture people use to get
+    // back to the whole frame.
+    void SetAspect(bool fill,bool onePixel){
+        const bool zoomEnded=m_zoomStep!=0;
+        m_fill=fill;m_onePixel=onePixel;
+        if(zoomEnded){m_zoomStep=0;m_comparison.zoomCenterX=0.5f;m_comparison.zoomCenterY=0.5f;}
+        Layout();SyncFeatureMenuState();InvalidateControls();
+        // Layout already sent the new framing to the renderer. A zoom that has just
+        // ended also has to reach the paused picture and the status line, which the
+        // playback tick does by itself; ApplyComparison is the one path that does both.
+        if(zoomEnded)ApplyComparison();
+    }
+    // View > Window fits the picture: the window takes the source's own shape, so the
+    // whole frame is on screen at the largest size this display allows and the picture
+    // fills it edge to edge, with no bar to give up and nothing to crop.
+    //
+    // The two framings above answer a question the window's shape has already settled:
+    // a 16:9 film in a 2.13 window is either pillarboxed (Fit, and the picture is
+    // smaller than the window promises) or cropped top and bottom (Fill, and the last
+    // rows - where a burned-in subtitle lives - go with it). Neither can fill a shape
+    // the source does not have, so the one honest answer for "show all of it, as large
+    // as it goes" is to move the window. Reported 2026-11-27.
+    void FitWindowToPicture(){
+        if(!m_hwnd||!m_loaded||!(m_dar>0.0))return;
+        // A fullscreen window's shape is the screen's: nothing here can change it, and
+        // Fit already shows the whole frame there.
+        if(m_fullscreen)ToggleFullscreen();
+        if(IsZoomed(m_hwnd)||IsIconic(m_hwnd))ShowWindow(m_hwnd,SW_RESTORE);
+        MONITORINFO info{sizeof(info)};
+        if(!GetMonitorInfoW(MonitorFromWindow(m_hwnd,MONITOR_DEFAULTTONEAREST),&info))return;
+        const RECT work=info.rcWork;
+        RECT outer{},client{};
+        if(!GetWindowRect(m_hwnd,&outer)||!GetClientRect(m_hwnd,&client))return;
+        const int frameW=(outer.right-outer.left)-client.right;
+        const int frameH=(outer.bottom-outer.top)-client.bottom;
+        const int chrome=ControlHeight();
+        const int maxClientW=std::max(240,static_cast<int>(work.right-work.left)-frameW);
+        const int maxClientH=std::max(240,static_cast<int>(work.bottom-work.top)-frameH);
+        // The screen's height binds first for anything wider than it is tall, so the
+        // picture is sized by height and the width follows from the source's aspect.
+        int areaH=std::max(1,maxClientH-chrome);
+        int clientW=static_cast<int>(std::lround(areaH*m_dar));
+        if(clientW>maxClientW){
+            clientW=maxClientW;
+            areaH=std::max(1,static_cast<int>(std::lround(clientW/m_dar)));
+        }
+        int clientH=areaH+chrome;
+        // Windows' own minimum size still applies (WM_GETMINMAXINFO), so a tall source
+        // leaves the window at that minimum rather than a sliver.
+        const int x=work.left+std::max(0,(static_cast<int>(work.right-work.left)-(clientW+frameW))/2);
+        const int y=work.top+std::max(0,(static_cast<int>(work.bottom-work.top)-(clientH+frameH))/2);
+        SetWindowPos(m_hwnd,nullptr,x,y,clientW+frameW,clientH+frameH,SWP_NOZORDER|SWP_NOACTIVATE);
+        Layout();
+    }
     // A press on the picture: the divider, a drag, or the press-and-hold A/B; see
     // compare_gesture for how the three are told apart.
     void RenderMouseDown(HWND source,LPARAM position){
@@ -7860,6 +7929,9 @@ private:
                     MF_BYCOMMAND|((m_exportWorker.joinable()||(m_loaded&&!ActivityBusy()&&!m_frameGenWorker.joinable()))?MF_ENABLED:MF_GRAYED));
             }
             app_menu::CheckRadioCommand(menu,IDM_ASPECT_FIT,IDM_ASPECT_ONE_TO_ONE,m_onePixel?IDM_ASPECT_ONE_TO_ONE:(m_fill?IDM_ASPECT_FILL:IDM_ASPECT_FIT));
+            // Outside that radio range: a window that has no picture to take the shape of
+            // would do nothing, which is the one thing a menu row must never look like.
+            EnableMenuItem(menu,IDM_ASPECT_FIT_WINDOW,MF_BYCOMMAND|(m_loaded?MF_ENABLED:MF_GRAYED));
             app_menu::UpdateRenderActionAvailability(menu,m_loaded,RangeRenderAvailable(),NeuralJobActive(),NeuralJobPaused(),!m_cachedReceiptPath.empty());
             app_menu::UpdateComparisonMenu(menu,ComparisonModesAvailable(),m_loaded&&m_renderer!=nullptr,CommandForComparisonMode(SelectedComparisonMode()),m_zoomStep>0,m_comparison.swap,m_loupe,m_comparison.differenceLuma,
                                            VsrUsable(),m_comparison.againstVsr);
@@ -16574,7 +16646,7 @@ private:
         case IDM_NEURAL_WINDOW_300:SetLiveWindowSeconds(300.0);break;
         case IDM_AUDIO_PASSTHROUGH:SetAudioPassthrough(!m_audioPassthrough);break;
         case IDM_EXPORT_CACHED_VIDEO:ExportCachedVideo();break;
-        case IDM_VIEW_FINAL:SetDebug(D3D12Renderer::DebugView::Final);break;case IDM_VIEW_INPUT:SetDebug(D3D12Renderer::DebugView::Input);break;case IDM_VIEW_MV:SetDebug(D3D12Renderer::DebugView::MotionVectors);break;case IDM_VIEW_DEPTH:SetDebug(D3D12Renderer::DebugView::Depth);break;case IDM_VIEW_FRAME_GENERATED:SetDebug(D3D12Renderer::DebugView::FrameGenerated);break;case IDM_VIDEO_ADJUSTMENTS:ShowAdjustments();break;case IDM_ASPECT_FIT:SetAspect(false,false);break;case IDM_ASPECT_FILL:SetAspect(true,false);break;case IDM_FULLSCREEN:ToggleFullscreen();break;case IDM_ADVANCED_SAFE_MODE:RestartInSafeMode();break;case IDM_CLEAR_NEURAL_CACHE:ClearNeuralCache();break;
+        case IDM_VIEW_FINAL:SetDebug(D3D12Renderer::DebugView::Final);break;case IDM_VIEW_INPUT:SetDebug(D3D12Renderer::DebugView::Input);break;case IDM_VIEW_MV:SetDebug(D3D12Renderer::DebugView::MotionVectors);break;case IDM_VIEW_DEPTH:SetDebug(D3D12Renderer::DebugView::Depth);break;case IDM_VIEW_FRAME_GENERATED:SetDebug(D3D12Renderer::DebugView::FrameGenerated);break;case IDM_VIDEO_ADJUSTMENTS:ShowAdjustments();break;case IDM_ASPECT_FIT:SetAspect(false,false);break;case IDM_ASPECT_FILL:SetAspect(true,false);break;case IDM_ASPECT_FIT_WINDOW:FitWindowToPicture();break;case IDM_FULLSCREEN:ToggleFullscreen();break;case IDM_ADVANCED_SAFE_MODE:RestartInSafeMode();break;case IDM_CLEAR_NEURAL_CACHE:ClearNeuralCache();break;
         case IDM_MARK_IN:SetMarker(true,Position100ns());break;case IDM_MARK_OUT:SetMarker(false,Position100ns());break;case IDM_CLEAR_MARKS:ClearMarkers();break;case IDM_GOTO_TIMECODE:ShowTimecodeDialog();break;
         case IDM_PAUSE_NEURAL_RENDER:if(NeuralJobActive())SetNeuralJobPaused(!NeuralJobPaused());break;
         case IDM_PREVIEW_FRAME:PreviewCurrentFrame();break;case IDM_PREVIEW_CLIP:PreviewClip();break;case IDM_RENDER_RANGE:RenderMarkedRange();break;case IDM_RENDER_WHOLE:RenderWholeSource();break;

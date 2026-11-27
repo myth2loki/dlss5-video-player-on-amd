@@ -892,16 +892,23 @@ public:
     bool SetMask(const uint8_t* gray, uint32_t width, uint32_t height);
     void ClearMask();
     bool HasMask() const { return m_mask != nullptr; }
-    // The subtitle overlay: premultiplied BGRA at the backbuffer's size, drawn by the
-    // window compositor over everything else and never by PSPresent, so it cannot reach
-    // the cache capture. Copied into an upload buffer now and onto the GPU by the next
-    // frame or present, like the comparison reference; only a new size drains the
-    // queue. Null hides it. False when the renderer has no window compositor.
+    // The subtitle overlay: premultiplied BGRA at the size of the part of the picture
+    // the window shows, drawn by the window compositor over everything else and never by
+    // PSPresent, so it cannot reach the cache capture. Copied into an upload buffer now
+    // and onto the GPU by the next frame or present, like the comparison reference; only
+    // a new size drains the queue. Null hides it. False when the renderer has no window
+    // compositor.
     // `drawn` bounds every non-zero pixel of the picture (subtitle::NonZeroBounds);
     // with it only what changed since the last picture is copied, without it all of it.
     bool SetSubtitleOverlay(const uint8_t* premultipliedBgra, uint32_t width, uint32_t height,
                             const subtitle::PixelBox* drawn = nullptr);
     bool SubtitleOverlayShown() const { return m_subtitleShown || m_subtitlePending; }
+    // The size the subtitle canvas has to be, in backbuffer pixels: the part of the
+    // picture the window shows. Fit's window is all of it, but Fill and a cropped 1:1
+    // view put a window larger than the video area behind the control strip, and a
+    // canvas the window's size there lands the text's bottom edge under that strip -
+    // out of sight, which is what a viewer reads as "the subtitles are covered".
+    RECT SubtitleCanvasRect() const;
     // The picture on screen, drawn again into an offscreen target of the present's own
     // size with the present's own constants and program - so a saved comparison is what
     // the window shows, tags and loupe included - and read back as tightly packed RGBA.

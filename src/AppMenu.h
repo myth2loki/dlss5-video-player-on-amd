@@ -153,6 +153,9 @@ inline constexpr UINT IDM_NEURAL_WINDOW_300 = 356;
 inline constexpr UINT IDM_ASPECT_FIT = 400;
 inline constexpr UINT IDM_ASPECT_FILL = 401;
 inline constexpr UINT IDM_ASPECT_ONE_TO_ONE = 404;
+// Not a framing like the three above: it moves the window instead of the picture, so it
+// sits outside their radio range (CheckMenuRadioItem would clear it as one of them).
+inline constexpr UINT IDM_ASPECT_FIT_WINDOW = 405;
 inline constexpr UINT IDM_FULLSCREEN = 402;
 inline constexpr UINT IDM_VIDEO_ADJUSTMENTS = 403;
 inline constexpr UINT IDM_YOUTUBE_QUALITY_AUTO = 410;

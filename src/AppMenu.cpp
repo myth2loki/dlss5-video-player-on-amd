@@ -132,6 +132,9 @@ HMENU CreateMenuBar(const Localizer& localizer, bool youtubeAvailable)
     // alone at the bottom: it is the third answer to the same question the two
     // aspect commands answer.
     add(video, IDM_ASPECT_FIT, L"menu.aspectfit"); add(video, IDM_ASPECT_FILL, L"menu.aspectfill"); add(video, IDM_ASPECT_ONE_TO_ONE, L"menu.aspect_pixels");
+    // The fourth answer, and the only one that loses nothing: the window is resized to
+    // the picture's shape instead of the picture being fitted into or over the window's.
+    add(video, IDM_ASPECT_FIT_WINDOW, L"menu.fitwindow");
     add(video, IDM_FULLSCREEN, L"menu.fullscreen");
     AppendMenuW(video, MF_SEPARATOR, 0, nullptr);
     // What the picture is made of: the resolution it was fetched at, and the
@@ -925,6 +928,9 @@ std::optional<UINT> CommandForPlayerKey(UINT key, bool controlDown, bool shiftDo
     }
     switch (key) {
     case 'I': return shiftDown ? IDM_CLEAR_MARKS : IDM_MARK_IN;
+    // Bare A toggles Fit and Fill where the key handler reaches it; Shift+A is the
+    // framing that instead moves the window to the picture.
+    case 'A': return shiftDown ? std::optional<UINT>(IDM_ASPECT_FIT_WINDOW) : std::nullopt;
     case 'O': return shiftDown ? IDM_CLEAR_MARKS : IDM_MARK_OUT;
     case 'F': return shiftDown ? IDM_PREVIEW_CLIP : IDM_PREVIEW_FRAME;
     case 'Z': return shiftDown ? IDM_COMPARE_ZOOM_OUT : IDM_COMPARE_ZOOM;

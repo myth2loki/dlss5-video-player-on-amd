@@ -630,17 +630,27 @@ float4 PSConvertPq(V i):SV_Target{return float4(PqToLinear(T.SampleLevel(S,i.uv,
 #define OVERLAY_LINEAR(t) (t)
 #define DEBUG_OUTPUT(c) (c)
 #endif
-// Subtitles, last of all: premultiplied BGRA drawn at the backbuffer's own size by
-// the player's subtitle child, over whatever the rest of the compositor made - the
-// picture, the panes, the tags, the loupe - and in the sRGB-encoded values every
-// subtitle is authored in. On an HDR backbuffer they are brought into linear light
+// Subtitles, last of all: premultiplied BGRA drawn by the player's subtitle child at
+// the size of the part of the picture the window shows, over whatever the rest of the
+// compositor made - the picture, the panes, the tags, the loupe - and in the sRGB-
+// encoded values every subtitle is authored in. The canvas is mapped onto that part
+// rather than onto the whole backbuffer, so its bottom edge is the bottom of what the
+// viewer can see: Fill and a cropped 1:1 view put a window larger than the video area
+// behind the control strip, and a canvas the window's size there carried the text down
+// with it, out of sight. On an HDR backbuffer they are brought into linear light
 // like the tags, so they sit at SDR white with the rest of the SDR content and never
 // at an HDR original's highlights. Never in PSPresent, so never in the cache
 // capture, the neural input or an export; while the window is being resized it is
 // stretched until a canvas of the new size arrives.
 float3 SubtitlesOver(float3 o,float2 uv,out float cover){
     cover=0.0;
-    if(Subs.x>0.5){float4 s=Subtitles.SampleLevel(S,uv,0);o=OVERLAY_LINEAR(s.rgb)+o*(1.0-s.a);cover=s.a;}
+    if(Subs.x>0.5){
+        const float2 span=max(Visible.zw-Visible.xy,float2(1.0,1.0));
+        const float2 suv=(uv*Target.xy-Visible.xy)/span;
+        if(all(suv>=0.0)&&all(suv<=1.0)){
+            float4 s=Subtitles.SampleLevel(S,suv,0);o=OVERLAY_LINEAR(s.rgb)+o*(1.0-s.a);cover=s.a;
+        }
+    }
     return o;
 }
 // The dither of the backbuffer's store (DitherPolicy.h), added to the encoded value
@@ -5345,6 +5355,15 @@ bool D3D12Renderer::CreateSubtitleResources(uint32_t width,uint32_t height){
     m_subtitleHeld={0,0,width,height};m_subtitleDirty={};
     LOG("Subtitle overlay allocated: "<<width<<"x"<<height<<" with "<<ReferenceUploads<<" uploads.");
     return true;
+}
+
+// The canvas the subtitle child draws on, in backbuffer pixels. It is the same rectangle
+// the compositor maps it back onto (SubtitlesOver, the Compose constant Visible), so the
+// text sits at the bottom of what the window shows rather than of the window.
+RECT D3D12Renderer::SubtitleCanvasRect()const{
+    const uint32_t width=m_backbufferW?m_backbufferW:m_outputW;
+    const uint32_t height=m_backbufferH?m_backbufferH:m_outputH;
+    return compare_view::VisibleInTarget(m_comparison.visible,width,height);
 }
 
 bool D3D12Renderer::SetSubtitleOverlay(const uint8_t*premultipliedBgra,uint32_t width,uint32_t height,const subtitle::PixelBox*drawn){
