@@ -3841,6 +3841,12 @@ public:
     void StopModalTick(){
         if(m_modalTickTimer){if(m_hwnd)KillTimer(m_hwnd,m_modalTickTimer);m_modalTickTimer=0;}
     }
+    // Diagnostics (DLSS5_TICK_TRACE=1): splits a hitch between the tick's own body, the synchronous
+    // repaint it sends, and the message handler that ran before it.
+    static bool TickTraceEnabled(){
+        static const bool on=[]{wchar_t v[8]{};return GetEnvironmentVariableW(L"DLSS5_TICK_TRACE",v,8)!=0&&v[0]==L'1';}();
+        return on;
+    }
     // Never re-entered. Tick itself can open a message box (a failed seek, a
     // lost device), whose modal loop dispatches the timer above; a nested Tick
     // would run a seek or a present in the middle of the one that raised it.
@@ -3861,21 +3867,40 @@ public:
         // of 0.75 means the tick ate the budget it was supposed to leave for
         // the next one.
         const auto tickStart=Clock::now();
+        // Read before the tick runs: a seek clears m_seeking and m_seekPending
+        // inside itself, so a judgement made at the end of that tick sees a
+        // player that was never seeking and reports the seek's 350 ms as a
+        // hitch - which is exactly the line the loading state replaces.
+        const bool seekThisTick=m_seeking||m_seekPending;
         const double gapMs=m_lastTickEnd.time_since_epoch().count()
             ?std::chrono::duration<double,std::milli>(tickStart-m_lastTickEnd).count():0.0;
         struct TickScope{bool& active;Clock::time_point& last;Clock::time_point start;
             ~TickScope(){active=false;last=Clock::now();}}scope{m_inTick,m_lastTickEnd,tickStart};
+        const auto tickBodyStage=Clock::now();
         TickOnce();
+        const double tickOnceMs=std::chrono::duration<double,std::milli>(Clock::now()-tickBodyStage).count();
         // One synchronous paint per tick, after the frame was presented. See
         // InvalidateControls for why the paint is sent at all and why sending
         // it on every state change cost frames at a render's publish seam.
         // Done here rather than in a WM_PAINT handler because a playing
         // window's posted paint otherwise never arrives.
-        if(m_controlsPaintPending){m_controlsPaintPending=false;UpdateWindow(m_hwnd);}
+        double paintMs=0.0;
+        if(m_controlsPaintPending){
+            m_controlsPaintPending=false;
+            const auto paintStage=Clock::now();
+            UpdateWindow(m_hwnd);
+            paintMs=std::chrono::duration<double,std::milli>(Clock::now()-paintStage).count();
+        }
+        if(TickTraceEnabled()&&(tickOnceMs>20.0||paintMs>10.0))
+            LOG("TICK TRACE: once="<<tickOnceMs<<" ms paint="<<paintMs<<" ms gap="<<gapMs<<" ms");
         const double bodyMs=std::chrono::duration<double,std::milli>(Clock::now()-tickStart).count();
         // Only while playing: a load, a seek and a settings preview all run long
-        // tick bodies by design, and none of them is a dropped frame.
-        if(m_loaded&&m_playing&&m_decoder.FrameRate()>0.0){
+        // tick bodies by design, and none of them is a dropped frame. The seek
+        // flags are spelled out rather than left to m_playing, because a seek
+        // keeps m_playing until it decides whether to resume - so the tick that
+        // ran the seek (244-700 ms on this machine) was reported as a hitch at
+        // the exact moment the UI was already saying "Seeking...".
+        if(m_loaded&&m_playing&&m_decoder.FrameRate()>0.0&&!seekThisTick&&!m_seeking&&!m_seekPending){
             const double frameMs=1000.0/m_decoder.FrameRate();
             if(gapMs>=frameMs*1.5||bodyMs>=frameMs*0.75){
                 LOG("Tick hitch: gap="<<gapMs<<" ms body="<<bodyMs<<" ms of a "<<frameMs
@@ -4035,7 +4060,14 @@ private:
             while(PeekMessageW(&message,nullptr,0,0,PM_REMOVE)){
                 if(message.message==WM_QUIT){quit=true;break;}
                 TranslateMessage(&message);
+                const auto dispatchStart=Clock::now();
                 DispatchMessageW(&message);
+                if(TickTraceEnabled()){
+                    const double ms=std::chrono::duration<double,std::milli>(Clock::now()-dispatchStart).count();
+                    if(ms>10.0)
+                        LOG("MSG TRACE: msg=0x"<<std::hex<<message.message<<std::dec
+                            <<" hwnd="<<message.hwnd<<" took "<<ms<<" ms (deferred present wait)");
+                }
             }
             if(quit){PostQuitMessage(static_cast<int>(message.wParam));break;}
             m_tickSleeper.SleepMs(remain>3.0?3:1);
@@ -11087,6 +11119,16 @@ private:
                 <<" s); listening again from there.");
             StartSpeechFrom(sec);
         }SetSeeking(true);LeaveSettingsPreviewFrame();CancelPausedSettingsPreview();sec=ClampSeek(sec);LOG("Seek begin target="<<sec<<" resume="<<resumeAfter);
+        // Show the loading state before the work, not after it. A seek is
+        // transactional and synchronous - 244 ms to the first byte on a 720p
+        // local file, 700 ms on a pair - so the "Seeking..." notice this state
+        // feeds was painted only once the seek had finished, which is the one
+        // moment it stops being true. One synchronous paint here costs a frame
+        // and buys the viewer a reason for the freeze instead of a frozen
+        // picture that looks like a hang.
+        UpdateCachedStatus();InvalidateControls();InvalidatePlaybackProgress();
+        m_controlsPaintPending=false;
+        if(m_hwnd)UpdateWindow(m_hwnd);
         // Seek is deliberately transactional and performed from Tick(), never from a mouse message.
         // Shut down the audio producer first, wait for GPU work, then restart the video decoder.
         Audio().Stop();
@@ -12347,7 +12389,18 @@ private:
 
     void SetSeeking(bool seeking){
         if(m_seeking==seeking)return;m_seeking=seeking;ReconcileFocusForCurrentLayout();RefreshHoverForCurrentLayout();InvalidateControls();
-        if(!seeking)RunDeferredNeuralToggle();
+        // The health window restarts when the seek lands. Otherwise the one
+        // line printed after it divides the frames it did present by a window
+        // that also contains the seek, and reports "presented=18 fps of 23.976"
+        // for a player that is now perfectly on cadence - the same false alarm
+        // the loading state exists to stop.
+        if(!seeking){
+            m_playbackHealthAt=Clock::now();
+            m_playbackHealthDropped=m_droppedFrames;
+            m_playbackHealthPresented=m_cachedPresentedFrames;
+            m_guideMsTotal=0.0;m_renderMsTotal=0.0;m_renderMsFrames=0;
+            RunDeferredNeuralToggle();
+        }
     }
     // The toggle press that arrived mid-seek, honoured once the seek lands. The
     // press is dropped rather than queued twice if the seek left the player
@@ -13325,9 +13378,16 @@ private:
     }
 
     void Paint(){
+        const auto paintStarted=Clock::now();
         PAINTSTRUCT ps{};SetLastError(ERROR_SUCCESS);HDC windowDc=BeginPaint(m_hwnd,&ps);
         if(!windowDc){const DWORD error=GetLastError();LOG("BeginPaint failed winerr="<<error);return;}
-        const auto finishPaint=[&](){SetLastError(ERROR_SUCCESS);if(!EndPaint(m_hwnd,&ps)){const DWORD error=GetLastError();LOG("EndPaint failed winerr="<<error);}};
+        const auto finishPaint=[&](){SetLastError(ERROR_SUCCESS);if(!EndPaint(m_hwnd,&ps)){const DWORD error=GetLastError();LOG("EndPaint failed winerr="<<error);}
+            if(TickTraceEnabled()){
+                const double ms=std::chrono::duration<double,std::milli>(Clock::now()-paintStarted).count();
+                if(ms>6.0)LOG("PAINT TRACE: "<<ms<<" ms dirty="
+                    <<(ps.rcPaint.right-ps.rcPaint.left)<<"x"<<(ps.rcPaint.bottom-ps.rcPaint.top)
+                    <<" at "<<ps.rcPaint.left<<","<<ps.rcPaint.top);
+            }};
         RECT client{};if(!GetClientRect(m_hwnd,&client)){const DWORD error=GetLastError();LOG("GetClientRect during paint failed winerr="<<error);finishPaint();return;}
         const auto layout=LayoutPaintBuffer(client,ps.rcPaint);if(!layout){finishPaint();return;}
 
@@ -17916,11 +17976,21 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int)
 
             MSG msg{};
             bool quit=false;
+            // Diagnostics (DLSS5_TICK_TRACE=1): a handler that runs long is what the hitch line calls
+            // "gap" - the loop was busy somewhere this tick does not own.
             while(app.Running()&&!quit){
                 while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){
                     if(msg.message==WM_QUIT){quit=true;break;}
                     TranslateMessage(&msg);
+                    const auto dispatchStart=std::chrono::steady_clock::now();
                     DispatchMessageW(&msg);
+                    if(PlayerApp::TickTraceEnabled()){
+                        const double ms=std::chrono::duration<double,std::milli>(
+                            std::chrono::steady_clock::now()-dispatchStart).count();
+                        if(ms>10.0)
+                            LOG("MSG TRACE: msg=0x"<<std::hex<<msg.message<<std::dec
+                                <<" hwnd="<<msg.hwnd<<" took "<<ms<<" ms");
+                    }
                 }
                 if(quit)break;
                 app.Tick();

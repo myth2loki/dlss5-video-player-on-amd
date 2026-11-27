@@ -21,7 +21,10 @@
 #include <vector>
 #include <iterator>
 #include <cstring>
+#include <mutex>
+#include <optional>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <system_error>
 #include <string_view>
@@ -652,6 +655,53 @@ void VideoDecoder::ProbeHdrPeak(const std::wstring& path, const std::wstring& in
         << "-nit peak. The neural pass sees the tone-mapped frames.");
 }
 
+// A source's packet spacing cannot change between opens: same file, same bytes,
+// same answer. Every Open ran the probe anyway - a fresh ffprobe process for a
+// 119-packet walk - and one playback makes several: the initial load, the
+// range-selection job that reopens the same file, and a pair's two members.
+// Keyed on the two facts a rewrite changes, so a file replaced in place is
+// probed again rather than inheriting the old answer. A seek does NOT come
+// through here (it restarts the decoder in place), so this saves the reopen
+// paths, not the seek.
+namespace {
+struct SpacingAnswer {
+    uint64_t size = 0;
+    uint64_t writtenTicks = 0;
+    bool decided = false;
+    bool constant = true;
+};
+
+std::mutex g_spacingAnswersMutex;
+std::unordered_map<std::wstring, SpacingAnswer> g_spacingAnswers;
+
+std::optional<SpacingAnswer> CachedSpacingAnswer(const std::wstring& path) {
+    std::error_code error;
+    const uint64_t size = std::filesystem::file_size(path, error);
+    if (error) return std::nullopt;
+    const auto written = std::filesystem::last_write_time(path, error);
+    if (error) return std::nullopt;
+    const uint64_t ticks = static_cast<uint64_t>(written.time_since_epoch().count());
+    std::lock_guard<std::mutex> lock(g_spacingAnswersMutex);
+    const auto found = g_spacingAnswers.find(path);
+    if (found == g_spacingAnswers.end() || found->second.size != size
+        || found->second.writtenTicks != ticks) {
+        return std::nullopt;
+    }
+    return found->second;
+}
+
+void RememberSpacingAnswer(const std::wstring& path, bool decided, bool constant) {
+    std::error_code error;
+    const uint64_t size = std::filesystem::file_size(path, error);
+    if (error) return;
+    const auto written = std::filesystem::last_write_time(path, error);
+    if (error) return;
+    std::lock_guard<std::mutex> lock(g_spacingAnswersMutex);
+    g_spacingAnswers[path] = SpacingAnswer{
+        size, static_cast<uint64_t>(written.time_since_epoch().count()), decided, constant};
+}
+}  // namespace
+
 // Samples the first packets' presentation timestamps and asks whether they are
 // evenly spaced. See VariableFrameRatePolicy.h for why the two rates the
 // container declares cannot answer that.
@@ -671,6 +721,14 @@ void VideoDecoder::ProbePacketSpacing(const std::wstring& path, const std::wstri
     m_source.spacingConstant = true;
     if (m_source.stillImage || m_sourceKind != MediaSourceKind::LocalFile) return;
     if (m_ffprobeExe.empty()) return;
+    if (const auto known = CachedSpacingAnswer(path)) {
+        m_source.spacingDecided = known->decided;
+        m_source.spacingConstant = known->constant;
+        LOG("ffprobe: packet spacing for this file is already known ("
+            << (known->decided ? (known->constant ? "constant" : "variable") : "undecided")
+            << "); no probe run.");
+        return;
+    }
 
     // Packets come back in decode order; the slack is what lets
     // PresentationOrder return a window with no B-frame missing from its end.
@@ -721,6 +779,11 @@ void VideoDecoder::ProbePacketSpacing(const std::wstring& path, const std::wstri
     }
     m_source.spacingDecided = true;
     m_source.spacingConstant = verdict.constant;
+    // Only a verdict is remembered. "Too few packets to judge" is a property of
+    // the file as much as this one, but it costs a probe that returns in a few
+    // tens of milliseconds, and caching it would make a later, longer read of
+    // the same path answer with the first read's ignorance.
+    RememberSpacingAnswer(path, true, verdict.constant);
     LOG("ffprobe: packet spacing over " << verdict.intervals << " intervals is "
         << (verdict.constant ? "constant" : "variable") << " (median "
         << (verdict.medianIntervalSeconds * 1000.0) << " ms, " << verdict.deviatingIntervals
