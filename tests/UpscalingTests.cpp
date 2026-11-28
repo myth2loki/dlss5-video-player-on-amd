@@ -23,6 +23,17 @@ int main() {
     const auto fhd = UpscalingTarget(1280,720,1080);
     CHECK_EQ(fhd.width,1920u); CHECK_EQ(fhd.height,1080u); CHECK(fhd.grows);
     CHECK(!UpscalingTarget(1920,1080,1080).grows);
+    // A short, narrow source in a tall box asked for 3.46x and lost FSR 4 at
+    // the renderer's 3.0x gate. The fit now caps at 3.0x in both tall boxes,
+    // and every caller sees the size the renderer actually builds.
+    const auto capped = UpscalingTarget(640,416,1440);
+    CHECK_EQ(capped.width,1920u); CHECK_EQ(capped.height,1248u); CHECK(capped.grows);
+    CHECK(double(capped.width)/640.0 <= 3.0);
+    const auto cappedUhd = UpscalingTarget(640,416,2160);
+    CHECK_EQ(cappedUhd.width,1920u); CHECK_EQ(cappedUhd.height,1248u); CHECK(cappedUhd.grows);
+    // A rung below the cap is still honoured exactly.
+    const auto shortRung = UpscalingTarget(640,416,1080);
+    CHECK_EQ(shortRung.width,1662u); CHECK_EQ(shortRung.height,1080u); CHECK(shortRung.grows);
     CHECK_EQ(UpscaleRungWidth(1080),1920u);
     CHECK_EQ(UpscaleRungWidth(1440),2560u);
     CHECK_EQ(UpscaleRungWidth(2160),3840u);

@@ -10,7 +10,12 @@ struct UpscalingSize { uint32_t width{}, height{}; bool grows{}; };
 
 // The output bounding boxes the player offers, smallest first. They are 16:9
 // boxes, not a forced aspect: UpscalingTarget fits the source inside one.
+// The fit is capped at 3.0x, the largest ratio FSR defines: a source far from
+// 16:9 can otherwise ask for 3.46x in a 1440 box, which the renderer would
+// refuse outright (see D3D12Renderer's FSR 4 gate) even though a smaller output
+// in the same rung keeps every upscaler available.
 inline constexpr uint32_t kUpscaleRungHeights[]{1080, 1440, 2160};
+inline constexpr double kMaxUpscaleScale = 3.0;
 
 // Width of a rung, or 0 when `targetHeight` names none.
 inline constexpr uint32_t UpscaleRungWidth(uint32_t targetHeight) noexcept {
@@ -40,7 +45,13 @@ inline UpscalingSize UpscalingTarget(uint32_t width, uint32_t height, uint32_t t
     const uint32_t targetWidth = UpscaleRungWidth(targetHeight);
     if (!width || !height || !targetWidth)
         return {width,height,false};
-    const double scale = std::min(double(targetWidth)/width,double(targetHeight)/height);
+    // Capping the fit rather than the renderer's ratio keeps every caller - the
+    // status line, Auto's rung-drift check, and the export plan - on the same
+    // size the renderer actually builds. 640x416 at 1440 therefore fits to
+    // 1920x1248 (3.0x), not 2214x1440 (3.46x, past FSR's ceiling).
+    const double scale = std::min({double(targetWidth)/width,
+                                   double(targetHeight)/height,
+                                   kMaxUpscaleScale});
     if (scale <= 1.0) return {width,height,false};
     return {std::max(width, uint32_t(std::lround(width*scale)) & ~1u),
             std::max(height,uint32_t(std::lround(height*scale)) & ~1u),true};
